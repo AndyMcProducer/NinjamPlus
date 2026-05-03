@@ -3543,7 +3543,11 @@ void NJClient::SetWorkDir(char *path)
     sprintf(buf,"%x",a);
     tmp.Append(buf);
 #ifdef _WIN32
-    CreateDirectory(tmp.Get(),NULL);
+    int len = MultiByteToWideChar(CP_UTF8, 0, tmp.Get(), -1, NULL, 0);
+    wchar_t *wpath = new wchar_t[len];
+    MultiByteToWideChar(CP_UTF8, 0, tmp.Get(), -1, wpath, len);
+    CreateDirectoryW(wpath, NULL);
+    delete[] wpath;
 #else
     mkdir(tmp.Get(),0700);
 #endif
