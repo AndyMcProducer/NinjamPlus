@@ -50,7 +50,7 @@ struct WinVideoReader : public juce::Thread
     ~WinVideoReader() override
     {
         signalThreadShouldExit();
-        stopThread (3000);
+        stopThread (200);
         if (reader    != nullptr) { reader->Release();  reader    = nullptr; }
         if (mfStarted)           { MFShutdown();        mfStarted = false; }
     }
@@ -1471,14 +1471,15 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         if (metronomeMuteButton.getToggleState())
         {
             // unmuting: restore stored volume
+            storedMetronomeVolume = audioProcessor.getStoredMetronomeVolume();
             metronomeSlider.setValue(storedMetronomeVolume, juce::dontSendNotification);
-            audioProcessor.setMetronomeVolume(storedMetronomeVolume);
+            audioProcessor.setMetronomeMuted(false);
         }
         else
         {
             // muting: store current volume and silence
             storedMetronomeVolume = (float)metronomeSlider.getValue();
-            audioProcessor.setMetronomeVolume(0.0f);
+            audioProcessor.setMetronomeMuted(true);
         }
         updateMetronomeButtonColor();
     };
@@ -1973,14 +1974,50 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     chatButton.setToggleState(true, juce::dontSendNotification);
     updateChatButtonColor();
 
+    // Initialize chat display from processor state so reopening the GUI reflects current history
+    {
+        const juce::ScopedLock lock(audioProcessor.chatLock);
+        applyColoredChat(chatDisplay, audioProcessor.chatHistory, audioProcessor.chatSenders);
+        lastChatRevision = audioProcessor.chatRevision.load();
+        juce::Logger::writeToLog("Chat UI init revision=" + juce::String(lastChatRevision));
+    }
+
+    // Initialize metronome UI from processor state so mute/volume persist across GUI reopen
+    {
+        storedMetronomeVolume = audioProcessor.getStoredMetronomeVolume();
+        const float vol = audioProcessor.getMetronomeVolume();
+        if (audioProcessor.isMetronomeMuted())
+        {
+            metronomeMuteButton.setToggleState(false, juce::dontSendNotification); // muted
+            metronomeSlider.setValue(0.0, juce::dontSendNotification);
+        }
+        else
+        {
+            metronomeMuteButton.setToggleState(true, juce::dontSendNotification); // unmuted
+            metronomeSlider.setValue(vol, juce::dontSendNotification);
+        }
+        updateMetronomeButtonColor();
+        juce::Logger::writeToLog("Metronome UI init vol=" + juce::String(vol));
+    }
+
     startTimer(30);
 }
 
 NinjamVst3AudioProcessorEditor::~NinjamVst3AudioProcessorEditor()
 {
+    // Stop periodic UI ticks first so timerCallback won't touch UI-owned resources
+    stopTimer();
+
 #if JUCE_WINDOWS
-    videoFrameReader.reset();
+    if (videoFrameReader != nullptr)
+    {
+        videoFrameReader->signalThreadShouldExit();
+        // brief wait for the background decoder thread to stop (avoid long UI blocking)
+        videoFrameReader->stopThread(200);
+        videoFrameReader.reset();
+    }
 #endif
+
     for (auto& pair : midiTargetsByComponent)
         if (pair.first != nullptr)
             pair.first->removeMouseListener(this);
@@ -1994,7 +2031,6 @@ NinjamVst3AudioProcessorEditor::~NinjamVst3AudioProcessorEditor()
     midiRelayInputDevice.reset();
     openedMidiLearnInputDeviceId.clear();
     openedMidiRelayInputDeviceId.clear();
-    stopTimer();
     disconnect();
     atButton.setLookAndFeel(nullptr);
     chatButton.setLookAndFeel(nullptr);
@@ -2382,11 +2418,13 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         const juce::ScopedLock lock(audioProcessor.chatLock);
         const auto& history = audioProcessor.chatHistory;
         const auto& senders = audioProcessor.chatSenders;
+        const int revision = audioProcessor.chatRevision.load();
 
-        if (history.size() != lastChatSize)
+        if (revision != lastChatRevision)
         {
+            juce::Logger::writeToLog("UI Chat update: history=" + juce::String(history.size()) + " revision=" + juce::String(revision));
             applyColoredChat(chatDisplay, history, senders);
-            lastChatSize = history.size();
+            lastChatRevision = revision;
 
             if (chatWindow)
             {
@@ -3025,7 +3063,10 @@ void NinjamVst3AudioProcessorEditor::metronomeChanged()
     if (metronomeMuteButton.getToggleState())
         audioProcessor.setMetronomeVolume((float)metronomeSlider.getValue());
     else
+    {
         storedMetronomeVolume = (float)metronomeSlider.getValue(); // update stored value silently
+        audioProcessor.setStoredMetronomeVolume(storedMetronomeVolume);
+    }
 }
 
 void NinjamVst3AudioProcessorEditor::chatToggled()

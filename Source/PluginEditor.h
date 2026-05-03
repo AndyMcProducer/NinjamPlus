@@ -1096,7 +1096,7 @@ private:
         bool binaryOn = false;
     };
     
-    int lastChatSize = 0;
+    int lastChatRevision = 0;
 
     std::unique_ptr<juce::DocumentWindow> serverListWindow;
     std::unique_ptr<juce::DocumentWindow> chatWindow;

@@ -59,6 +59,10 @@ public:
     // Metronome
     void setMetronomeVolume(float vol);
     float getMetronomeVolume() const;
+    void setMetronomeMuted(bool shouldMute);
+    bool isMetronomeMuted() const;
+    void setStoredMetronomeVolume(float vol);
+    float getStoredMetronomeVolume() const;
 
     // Local Channel
     void setTransmitLocal(bool shouldTransmit);
@@ -254,6 +258,7 @@ private:
     juce::CriticalSection chatLock;
     juce::StringArray chatHistory;
     juce::StringArray chatSenders;  // parallel: "me", username, or "" for system
+    std::atomic<int> chatRevision { 0 };
     bool autoTranslate = false;
     juce::String translateTargetLang = "en";
     
@@ -262,6 +267,8 @@ private:
     int localBitrate = 128;
     bool voiceChatMode = false;
     int lastStatus = 0;
+    std::atomic<bool> metronomeMuted { false };
+    std::atomic<float> storedMetronomeVolume { 1.0f };
     
     juce::AudioBuffer<float> tempInputBuffer;
     juce::AudioBuffer<float> localChannelBuffer;

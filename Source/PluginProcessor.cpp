@@ -319,6 +319,7 @@ void NinjamVst3AudioProcessor::sendChatMessage(juce::String msg)
         juce::String localLine = "Me: " + msg;
         chatHistory.add(localLine);
         chatSenders.add("me");
+        chatRevision.fetch_add(1);
         if (chatHistory.size() > 100)
         {
             chatHistory.removeRange(0, chatHistory.size() - 100);
@@ -333,12 +334,49 @@ void NinjamVst3AudioProcessor::sendChatMessage(juce::String msg)
 
 void NinjamVst3AudioProcessor::setMetronomeVolume(float vol)
 {
-    ninjamClient.config_metronome = vol;
+    vol = juce::jlimit(0.0f, 1.0f, vol);
+    if (vol > 0.0f)
+    {
+        storedMetronomeVolume.store(vol);
+        metronomeMuted.store(false);
+    }
+    ninjamClient.config_metronome = metronomeMuted.load() ? 0.0f : vol;
 }
 
 float NinjamVst3AudioProcessor::getMetronomeVolume() const
 {
     return ninjamClient.config_metronome;
+}
+
+void NinjamVst3AudioProcessor::setMetronomeMuted(bool shouldMute)
+{
+    metronomeMuted.store(shouldMute);
+    if (shouldMute)
+    {
+        const float current = ninjamClient.config_metronome;
+        if (current > 0.0f)
+            storedMetronomeVolume.store(current);
+        ninjamClient.config_metronome = 0.0f;
+    }
+    else
+    {
+        ninjamClient.config_metronome = juce::jlimit(0.0f, 1.0f, storedMetronomeVolume.load());
+    }
+}
+
+bool NinjamVst3AudioProcessor::isMetronomeMuted() const
+{
+    return metronomeMuted.load();
+}
+
+void NinjamVst3AudioProcessor::setStoredMetronomeVolume(float vol)
+{
+    storedMetronomeVolume.store(juce::jlimit(0.0f, 1.0f, vol));
+}
+
+float NinjamVst3AudioProcessor::getStoredMetronomeVolume() const
+{
+    return juce::jlimit(0.0f, 1.0f, storedMetronomeVolume.load());
 }
 
 bool NinjamVst3AudioProcessor::isOpusSyncAvailable() const
@@ -486,6 +524,7 @@ void NinjamVst3AudioProcessor::refreshOpusSyncAvailabilityFromUsers()
         juce::ScopedLock lock(chatLock);
         chatHistory.add("Multi-Channel Audio Detected.");
         chatSenders.add("");
+        chatRevision.fetch_add(1);
         if (chatHistory.size() > 100)
         {
             chatHistory.removeRange(0, chatHistory.size() - 100);
@@ -798,6 +837,7 @@ void NinjamVst3AudioProcessor::launchVideoSessionAsync()
             juce::ScopedLock lock(chatLock);
             chatHistory.add("Video launch failed unexpectedly; opening direct VDO link may be unavailable.");
             chatSenders.add("");
+            chatRevision.fetch_add(1);
             if (chatHistory.size() > 100)
             {
                 chatHistory.removeRange(0, chatHistory.size() - 100);
@@ -825,6 +865,7 @@ void NinjamVst3AudioProcessor::launchVideoSession()
         juce::ScopedLock lock(chatLock);
         chatHistory.add("Connect to a server first, then click VDO.");
         chatSenders.add("");
+        chatRevision.fetch_add(1);
         if (chatHistory.size() > 100)
         {
             chatHistory.removeRange(0, chatHistory.size() - 100);
@@ -911,6 +952,7 @@ void NinjamVst3AudioProcessor::launchVideoSession()
             juce::ScopedLock lock(chatLock);
             chatHistory.add("Tip: If your cam isn't showing, refresh the video page and select your camera before entering the room.");
             chatSenders.add("");
+            chatRevision.fetch_add(1);
             if (chatHistory.size() > 100)
             {
                 chatHistory.removeRange(0, chatHistory.size() - 100);
@@ -924,6 +966,7 @@ void NinjamVst3AudioProcessor::launchVideoSession()
             juce::ScopedLock lock(chatLock);
             chatHistory.add("Failed to open video helper URL: " + helperUrlText);
             chatSenders.add("");
+            chatRevision.fetch_add(1);
             if (chatHistory.size() > 100)
             {
                 chatHistory.removeRange(0, chatHistory.size() - 100);
@@ -949,6 +992,7 @@ void NinjamVst3AudioProcessor::launchVideoSession()
         chatSenders.add("");
         chatHistory.add("Tip: If your cam isn't showing, refresh the video page and select your camera before entering the room.");
         chatSenders.add("");
+        chatRevision.fetch_add(2);
         if (chatHistory.size() > 100)
         {
             chatHistory.removeRange(0, chatHistory.size() - 100);
@@ -962,6 +1006,7 @@ void NinjamVst3AudioProcessor::launchVideoSession()
         juce::ScopedLock lock(chatLock);
         chatHistory.add("Failed to open VDO URL: " + directUrlText);
         chatSenders.add("");
+        chatRevision.fetch_add(1);
         if (chatHistory.size() > 100)
         {
             chatHistory.removeRange(0, chatHistory.size() - 100);
@@ -1568,6 +1613,7 @@ void NinjamVst3AudioProcessor::setNumLocalChannels(int num)
         juce::ScopedLock lock(chatLock);
         chatHistory.add(msg);
         chatSenders.add("");
+        chatRevision.fetch_add(1);
         if (chatHistory.size() > 100)
         {
             chatHistory.removeRange(0, chatHistory.size() - 100);
@@ -2826,6 +2872,7 @@ void NinjamVst3AudioProcessor::ChatMessage_Callback(void* userData, NJClient* in
                 juce::ScopedLock lock(self->chatLock);
                 self->chatHistory.add(recognizedMessage);
                 self->chatSenders.add("");
+                self->chatRevision.fetch_add(1);
                 if (self->chatHistory.size() > 100)
                 {
                     self->chatHistory.removeRange(0, self->chatHistory.size() - 100);
@@ -2997,6 +3044,7 @@ void NinjamVst3AudioProcessor::ChatMessage_Callback(void* userData, NJClient* in
             juce::ScopedLock lock(self->chatLock);
             self->chatHistory.add(stored);
             self->chatSenders.add(lineSender);
+            self->chatRevision.fetch_add(1);
             if (self->chatHistory.size() > 100)
             {
                 self->chatHistory.removeRange(0, self->chatHistory.size() - 100);
@@ -3806,6 +3854,7 @@ void NinjamVst3AudioProcessor::IntervalMediaItem_Callback(void* userData, NJClie
         juce::ScopedLock lock(self->chatLock);
         self->chatHistory.add(recognizedMessage);
         self->chatSenders.add("");
+        self->chatRevision.fetch_add(1);
         if (self->chatHistory.size() > 100)
         {
             self->chatHistory.removeRange(0, self->chatHistory.size() - 100);
@@ -4259,6 +4308,8 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     state.setProperty("midiRelayInputDeviceId", getMidiRelayInputDeviceId(), nullptr);
     state.setProperty("fxReverbWetDryMix", (double)getFxReverbWetDryMix(), nullptr);
     state.setProperty("fxDelayWetDryMix", (double)getFxDelayWetDryMix(), nullptr);
+    state.setProperty("metronomeMuted", isMetronomeMuted(), nullptr);
+    state.setProperty("metronomeVolume", (double)getStoredMetronomeVolume(), nullptr);
     for (int channel = 0; channel < maxLocalChannels; ++channel)
         state.setProperty("localInput" + juce::String(channel), getLocalChannelInput(channel), nullptr);
 
@@ -4283,6 +4334,8 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setMidiRelayInputDeviceId(state.getProperty("midiRelayInputDeviceId", "").toString());
     setFxReverbWetDryMix((float)(double)state.getProperty("fxReverbWetDryMix", 1.0));
     setFxDelayWetDryMix((float)(double)state.getProperty("fxDelayWetDryMix", 1.0));
+    storedMetronomeVolume.store(juce::jlimit(0.0f, 1.0f, (float)(double)state.getProperty("metronomeVolume", 1.0)));
+    setMetronomeMuted((bool)state.getProperty("metronomeMuted", false));
     for (int channel = 0; channel < maxLocalChannels; ++channel)
         setLocalChannelInput(channel, (int)state.getProperty("localInput" + juce::String(channel), -1));
 }
