@@ -76,6 +76,62 @@ static juce::String resolveTranslateTargetLanguageCode(const juce::String& prefe
     return normalised.isNotEmpty() ? normalised : "en";
 }
 
+static int computeJamTabaHostSyncStartPositionSamples(const juce::AudioPlayHead::CurrentPositionInfo& hostInfo,
+                                                      double sampleRate)
+{
+    if (sampleRate <= 1.0
+        || !std::isfinite(hostInfo.bpm)
+        || hostInfo.bpm <= 0.0
+        || !std::isfinite(hostInfo.ppqPosition))
+    {
+        return 0;
+    }
+
+    const double samplesPerBeat = (60.0 * sampleRate) / hostInfo.bpm;
+    if (!std::isfinite(samplesPerBeat) || samplesPerBeat <= 0.0)
+        return 0;
+
+    if (hostInfo.ppqPosition > 0.0)
+    {
+        const int denominator = hostInfo.timeSigDenominator > 0 ? hostInfo.timeSigDenominator : 4;
+        const int numerator = hostInfo.timeSigNumerator > 0 ? hostInfo.timeSigNumerator : 4;
+        const double barLengthInQuarterNotes = (4.0 * (double) numerator) / (double) denominator;
+        if (barLengthInQuarterNotes > 0.0)
+        {
+            double cursorPosInMeasure = hostInfo.ppqPosition - hostInfo.ppqPositionOfLastBarStart;
+            if (!std::isfinite(hostInfo.ppqPositionOfLastBarStart)
+                || cursorPosInMeasure < -1.0e-8
+                || cursorPosInMeasure > barLengthInQuarterNotes + 1.0e-8)
+            {
+                cursorPosInMeasure = std::fmod(hostInfo.ppqPosition, barLengthInQuarterNotes);
+                if (cursorPosInMeasure < 0.0)
+                    cursorPosInMeasure += barLengthInQuarterNotes;
+            }
+
+            if (cursorPosInMeasure > 1.0e-8)
+            {
+                const double samplesUntilNextMeasure = (barLengthInQuarterNotes - cursorPosInMeasure) * samplesPerBeat;
+                return -(int) std::llround(samplesUntilNextMeasure);
+            }
+        }
+
+        return 0;
+    }
+
+    return (int) std::llround(hostInfo.ppqPosition * samplesPerBeat);
+}
+
+static int normaliseSignedIntervalPosition(int positionSamples, int intervalLength)
+{
+    if (intervalLength <= 0)
+        return 0;
+
+    int normalised = positionSamples % intervalLength;
+    if (normalised < 0)
+        normalised += intervalLength;
+    return normalised;
+}
+
 static bool openUrlExternal(const juce::String& urlText)
 {
 #ifdef _WIN32
@@ -3505,24 +3561,30 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     {
         bool hostValid = gotHostPosition;
         bool hostPlaying = hostValid && hostInfoAtBlock.isPlaying;
+        const bool waitingForRestart = syncAwaitingHostRestart.load();
 
         bool prev = hostWasPlaying.load();
         if (!hostValid || !hostPlaying)
         {
             hostWasPlaying.store(false);
+            syncAwaitingHostRestart.store(false);
             syncWaitForInterval.store(false);
             syncTargetInterval.store(-1);
+            syncDisplayPositionOffset.store(0);
+        }
+        else if (waitingForRestart)
+        {
+            hostWasPlaying.store(false);
+            gateForSync = true;
             syncDisplayPositionOffset.store(0);
         }
         else if (!prev)
         {
             hostWasPlaying.store(true);
-            ninjamClient.ResetTransportPhase();
-            ninjamClient.ResetLocalBroadcastState();
+            primeSyncTransportStart(&hostInfoAtBlock);
             syncWaitForInterval.store(false);
             syncTargetInterval.store(-1);
             syncDisplayIntervalOffset.store(intervalIndex.load());
-            syncDisplayPositionOffset.store(0);
         }
 
         if (!hostValid || !hostPlaying)
@@ -3542,6 +3604,7 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
 
     const bool monitorEnabled = localMonitorEnabled.load();
     const bool transmitEnabled = isTransmittingLocal();
+
     // Feed local input to engine only for transmit. Monitoring is handled below
     // with explicit per-channel routing so stereo doesn't collapse when transmit toggles.
     const bool allowEngineLocalInput = transmitEnabled;
@@ -3845,18 +3908,62 @@ void NinjamVst3AudioProcessor::setSyncToHost(bool shouldSync)
 {
     syncToHost = shouldSync;
     hostWasPlaying.store(false);
+    bool hostIsPlayingNow = false;
+    {
+        const juce::ScopedLock lock(transportLock);
+        hostIsPlayingNow = lastHostPosition.isPlaying;
+    }
+    syncAwaitingHostRestart.store(shouldSync && hostIsPlayingNow);
     syncWaitForInterval.store(false);
     syncTargetInterval.store(-1);
     syncDisplayIntervalOffset.store(intervalIndex.load());
-    int pos = 0;
-    int length = 0;
-    ninjamClient.GetPosition(&pos, &length);
-    syncDisplayPositionOffset.store(length > 0 ? pos : 0);
+    syncDisplayPositionOffset.store(0);
+
+    if (shouldSync)
+        primeSyncTransportStart();
 }
 
 bool NinjamVst3AudioProcessor::isSyncToHostEnabled() const
 {
     return syncToHost;
+}
+
+void NinjamVst3AudioProcessor::setSyncStartCompensationMs(float ms)
+{
+    syncStartCompensationMs.store(juce::jlimit(0.0f, 250.0f, ms));
+}
+
+float NinjamVst3AudioProcessor::getSyncStartCompensationMs() const
+{
+    return syncStartCompensationMs.load();
+}
+
+int NinjamVst3AudioProcessor::getSyncStartCompensationSamples() const
+{
+    const double sampleRate = getSampleRate();
+    if (sampleRate <= 1.0)
+        return 0;
+
+    const double compensationSamples = (double) syncStartCompensationMs.load() * sampleRate / 1000.0;
+    return juce::jmax(0, (int) std::llround(compensationSamples));
+}
+
+void NinjamVst3AudioProcessor::primeSyncTransportStart(const juce::AudioPlayHead::CurrentPositionInfo* hostInfo)
+{
+    ninjamClient.ResetTransportPhase();
+    ninjamClient.ResetLocalBroadcastState();
+
+    int intervalLength = 0;
+    ninjamClient.GetPosition(nullptr, &intervalLength);
+
+    int startPositionSamples = getSyncStartCompensationSamples();
+    if (hostInfo != nullptr)
+        startPositionSamples += computeJamTabaHostSyncStartPositionSamples(*hostInfo, getSampleRate());
+
+    const int displayOffset = normaliseSignedIntervalPosition(startPositionSamples, intervalLength);
+
+    ninjamClient.SetTransportPosition(displayOffset);
+    syncDisplayPositionOffset.store(displayOffset);
 }
 
 bool NinjamVst3AudioProcessor::getHostPosition(juce::AudioPlayHead::CurrentPositionInfo& info) const
@@ -4287,6 +4394,7 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     state.setProperty("translateTargetLang", getTranslateTargetLang(), nullptr);
     state.setProperty("fxReverbWetDryMix", (double)getFxReverbWetDryMix(), nullptr);
     state.setProperty("fxDelayWetDryMix", (double)getFxDelayWetDryMix(), nullptr);
+    state.setProperty("syncStartCompensationMs", (double)getSyncStartCompensationMs(), nullptr);
     state.setProperty("metronomeMuted", isMetronomeMuted(), nullptr);
     state.setProperty("metronomeVolume", (double)getStoredMetronomeVolume(), nullptr);
     for (int channel = 0; channel < maxLocalChannels; ++channel)
@@ -4316,6 +4424,7 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setTranslateTargetLang(state.getProperty("translateTargetLang", "en").toString());
     setFxReverbWetDryMix((float)(double)state.getProperty("fxReverbWetDryMix", 1.0));
     setFxDelayWetDryMix((float)(double)state.getProperty("fxDelayWetDryMix", 1.0));
+    setSyncStartCompensationMs((float)(double)state.getProperty("syncStartCompensationMs", 0.0));
     storedMetronomeVolume.store(juce::jlimit(0.0f, 1.0f, (float)(double)state.getProperty("metronomeVolume", 1.0)));
     setMetronomeMuted((bool)state.getProperty("metronomeMuted", false));
     for (int channel = 0; channel < maxLocalChannels; ++channel)

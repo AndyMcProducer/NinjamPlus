@@ -983,7 +983,7 @@ private:
     LeftClickOnlySlider metronomeSlider;
     LeftClickOnlyTextButton metronomeMuteButton{ "" };
     LeftClickOnlyTextButton autoLevelButton{ "Auto Level" };
-    LeftClickOnlyTextButton syncButton{ "" };
+    TranslateMenuTextButton syncButton{ "" };
     LeftClickOnlyTextButton fxButton{ "FX" };
     LeftClickOnlyTextButton optionsButton{ "Options" };
     juce::Label tempoLabel;
@@ -1072,6 +1072,7 @@ private:
     void anonymousToggled();
     void atToggled();
     void showTranslateLanguageMenu(juce::Component& anchorComponent);
+    void showSyncCompensationMenu(juce::Component& anchorComponent);
     void syncToggled();
     void chatToggled();
     void chatPopoutClicked();
@@ -1088,6 +1089,7 @@ private:
     void updateLayoutButtonColor();
     void updateMetronomeButtonColor();
     void updateSyncButtonColor();
+    void updateSyncButtonTooltip();
     void updateFxButtonLabel();
     void showFxMenu();
     void showOptionsMenu();

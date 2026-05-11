@@ -210,6 +210,8 @@ public:
 
     void setSyncToHost(bool shouldSync);
     bool isSyncToHostEnabled() const;
+    void setSyncStartCompensationMs(float ms);
+    float getSyncStartCompensationMs() const;
     bool getHostPosition(juce::AudioPlayHead::CurrentPositionInfo& info) const;
     void setMtcOutputEnabled(bool shouldEnable);
     bool isMtcOutputEnabled() const;
@@ -251,6 +253,8 @@ public:
     juce::String getIntervalSyncStatusText() const;
 
 private:
+    int getSyncStartCompensationSamples() const;
+    void primeSyncTransportStart(const juce::AudioPlayHead::CurrentPositionInfo* hostInfo = nullptr);
     NJClient ninjamClient;
     juce::CriticalSection processLock;
     mutable juce::CriticalSection serverListLock;
@@ -331,10 +335,12 @@ private:
 
     bool syncToHost = false;
     std::atomic<bool> hostWasPlaying { false };
+    std::atomic<bool> syncAwaitingHostRestart { false };
     std::atomic<bool> syncWaitForInterval { false };
     std::atomic<int> syncTargetInterval { -1 };
     std::atomic<int> syncDisplayIntervalOffset { 0 };
     std::atomic<int> syncDisplayPositionOffset { 0 };
+    std::atomic<float> syncStartCompensationMs { 0.0f };
     std::atomic<bool> mtcOutputEnabled { true };
     std::atomic<int> mtcFrameRateFps { 30 };
     bool mtcWasRunning = false;

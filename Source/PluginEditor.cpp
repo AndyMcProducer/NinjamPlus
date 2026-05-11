@@ -1238,6 +1238,20 @@ juce::String buildTranslateTooltip(const juce::String& targetCode)
          + ". Left-click toggles. Right-click for language setup.";
 }
 
+juce::String buildSyncTooltip(float compensationMs)
+{
+#if JucePlugin_Build_Standalone
+    juce::String tooltip = "Click to Sync to Midi Clock";
+#else
+    juce::String tooltip = "Click to Sync to Host (vst)";
+#endif
+
+    tooltip << ". Right-click for sync compensation. Current advance: "
+            << juce::String(compensationMs, compensationMs < 10.0f ? 1 : 0)
+            << " ms.";
+    return tooltip;
+}
+
 void populateTranslationLanguageMenu(juce::PopupMenu& menu,
                                      int baseId,
                                      const juce::String& selectedCode,
@@ -1288,6 +1302,54 @@ void showTranslateLanguageMenuForButton(NinjamVst3AudioProcessor& processor,
                            if (result >= 200)
                                processorPtr->setTranslateTargetLang(it->second);
 
+                           if (onUpdated)
+                               onUpdated();
+                       });
+}
+
+void showSyncCompensationMenuForButton(NinjamVst3AudioProcessor& processor,
+                                       juce::Component& anchorComponent,
+                                       std::function<void()> onUpdated)
+{
+    static constexpr float presetValuesMs[] = { 0.0f, 5.0f, 10.0f, 15.0f, 20.0f, 25.0f, 32.0f, 40.0f,
+                                                50.0f, 64.0f, 80.0f, 96.0f, 128.0f, 160.0f, 192.0f, 250.0f };
+
+    auto idToMs = std::make_shared<std::map<int, float>>();
+    juce::PopupMenu presetMenu;
+    const float currentMs = processor.getSyncStartCompensationMs();
+
+    int id = 100;
+    for (float presetMs : presetValuesMs)
+    {
+        ++id;
+        presetMenu.addItem(id,
+                           juce::String(presetMs, presetMs < 10.0f ? 1 : 0) + " ms",
+                           true,
+                           std::abs(currentMs - presetMs) < 0.1f);
+        (*idToMs)[id] = presetMs;
+    }
+
+    juce::PopupMenu menu;
+    menu.addSectionHeader("Host Sync Compensation");
+    menu.addItem(1, "Use this if Cubase/ASIO Guard makes NINJAM start late.", false, false);
+    menu.addSeparator();
+    menu.addSubMenu("Advance NINJAM Start", presetMenu);
+
+    const auto screenPos = anchorComponent.getScreenPosition();
+    juce::Rectangle<int> popupAnchor(screenPos.x,
+                                     screenPos.y + anchorComponent.getHeight(),
+                                     anchorComponent.getWidth(),
+                                     1);
+
+    auto* processorPtr = &processor;
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&anchorComponent).withTargetScreenArea(popupAnchor),
+                       [idToMs, processorPtr, onUpdated = std::move(onUpdated)](int result) mutable
+                       {
+                           auto it = idToMs->find(result);
+                           if (it == idToMs->end())
+                               return;
+
+                           processorPtr->setSyncStartCompensationMs(it->second);
                            if (onUpdated)
                                onUpdated();
                        });
@@ -1797,13 +1859,10 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     addAndMakeVisible(syncButton);
     syncButton.setClickingTogglesState(true);
     syncButton.setToggleState(false, juce::dontSendNotification);
-#if JucePlugin_Build_Standalone
-    syncButton.setTooltip("Click to Sync to Midi Clock");
-#else
-    syncButton.setTooltip("Click to Sync to Host (vst)");
-#endif
     syncButton.setLookAndFeel(&syncIconLAF);
     syncButton.onClick = [this] { syncToggled(); updateSyncButtonColor(); };
+    syncButton.onPopupMenuRequest = [this] { showSyncCompensationMenu(syncButton); };
+    updateSyncButtonTooltip();
     updateSyncButtonColor();
 
     addAndMakeVisible(fxButton);
@@ -3464,6 +3523,16 @@ void NinjamVst3AudioProcessorEditor::showTranslateLanguageMenu(juce::Component& 
     });
 }
 
+void NinjamVst3AudioProcessorEditor::showSyncCompensationMenu(juce::Component& anchorComponent)
+{
+    juce::Component::SafePointer<NinjamVst3AudioProcessorEditor> safeThis(this);
+    showSyncCompensationMenuForButton(audioProcessor, anchorComponent, [safeThis]()
+    {
+        if (safeThis != nullptr)
+            safeThis->updateSyncButtonTooltip();
+    });
+}
+
 void NinjamVst3AudioProcessorEditor::updateTranslateButtonState()
 {
     atButton.setToggleState(audioProcessor.isAutoTranslateEnabled(), juce::dontSendNotification);
@@ -4195,6 +4264,11 @@ void NinjamVst3AudioProcessorEditor::updateMetronomeButtonColor()
 void NinjamVst3AudioProcessorEditor::updateSyncButtonColor()
 {
     repaint();
+}
+
+void NinjamVst3AudioProcessorEditor::updateSyncButtonTooltip()
+{
+    syncButton.setTooltip(buildSyncTooltip(audioProcessor.getSyncStartCompensationMs()));
 }
 
 void NinjamVst3AudioProcessorEditor::updateFxButtonLabel()
