@@ -67,7 +67,7 @@ jobs:
           }
           $nodeExe = $nodeCmd.Source
 
-          $artefacts = Join-Path $PWD "build\NINJAM_VST3_artefacts\Release"
+          $artefacts = Join-Path $PWD "build\NINJAMplus\Release"
           $standaloneDir = Join-Path $artefacts "Standalone"
           $vst3Dir = Join-Path $artefacts "VST3"
 
@@ -95,7 +95,7 @@ jobs:
               }
               Copy-Item -Force $nodeExe (Join-Path $vdoDst "node.exe")
             }
-            Compress-Archive -Force -Path (Join-Path $standaloneDir "*") -DestinationPath "out\windows-standalone.zip"
+            Compress-Archive -Force -Path (Join-Path $standaloneDir "*") -DestinationPath "out\NINJAMplus-windows-standalone.zip"
           } else {
             throw "Standalone artefacts not found at $standaloneDir"
           }
@@ -131,7 +131,7 @@ jobs:
                 Copy-Item -Force $nodeExe (Join-Path $vdoDst "node.exe")
               }
             }
-            Compress-Archive -Force -Path (Join-Path $vst3Dir "*") -DestinationPath "out\windows-vst3.zip"
+            Compress-Archive -Force -Path (Join-Path $vst3Dir "*") -DestinationPath "out\NINJAMplus-windows-vst3.zip"
           } else {
             throw "VST3 artefacts not found at $vst3Dir"
           }
@@ -194,7 +194,7 @@ jobs:
           set -euo pipefail
           mkdir -p out
 
-          ARTEFACTS="build/NINJAM_VST3_artefacts/Release"
+          ARTEFACTS="build/NINJAMplus/Release"
           STANDALONE_DIR="${ARTEFACTS}/Standalone"
           AU_DIR="${ARTEFACTS}/AU"
           VST3_DIR="${ARTEFACTS}/VST3"
@@ -229,7 +229,7 @@ jobs:
             cp -f "${NODE_BIN}" "${MACOS_DIR}/advanced-vdo-client/node"
             chmod +x "${MACOS_DIR}/advanced-vdo-client/node"
 
-            ditto -c -k --sequesterRsrc --keepParent "${APP_PATH}" "out/macos-standalone.zip"
+            ditto -c -k --sequesterRsrc --keepParent "${APP_PATH}" "out/NINJAMplus-macos-standalone.zip"
           else
             echo "Standalone artefacts not found at ${STANDALONE_DIR}"
             exit 1
@@ -248,7 +248,7 @@ jobs:
             install_vdo_deps "${COMP_PATH}/Contents/Resources/advanced-vdo-client"
             cp -f "${NODE_BIN}" "${COMP_PATH}/Contents/Resources/advanced-vdo-client/node"
             chmod +x "${COMP_PATH}/Contents/Resources/advanced-vdo-client/node"
-            ditto -c -k --sequesterRsrc --keepParent "${COMP_PATH}" "out/macos-au.zip"
+            ditto -c -k --sequesterRsrc --keepParent "${COMP_PATH}" "out/NINJAMplus-macos-au.zip"
           else
             echo "AU artefacts not found at ${AU_DIR}"
             exit 1
@@ -267,7 +267,7 @@ jobs:
             install_vdo_deps "${VST3_PATH}/Contents/Resources/advanced-vdo-client"
             cp -f "${NODE_BIN}" "${VST3_PATH}/Contents/Resources/advanced-vdo-client/node"
             chmod +x "${VST3_PATH}/Contents/Resources/advanced-vdo-client/node"
-            ditto -c -k --sequesterRsrc --keepParent "${VST3_PATH}" "out/macos-vst3.zip"
+            ditto -c -k --sequesterRsrc --keepParent "${VST3_PATH}" "out/NINJAMplus-macos-vst3.zip"
           else
             echo "VST3 artefacts not found at ${VST3_DIR}"
             exit 1

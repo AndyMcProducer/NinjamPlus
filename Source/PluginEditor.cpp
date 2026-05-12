@@ -2265,9 +2265,9 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
 
         // Determine which texture to select: saved preference > "Brushed Metal 1" > first item
         juce::PropertiesFile::Options popts;
-        popts.applicationName     = "NINJAM VST3";
+        popts.applicationName     = JucePlugin_Name;
         popts.filenameSuffix      = "settings";
-        popts.folderName          = "NINJAM VST3";
+        popts.folderName          = JucePlugin_Name;
         popts.osxLibrarySubFolder = "Application Support";
         juce::PropertiesFile props(popts);
         juce::String savedTexture = props.getValue("texture", "");
@@ -2297,9 +2297,9 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         {
             // Persist the user's choice
             juce::PropertiesFile::Options popts;
-            popts.applicationName     = "NINJAM VST3";
+            popts.applicationName     = JucePlugin_Name;
             popts.filenameSuffix      = "settings";
-            popts.folderName          = "NINJAM VST3";
+            popts.folderName          = JucePlugin_Name;
             popts.osxLibrarySubFolder = "Application Support";
             juce::PropertiesFile props(popts);
             props.setValue("texture", textureFiles[idx].getFileName());
@@ -3350,9 +3350,9 @@ void NinjamVst3AudioProcessorEditor::saveLearnMappingsToDisk()
 {
     syncLearnMappingsToProcessor();
     juce::PropertiesFile::Options popts;
-    popts.applicationName = "NINJAM VST3";
+    popts.applicationName = JucePlugin_Name;
     popts.filenameSuffix = "settings";
-    popts.folderName = "NINJAM VST3";
+    popts.folderName = JucePlugin_Name;
     popts.osxLibrarySubFolder = "Application Support";
     juce::PropertiesFile props(popts);
     props.setValue("midiLearnStateJson", audioProcessor.getMidiLearnStateJson());
@@ -3363,9 +3363,9 @@ void NinjamVst3AudioProcessorEditor::saveLearnMappingsToDisk()
 void NinjamVst3AudioProcessorEditor::loadLearnMappingsFromDisk()
 {
     juce::PropertiesFile::Options popts;
-    popts.applicationName = "NINJAM VST3";
+    popts.applicationName = JucePlugin_Name;
     popts.filenameSuffix = "settings";
-    popts.folderName = "NINJAM VST3";
+    popts.folderName = JucePlugin_Name;
     popts.osxLibrarySubFolder = "Application Support";
     juce::PropertiesFile props(popts);
     audioProcessor.setMidiLearnStateJson(props.getValue("midiLearnStateJson", {}));
@@ -4076,9 +4076,9 @@ void NinjamVst3AudioProcessorEditor::setAbletonWindowSizePreset(int presetIndex)
     hostResizeLockedForConnection = true;
 
     juce::PropertiesFile::Options popts;
-    popts.applicationName     = "NINJAM VST3";
+    popts.applicationName     = JucePlugin_Name;
     popts.filenameSuffix      = "settings";
-    popts.folderName          = "NINJAM VST3";
+    popts.folderName          = JucePlugin_Name;
     popts.osxLibrarySubFolder = "Application Support";
     juce::PropertiesFile props(popts);
     props.setValue("abletonWindowSizePreset", abletonWindowSizePreset);

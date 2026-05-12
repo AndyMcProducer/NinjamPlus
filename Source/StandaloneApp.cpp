@@ -393,7 +393,7 @@ class NinjamStandaloneApp final : public JUCEApplication
 {
 public:
     const String getApplicationName() override              { return JucePlugin_Name; }
-    const String getApplicationVersion() override           { return JucePlugin_VersionString; }
+    const String getApplicationVersion() override           { return NINJAM_DISPLAY_VERSION; }
     bool moreThanOneInstanceAllowed() override              { return true; }
     void anotherInstanceStarted (const String&) override    {}
 

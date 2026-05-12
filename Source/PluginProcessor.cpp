@@ -967,7 +967,7 @@ void NinjamVst3AudioProcessor::broadcastOpusSyncSupport(const juce::String& targ
     obj->setProperty("handshakeVersion", opusSyncHandshakeVersion);
     obj->setProperty("runtimeFormat", getWrapperTypeName(wrapperType));
     obj->setProperty("pluginName", juce::String(JucePlugin_Name));
-    obj->setProperty("pluginVersion", juce::String(JucePlugin_VersionString));
+    obj->setProperty("pluginVersion", juce::String(NINJAM_DISPLAY_VERSION));
     obj->setProperty("supportsOpus", true);
     obj->setProperty("enabled", numLocalChannels.load() > 1);
     obj->setProperty("numChannels", numLocalChannels.load());
@@ -1024,7 +1024,7 @@ void NinjamVst3AudioProcessor::refreshOpusSyncAvailabilityFromUsers()
     if (!previous && available)
     {
         juce::ScopedLock lock(chatLock);
-        chatHistory.add("Multi-Channel Audio Detected.");
+        chatHistory.add("Multi Channel Client Detected.");
         chatSenders.add("");
         chatRevision.fetch_add(1);
         if (chatHistory.size() > 100)
@@ -2763,7 +2763,7 @@ NinjamVst3AudioProcessor::~NinjamVst3AudioProcessor()
 
 const juce::String NinjamVst3AudioProcessor::getName() const
 {
-    return "NINJAM VST3";
+    return JucePlugin_Name;
 }
 
 bool NinjamVst3AudioProcessor::acceptsMidi() const
@@ -3205,8 +3205,7 @@ void NinjamVst3AudioProcessor::ChatMessage_Callback(void* userData, NJClient* in
                     self->chatSenders.removeRange(0, juce::jmax(0, self->chatSenders.size() - 100));
                 }
             }
-            vlogStr("[MCRefresh] processOpusSyncSupport calling refresh. sender='" + sender + "' userId='" + userId + "' multiChanEnabled=" + juce::String(multiChanEnabled ? 1 : 0) + " nCh=" + juce::String(peerNumChannels));
-            self->refreshOpusSyncAvailabilityFromUsers();
+            vlogStr("[MCRefresh] processOpusSyncSupport updated peer cache. sender='" + sender + "' userId='" + userId + "' multiChanEnabled=" + juce::String(multiChanEnabled ? 1 : 0) + " nCh=" + juce::String(peerNumChannels));
         }
         return true;
     };
@@ -3239,8 +3238,6 @@ void NinjamVst3AudioProcessor::ChatMessage_Callback(void* userData, NJClient* in
                                      || caps.contains("hd_sync_v2");
             self->opusSyncServerSupported.store(hasOpusSyncCap);
             juce::Logger::writeToLog("opusSyncServerSupported -> " + juce::String(hasOpusSyncCap ? "true" : "false"));
-            if (!hasOpusSyncCap)
-                self->refreshOpusSyncAvailabilityFromUsers();
         };
         juce::String line;
         if (cmd == "SERVER_CAPS" && nparms >= 2)
@@ -4191,8 +4188,7 @@ void NinjamVst3AudioProcessor::IntervalMediaItem_Callback(void* userData, NJClie
             self->chatSenders.removeRange(0, juce::jmax(0, self->chatSenders.size() - 100));
         }
     }
-    vlogStr("[MCRefresh] IntervalMediaItem_Callback calling refresh. peerKey='" + peerKey + "' userId='" + userId + "' multiChanEnabled=" + juce::String(multiChanEnabled ? 1 : 0) + " nCh=" + juce::String(peerNumChannels));
-    self->refreshOpusSyncAvailabilityFromUsers();
+    vlogStr("[MCRefresh] IntervalMediaItem_Callback updated peer cache. peerKey='" + peerKey + "' userId='" + userId + "' multiChanEnabled=" + juce::String(multiChanEnabled ? 1 : 0) + " nCh=" + juce::String(peerNumChannels));
 }
 
 void NinjamVst3AudioProcessor::setSyncToHost(bool shouldSync)
@@ -4806,6 +4802,7 @@ void NinjamVst3AudioProcessor::timerCallback()
 
     if (status == NJClient::NJC_STATUS_OK)
     {
+        // Rebuild peer capability state only after Run() finishes dispatching inbound callbacks.
         refreshOpusSyncAvailabilityFromUsers();
         const double nowMs = juce::Time::getMillisecondCounterHiRes();
         {
