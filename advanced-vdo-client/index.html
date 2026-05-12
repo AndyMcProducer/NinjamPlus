@@ -77,6 +77,20 @@
             font-size: 12px;
             color: #d5dded;
         }
+        .peer-metrics {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 2px;
+            min-width: 170px;
+        }
+        .peer-latency {
+            min-width: 170px;
+            text-align: right;
+            font-size: 11px;
+            color: #8fa4c9;
+            white-space: nowrap;
+        }
         .status {
             margin-left: auto;
             font-size: 12px;
@@ -194,6 +208,7 @@
         }
 
         const measuredBufferMsByUser = {};
+        const latencyDebugByUser = {};
         const userLastSeenAt = {};
         const userLastSampleKey = {};
         const userStaleMs = 12000;
@@ -207,6 +222,26 @@
             const measured = getMeasuredBufferMs(userId);
             const measuredText = measured !== null ? String(measured) + 'ms' : '--';
             return fmt(getOffsetMs(userId)) + ' | ' + measuredText;
+        }
+
+        function getLatencyDebug(userId) {
+            return latencyDebugByUser[normalizeUserId(userId)] || null;
+        }
+
+        function fmtMeasured(v) {
+            return (typeof v === 'number' && isFinite(v) && v >= 0) ? (String(Math.round(v)) + 'ms') : '--';
+        }
+
+        function getUserLatencyText(userId) {
+            const measured = getMeasuredBufferMs(userId);
+            const debug = getLatencyDebug(userId);
+            if (!debug) {
+                return 'buffer ' + fmtMeasured(measured);
+            }
+            const sender = fmtMeasured(debug.senderServerLatencyMs);
+            const receiver = fmtMeasured(debug.receiverServerLatencyMs);
+            const total = fmtMeasured(measured !== null ? measured : debug.bufferMs);
+            return 'srv ' + sender + ' + ' + receiver + ' => ' + total;
         }
 
         function pushOffsetToFrame(userId) {
@@ -264,6 +299,7 @@
                 if ((now - lastSeen) > userStaleMs) {
                     delete knownUsers[userId];
                     delete measuredBufferMsByUser[userId];
+                    delete latencyDebugByUser[userId];
                     delete userLastSeenAt[userId];
                     delete userLastSampleKey[userId];
                     changed = true;
@@ -315,11 +351,20 @@
                 resetBtn.type = 'button';
                 resetBtn.textContent = 'Reset';
 
+                const metricsEl = document.createElement('div');
+                metricsEl.className = 'peer-metrics';
+
                 const offsetEl = document.createElement('span');
                 offsetEl.className = 'peer-offset';
                 offsetEl.id = 'peer-offset-display-' + userId.replace(/[^a-zA-Z0-9_-]/g, '_');
+
+                const latencyEl = document.createElement('span');
+                latencyEl.className = 'peer-latency';
+                latencyEl.id = 'peer-latency-display-' + userId.replace(/[^a-zA-Z0-9_-]/g, '_');
+
                 const syncOffset = function () {
                     offsetEl.textContent = getUserDisplayText(userId);
+                    latencyEl.textContent = getUserLatencyText(userId);
                 };
                 syncOffset();
 
@@ -343,7 +388,9 @@
                 wrap.appendChild(minusBtn);
                 wrap.appendChild(plusBtn);
                 wrap.appendChild(resetBtn);
-                wrap.appendChild(offsetEl);
+                metricsEl.appendChild(offsetEl);
+                metricsEl.appendChild(latencyEl);
+                wrap.appendChild(metricsEl);
                 peerOffsets.appendChild(wrap);
             }
             statusText.textContent = 'Remote users: ' + users.length;
@@ -371,7 +418,11 @@
                         : ((typeof msg.bufferTotalMs === 'number')
                             ? msg.bufferTotalMs
                             : NaN));
-                const sampleKey = buildUserSampleKey(msg, bufferVal);
+                const senderServerLatencyMs = (typeof msg.senderServerLatencyMs === 'number') ? msg.senderServerLatencyMs : NaN;
+                const receiverServerLatencyMs = (typeof msg.receiverServerLatencyMs === 'number') ? msg.receiverServerLatencyMs : NaN;
+                const sampleKey = buildUserSampleKey(msg, bufferVal)
+                    + '|' + (isFinite(senderServerLatencyMs) ? String(Math.round(senderServerLatencyMs)) : '')
+                    + '|' + (isFinite(receiverServerLatencyMs) ? String(Math.round(receiverServerLatencyMs)) : '');
                 if (userLastSampleKey[normalizedUserId] === sampleKey) {
                     continue;
                 }
@@ -379,11 +430,21 @@
                 markUserSeen(normalizedUserId);
                 if (isFinite(bufferVal) && bufferVal >= 0) {
                     measuredBufferMsByUser[normalizedUserId] = Math.round(bufferVal);
+                    latencyDebugByUser[normalizedUserId] = {
+                        senderServerLatencyMs: (isFinite(senderServerLatencyMs) && senderServerLatencyMs >= 0) ? Math.round(senderServerLatencyMs) : null,
+                        receiverServerLatencyMs: (isFinite(receiverServerLatencyMs) && receiverServerLatencyMs >= 0) ? Math.round(receiverServerLatencyMs) : null,
+                        bufferMs: Math.round(bufferVal)
+                    };
                     updated = true;
-                    const id = 'peer-offset-display-' + normalizedUserId.replace(/[^a-zA-Z0-9_-]/g, '_');
-                    const el = document.getElementById(id);
-                    if (el) {
-                        el.textContent = getUserDisplayText(normalizedUserId);
+                    const offsetId = 'peer-offset-display-' + normalizedUserId.replace(/[^a-zA-Z0-9_-]/g, '_');
+                    const offsetEl = document.getElementById(offsetId);
+                    if (offsetEl) {
+                        offsetEl.textContent = getUserDisplayText(normalizedUserId);
+                    }
+                    const latencyId = 'peer-latency-display-' + normalizedUserId.replace(/[^a-zA-Z0-9_-]/g, '_');
+                    const latencyEl = document.getElementById(latencyId);
+                    if (latencyEl) {
+                        latencyEl.textContent = getUserLatencyText(normalizedUserId);
                     }
                 }
             }

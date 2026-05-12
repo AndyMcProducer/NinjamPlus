@@ -1,0 +1,818 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <link rel="icon" type="image/png" href="/icon.png">
+    <title>NINJAM Advanced VDO Client</title>
+    <style>
+        * { box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; margin: 0; }
+        body {
+            background: #0a0b10;
+            color: #e7eaf0;
+            font-family: "Segoe UI", Arial, sans-serif;
+        }
+        .app {
+            width: 100%;
+            height: 100%;
+            display: grid;
+            grid-template-rows: auto 1fr;
+        }
+        .header {
+            background: linear-gradient(180deg, #171a22 0%, #10131a 100%);
+            border-bottom: 1px solid #2a3040;
+            padding: 10px 14px;
+            display: grid;
+            gap: 4px;
+        }
+        .title {
+            font-size: 14px;
+            font-weight: 600;
+            letter-spacing: 0.2px;
+        }
+        .meta {
+            font-size: 13px;
+            color: #aeb7c9;
+            display: flex;
+            gap: 14px;
+            flex-wrap: wrap;
+        }
+        .frame-wrap {
+            width: 100%;
+            height: 100%;
+            background: #000;
+        }
+        #vdoFrame {
+            width: 100%;
+            height: 100%;
+            border: 0;
+            display: block;
+            background: #000;
+        }
+        body.green-mode {
+            background: #00ff00;
+        }
+        body.green-mode .app {
+            grid-template-rows: 1fr;
+        }
+        body.green-mode .header {
+            display: none;
+        }
+        body.green-mode .frame-wrap {
+            background: #00ff00;
+        }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <div class="header" id="header">
+            <div class="title">NINJAM video room</div>
+            <div class="meta">
+                <span id="roomValue"></span>
+                <span id="labelValue"></span>
+                <span id="syncValue"></span>
+            </div>
+        </div>
+        <div class="frame-wrap">
+            <iframe id="vdoFrame" allow="camera; microphone; fullscreen"></iframe>
+        </div>
+    </div>
+    <script>
+        const query = new URLSearchParams(window.location.search);
+        const ninjamServer = query.get('ninjamServer') || '';
+        const roomParam = query.get('room');
+        const roomFromServer = ninjamServer ? ninjamServer.replace(/\./g, '_') : '';
+        const resolvedRoom = roomParam || roomFromServer || 'ninjam';
+        const minimumBufferMs = 0;
+        const appState = {
+            room: resolvedRoom,
+            label: query.get('label') || 'NINJAM',
+            store: query.get('store') || '',
+            bg: query.get('bg') || '',
+            intervalSource: query.get('intervalSource') || '',
+            intervalPollMs: parseInt(query.get('intervalPollMs') || '', 10) || 500,
+            requestedBufferMs: Math.max(minimumBufferMs, parseInt(query.get('buffer') || '', 10) || minimumBufferMs),
+            chunkedMs: parseInt(query.get('chunked') || '', 10) || 120,
+            ninjamServer: ninjamServer,
+            intervalMessages: 0
+        };
+
+        const vdoFrame = document.getElementById('vdoFrame');
+        const roomValue = document.getElementById('roomValue');
+        const labelValue = document.getElementById('labelValue');
+        const syncValue = document.getElementById('syncValue');
+
+        const ninjamSync = {
+            intervalInfo: null,
+            remoteTimecodes: {},
+            remoteBuffers: {},
+            userLastSeenAt: {},
+            userLastSampleKey: {},
+            setIntervalInfo(interval, pos, bpm, bpi, length) {
+                this.intervalInfo = {
+                    interval,
+                    pos,
+                    bpm,
+                    bpi,
+                    length: typeof length === 'number' ? length : 0,
+                    updatedAt: Date.now()
+                };
+            },
+            setRemoteTimecode(userId, interval, timecode, bufferMs, sampleKey) {
+                const key = normalizeUserId(userId);
+                if (!key) {
+                    return;
+                }
+                if (this.userLastSampleKey[key] === sampleKey) {
+                    return;
+                }
+                this.userLastSampleKey[key] = sampleKey;
+                if (!this.remoteTimecodes[key]) {
+                    this.remoteTimecodes[key] = {};
+                }
+                this.remoteTimecodes[key][interval] = {
+                    timecode,
+                    updatedAt: Date.now()
+                };
+                if (typeof bufferMs === 'number' && isFinite(bufferMs) && bufferMs >= 0) {
+                    this.remoteBuffers[key] = Math.round(bufferMs);
+                }
+                this.userLastSeenAt[key] = Date.now();
+            }
+        };
+
+        const vdoState = {
+            iframeLoaded: false,
+            streamIdByUser: {},
+            targetIdByUser: {},
+            labelByStreamId: {},
+            lastAppliedBufferByUser: {},
+            latencyMsByUser: {},
+            latencyUpdatedAtByUser: {},
+            rosterTimerId: 0
+        };
+
+        const manualOffsetsMs = {};
+        const remoteUserStaleMs = 12000;
+        const vdoLatencyStaleMs = 8000;
+
+        if (!appState.intervalSource) {
+            appState.intervalSource = window.location.origin + '/intervals';
+        }
+
+        function normalizeUserId(userId) {
+            let value = String(userId || '').trim().toLowerCase();
+            value = value.replace(/^anonymous:/, '');
+            value = value.replace(/^guest:/, '');
+            value = value.replace(/\s+/g, '');
+            value = value.replace(/@.*$/, '');
+            value = value.replace(/[^a-z0-9._-]/g, '');
+            return value;
+        }
+
+        function getOffsetStorageKey(userId) {
+            return 'ninjamPeerOffset:' + appState.room + ':' + normalizeUserId(userId);
+        }
+
+        function getManualOffsetMs(userId) {
+            const key = normalizeUserId(userId);
+            if (typeof manualOffsetsMs[key] === 'number' && isFinite(manualOffsetsMs[key])) {
+                return Math.round(manualOffsetsMs[key]);
+            }
+            try {
+                if (window.localStorage) {
+                    const raw = window.localStorage.getItem(getOffsetStorageKey(key));
+                    const parsed = parseInt(raw || '', 10);
+                    if (isFinite(parsed)) {
+                        manualOffsetsMs[key] = parsed;
+                        return parsed;
+                    }
+                }
+            } catch (e) {
+            }
+            manualOffsetsMs[key] = 0;
+            return 0;
+        }
+
+        function setManualOffsetMs(userId, value) {
+            const key = normalizeUserId(userId);
+            const nextValue = Math.max(-6000, Math.min(6000, Math.round(value)));
+            manualOffsetsMs[key] = nextValue;
+            try {
+                if (window.localStorage) {
+                    window.localStorage.setItem(getOffsetStorageKey(key), String(nextValue));
+                }
+            } catch (e) {
+            }
+            return nextValue;
+        }
+
+        function buildUserSampleKey(data, bufferMs) {
+            return [
+                String(data.interval ?? ''),
+                String(data.syncTag ?? ''),
+                String(data.videoClockMs ?? ''),
+                String(data.timecode ?? ''),
+                String(data.eventId ?? ''),
+                (typeof bufferMs === 'number' && isFinite(bufferMs)) ? String(Math.round(bufferMs)) : ''
+            ].join('|');
+        }
+
+        function getTrackedUserKeys() {
+            const keys = {};
+            const sets = [
+                ninjamSync.remoteBuffers,
+                ninjamSync.remoteTimecodes
+            ];
+            for (let i = 0; i < sets.length; i++) {
+                const source = sets[i] || {};
+                const sourceKeys = Object.keys(source);
+                for (let j = 0; j < sourceKeys.length; j++) {
+                    const key = normalizeUserId(sourceKeys[j]);
+                    if (key) {
+                        keys[key] = true;
+                    }
+                }
+            }
+            return Object.keys(keys).sort();
+        }
+
+        function resolveUserKeyFromLabel(label) {
+            const normalizedLabel = normalizeUserId(label);
+            if (!normalizedLabel) {
+                return '';
+            }
+            const trackedUsers = getTrackedUserKeys();
+            if (trackedUsers.indexOf(normalizedLabel) >= 0) {
+                return normalizedLabel;
+            }
+
+            let matchedUser = '';
+            for (let i = 0; i < trackedUsers.length; i++) {
+                const candidate = trackedUsers[i];
+                if (normalizedLabel.indexOf(candidate) >= 0 || candidate.indexOf(normalizedLabel) >= 0) {
+                    if (matchedUser && matchedUser !== candidate) {
+                        return '';
+                    }
+                    matchedUser = candidate;
+                }
+            }
+            return matchedUser;
+        }
+
+        function extractPeerLabel(data) {
+            if (!data || typeof data !== 'object') {
+                return '';
+            }
+            if (typeof data.label === 'string' && data.label.trim()) {
+                return data.label;
+            }
+            const value = data.value;
+            if (!value || typeof value !== 'object') {
+                return '';
+            }
+            const labelKeys = ['label', 'displayName', 'guestLabel', 'name', 'id'];
+            for (let i = 0; i < labelKeys.length; i++) {
+                const labelValue = value[labelKeys[i]];
+                if (typeof labelValue === 'string' && labelValue.trim()) {
+                    return labelValue;
+                }
+            }
+            return '';
+        }
+
+        function registerPeerTarget(streamId, label, explicitTargetId) {
+            const cleanStreamId = String(streamId || '').trim();
+            if (!cleanStreamId) {
+                return false;
+            }
+            if (label) {
+                vdoState.labelByStreamId[cleanStreamId] = label;
+            }
+            const userKey = resolveUserKeyFromLabel(label);
+            if (!userKey) {
+                return false;
+            }
+            const targetId = String(explicitTargetId || cleanStreamId).trim();
+            const changed = vdoState.streamIdByUser[userKey] !== cleanStreamId
+                || vdoState.targetIdByUser[userKey] !== targetId;
+            vdoState.streamIdByUser[userKey] = cleanStreamId;
+            vdoState.targetIdByUser[userKey] = targetId;
+            return changed;
+        }
+
+        function unregisterPeerTarget(streamId) {
+            const cleanStreamId = String(streamId || '').trim();
+            if (!cleanStreamId) {
+                return false;
+            }
+            delete vdoState.labelByStreamId[cleanStreamId];
+            let changed = false;
+            const trackedUsers = Object.keys(vdoState.streamIdByUser);
+            for (let i = 0; i < trackedUsers.length; i++) {
+                const userKey = trackedUsers[i];
+                if (vdoState.streamIdByUser[userKey] === cleanStreamId) {
+                    delete vdoState.streamIdByUser[userKey];
+                    delete vdoState.targetIdByUser[userKey];
+                    delete vdoState.lastAppliedBufferByUser[userKey];
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        function getStringProperty(node, keyNames) {
+            if (!node || typeof node !== 'object') {
+                return '';
+            }
+            const wanted = {};
+            for (let i = 0; i < keyNames.length; i++) {
+                wanted[String(keyNames[i]).toLowerCase()] = true;
+            }
+            const entries = Object.entries(node);
+            for (let i = 0; i < entries.length; i++) {
+                const entry = entries[i];
+                if (!wanted[String(entry[0]).toLowerCase()]) {
+                    continue;
+                }
+                if (typeof entry[1] === 'string' && entry[1].trim()) {
+                    return entry[1].trim();
+                }
+            }
+            return '';
+        }
+
+        function getNumericProperty(node, keyNames) {
+            if (!node || typeof node !== 'object') {
+                return NaN;
+            }
+            const wanted = {};
+            for (let i = 0; i < keyNames.length; i++) {
+                wanted[String(keyNames[i]).toLowerCase()] = true;
+            }
+            const entries = Object.entries(node);
+            for (let i = 0; i < entries.length; i++) {
+                const entry = entries[i];
+                if (!wanted[String(entry[0]).toLowerCase()]) {
+                    continue;
+                }
+                if (typeof entry[1] === 'number' && isFinite(entry[1])) {
+                    return entry[1];
+                }
+            }
+            return NaN;
+        }
+
+        function clampLatencyMs(value) {
+            if (typeof value !== 'number' || !isFinite(value) || value < 0) {
+                return NaN;
+            }
+            return Math.max(0, Math.min(6000, value));
+        }
+
+        function resolveUserKeyFromPeerIds(streamId, targetId, label) {
+            const cleanTargetId = String(targetId || '').trim();
+            if (cleanTargetId) {
+                const users = Object.keys(vdoState.targetIdByUser || {});
+                for (let i = 0; i < users.length; i++) {
+                    const userKey = users[i];
+                    if (String(vdoState.targetIdByUser[userKey] || '').trim() === cleanTargetId) {
+                        return userKey;
+                    }
+                }
+            }
+
+            const cleanStreamId = String(streamId || '').trim();
+            if (cleanStreamId) {
+                const users = Object.keys(vdoState.streamIdByUser || {});
+                for (let i = 0; i < users.length; i++) {
+                    const userKey = users[i];
+                    if (String(vdoState.streamIdByUser[userKey] || '').trim() === cleanStreamId) {
+                        return userKey;
+                    }
+                }
+            }
+
+            return resolveUserKeyFromLabel(label);
+        }
+
+        function extractLatencyMsFromNode(node) {
+            const directMs = getNumericProperty(node, [
+                'latencyMs', 'delayMs', 'currentDelayMs', 'audioDelayMs', 'videoDelayMs',
+                'bufferDelayMs', 'jitterBufferMs', 'googCurrentDelayMs', 'googJitterBufferMs',
+                'playoutDelayMs', 'targetDelayMs', 'receiverDelayMs'
+            ]);
+            if (isFinite(directMs)) {
+                return clampLatencyMs(directMs);
+            }
+
+            const jitterDelaySeconds = getNumericProperty(node, ['jitterBufferDelay']);
+            const jitterEmittedCount = getNumericProperty(node, ['jitterBufferEmittedCount']);
+            if (isFinite(jitterDelaySeconds) && isFinite(jitterEmittedCount) && jitterEmittedCount > 0) {
+                return clampLatencyMs((jitterDelaySeconds / jitterEmittedCount) * 1000.0);
+            }
+
+            const directSeconds = getNumericProperty(node, [
+                'audioCurrentDelay', 'currentDelay', 'jitterBufferTargetDelay',
+                'jitterBufferMinimumDelay', 'playoutDelay'
+            ]);
+            if (isFinite(directSeconds)) {
+                return clampLatencyMs(directSeconds * 1000.0);
+            }
+
+            const genericLatency = getNumericProperty(node, ['latency', 'audioLatency', 'videoLatency', 'bufferDelay']);
+            if (isFinite(genericLatency)) {
+                return clampLatencyMs(genericLatency > 20 ? genericLatency : (genericLatency * 1000.0));
+            }
+
+            const rttSeconds = getNumericProperty(node, ['currentRoundTripTime', 'roundTripTime', 'totalRoundTripTime', 'rtt']);
+            if (isFinite(rttSeconds)) {
+                return clampLatencyMs((rttSeconds * 1000.0) * 0.5);
+            }
+
+            const googRttMs = getNumericProperty(node, ['googRtt', 'googRttMs']);
+            if (isFinite(googRttMs)) {
+                return clampLatencyMs(googRttMs * 0.5);
+            }
+
+            return NaN;
+        }
+
+        function collectDetailedStateLatencyByUser(root) {
+            const byUser = {};
+            const seen = (typeof WeakSet === 'function') ? new WeakSet() : null;
+
+            function visit(node, depth, context) {
+                if (!node || typeof node !== 'object' || depth > 7) {
+                    return;
+                }
+                if (seen) {
+                    if (seen.has(node)) {
+                        return;
+                    }
+                    seen.add(node);
+                }
+
+                const nextContext = {
+                    streamId: getStringProperty(node, ['streamID', 'streamId', 'streamid']) || context.streamId,
+                    targetId: getStringProperty(node, ['UUID', 'uuid', 'target', 'targetId', 'peerID', 'peerId']) || context.targetId,
+                    label: getStringProperty(node, ['label', 'displayName', 'guestLabel', 'name']) || context.label
+                };
+
+                const userKey = resolveUserKeyFromPeerIds(nextContext.streamId, nextContext.targetId, nextContext.label);
+                const latencyMs = extractLatencyMsFromNode(node);
+                if (userKey && isFinite(latencyMs) && latencyMs >= 0) {
+                    const prior = byUser[userKey];
+                    byUser[userKey] = (typeof prior === 'number' && isFinite(prior))
+                        ? Math.max(prior, latencyMs)
+                        : latencyMs;
+                }
+
+                const children = Array.isArray(node) ? node : Object.values(node);
+                for (let i = 0; i < children.length; i++) {
+                    const child = children[i];
+                    if (child && typeof child === 'object') {
+                        visit(child, depth + 1, nextContext);
+                    }
+                }
+            }
+
+            visit(root, 0, { streamId: '', targetId: '', label: '' });
+            return byUser;
+        }
+
+        function setEstimatedVdoLatencyMs(userId, latencyMs) {
+            const userKey = normalizeUserId(userId);
+            if (!userKey || !isFinite(latencyMs) || latencyMs < 0) {
+                return false;
+            }
+            const nextValue = Math.max(0, Math.round(latencyMs));
+            const previousValue = vdoState.latencyMsByUser[userKey];
+            vdoState.latencyMsByUser[userKey] = nextValue;
+            vdoState.latencyUpdatedAtByUser[userKey] = Date.now();
+            return previousValue !== nextValue;
+        }
+
+        function getEstimatedVdoLatencyMs(userId) {
+            const userKey = normalizeUserId(userId);
+            if (!userKey) {
+                return 0;
+            }
+            const updatedAt = vdoState.latencyUpdatedAtByUser[userKey] || 0;
+            if (updatedAt > 0 && (Date.now() - updatedAt) > vdoLatencyStaleMs) {
+                return 0;
+            }
+            const latencyMs = vdoState.latencyMsByUser[userKey];
+            if (typeof latencyMs !== 'number' || !isFinite(latencyMs) || latencyMs < 0) {
+                return 0;
+            }
+            return Math.round(latencyMs);
+        }
+
+        function getDesiredBufferMs(userKey) {
+            const baseBuffer = ninjamSync.remoteBuffers[userKey];
+            const safeBase = (typeof baseBuffer === 'number' && isFinite(baseBuffer) && baseBuffer >= 0)
+                ? Math.round(baseBuffer)
+                : appState.requestedBufferMs;
+            const compensatedBase = safeBase - getEstimatedVdoLatencyMs(userKey);
+            return Math.max(minimumBufferMs, compensatedBase + getManualOffsetMs(userKey));
+        }
+
+        function postToVdo(message) {
+            if (!vdoFrame || !vdoFrame.contentWindow) {
+                return false;
+            }
+            try {
+                vdoFrame.contentWindow.postMessage(message, '*');
+                return true;
+            } catch (e) {
+            }
+            return false;
+        }
+
+        function sendTargetedBuffer(userKey, bufferMs) {
+            const targetId = vdoState.targetIdByUser[userKey];
+            const streamId = vdoState.streamIdByUser[userKey];
+            if (!targetId && !streamId) {
+                return false;
+            }
+            const nextBuffer = Math.max(minimumBufferMs, Math.round(bufferMs));
+            let sent = false;
+            if (targetId) {
+                sent = postToVdo({ setBufferDelay: nextBuffer, UUID: targetId }) || sent;
+                sent = postToVdo({ setBufferDelay: nextBuffer, target: targetId }) || sent;
+            }
+            if (streamId) {
+                sent = postToVdo({ setBufferDelay: nextBuffer, streamID: streamId }) || sent;
+                if (!targetId) {
+                    sent = postToVdo({ setBufferDelay: nextBuffer, target: streamId }) || sent;
+                }
+            }
+            return sent;
+        }
+
+        function requestVdoRoster() {
+            if (!vdoState.iframeLoaded) {
+                return;
+            }
+            postToVdo({ getStreamIDs: true });
+            postToVdo({ getDetailedState: true });
+        }
+
+        function applyPeerBuffers(force) {
+            const trackedUsers = getTrackedUserKeys();
+            let linkedUsers = 0;
+            for (let i = 0; i < trackedUsers.length; i++) {
+                const userKey = trackedUsers[i];
+                const hasTarget = !!(vdoState.targetIdByUser[userKey] || vdoState.streamIdByUser[userKey]);
+                if (hasTarget) {
+                    linkedUsers += 1;
+                } else {
+                    continue;
+                }
+                const desiredBufferMs = getDesiredBufferMs(userKey);
+                if (!force && vdoState.lastAppliedBufferByUser[userKey] === desiredBufferMs) {
+                    continue;
+                }
+                if (sendTargetedBuffer(userKey, desiredBufferMs)) {
+                    vdoState.lastAppliedBufferByUser[userKey] = desiredBufferMs;
+                }
+            }
+            updateSyncStatus(linkedUsers, trackedUsers.length);
+        }
+
+        function updateSyncStatus(linkedUsers, trackedUsers) {
+            const totalUsers = typeof trackedUsers === 'number' ? trackedUsers : getTrackedUserKeys().length;
+            let totalLinkedUsers = typeof linkedUsers === 'number' ? linkedUsers : 0;
+            if (typeof linkedUsers !== 'number') {
+                const trackedKeys = getTrackedUserKeys();
+                for (let i = 0; i < trackedKeys.length; i++) {
+                    const userKey = trackedKeys[i];
+                    if (vdoState.targetIdByUser[userKey] || vdoState.streamIdByUser[userKey]) {
+                        totalLinkedUsers += 1;
+                    }
+                }
+            }
+            syncValue.textContent = 'Base ' + appState.requestedBufferMs + 'ms | linked '
+                + totalLinkedUsers + '/' + totalUsers + ' | updates ' + appState.intervalMessages;
+        }
+
+        function pruneInactiveUsers() {
+            const now = Date.now();
+            const users = Object.keys(ninjamSync.userLastSeenAt || {});
+            let changed = false;
+            for (let i = 0; i < users.length; i++) {
+                const userKey = users[i];
+                const lastSeen = ninjamSync.userLastSeenAt[userKey] || 0;
+                if ((now - lastSeen) <= remoteUserStaleMs) {
+                    continue;
+                }
+                delete ninjamSync.userLastSeenAt[userKey];
+                delete ninjamSync.userLastSampleKey[userKey];
+                delete ninjamSync.remoteTimecodes[userKey];
+                delete ninjamSync.remoteBuffers[userKey];
+                delete vdoState.streamIdByUser[userKey];
+                delete vdoState.targetIdByUser[userKey];
+                delete vdoState.lastAppliedBufferByUser[userKey];
+                delete vdoState.latencyMsByUser[userKey];
+                delete vdoState.latencyUpdatedAtByUser[userKey];
+                changed = true;
+            }
+            if (changed) {
+                updateSyncStatus();
+            }
+        }
+
+        function handleIntervalMessage(data) {
+            if (!data || typeof data !== 'object') {
+                return;
+            }
+            appState.intervalMessages += 1;
+            if (data.type === 'intervalInfo') {
+                ninjamSync.setIntervalInfo(
+                    data.interval,
+                    data.pos,
+                    data.bpm,
+                    data.bpi,
+                    typeof data.length === 'number' ? data.length : 0
+                );
+                updateSyncStatus();
+                return;
+            }
+            if (data.type !== 'remoteTimecode' && data.type !== 'videoTimecode') {
+                return;
+            }
+            const receiverBufferMs = typeof data.receiverBufferMs === 'number'
+                ? data.receiverBufferMs
+                : ((typeof data.measuredAudioDelayMs === 'number')
+                    ? data.measuredAudioDelayMs
+                    : (typeof data.bufferTotalMs === 'number' ? data.bufferTotalMs : NaN));
+            ninjamSync.setRemoteTimecode(
+                data.userId || data.userKey || '',
+                data.interval,
+                data.timecode,
+                receiverBufferMs,
+                buildUserSampleKey(data, receiverBufferMs)
+            );
+        }
+
+        function processIntervalPayload(payload) {
+            const items = Array.isArray(payload) ? payload : [payload];
+            for (let i = 0; i < items.length; i++) {
+                handleIntervalMessage(items[i] || {});
+            }
+            pruneInactiveUsers();
+            applyPeerBuffers(false);
+        }
+
+        function startIntervalSource() {
+            if (!appState.intervalSource) {
+                return;
+            }
+            if (appState.intervalSource.startsWith('ws:') || appState.intervalSource.startsWith('wss:')) {
+                let wsReconnectDelay = 250;
+                const wsMaxReconnectDelay = 4000;
+                function connectWs() {
+                    try {
+                        const ws = new WebSocket(appState.intervalSource);
+                        ws.onopen = function () {
+                            wsReconnectDelay = 250;
+                        };
+                        ws.onmessage = function (event) {
+                            try {
+                                processIntervalPayload(JSON.parse(event.data));
+                            } catch (e) {
+                            }
+                        };
+                        ws.onclose = function () {
+                            setTimeout(connectWs, wsReconnectDelay);
+                            wsReconnectDelay = Math.min(wsReconnectDelay * 2, wsMaxReconnectDelay);
+                        };
+                        ws.onerror = function () {
+                            try { ws.close(); } catch (e) {}
+                        };
+                    } catch (e) {
+                        setTimeout(connectWs, wsReconnectDelay);
+                        wsReconnectDelay = Math.min(wsReconnectDelay * 2, wsMaxReconnectDelay);
+                    }
+                }
+                connectWs();
+                return;
+            }
+
+            function tick() {
+                fetch(appState.intervalSource, { cache: 'no-store' })
+                    .then(function (response) {
+                        return response.json();
+                    })
+                    .then(function (payload) {
+                        processIntervalPayload(payload);
+                    })
+                    .catch(function () {
+                    })
+                    .finally(function () {
+                        setTimeout(tick, appState.intervalPollMs);
+                    });
+            }
+            tick();
+        }
+
+        function buildIframeUrl() {
+            const iframeParams = new URLSearchParams();
+            iframeParams.set('room', appState.room);
+            iframeParams.set('label', appState.label);
+            iframeParams.set('chunked', String(Math.max(60, appState.chunkedMs || 120)));
+            iframeParams.set('chunkbufferadaptive', '0');
+            iframeParams.set('chunkbufferceil', '180000');
+            iframeParams.set('buffer2', '0');
+            iframeParams.set('buffer', String(appState.requestedBufferMs));
+            return 'https://vdo.ninja/?' + iframeParams.toString();
+        }
+
+        function handleVdoMessage(data) {
+            if (!data || typeof data !== 'object') {
+                return;
+            }
+
+            let changed = false;
+
+            if (data.streamIDs && typeof data.streamIDs === 'object') {
+                const entries = Object.entries(data.streamIDs);
+                for (let i = 0; i < entries.length; i++) {
+                    const entry = entries[i];
+                    changed = registerPeerTarget(entry[0], entry[1], entry[0]) || changed;
+                }
+            }
+
+            if (data.action === 'guest-connected' && data.streamID) {
+                changed = registerPeerTarget(data.streamID, extractPeerLabel(data), data.UUID || data.streamID) || changed;
+            } else if (data.action === 'push-connection' && data.streamID) {
+                if (data.value === false) {
+                    changed = unregisterPeerTarget(data.streamID) || changed;
+                } else {
+                    changed = registerPeerTarget(data.streamID, extractPeerLabel(data), data.UUID || data.streamID) || changed;
+                }
+            }
+
+            const detailedLatencyByUser = collectDetailedStateLatencyByUser(data);
+            const detailedUsers = Object.keys(detailedLatencyByUser);
+            for (let i = 0; i < detailedUsers.length; i++) {
+                const userKey = detailedUsers[i];
+                changed = setEstimatedVdoLatencyMs(userKey, detailedLatencyByUser[userKey]) || changed;
+            }
+
+            if (changed) {
+                applyPeerBuffers(true);
+            } else {
+                updateSyncStatus();
+            }
+        }
+
+        window.addEventListener('message', function (event) {
+            if (vdoFrame && event.source === vdoFrame.contentWindow) {
+                handleVdoMessage(event.data);
+                return;
+            }
+            if (event.origin !== window.location.origin) {
+                return;
+            }
+            if (!event.data || typeof event.data !== 'object' || event.data.type !== 'ninjamOffsetUpdate') {
+                return;
+            }
+            const userKey = normalizeUserId(event.data.userId || '');
+            if (!userKey) {
+                return;
+            }
+            const offsetMs = parseInt(event.data.offsetMs, 10);
+            if (!isFinite(offsetMs)) {
+                return;
+            }
+            setManualOffsetMs(userKey, offsetMs);
+            applyPeerBuffers(true);
+        });
+
+        if (vdoFrame) {
+            vdoFrame.addEventListener('load', function () {
+                vdoState.iframeLoaded = true;
+                requestVdoRoster();
+                applyPeerBuffers(true);
+                if (vdoState.rosterTimerId) {
+                    clearInterval(vdoState.rosterTimerId);
+                }
+                vdoState.rosterTimerId = setInterval(requestVdoRoster, 2500);
+            });
+            vdoFrame.src = buildIframeUrl();
+        }
+
+        if (appState.bg.toLowerCase() === 'green') {
+            document.body.classList.add('green-mode');
+        }
+
+        roomValue.textContent = 'Room: ' + appState.room;
+        labelValue.textContent = 'Label: ' + appState.label;
+        updateSyncStatus();
+        startIntervalSource();
+        setInterval(pruneInactiveUsers, 1500);
+    </script>
+</body>
+</html>

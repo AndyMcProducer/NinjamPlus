@@ -10,6 +10,7 @@ try {
 }
 
 const helperPagePath = path.join(__dirname, 'index.html');
+const appHtmlPath = path.join(__dirname, 'app.html');
 const intervalsJsonPath = path.join(__dirname, 'intervals.json');
 
 const htmlPage = `
@@ -202,7 +203,7 @@ const htmlPage = `
                 <span id="roomValue"></span>
                 <span id="labelValue"></span>
                 <span id="syncValue"></span>
-                <a id="openRendererLink">Interval view</a>
+                <a id="openRendererLink">Buffer view</a>
             </div>
         </div>
         <div class="frame-wrap" id="hostedWrap">
@@ -221,6 +222,7 @@ const htmlPage = `
         const roomFromServer = ninjamServer ? ninjamServer.replace(/\./g, '_') : '';
         const resolvedRoom = roomParam || roomFromServer || 'ninjam';
         const view = query.get('view') || '';
+        const minimumBufferMs = 200;
         const appState = {
             room: resolvedRoom,
             label: query.get('label') || 'NINJAM',
@@ -228,7 +230,7 @@ const htmlPage = `
             bg: query.get('bg') || '',
             intervalSource: query.get('intervalSource') || '',
             intervalPollMs: parseInt(query.get('intervalPollMs') || '', 10) || 500,
-            requestedBufferMs: parseInt(query.get('buffer') || '', 10) || 0,
+            requestedBufferMs: Math.max(minimumBufferMs, parseInt(query.get('buffer') || '', 10) || minimumBufferMs),
             chunkedMs: parseInt(query.get('chunked') || '', 10) || 120,
             ninjamServer: ninjamServer,
             view: view,
@@ -303,13 +305,8 @@ const htmlPage = `
             if (!infoEl || !gridEl) {
                 return;
             }
-            let infoText = '';
-            if (ninjamSync.intervalInfo) {
-                const i = ninjamSync.intervalInfo;
-                infoText = 'Interval ' + i.interval + ' pos ' + i.pos + ' bpm ' + i.bpm + ' bpi ' + i.bpi;
-            } else {
-                infoText = 'Waiting for interval data';
-            }
+            let infoText = 'Per-user buffer control active';
+            infoText += ' | updates ' + String(appState.intervalMessages);
             infoText += ' | Per-user offset controls are on each tile header';
             infoEl.textContent = infoText;
             const users = Object.keys(ninjamSync.remoteTimecodes);
@@ -479,10 +476,6 @@ const htmlPage = `
             params.set('view', 'renderer');
             if (appState.bg) params.set('bg', appState.bg);
             if (appState.store) params.set('store', appState.store);
-            if (appState.intervalSource) params.set('intervalSource', appState.intervalSource);
-            if (appState.intervalPollMs && appState.intervalPollMs !== 500) {
-                params.set('intervalPollMs', String(appState.intervalPollMs));
-            }
             if (appState.ninjamServer) params.set('ninjamServer', appState.ninjamServer);
             return buildBaseUrl() + '?' + params.toString();
         }
@@ -522,7 +515,7 @@ const htmlPage = `
             const userCount = Object.keys(ninjamSync.remoteBuffers || {}).length;
             const msgCount = appState.intervalMessages;
             const bufferText = appliedBufferMs >= 0 ? String(appliedBufferMs) + 'ms' : 'pending';
-            syncEl.textContent = 'AutoBuffer: ' + bufferText + ' peers: ' + userCount + ' sync: ' + msgCount;
+            syncEl.textContent = 'AutoBuffer: ' + bufferText + ' peers: ' + userCount + ' updates: ' + msgCount;
         }
 
         const rendererLink = document.getElementById('openRendererLink');
@@ -552,7 +545,7 @@ const htmlPage = `
                 const withOffset = Math.max(0, Math.round(base) + getManualOffsetMs(userId));
                 maxBuffer = Math.max(maxBuffer, withOffset);
             }
-            return Math.max(0, maxBuffer);
+            return Math.max(minimumBufferMs, maxBuffer);
         }
 
         function buildIframeUrl(bufferMs) {
@@ -563,7 +556,7 @@ const htmlPage = `
             iframeParams.set('chunkbufferadaptive', '0');
             iframeParams.set('chunkbufferceil', '180000');
             iframeParams.set('buffer2', '0');
-            iframeParams.set('buffer', String(Math.max(0, Math.round(bufferMs || 0))));
+            iframeParams.set('buffer', String(Math.max(minimumBufferMs, Math.round(bufferMs || minimumBufferMs))));
             return 'https://vdo.ninja/?' + iframeParams.toString();
         }
 
@@ -575,7 +568,7 @@ const htmlPage = `
             iframeParams.set('chunkbufferadaptive', '0');
             iframeParams.set('chunkbufferceil', '180000');
             iframeParams.set('buffer2', '0');
-            iframeParams.set('buffer', String(Math.max(0, Math.round(bufferMs || 0))));
+            iframeParams.set('buffer', String(Math.max(minimumBufferMs, Math.round(bufferMs || minimumBufferMs))));
             return 'https://vdo.ninja/?' + iframeParams.toString();
         }
 
@@ -672,7 +665,7 @@ const htmlPage = `
                 ? Math.round(remoteBuffer)
                 : appState.requestedBufferMs;
             const manualOffset = getManualOffsetMs(userId);
-            return Math.max(0, baseBuffer + manualOffset);
+            return Math.max(minimumBufferMs, baseBuffer + manualOffset);
         }
 
         function copyTextToClipboard(text) {
@@ -836,7 +829,7 @@ const htmlPage = `
             if (!frameEl || !frameEl.contentWindow) {
                 return;
             }
-            const next = Math.max(0, Math.round(bufferMs));
+            const next = Math.max(minimumBufferMs, Math.round(bufferMs));
             try {
                 frameEl.contentWindow.postMessage({ setBufferDelay: next }, '*');
                 frameEl.contentWindow.postMessage({ setBufferDelay: next, UUID: '*' }, '*');
@@ -848,12 +841,13 @@ const htmlPage = `
             if (!iframe || !iframe.contentWindow) {
                 return;
             }
+            const next = Math.max(minimumBufferMs, Math.round(bufferMs));
             try {
                 iframe.contentWindow.postMessage({
-                    setBufferDelay: Math.max(0, Math.round(bufferMs))
+                    setBufferDelay: next
                 }, '*');
                 iframe.contentWindow.postMessage({
-                    setBufferDelay: Math.max(0, Math.round(bufferMs)),
+                    setBufferDelay: next,
                     UUID: '*'
                 }, '*');
             } catch (e) {
@@ -975,7 +969,7 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    if (pathname === '/' || pathname === '/sync-buffer-room' || pathname === '/index.html') {
+    if (pathname === '/' || pathname === '/buffer-room' || pathname === '/sync-buffer-room' || pathname === '/index.html') {
         fs.readFile(helperPagePath, 'utf8', (err, body) => {
             const responseBody = err ? htmlPage : body;
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -988,14 +982,17 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    if (req.method === 'HEAD' && pathname === '/app') {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        return res.end();
-    }
-
     if (pathname === '/app') {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        return res.end(htmlPage);
+        fs.readFile(appHtmlPath, 'utf8', (err, body) => {
+            const responseBody = (!err && body && body.trim().length) ? body : htmlPage;
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            if (req.method === 'HEAD') {
+                res.end();
+                return;
+            }
+            res.end(responseBody);
+        });
+        return;
     }
 
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });

@@ -158,11 +158,16 @@ endif()
 if (TARGET NINJAM_VST3_Standalone)
     add_custom_target(NINJAM_VST3_SyncWebAssets
         COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client"
-        COMMAND ${CMAKE_COMMAND} -E rm -f
-            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/intervals.json"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/index.html"
+            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/index.html"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/app.html"
+            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/app.html"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/icon.png"
+            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/icon.png"
         VERBATIM
     )
     add_dependencies(NINJAM_VST3_Standalone NINJAM_VST3_SyncWebAssets)
@@ -172,11 +177,16 @@ if (TARGET NINJAM_VST3_VST3)
     add_custom_target(NINJAM_VST3_SyncVst3WebAssets
         COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client"
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client"
-        COMMAND ${CMAKE_COMMAND} -E rm -f
-            "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/intervals.json"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/index.html"
+            "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/index.html"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/app.html"
+            "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/app.html"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/icon.png"
+            "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/icon.png"
         VERBATIM
     )
     add_dependencies(NINJAM_VST3_VST3 NINJAM_VST3_SyncVst3WebAssets)

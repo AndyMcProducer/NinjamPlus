@@ -1,6 +1,7 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include <future>
 #include <atomic>
 
 // Disable min/max macros before including ninjam headers
@@ -11,6 +12,7 @@
 #include "ninjam/njclient.h"
 
 class NinjamVst3AudioProcessorEditor;
+class LocalVideoHttpServer;
 
 class NinjamVst3AudioProcessor : public juce::AudioProcessor,
                                  public juce::Timer
@@ -355,10 +357,13 @@ private:
     juce::String currentServer;
     juce::String currentUser;
     juce::File videoHelperRootDir;
-    juce::File intervalJsonFile;
+    mutable juce::CriticalSection intervalHelperPayloadLock;
+    juce::String intervalHelperPayload { "[]" };
     std::atomic<bool> videoHelperRunning { false };
     std::atomic<bool> videoLaunchInProgress { false };
-    std::unique_ptr<juce::ChildProcess> advancedVideoProcess;
+    juce::CriticalSection videoLaunchWorkerLock;
+    std::future<void> videoLaunchFuture;
+    std::unique_ptr<LocalVideoHttpServer> advancedVideoServer;
     std::map<juce::String, int> remoteLatencyFirmDelayMsByUser;
 
     std::atomic<bool> opusSyncAvailable { false };
@@ -374,13 +379,19 @@ private:
     {
         int remoteInterval = -1;
         int remoteIntervalAbsolute = -1;
+        int remoteServerLatencyMs = -1;
         juce::String displaySender;
         long long receivedSampleCount = -1;
     };
     std::map<juce::String, PendingRemoteIntervalStart> pendingRemoteIntervalStartsByUser;
-    std::map<juce::String, double> remoteTransportRttMsByUser;
+    std::map<juce::String, int> lastRemoteServerLatencyMsByUser;
     std::map<juce::String, double> pendingTransportProbeSentMsById;
     std::map<juce::String, int> remoteLatencyLastAppliedIntervalByUser;
+    std::atomic<int> localServerLatencyMs { -1 };
+    std::atomic<int> lastServerLatencyProbeInterval { -1 };
+    std::atomic<bool> serverLatencyProbeInProgress { false };
+    std::future<void> serverLatencyProbeFuture;
+    double lastServerLatencyProbeAttemptMs = 0.0;
     struct RemoteLatencyAverageState
     {
         int sampleCount = 0;
@@ -411,9 +422,7 @@ private:
     juce::CriticalSection peerMultiChanLock;
     juce::String opusSyncInstanceId;
     double lastOpusSupportBroadcastMs = 0.0;
-    std::atomic<bool> pendingJoinSyncBroadcast { false };
     std::atomic<juce::uint64> transportProbeCounter { 0 };
-    double lastTransportProbeBroadcastMs = 0.0;
     std::atomic<long long> intervalSyncSampleCounter { 0 };
     juce::SpinLock midiEventQueueLock;
     std::vector<MidiControllerEvent> pendingMidiControllerEvents;
@@ -443,6 +452,7 @@ private:
     void setIntervalSyncStatusText(const juce::String& text);
     void broadcastIntervalSyncTag(const juce::String& target = "*");
     void broadcastTransportProbe(const juce::String& target = "*");
+    void measureServerLatencyAsync();
     juce::String buildIntervalSyncTag(int interval, int length) const;
     juce::File resolveVideoHelperRootDir() const;
     bool isAdvancedVideoClientAvailable() const;
