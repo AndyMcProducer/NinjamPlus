@@ -34,6 +34,70 @@ static juce::File getThisModuleFile()
 #endif
 }
 
+static juce::PropertiesFile::Options makeSettingsOptions()
+{
+    juce::PropertiesFile::Options options;
+    options.applicationName = JucePlugin_Name;
+    options.filenameSuffix = ".settings";
+    options.osxLibrarySubFolder = "Application Support";
+#if JUCE_WINDOWS
+    options.folderName = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+                             .getChildFile("NINJAMplus")
+                             .getFullPathName();
+#elif JUCE_LINUX || JUCE_BSD
+    options.folderName = "~/.config";
+#else
+    options.folderName = JucePlugin_Name;
+#endif
+    return options;
+}
+
+// Migrates settings from pre-Documents/NINJAMplus locations to the new location on first run.
+static void migrateOldSettingsIfNeeded()
+{
+    auto newOpts = makeSettingsOptions();
+    if (newOpts.getDefaultFile().existsAsFile())
+        return; // already have a new-location settings file — nothing to migrate
+
+    // Candidate old locations, tried in priority order:
+    // 1. Plugin editor location: folderName = JucePlugin_Name, suffix = "settings" (no dot)
+    // 2. Standalone location:    folderName = "",              suffix = ".settings"
+    const juce::PropertiesFile::Options candidates[] = {
+        [&]() {
+            juce::PropertiesFile::Options o;
+            o.applicationName     = JucePlugin_Name;
+            o.filenameSuffix      = "settings";   // old plugin editor: no leading dot
+            o.folderName          = JucePlugin_Name;
+            o.osxLibrarySubFolder = "Application Support";
+            return o;
+        }(),
+        [&]() {
+            juce::PropertiesFile::Options o;
+            o.applicationName     = JucePlugin_Name;
+            o.filenameSuffix      = ".settings";  // old standalone: empty folderName
+            o.folderName          = "";
+            o.osxLibrarySubFolder = "Application Support";
+            return o;
+        }()
+    };
+
+    for (const auto& oldOpts : candidates)
+    {
+        if (! oldOpts.getDefaultFile().existsAsFile())
+            continue;
+
+        juce::PropertiesFile oldProps(oldOpts);
+        juce::PropertiesFile newProps(newOpts);
+
+        const auto keys = oldProps.getAllProperties().getAllKeys();
+        for (const auto& key : keys)
+            newProps.setValue(key, oldProps.getValue(key));
+
+        newProps.saveIfNeeded();
+        return; // stop after first successful migration
+    }
+}
+
 #if JUCE_WINDOWS
 #include <mfapi.h>
 #include <mfidl.h>
@@ -2264,11 +2328,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
             backgroundSelector.addItem("Default", 1);
 
         // Determine which texture to select: saved preference > "Brushed Metal 1" > first item
-        juce::PropertiesFile::Options popts;
-        popts.applicationName     = JucePlugin_Name;
-        popts.filenameSuffix      = "settings";
-        popts.folderName          = JucePlugin_Name;
-        popts.osxLibrarySubFolder = "Application Support";
+        auto popts = makeSettingsOptions();
         juce::PropertiesFile props(popts);
         juce::String savedTexture = props.getValue("texture", "");
         abletonWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonWindowSizePreset", 1));
@@ -2296,11 +2356,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         if (idx >= 0 && idx < textureFiles.size())
         {
             // Persist the user's choice
-            juce::PropertiesFile::Options popts;
-            popts.applicationName     = JucePlugin_Name;
-            popts.filenameSuffix      = "settings";
-            popts.folderName          = JucePlugin_Name;
-            popts.osxLibrarySubFolder = "Application Support";
+            auto popts = makeSettingsOptions();
             juce::PropertiesFile props(popts);
             props.setValue("texture", textureFiles[idx].getFileName());
             props.saveIfNeeded();
@@ -2369,11 +2425,16 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         juce::Logger::writeToLog("Metronome UI init vol=" + juce::String(vol));
     }
 
+    loadPersistentSettingsFromDisk();
+    lastPersistentSettingsSaveMs = juce::Time::getMillisecondCounterHiRes();
+
     startTimer(30);
 }
 
 NinjamVst3AudioProcessorEditor::~NinjamVst3AudioProcessorEditor()
 {
+    savePersistentSettingsToDisk();
+
     // Stop periodic UI ticks first so timerCallback won't touch UI-owned resources
     stopTimer();
 
@@ -2730,6 +2791,12 @@ void NinjamVst3AudioProcessorEditor::resized()
 void NinjamVst3AudioProcessorEditor::timerCallback()
 {
     const double nowMs = juce::Time::getMillisecondCounterHiRes();
+
+    if (nowMs - lastPersistentSettingsSaveMs >= 1500.0)
+    {
+        savePersistentSettingsToDisk();
+        lastPersistentSettingsSaveMs = nowMs;
+    }
 
     if (pendingDeferredResizeLayout && !audioProcessor.isStandaloneWrapper())
     {
@@ -3346,11 +3413,7 @@ void NinjamVst3AudioProcessorEditor::loadLearnMappingsFromProcessor()
 void NinjamVst3AudioProcessorEditor::saveLearnMappingsToDisk()
 {
     syncLearnMappingsToProcessor();
-    juce::PropertiesFile::Options popts;
-    popts.applicationName = JucePlugin_Name;
-    popts.filenameSuffix = "settings";
-    popts.folderName = JucePlugin_Name;
-    popts.osxLibrarySubFolder = "Application Support";
+    auto popts = makeSettingsOptions();
     juce::PropertiesFile props(popts);
     props.setValue("midiLearnStateJson", audioProcessor.getMidiLearnStateJson());
     props.setValue("oscLearnStateJson", audioProcessor.getOscLearnStateJson());
@@ -3359,15 +3422,140 @@ void NinjamVst3AudioProcessorEditor::saveLearnMappingsToDisk()
 
 void NinjamVst3AudioProcessorEditor::loadLearnMappingsFromDisk()
 {
-    juce::PropertiesFile::Options popts;
-    popts.applicationName = JucePlugin_Name;
-    popts.filenameSuffix = "settings";
-    popts.folderName = JucePlugin_Name;
-    popts.osxLibrarySubFolder = "Application Support";
+    auto popts = makeSettingsOptions();
     juce::PropertiesFile props(popts);
     audioProcessor.setMidiLearnStateJson(props.getValue("midiLearnStateJson", {}));
     audioProcessor.setOscLearnStateJson(props.getValue("oscLearnStateJson", {}));
     loadLearnMappingsFromProcessor();
+}
+
+void NinjamVst3AudioProcessorEditor::savePersistentSettingsToDisk()
+{
+    auto popts = makeSettingsOptions();
+    juce::PropertiesFile props(popts);
+
+    props.setValue("server", serverField.getText());
+    props.setValue("username", userField.getText());
+    props.setValue("password", passField.getText());
+    props.setValue("anonymous", anonymousButton.getToggleState());
+    props.setValue("layoutVertical", layoutButton.getToggleState());
+    props.setValue("chatVisible", chatButton.getToggleState());
+    props.setValue("videoBgEnabled", videoBgToggle.getToggleState());
+    props.setValue("autoLevelEnabled", autoLevelButton.getToggleState());
+    props.setValue("spreadOutputs", spreadOutputsButton.getToggleState());
+    props.setValue("abletonWindowSizePreset", abletonWindowSizePreset);
+
+    const int textureIdx = backgroundSelector.getSelectedItemIndex();
+    if (textureIdx >= 0 && textureIdx < textureFiles.size())
+        props.setValue("texture", textureFiles[textureIdx].getFileName());
+
+    juce::MemoryBlock processorState;
+    audioProcessor.getStateInformation(processorState);
+    if (processorState.getSize() > 0)
+        props.setValue("pluginStateBase64", juce::Base64::toBase64(processorState.getData(), processorState.getSize()));
+
+    props.saveIfNeeded();
+}
+
+void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
+{
+    migrateOldSettingsIfNeeded();
+
+    auto popts = makeSettingsOptions();
+    juce::PropertiesFile props(popts);
+
+    const juce::String encodedState = props.getValue("pluginStateBase64");
+    if (encodedState.isNotEmpty())
+    {
+        juce::MemoryOutputStream stateData;
+        if (juce::Base64::convertFromBase64(stateData, encodedState))
+        {
+            const auto state = stateData.getMemoryBlock();
+            if (state.getSize() > 0)
+                audioProcessor.setStateInformation(state.getData(), (int) state.getSize());
+        }
+    }
+
+    const juce::String savedServer = props.getValue("server", {});
+    if (savedServer.isNotEmpty())
+        serverField.setText(savedServer, juce::dontSendNotification);
+
+    const juce::String savedUser = props.getValue("username", {});
+    if (savedUser.isNotEmpty())
+        userField.setText(savedUser, juce::dontSendNotification);
+
+    passField.setText(props.getValue("password", {}), juce::dontSendNotification);
+    anonymousButton.setToggleState(props.getBoolValue("anonymous", anonymousButton.getToggleState()), juce::dontSendNotification);
+    anonymousToggled();
+
+    layoutButton.setToggleState(props.getBoolValue("layoutVertical", layoutButton.getToggleState()), juce::dontSendNotification);
+    layoutToggled();
+    updateLayoutButtonColor();
+
+    const bool chatVisible = props.getBoolValue("chatVisible", chatButton.getToggleState());
+    chatButton.setToggleState(chatVisible, juce::dontSendNotification);
+    chatToggled();
+
+    videoBgToggle.setToggleState(props.getBoolValue("videoBgEnabled", videoBgToggle.getToggleState()), juce::dontSendNotification);
+
+    autoLevelEnabled = props.getBoolValue("autoLevelEnabled", autoLevelEnabled);
+    autoLevelButton.setToggleState(autoLevelEnabled, juce::dontSendNotification);
+    updateAutoLevelButtonColor();
+
+    const bool spreadOutputs = props.getBoolValue("spreadOutputs", spreadOutputsButton.getToggleState());
+    spreadOutputsButton.setToggleState(spreadOutputs, juce::dontSendNotification);
+    audioProcessor.setSpreadOutputsEnabled(spreadOutputs);
+
+    abletonWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonWindowSizePreset", abletonWindowSizePreset));
+    if (isAbletonLiveHost() && !audioProcessor.isStandaloneWrapper())
+        setAbletonWindowSizePreset(abletonWindowSizePreset);
+
+    transmitButton.setToggleState(audioProcessor.isTransmittingLocal(), juce::dontSendNotification);
+    updateTransmitButtonColor();
+
+    localMonitorButton.setToggleState(audioProcessor.isLocalMonitorEnabled(), juce::dontSendNotification);
+    updateMonitorButtonColor();
+
+    voiceChatButton.setToggleState(audioProcessor.isVoiceChatMode(), juce::dontSendNotification);
+    updateVoiceChatButtonColor();
+
+    const int bitrates[] = { 64, 96, 128, 160, 192, 256, 320 };
+    const int savedBitrate = audioProcessor.getLocalBitrate();
+    int selectedBitrateId = 3;
+    for (int i = 0; i < 7; ++i)
+        if (bitrates[i] == savedBitrate)
+            selectedBitrateId = i + 1;
+    bitrateSelector.setSelectedId(selectedBitrateId, juce::dontSendNotification);
+
+    syncButton.setToggleState(audioProcessor.isSyncToHostEnabled(), juce::dontSendNotification);
+    updateSyncButtonColor();
+    updateSyncButtonTooltip();
+
+    masterFader.setValue(audioProcessor.getMasterOutputGain(), juce::dontSendNotification);
+    limiterButton.setToggleState(audioProcessor.isMasterLimiterEnabled(), juce::dontSendNotification);
+    limiterThresholdSlider.setValue(audioProcessor.getLimiterThreshold(), juce::dontSendNotification);
+    limiterReleaseSlider.setValue(audioProcessor.getLimiterRelease(), juce::dontSendNotification);
+    updateLimiterButtonColor();
+
+    // Re-apply the saved texture selection so the dropdown always reflects the loaded skin.
+    // Something called above (setStateInformation, setSize, colour-scheme update) can
+    // cause the ComboBox to lose its selection; re-selecting here fixes that without
+    // triggering onChange (we don't want to re-save or reload images unnecessarily).
+    {
+        const juce::String savedTexture = props.getValue("texture", "");
+        if (savedTexture.isNotEmpty())
+        {
+            for (int i = 0; i < textureFiles.size(); ++i)
+            {
+                if (textureFiles[i].getFileName() == savedTexture)
+                {
+                    backgroundSelector.setSelectedId(backgroundSelector.getItemId(i),
+                                                    juce::dontSendNotification);
+                    break;
+                }
+            }
+        }
+    }
 }
 
 void NinjamVst3AudioProcessorEditor::clearLearnMappings()
@@ -4072,11 +4260,7 @@ void NinjamVst3AudioProcessorEditor::setAbletonWindowSizePreset(int presetIndex)
     suppressHeavyUiUntilMs = juce::Time::getMillisecondCounterHiRes() + 400.0;
     hostResizeLockedForConnection = true;
 
-    juce::PropertiesFile::Options popts;
-    popts.applicationName     = JucePlugin_Name;
-    popts.filenameSuffix      = "settings";
-    popts.folderName          = JucePlugin_Name;
-    popts.osxLibrarySubFolder = "Application Support";
+    auto popts = makeSettingsOptions();
     juce::PropertiesFile props(popts);
     props.setValue("abletonWindowSizePreset", abletonWindowSizePreset);
     props.saveIfNeeded();

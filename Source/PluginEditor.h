@@ -1111,6 +1111,8 @@ private:
     void loadLearnMappingsFromProcessor();
     void saveLearnMappingsToDisk();
     void loadLearnMappingsFromDisk();
+    void savePersistentSettingsToDisk();
+    void loadPersistentSettingsFromDisk();
     void clearLearnMappings();
     bool isSidechainInputActive() const;
     bool isAbletonLiveHost() const;
@@ -1185,6 +1187,7 @@ private:
     std::unique_ptr<juce::MidiInput> midiRelayInputDevice;
     juce::String openedMidiLearnInputDeviceId;
     juce::String openedMidiRelayInputDeviceId;
+    double lastPersistentSettingsSaveMs = 0.0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NinjamVst3AudioProcessorEditor)
 };

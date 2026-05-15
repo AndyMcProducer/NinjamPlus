@@ -403,13 +403,44 @@ public:
         options.applicationName = JucePlugin_Name;
         options.filenameSuffix = ".settings";
         options.osxLibrarySubFolder = "Application Support";
-       #if JUCE_LINUX || JUCE_BSD
+       #if JUCE_WINDOWS
+        options.folderName = File::getSpecialLocation (File::userDocumentsDirectory)
+                                .getChildFile ("NINJAMplus")
+                                .getFullPathName();
+       #elif JUCE_LINUX || JUCE_BSD
         options.folderName = "~/.config";
        #else
-        options.folderName = "";
+        options.folderName = JucePlugin_Name;
        #endif
 
         appProperties.setStorageParameters (options);
+
+        // Migrate audio-device settings from old Roaming location to Documents/NINJAMplus.
+        // Only runs once: if the new file already exists we skip.
+       #if JUCE_WINDOWS
+        {
+            File newFile = options.getDefaultFile();
+            if (! newFile.existsAsFile())
+            {
+                PropertiesFile::Options oldOpts;
+                oldOpts.applicationName     = JucePlugin_Name;
+                oldOpts.filenameSuffix      = ".settings";
+                oldOpts.folderName          = "";
+                oldOpts.osxLibrarySubFolder = "Application Support";
+                File oldFile = oldOpts.getDefaultFile();
+                if (oldFile.existsAsFile())
+                {
+                    PropertiesFile oldProps (oldOpts);
+                    PropertiesFile newProps (options);
+                    const auto keys = oldProps.getAllProperties().getAllKeys();
+                    for (const auto& key : keys)
+                        newProps.setValue (key, oldProps.getValue (key));
+                    newProps.saveIfNeeded();
+                }
+            }
+        }
+       #endif
+
         mainWindow.reset (createWindow());
     }
 
