@@ -11,6 +11,10 @@ set(NINJAM_PLUGIN_VERSION "0.9.8.4")
 set(NINJAM_DISPLAY_VERSION "V0.9.8.4.1")
 set(NINJAM_OUTPUT_ROOT "${CMAKE_CURRENT_BINARY_DIR}/${NINJAM_BRAND_NAME}")
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # Enable C++17
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -61,6 +65,14 @@ FetchContent_Declare(
     GIT_TAG        v1.4
 )
 FetchContent_MakeAvailable(opus)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(pic_target IN ITEMS ogg vorbis vorbisenc vorbisfile opus)
+        if (TARGET ${pic_target})
+            set_target_properties(${pic_target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        endif()
+    endforeach()
+endif()
 
 set(NINJAM_PLUGIN_FORMATS VST3 Standalone)
 
