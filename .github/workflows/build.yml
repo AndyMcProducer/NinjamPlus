@@ -45,11 +45,6 @@ jobs:
           cmake --build build --config Release
           --target NINJAM_VST3_Standalone NINJAM_VST3_VST3
 
-      - name: Setup Node LTS For Packaging
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
       - name: Package
         shell: pwsh
         run: |
@@ -57,15 +52,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path out | Out-Null
 
           $srcRoot = Join-Path $PWD $env:SRC_DIR
-          $npmCmd = Get-Command npm -ErrorAction SilentlyContinue
-          if ($null -eq $npmCmd -or -not (Test-Path $npmCmd.Source)) {
-            throw "npm executable not found on PATH"
-          }
-          $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
-          if ($null -eq $nodeCmd -or -not (Test-Path $nodeCmd.Source)) {
-            throw "Node executable not found on PATH"
-          }
-          $nodeExe = $nodeCmd.Source
           $noticeFiles = @("LEGAL_NOTICES.txt", "THIRD_PARTY_NOTICES.md")
 
           $artefacts = Join-Path $PWD "build\NINJAMplus\Release"
@@ -90,17 +76,6 @@ jobs:
               $vdoDst = Join-Path $standaloneDir "advanced-vdo-client"
               if (Test-Path $vdoDst) { Remove-Item -Recurse -Force $vdoDst }
               Copy-Item -Recurse -Force $vdoSrc $vdoDst
-              Push-Location $vdoDst
-              try {
-                if (Test-Path "package-lock.json") {
-                  & $npmCmd.Source ci --omit=dev --no-audit --no-fund
-                } else {
-                  & $npmCmd.Source install --omit=dev --no-audit --no-fund
-                }
-              } finally {
-                Pop-Location
-              }
-              Copy-Item -Force $nodeExe (Join-Path $vdoDst "node.exe")
             }
             Compress-Archive -Force -Path (Join-Path $standaloneDir "*") -DestinationPath "out\NINJAMplus-windows-standalone.zip"
           } else {
@@ -131,17 +106,6 @@ jobs:
                 $vdoDst = Join-Path $resourcesDir "advanced-vdo-client"
                 if (Test-Path $vdoDst) { Remove-Item -Recurse -Force $vdoDst }
                 Copy-Item -Recurse -Force $vdoSrc $vdoDst
-                Push-Location $vdoDst
-                try {
-                  if (Test-Path "package-lock.json") {
-                    & $npmCmd.Source ci --omit=dev --no-audit --no-fund
-                  } else {
-                    & $npmCmd.Source install --omit=dev --no-audit --no-fund
-                  }
-                } finally {
-                  Pop-Location
-                }
-                Copy-Item -Force $nodeExe (Join-Path $vdoDst "node.exe")
               }
             }
             Compress-Archive -Force -Path (Join-Path $vst3Dir "*") -DestinationPath "out\NINJAMplus-windows-vst3.zip"
@@ -196,11 +160,6 @@ jobs:
           --target NINJAM_VST3_Standalone NINJAM_VST3_AU NINJAM_VST3_VST3
           -- CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY=""
 
-      - name: Setup Node LTS For Packaging
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
       - name: Package
         shell: bash
         run: |
@@ -212,11 +171,6 @@ jobs:
           AU_DIR="${ARTEFACTS}/AU"
           VST3_DIR="${ARTEFACTS}/VST3"
           SRC_ROOT="${SRC_DIR}"
-          NODE_BIN="$(command -v node || true)"
-          if [ -z "${NODE_BIN}" ] || [ ! -f "${NODE_BIN}" ]; then
-            echo "Node executable not found on PATH"
-            exit 1
-          fi
           NOTICE_FILES=("LEGAL_NOTICES.txt" "THIRD_PARTY_NOTICES.md")
 
           copy_notice_files() {
@@ -227,15 +181,6 @@ jobs:
                 cp -f "${SRC_ROOT}/${notice}" "${dest_dir}/"
               fi
             done
-          }
-
-          install_vdo_deps() {
-            local target_dir="$1"
-            if [ -f "${target_dir}/package-lock.json" ]; then
-              (cd "${target_dir}" && npm ci --omit=dev --no-audit --no-fund)
-            else
-              (cd "${target_dir}" && npm install --omit=dev --no-audit --no-fund)
-            fi
           }
 
           if [ -d "${STANDALONE_DIR}" ]; then
@@ -251,9 +196,6 @@ jobs:
             rm -rf "${MACOS_DIR}/textures" "${MACOS_DIR}/advanced-vdo-client" || true
             cp -R "${SRC_ROOT}/textures" "${MACOS_DIR}/textures"
             cp -R "${SRC_ROOT}/advanced-vdo-client" "${MACOS_DIR}/advanced-vdo-client"
-            install_vdo_deps "${MACOS_DIR}/advanced-vdo-client"
-            cp -f "${NODE_BIN}" "${MACOS_DIR}/advanced-vdo-client/node"
-            chmod +x "${MACOS_DIR}/advanced-vdo-client/node"
 
             ditto -c -k --sequesterRsrc --keepParent "${APP_PATH}" "out/NINJAMplus-macos-standalone.zip"
           else
@@ -272,9 +214,6 @@ jobs:
             rm -rf "${COMP_PATH}/Contents/Resources/textures" "${COMP_PATH}/Contents/Resources/advanced-vdo-client" || true
             cp -R "${SRC_ROOT}/textures" "${COMP_PATH}/Contents/Resources/textures"
             cp -R "${SRC_ROOT}/advanced-vdo-client" "${COMP_PATH}/Contents/Resources/advanced-vdo-client"
-            install_vdo_deps "${COMP_PATH}/Contents/Resources/advanced-vdo-client"
-            cp -f "${NODE_BIN}" "${COMP_PATH}/Contents/Resources/advanced-vdo-client/node"
-            chmod +x "${COMP_PATH}/Contents/Resources/advanced-vdo-client/node"
             ditto -c -k --sequesterRsrc --keepParent "${COMP_PATH}" "out/NINJAMplus-macos-au.zip"
           else
             echo "AU artefacts not found at ${AU_DIR}"
@@ -292,19 +231,10 @@ jobs:
             rm -rf "${VST3_PATH}/Contents/Resources/textures" "${VST3_PATH}/Contents/Resources/advanced-vdo-client" || true
             cp -R "${SRC_ROOT}/textures" "${VST3_PATH}/Contents/Resources/textures"
             cp -R "${SRC_ROOT}/advanced-vdo-client" "${VST3_PATH}/Contents/Resources/advanced-vdo-client"
-            install_vdo_deps "${VST3_PATH}/Contents/Resources/advanced-vdo-client"
-            cp -f "${NODE_BIN}" "${VST3_PATH}/Contents/Resources/advanced-vdo-client/node"
-            chmod +x "${VST3_PATH}/Contents/Resources/advanced-vdo-client/node"
             ditto -c -k --sequesterRsrc --keepParent "${VST3_PATH}" "out/NINJAMplus-macos-vst3.zip"
           else
             echo "VST3 artefacts not found at ${VST3_DIR}"
             exit 1
-          fi
-
-          FIX_SCRIPT_SRC="${SRC_ROOT}/scripts/macos/NINJAM-VDO-Fix.command"
-          if [ -f "${FIX_SCRIPT_SRC}" ]; then
-            cp -f "${FIX_SCRIPT_SRC}" "out/NINJAM-VDO-Fix.command"
-            chmod +x "out/NINJAM-VDO-Fix.command"
           fi
 
       - name: Upload

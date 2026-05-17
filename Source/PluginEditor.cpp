@@ -2891,7 +2891,7 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
     for (int i = 0; i < numLocal; ++i)
     {
         float peak = audioProcessor.getLocalChannelPeak(i);
-        localPeakMeters[(size_t)i].setPeak(peak);
+        localPeakMeters[(size_t)i].setPeak(audioProcessor.getLocalChannelPeakLeft(i), audioProcessor.getLocalChannelPeakRight(i));
         float db = -60.0f;
         if (peak > 1.0e-6f)
             db = juce::jlimit(-60.0f, 6.0f, 20.0f * std::log10(peak));
@@ -2899,7 +2899,7 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
     }
 
     float masterPk = audioProcessor.getMasterPeak();
-    masterPeakMeter.setPeak(masterPk);
+    masterPeakMeter.setPeak(audioProcessor.getMasterPeakLeft(), audioProcessor.getMasterPeakRight());
     {
         float db = -60.0f;
         if (masterPk > 1.0e-6f)

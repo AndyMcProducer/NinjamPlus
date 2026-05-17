@@ -61,11 +61,6 @@ jobs:
           cmake --build build --config Release
           --target NINJAM_VST3_Standalone NINJAM_VST3_VST3
 
-      - name: Setup Node LTS For Packaging
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
       - name: Package
         shell: pwsh
         run: |
@@ -73,15 +68,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path out | Out-Null
 
           $srcRoot = Join-Path $PWD $env:SRC_DIR
-          $npmCmd = Get-Command npm -ErrorAction SilentlyContinue
-          if ($null -eq $npmCmd -or -not (Test-Path $npmCmd.Source)) {
-            throw "npm executable not found on PATH"
-          }
-          $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
-          if ($null -eq $nodeCmd -or -not (Test-Path $nodeCmd.Source)) {
-            throw "Node executable not found on PATH"
-          }
-          $nodeExe = $nodeCmd.Source
           $noticeFiles = @("LEGAL_NOTICES.txt", "THIRD_PARTY_NOTICES.md")
 
           $artefacts = Join-Path $PWD "build\NINJAMplus\Release"
@@ -106,13 +92,6 @@ jobs:
               $vdoDst = Join-Path $standaloneDir "advanced-vdo-client"
               if (Test-Path $vdoDst) { Remove-Item -Recurse -Force $vdoDst }
               Copy-Item -Recurse -Force $vdoSrc $vdoDst
-              Push-Location $vdoDst
-              try {
-                & $npmCmd.Source install --omit=dev --no-audit --no-fund
-              } finally {
-                Pop-Location
-              }
-              Copy-Item -Force $nodeExe (Join-Path $vdoDst "node.exe")
             }
             Compress-Archive -Force -Path (Join-Path $standaloneDir "*") -DestinationPath "out\NINJAMplus-windows-standalone.zip"
           } else {
@@ -143,13 +122,6 @@ jobs:
                 $vdoDst = Join-Path $resourcesDir "advanced-vdo-client"
                 if (Test-Path $vdoDst) { Remove-Item -Recurse -Force $vdoDst }
                 Copy-Item -Recurse -Force $vdoSrc $vdoDst
-                Push-Location $vdoDst
-                try {
-                  & $npmCmd.Source install --omit=dev --no-audit --no-fund
-                } finally {
-                  Pop-Location
-                }
-                Copy-Item -Force $nodeExe (Join-Path $vdoDst "node.exe")
               }
             }
 
@@ -265,11 +237,6 @@ jobs:
           --target NINJAM_VST3_Standalone NINJAM_VST3_AU NINJAM_VST3_VST3
           -- CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY=""
 
-      - name: Setup Node LTS For Packaging
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
       - name: Package
         shell: bash
         env:
@@ -286,11 +253,6 @@ jobs:
           STANDALONE_DIR="${ARTEFACTS}/Standalone"
           AU_DIR="${ARTEFACTS}/AU"
           VST3_DIR="${ARTEFACTS}/VST3"
-          NODE_BIN="$(command -v node || true)"
-          if [ -z "${NODE_BIN}" ] || [ ! -f "${NODE_BIN}" ]; then
-            echo "Node executable not found on PATH"
-            exit 1
-          fi
           NOTICE_FILES=("LEGAL_NOTICES.txt" "THIRD_PARTY_NOTICES.md")
 
           SIGN_ENABLED=0
@@ -309,14 +271,6 @@ jobs:
             echo "Notarization secrets missing; skipping notarization."
           fi
 
-          sign_binary() {
-            local target="$1"
-            xattr -cr "${target}" || true
-            if [ "${SIGN_ENABLED}" -eq 1 ]; then
-              codesign --force --options runtime --timestamp --sign "${MACOS_SIGN_IDENTITY}" "${target}"
-            fi
-          }
-
           sign_bundle() {
             local target="$1"
             xattr -cr "${target}" || true
@@ -324,15 +278,6 @@ jobs:
               codesign --force --deep --options runtime --timestamp --sign "${MACOS_SIGN_IDENTITY}" "${target}"
             else
               codesign --force --deep --sign - "${target}"
-            fi
-          }
-
-          install_vdo_deps() {
-            local target_dir="$1"
-            if [ -f "${target_dir}/package-lock.json" ]; then
-              (cd "${target_dir}" && npm ci --omit=dev --no-audit --no-fund)
-            else
-              (cd "${target_dir}" && npm install --omit=dev --no-audit --no-fund)
             fi
           }
 
@@ -359,10 +304,6 @@ jobs:
             rm -rf "${MACOS_DIR}/textures" "${MACOS_DIR}/advanced-vdo-client" || true
             cp -R "${SRC_DIR}/textures" "${MACOS_DIR}/textures"
             cp -R "${SRC_DIR}/advanced-vdo-client" "${MACOS_DIR}/advanced-vdo-client"
-            install_vdo_deps "${MACOS_DIR}/advanced-vdo-client"
-            cp -f "${NODE_BIN}" "${MACOS_DIR}/advanced-vdo-client/node"
-            chmod +x "${MACOS_DIR}/advanced-vdo-client/node"
-            sign_binary "${MACOS_DIR}/advanced-vdo-client/node"
 
             sign_bundle "${APP_PATH}"
 
@@ -383,10 +324,6 @@ jobs:
             rm -rf "${COMP_PATH}/Contents/Resources/textures" "${COMP_PATH}/Contents/Resources/advanced-vdo-client" || true
             cp -R "${SRC_DIR}/textures" "${COMP_PATH}/Contents/Resources/textures"
             cp -R "${SRC_DIR}/advanced-vdo-client" "${COMP_PATH}/Contents/Resources/advanced-vdo-client"
-            install_vdo_deps "${COMP_PATH}/Contents/Resources/advanced-vdo-client"
-            cp -f "${NODE_BIN}" "${COMP_PATH}/Contents/Resources/advanced-vdo-client/node"
-            chmod +x "${COMP_PATH}/Contents/Resources/advanced-vdo-client/node"
-            sign_binary "${COMP_PATH}/Contents/Resources/advanced-vdo-client/node"
 
             sign_bundle "${COMP_PATH}"
 
@@ -407,10 +344,6 @@ jobs:
             rm -rf "${VST3_PATH}/Contents/Resources/textures" "${VST3_PATH}/Contents/Resources/advanced-vdo-client" || true
             cp -R "${SRC_DIR}/textures" "${VST3_PATH}/Contents/Resources/textures"
             cp -R "${SRC_DIR}/advanced-vdo-client" "${VST3_PATH}/Contents/Resources/advanced-vdo-client"
-            install_vdo_deps "${VST3_PATH}/Contents/Resources/advanced-vdo-client"
-            cp -f "${NODE_BIN}" "${VST3_PATH}/Contents/Resources/advanced-vdo-client/node"
-            chmod +x "${VST3_PATH}/Contents/Resources/advanced-vdo-client/node"
-            sign_binary "${VST3_PATH}/Contents/Resources/advanced-vdo-client/node"
 
             sign_bundle "${VST3_PATH}"
 
@@ -433,11 +366,6 @@ jobs:
           cp -R "${COMP_PATH}" "${PKGROOT}/Library/Audio/Plug-Ins/Components/"
           cp -R "${VST3_PATH}" "${PKGROOT}/Library/Audio/Plug-Ins/VST3/"
           copy_notice_files "${PKGROOT}/Library/Application Support/NINJAMplus"
-          FIX_SCRIPT_SRC="${SRC_DIR}/scripts/macos/NINJAM-VDO-Fix.command"
-          if [ -f "${FIX_SCRIPT_SRC}" ]; then
-            cp -f "${FIX_SCRIPT_SRC}" "${PKGROOT}/Library/Application Support/NINJAMplus/NINJAM-VDO-Fix.command"
-            chmod +x "${PKGROOT}/Library/Application Support/NINJAMplus/NINJAM-VDO-Fix.command"
-          fi
 
           PKGBUILD_ARGS=(
             --root "${PKGROOT}"
@@ -445,10 +373,6 @@ jobs:
             --identifier "com.amp.ninjamplus"
             --version "${VERSION}"
           )
-          if [ -x "${PKG_SCRIPTS_DIR}/postinstall" ]; then
-            chmod +x "${PKG_SCRIPTS_DIR}/postinstall"
-            PKGBUILD_ARGS+=(--scripts "${PKG_SCRIPTS_DIR}")
-          fi
           pkgbuild "${PKGBUILD_ARGS[@]}" "out/NINJAMplus-macOS-unsigned.pkg"
           if [ "${SIGN_ENABLED}" -eq 1 ] && [ -n "${MACOS_INSTALLER_IDENTITY:-}" ]; then
             productsign --sign "${MACOS_INSTALLER_IDENTITY}" "out/NINJAMplus-macOS-unsigned.pkg" "out/NINJAMplus-macOS.pkg"
@@ -467,11 +391,6 @@ jobs:
             xcrun stapler staple "${APP_PATH}" || true
             xcrun stapler staple "${COMP_PATH}" || true
             xcrun stapler staple "${VST3_PATH}" || true
-          fi
-
-          if [ -f "${FIX_SCRIPT_SRC}" ]; then
-            cp -f "${FIX_SCRIPT_SRC}" "out/NINJAM-VDO-Fix.command"
-            chmod +x "out/NINJAM-VDO-Fix.command"
           fi
 
       - name: Upload

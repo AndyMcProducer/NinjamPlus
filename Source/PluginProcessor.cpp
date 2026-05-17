@@ -1307,6 +1307,7 @@ void NinjamVst3AudioProcessor::syncLocalIntervalChannelConfig()
     const int flags = voiceChatMode ? 2 : 0;
     const int numCh = juce::jlimit(1, maxLocalChannels, numLocalChannels.load());
     const bool multiChanAuto = numCh > 1 && opusSyncAvailable.load() && shouldTransmit;
+    const bool singleStereoLocal = numCh == 1 && getLocalChannelInput(0) < 0;
 
     if (multiChanAuto)
     {
@@ -1317,6 +1318,8 @@ void NinjamVst3AudioProcessor::syncLocalIntervalChannelConfig()
         ninjamClient.SetLocalChannelInfo(0, ch0Name.toRawUTF8(),
             true, numCh,          // srcch = mix buffer at inputs[numCh]
             true, bitrate, true, true, false, 0, true, flags);
+        // Mute engine local output — monitor block handles local audio routing with proper stereo.
+        ninjamClient.SetLocalChannelMonitoring(0, false, 0.f, false, 0.f, true, true, false, false);
         for (int i = 0; i < numCh; ++i)
         {
             juce::String chName = getLocalChannelName(i);
@@ -1324,6 +1327,7 @@ void NinjamVst3AudioProcessor::syncLocalIntervalChannelConfig()
             ninjamClient.SetLocalChannelInfo(i + 1, chName.toRawUTF8(),
                 true, i,          // srcch = original buffer slot i
                 true, bitrate, true, true, false, 0, true, flags);
+            ninjamClient.SetLocalChannelMonitoring(i + 1, false, 0.f, false, 0.f, true, true, false, false);
         }
         for (int i = numCh + 1; i <= maxLocalChannels; ++i)
             ninjamClient.DeleteLocalChannel(i);
@@ -1333,9 +1337,11 @@ void NinjamVst3AudioProcessor::syncLocalIntervalChannelConfig()
         // Vorbis only: single channel
         juce::String ch0Name = getLocalChannelName(0);
         if (ch0Name.isEmpty()) ch0Name = "Input";
-        const int sourceChannel = shouldTransmit ? 0 : 1023;
+        const int sourceChannel = shouldTransmit ? (singleStereoLocal ? 1024 : 0) : 1023;
         ninjamClient.SetLocalChannelInfo(0, ch0Name.toRawUTF8(),
             true, sourceChannel, true, bitrate, true, true, false, 0, true, flags);
+        // Mute engine local output — monitor block handles local audio routing with proper stereo.
+        ninjamClient.SetLocalChannelMonitoring(0, false, 0.f, false, 0.f, true, true, false, false);
         for (int i = 1; i <= maxLocalChannels; ++i)
             ninjamClient.DeleteLocalChannel(i);
     }
@@ -3958,10 +3964,13 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
             globalLocalMaxR = localMaxR;
     }
 
-    if (totalInputChannels > 0 && numSamples > 0)
+    if (totalInputChannels > 0 && numSamples > 0 && actualLocal > 0)
     {
-        const float* dev0 = tempInputBuffer.getReadPointer(0);
-        const float* dev1 = tempInputBuffer.getNumChannels() > 1 ? tempInputBuffer.getReadPointer(1) : dev0;
+        const int srcL = monitorSourceLeft[0] >= 0 ? monitorSourceLeft[0] : 0;
+        const int srcR = (monitorSourceRight[0] >= 0 && monitorSourceRight[0] < totalInputChannels)
+                         ? monitorSourceRight[0] : srcL;
+        const float* dev0 = tempInputBuffer.getReadPointer(srcL);
+        const float* dev1 = tempInputBuffer.getReadPointer(srcR);
         float devMax = 0.0f;
         float devMaxL = 0.0f;
         float devMaxR = 0.0f;
@@ -4146,6 +4155,11 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     if (!multiChanAuto && fxSendActive)
         localChannelBuffer.addFrom(0, 0, fxTransmitBuffer, 0, 0, numSamples);
 
+    const bool singleStereoLocal = !multiChanAuto
+        && actualLocal == 1
+        && monitorStereo[0]
+        && isTransmittingLocal();
+
     if (multiChanAuto)
     {
         if (localMixBuffer.getNumSamples() < numSamples)
@@ -4177,8 +4191,41 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     }
     else
     {
-        inputs[0] = localChannelBuffer.getWritePointer(0);
-        actualInputChannels = 1;
+        if (singleStereoLocal)
+        {
+            if (localMixBuffer.getNumChannels() < 2 || localMixBuffer.getNumSamples() < numSamples)
+                localMixBuffer.setSize(2, numSamples, false, true, true);
+
+            const int sourceLeft = monitorSourceLeft[0];
+            const int sourceRight = monitorSourceRight[0];
+            const float gain = localChannelGains[0].load();
+
+            localMixBuffer.clear();
+            if (sourceLeft >= 0 && sourceLeft < totalInputChannels)
+                localMixBuffer.copyFrom(0, 0, tempInputBuffer, sourceLeft, 0, numSamples);
+            if (sourceRight >= 0 && sourceRight < totalInputChannels)
+                localMixBuffer.copyFrom(1, 0, tempInputBuffer, sourceRight, 0, numSamples);
+            else if (sourceLeft >= 0 && sourceLeft < totalInputChannels)
+                localMixBuffer.copyFrom(1, 0, tempInputBuffer, sourceLeft, 0, numSamples);
+
+            if (gain != 1.0f)
+                localMixBuffer.applyGain(gain);
+
+            if (fxSendActive)
+            {
+                localMixBuffer.addFrom(0, 0, fxTransmitBuffer, 0, 0, numSamples);
+                localMixBuffer.addFrom(1, 0, fxTransmitBuffer, 0, 0, numSamples);
+            }
+
+            inputs[0] = localMixBuffer.getWritePointer(0);
+            inputs[1] = localMixBuffer.getWritePointer(1);
+            actualInputChannels = 2;
+        }
+        else
+        {
+            inputs[0] = localChannelBuffer.getWritePointer(0);
+            actualInputChannels = 1;
+        }
     }
 
     float* outputs[32];
@@ -4278,7 +4325,7 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     int engineInputChannels = allowEngineLocalInput ? actualInputChannels : 0;
     ninjamClient.AudioProc(engineInputs, engineInputChannels, outputs, actualOutputChannels, numSamples, (int)getSampleRate(), runMonitorOnly);
 
-    if (monitorEnabled)
+    if (monitorEnabled || transmitEnabled)
     {
         int numOutputBusesOut = getBusCount(false);
         if (numOutputBusesOut > 0)
