@@ -3,10 +3,13 @@ cmake_minimum_required(VERSION 3.22)
 # Fix for old CMake policies in dependencies (ogg/vorbis)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
-project(NINJAM_VST3 VERSION 0.9.8.2)
+project(NINJAM_VST3 VERSION 0.9.8.4)
 
 set(NINJAM_BRAND_NAME "NINJAMplus")
 set(NINJAM_VENDOR_NAME "AMP")
+set(NINJAM_PLUGIN_VERSION "0.9.8.4")
+set(NINJAM_DISPLAY_VERSION "V0.9.8.4.1")
+set(NINJAM_OUTPUT_ROOT "${CMAKE_CURRENT_BINARY_DIR}/${NINJAM_BRAND_NAME}")
 
 # Enable C++17
 set(CMAKE_CXX_STANDARD 17)
@@ -59,22 +62,41 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(opus)
 
+set(NINJAM_PLUGIN_FORMATS VST3 Standalone)
+
+if (APPLE)
+    list(APPEND NINJAM_PLUGIN_FORMATS AU)
+endif()
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND NINJAM_PLUGIN_FORMATS LV2)
+endif()
+
 # Define the plugin
 juce_add_plugin(NINJAM_VST3
-    VERSION ${PROJECT_VERSION}
+    VERSION ${NINJAM_PLUGIN_VERSION}
+    BUILD_VERSION ${NINJAM_DISPLAY_VERSION}
     COMPANY_NAME "${NINJAM_VENDOR_NAME}"
     IS_SYNTH FALSE
     NEEDS_MIDI_INPUT TRUE
     NEEDS_MIDI_OUTPUT TRUE
     IS_MIDI_EFFECT FALSE
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE
-    COPY_PLUGIN_AFTER_BUILD TRUE
+    COPY_PLUGIN_AFTER_BUILD FALSE
     PLUGIN_MANUFACTURER_CODE Juce
     PLUGIN_CODE Njv3
     BUNDLE_ID "com.AMP.NINJAMplus"
-    FORMATS VST3 AU Standalone
+    LV2URI "urn:amp:ninjamplus"
+    FORMATS ${NINJAM_PLUGIN_FORMATS}
+    ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/icon.png"
+    ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/icon.png"
     PRODUCT_NAME "${NINJAM_BRAND_NAME}"
 )
+
+set_target_properties(NINJAM_VST3 PROPERTIES
+    ARCHIVE_OUTPUT_DIRECTORY "${NINJAM_OUTPUT_ROOT}/$<CONFIG>"
+    LIBRARY_OUTPUT_DIRECTORY "${NINJAM_OUTPUT_ROOT}/$<CONFIG>"
+    RUNTIME_OUTPUT_DIRECTORY "${NINJAM_OUTPUT_ROOT}/$<CONFIG>")
 
 # Generate JuceHeader.h
 juce_generate_juce_header(NINJAM_VST3)
@@ -166,19 +188,62 @@ if (WIN32)
     target_link_libraries(NINJAM_VST3 PRIVATE ws2_32 winmm)
 endif()
 
+set(NINJAM_HELPER_FILES
+    index.html
+    icon.png)
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/app.html")
+    list(APPEND NINJAM_HELPER_FILES app.html)
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/server.js")
+    list(APPEND NINJAM_HELPER_FILES server.js)
+endif()
+
 if (TARGET NINJAM_VST3_Standalone)
     add_custom_target(NINJAM_VST3_SyncWebAssets
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client"
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client"
-        COMMAND ${CMAKE_COMMAND} -E copy
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/server.js"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/server.js"
-        COMMAND ${CMAKE_COMMAND} -E copy
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/index.html"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/index.html"
-        COMMAND ${CMAKE_COMMAND} -E copy
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/icon.png"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/icon.png"
         VERBATIM
     )
+    foreach(helper_file IN LISTS NINJAM_HELPER_FILES)
+        add_custom_command(TARGET NINJAM_VST3_SyncWebAssets POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/${helper_file}"
+                "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/${helper_file}"
+            VERBATIM)
+    endforeach()
     add_dependencies(NINJAM_VST3_Standalone NINJAM_VST3_SyncWebAssets)
+endif()
+
+if (TARGET NINJAM_VST3_VST3)
+    add_custom_target(NINJAM_VST3_SyncVst3WebAssets
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client"
+        VERBATIM
+    )
+    foreach(helper_file IN LISTS NINJAM_HELPER_FILES)
+        add_custom_command(TARGET NINJAM_VST3_SyncVst3WebAssets POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/${helper_file}"
+                "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/${helper_file}"
+            VERBATIM)
+    endforeach()
+    add_dependencies(NINJAM_VST3_VST3 NINJAM_VST3_SyncVst3WebAssets)
+endif()
+
+if (TARGET NINJAM_VST3_LV2)
+    add_custom_target(NINJAM_VST3_SyncLv2WebAssets
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client"
+        VERBATIM
+    )
+    foreach(helper_file IN LISTS NINJAM_HELPER_FILES)
+        add_custom_command(TARGET NINJAM_VST3_SyncLv2WebAssets POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/${helper_file}"
+                "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client/${helper_file}"
+            VERBATIM)
+    endforeach()
+    add_dependencies(NINJAM_VST3_LV2 NINJAM_VST3_SyncLv2WebAssets)
 endif()
