@@ -254,7 +254,7 @@ jobs:
       - name: Build
         run: >
           cmake --build build
-          --target NINJAM_VST3_Standalone NINJAM_VST3_VST3 NINJAM_VST3_LV2
+          --target NINJAM_VST3_All
 
       - name: Package
         shell: bash
