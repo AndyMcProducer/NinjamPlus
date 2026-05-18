@@ -120,7 +120,7 @@
             userLastSeenAt: {},
             userLastSampleKey: {},
             setIntervalInfo(interval, pos, bpm, bpi, length, bufferMode, voiceChatMode) {
-                const nextInfo = {
+                this.intervalInfo = {
                     interval,
                     pos,
                     bpm,
@@ -130,25 +130,6 @@
                     voiceChatMode: !!voiceChatMode,
                     updatedAt: Date.now()
                 };
-                const previous = this.intervalInfo;
-                const changed = !previous
-                    || previous.interval !== nextInfo.interval
-                    || previous.bpm !== nextInfo.bpm
-                    || previous.bpi !== nextInfo.bpi
-                    || previous.length !== nextInfo.length
-                    || previous.bufferMode !== nextInfo.bufferMode
-                    || previous.voiceChatMode !== nextInfo.voiceChatMode;
-                this.intervalInfo = {
-                    interval: nextInfo.interval,
-                    pos: nextInfo.pos,
-                    bpm: nextInfo.bpm,
-                    bpi: nextInfo.bpi,
-                    length: nextInfo.length,
-                    bufferMode: nextInfo.bufferMode,
-                    voiceChatMode: nextInfo.voiceChatMode,
-                    updatedAt: nextInfo.updatedAt
-                };
-                return changed;
             },
             setRemoteTimecode(userId, interval, timecode, bufferMs, sampleKey, voiceChatMode) {
                 const key = normalizeUserId(userId);
@@ -688,7 +669,7 @@
             }
             appState.intervalMessages += 1;
             if (data.type === 'intervalInfo') {
-                const intervalSettingsChanged = ninjamSync.setIntervalInfo(
+                ninjamSync.setIntervalInfo(
                     data.interval,
                     data.pos,
                     data.bpm,
@@ -698,7 +679,7 @@
                     data.voiceChatMode
                 );
                 updateSyncStatus();
-                return intervalSettingsChanged;
+                return false;
             }
             if (data.type !== 'remoteTimecode' && data.type !== 'videoTimecode') {
                 return false;
@@ -721,12 +702,11 @@
 
         function processIntervalPayload(payload) {
             const items = Array.isArray(payload) ? payload : [payload];
-            let intervalSettingsChanged = false;
             for (let i = 0; i < items.length; i++) {
-                intervalSettingsChanged = handleIntervalMessage(items[i] || {}) || intervalSettingsChanged;
+                handleIntervalMessage(items[i] || {});
             }
             pruneInactiveUsers();
-            applyPeerBuffers(intervalSettingsChanged);
+            applyPeerBuffers(false);
         }
 
         function startIntervalSource() {

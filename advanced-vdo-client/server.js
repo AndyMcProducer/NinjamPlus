@@ -244,7 +244,7 @@ const htmlPage = `
             userLastSeenAt: {},
             userLastSampleKey: {},
             setIntervalInfo(interval, pos, bpm, bpi, length) {
-                const nextInfo = {
+                this.intervalInfo = {
                     interval,
                     pos,
                     bpm,
@@ -252,22 +252,7 @@ const htmlPage = `
                     length: typeof length === 'number' ? length : 0,
                     updatedAt: Date.now()
                 };
-                const previous = this.intervalInfo;
-                const changed = !previous
-                    || previous.interval !== nextInfo.interval
-                    || previous.bpm !== nextInfo.bpm
-                    || previous.bpi !== nextInfo.bpi
-                    || previous.length !== nextInfo.length;
-                this.intervalInfo = {
-                    interval: nextInfo.interval,
-                    pos: nextInfo.pos,
-                    bpm: nextInfo.bpm,
-                    bpi: nextInfo.bpi,
-                    length: nextInfo.length,
-                    updatedAt: nextInfo.updatedAt
-                };
                 console.log('ninjamSync.setIntervalInfo', this.intervalInfo);
-                return changed;
             },
             setRemoteTimecode(userId, interval, timecode, bufferMs, sampleKey) {
                 const u = normalizeUserId(userId);
@@ -337,7 +322,7 @@ const htmlPage = `
             }
             appState.intervalMessages += 1;
             if (data.type === 'intervalInfo') {
-                const intervalSettingsChanged = ninjamSync.setIntervalInfo(
+                ninjamSync.setIntervalInfo(
                     data.interval,
                     data.pos,
                     data.bpm,
@@ -347,7 +332,7 @@ const htmlPage = `
                 updateRendererView();
                 updateGuestOverlays();
                 updateSyncStatus();
-                return intervalSettingsChanged;
+                return false;
             } else if (data.type === 'remoteTimecode') {
                 const receiverBufferMs = typeof data.receiverBufferMs === 'number'
                     ? data.receiverBufferMs
@@ -412,13 +397,12 @@ const htmlPage = `
 
         function processIntervalPayload(payload) {
             const items = Array.isArray(payload) ? payload : [payload];
-            let intervalSettingsChanged = false;
             for (let i = 0; i < items.length; i++) {
                 const msg = items[i] || {};
-                intervalSettingsChanged = handleIntervalMessage(msg) || intervalSettingsChanged;
+                handleIntervalMessage(msg);
             }
             pruneInactiveUsers();
-            applyRecommendedBuffer(intervalSettingsChanged);
+            applyRecommendedBuffer(false);
         }
 
         function startIntervalSource() {
