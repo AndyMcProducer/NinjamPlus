@@ -584,24 +584,34 @@ public:
         : versionText(versionString)
     {
         setOpaque(true);
-        setSize(300, 120);
+        setSize(420, 180);
     }
     
     void paint(juce::Graphics& g) override
     {
-        g.fillAll(juce::Colour(0xff222222));
-        g.setColour(juce::Colours::white);
+        g.fillAll(juce::Colour(0xff1b1f23));
+        g.setColour(juce::Colour(0xff4a545e));
         g.drawRect(getLocalBounds(), 1);
-        
-        auto area = getLocalBounds().reduced(16);
-        juce::Font titleFont(16.0f);
-        titleFont = titleFont.boldened();
-        g.setFont(titleFont);
-        g.drawText("NINJAMplus", area.removeFromTop(20), juce::Justification::centredTop);
-        
-        g.setFont(juce::Font(12.0f));
+
+        auto area = getLocalBounds().reduced(20, 18);
+
+        g.setColour(juce::Colours::white);
+        g.setFont(juce::Font(24.0f, juce::Font::bold));
+        g.drawText("NINJAMplus", area.removeFromTop(30), juce::Justification::centredTop);
+
+        area.removeFromTop(6);
+
         g.setColour(juce::Colours::lightgrey);
-        g.drawText("Version: " + versionText, area.removeFromTop(20), juce::Justification::centredTop);
+        g.setFont(juce::Font(16.0f));
+        g.drawText("Version " + versionText, area.removeFromTop(24), juce::Justification::centredTop);
+
+        area.removeFromTop(10);
+
+        g.setFont(juce::Font(14.0f));
+        g.drawFittedText("Low-latency collaborative jamming with interval sync, video sync, and chord detection.",
+                         area,
+                         juce::Justification::centredTop,
+                         3);
     }
     
 private:
@@ -617,11 +627,15 @@ public:
         auto popup = new AboutPopup(versionString);
         setContentOwned(popup, true);
         setResizable(false, false);
-        setSize(300, 120);
+        setSize(420, 180);
         centreAroundComponent(nullptr, getWidth(), getHeight());
     }
     
-    void closeButtonPressed() override { exitModalState(0); }
+    void closeButtonPressed() override
+    {
+        setVisible(false);
+        exitModalState(0);
+    }
 };
 
 class MasterPeakMeter : public juce::Component
