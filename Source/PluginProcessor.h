@@ -3,6 +3,7 @@
 #include <JuceHeader.h>
 #include <future>
 #include <atomic>
+#include <memory>
 
 // Disable min/max macros before including ninjam headers
 #ifdef WIN32
@@ -14,6 +15,7 @@
 class NinjamVst3AudioProcessorEditor;
 class LocalVideoHttpServer;
 class AsyncChatTranslationWorker;
+class LocalChordAnalyzer;
 
 class NinjamVst3AudioProcessor : public juce::AudioProcessor,
                                  public juce::Timer
@@ -118,6 +120,9 @@ public:
     float getUserPeak(int userIndex, int channelIndex); // 0=L, 1=R
     float getUserChannelPeak(int userIndex, int njChanIdx, int lrSide); // per NINJAM channel L/R peak
     void setUserNjChannelVolume(int userIndex, int njChanIdx, float volume); // individual NINJAM channel volume
+    juce::String getUserChordLabel(int userIndex) const;
+    double getUserChordCpuPercent(int userIndex) const;
+    int getUserChordMemoryKb(int userIndex) const;
 
     void setMasterOutputGain(float gain);
     float getMasterOutputGain() const;
@@ -141,6 +146,7 @@ public:
     void setLocalInputGain(float gain);
     float getLocalInputGain() const;
     static constexpr int maxLocalChannels = 8;
+    static constexpr int maxRemoteChordUsers = 32;
     void setNumLocalChannels(int num);
     int getNumLocalChannels() const;
     void setLocalChannelName(int channel, const juce::String& name);
@@ -153,6 +159,9 @@ public:
     float getLocalChannelPeak(int channel) const;
     float getLocalChannelPeakLeft(int channel) const;
     float getLocalChannelPeakRight(int channel) const;
+    juce::String getLocalChordLabel() const;
+    double getLocalChordCpuPercent() const;
+    int getLocalChordMemoryKb() const;
     void setLocalMonitorEnabled(bool enabled);
     bool isLocalMonitorEnabled() const;
     void setFxReverbEnabled(bool enabled);
@@ -294,6 +303,8 @@ private:
     juce::AudioBuffer<float> tempInputBuffer;
     juce::AudioBuffer<float> localChannelBuffer;
     juce::AudioBuffer<float> localMixBuffer;   // 1-ch mix used by multiChanAuto Vorbis slot
+    std::unique_ptr<LocalChordAnalyzer> localChordAnalyzer;
+    std::array<std::unique_ptr<LocalChordAnalyzer>, maxRemoteChordUsers> remoteChordAnalyzers;
     std::atomic<float> masterOutputGain { 1.0f };
     std::atomic<float> localInputGain { 1.0f };
     std::atomic<float> masterPeak { 0.0f };
@@ -383,22 +394,26 @@ private:
     std::atomic<bool> opusSyncServerSupported { false };
     mutable juce::CriticalSection intervalSyncStatusLock;
     juce::String intervalSyncStatusText;
-    std::atomic<int> lastBroadcastIntervalTag { -1 };
+    std::atomic<long long> lastBroadcastIntervalTag { -1 };
+    std::atomic<long long> lastProcessedIntervalMarkerKey { -1 };
     juce::CriticalSection intervalSyncAnnouncementLock;
-    std::map<juce::String, int> lastAnnouncedRemoteIntervalByUser;
+    std::map<juce::String, long long> lastAnnouncedRemoteIntervalByUser;
     std::map<int, double> localIntervalStartMsByInterval;
     struct PendingRemoteIntervalStart
     {
         int remoteInterval = -1;
         int remoteIntervalAbsolute = -1;
+        int remoteBeat = 0;
+        int remoteBpi = 0;
         int remoteServerLatencyMs = -1;
+        juce::String senderKey;
         juce::String displaySender;
         long long receivedSampleCount = -1;
     };
     std::map<juce::String, PendingRemoteIntervalStart> pendingRemoteIntervalStartsByUser;
     std::map<juce::String, int> lastRemoteServerLatencyMsByUser;
     std::map<juce::String, double> pendingTransportProbeSentMsById;
-    std::map<juce::String, int> remoteLatencyLastAppliedIntervalByUser;
+    std::map<juce::String, long long> remoteLatencyLastAppliedIntervalByUser;
     int lastLatencyTimingBpi = -1;
     int lastLatencyTimingLength = -1;
     double lastLatencyTimingBpm = -1.0;
@@ -477,11 +492,12 @@ private:
     void refreshOpusSyncAvailabilityFromUsers();
     void applyCodecPreference();
     void setIntervalSyncStatusText(const juce::String& text);
-    void broadcastIntervalSyncTag(const juce::String& target = "*");
+    void broadcastIntervalSyncTag(const juce::String& target = "*", int markerBeatIndex = -1);
     void broadcastTransportProbe(const juce::String& target = "*");
     void measureServerLatencyAsync();
     juce::String buildIntervalSyncTag(int interval, int length) const;
     void invalidateIntervalSyncLatencyState(bool keepRemoteServerLatency);
+    void processPendingIntervalSyncMarkers(int localMarkerBeat, long long localMarkerSampleCount, double intervalDurationMs);
     juce::File resolveVideoHelperRootDir() const;
     bool isAdvancedVideoClientAvailable() const;
     bool ensureAdvancedVideoClientStarted();
@@ -491,6 +507,14 @@ private:
     void flushOutboundMidiRelayEvents();
     void flushOutboundOscRelayEvents();
     void injectInboundMidiRelayEvents(juce::MidiBuffer& midiMessages);
+    static void RemoteChannelAudioTap_Callback(void* userData,
+                                               int useridx,
+                                               const char* username,
+                                               int channelidx,
+                                               const float* interleaved,
+                                               int numChannels,
+                                               int numFrames,
+                                               int sampleRate);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NinjamVst3AudioProcessor)
 };

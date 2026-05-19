@@ -1967,6 +1967,19 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     removeLocalChannelButton.setTooltip("Remove Channel");
     addAndMakeVisible(localFaderLabel);
     localFaderLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(localChordLabel);
+    localChordLabel.setJustificationType(juce::Justification::centred);
+    localChordLabel.setFont(juce::Font(14.0f, juce::Font::bold));
+    localChordLabel.setColour(juce::Label::textColourId, juce::Colours::white);
+    localChordLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0xff202428));
+    localChordLabel.setColour(juce::Label::outlineColourId, juce::Colour(0xff48515a));
+    localChordLabel.setTooltip("Detected chord on local channel 1");
+    addAndMakeVisible(localChordStatsLabel);
+    localChordStatsLabel.setJustificationType(juce::Justification::centred);
+    localChordStatsLabel.setFont(juce::Font(9.0f));
+    localChordStatsLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+    localChordStatsLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0xff15181b));
+    localChordStatsLabel.setTooltip("Local chord detector CPU and memory estimate");
 
     addLocalChannelButton.onClick = [this]
     {
@@ -2541,7 +2554,7 @@ void NinjamVst3AudioProcessorEditor::paintOverChildren(juce::Graphics& g)
 
 void NinjamVst3AudioProcessorEditor::resized()
 {
-    if (!audioProcessor.isStandaloneWrapper() && !applyingDeferredResizeLayout)
+    if (!audioProcessor.isStandaloneWrapper() && isAbletonLiveHost() && !applyingDeferredResizeLayout)
     {
         if (getWidth() == lastLaidOutEditorWidth && getHeight() == lastLaidOutEditorHeight)
             return;
@@ -2665,9 +2678,16 @@ void NinjamVst3AudioProcessorEditor::resized()
     }
     localArea.removeFromTop(3);
 
+    localChordLabel.setBounds(localArea.removeFromTop(24));
+    localArea.removeFromTop(3);
+
     auto localHeader = localArea.removeFromTop(20);
     addLocalChannelButton.setBounds(localHeader.removeFromLeft(20));
     removeLocalChannelButton.setBounds(localHeader.removeFromLeft(20));
+    localFaderLabel.setVisible(true);
+    const bool showChordStats = localHeader.getWidth() >= 160;
+    localChordStatsLabel.setVisible(showChordStats);
+    localChordStatsLabel.setBounds(showChordStats ? localHeader.removeFromRight(84) : juce::Rectangle<int>());
     localFaderLabel.setBounds(localHeader);
     auto localInner = localArea.reduced(4);
 
@@ -2810,7 +2830,7 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         lastPersistentSettingsSaveMs = nowMs;
     }
 
-    if (pendingDeferredResizeLayout && !audioProcessor.isStandaloneWrapper())
+    if (pendingDeferredResizeLayout && !audioProcessor.isStandaloneWrapper() && isAbletonLiveHost())
     {
         if (nowMs - lastResizeEventMs >= 85.0)
         {
@@ -2909,6 +2929,13 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
             db = juce::jlimit(-60.0f, 6.0f, 20.0f * std::log10(peak));
         localDbLabels[(size_t)i].setText(juce::String(db, 1) + " dB", juce::dontSendNotification);
     }
+
+    const auto localChord = audioProcessor.getLocalChordLabel();
+    const auto localChordStats = "CPU " + juce::String(audioProcessor.getLocalChordCpuPercent(), 2)
+                               + "%  MEM ~" + juce::String(audioProcessor.getLocalChordMemoryKb()) + " KB";
+    localChordLabel.setText("Chord: " + localChord, juce::dontSendNotification);
+    localChordLabel.setTooltip("Local channel 1 chord: " + localChord + "\n" + localChordStats);
+    localChordStatsLabel.setText(localChordStats.replace("  MEM", " M"), juce::dontSendNotification);
 
     float masterPk = audioProcessor.getMasterPeak();
     masterPeakMeter.setPeak(audioProcessor.getMasterPeakLeft(), audioProcessor.getMasterPeakRight());
@@ -4241,6 +4268,8 @@ bool NinjamVst3AudioProcessorEditor::shouldDeferHeavyUiWork() const
 {
     if (audioProcessor.isStandaloneWrapper())
         return false;
+    if (!isAbletonLiveHost())
+        return false;
     if (pendingDeferredResizeLayout || applyingDeferredResizeLayout)
         return true;
     return juce::Time::getMillisecondCounterHiRes() < suppressHeavyUiUntilMs;
@@ -4708,6 +4737,14 @@ UserChannelStrip::UserChannelStrip(NinjamVst3AudioProcessor& p, int userIdx)
 
     addAndMakeVisible(outputSelector);
 
+    addAndMakeVisible(chordLabel);
+    chordLabel.setJustificationType(juce::Justification::centred);
+    chordLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0xff202428));
+    chordLabel.setColour(juce::Label::outlineColourId, juce::Colour(0xff48515a));
+    chordLabel.setColour(juce::Label::textColourId, juce::Colours::white);
+    chordLabel.setFont(juce::Font(11.0f, juce::Font::bold));
+    chordLabel.setTooltip("Detected remote chord");
+
     addAndMakeVisible(dbLabel);
     dbLabel.setJustificationType(juce::Justification::centred);
     dbLabel.setColour(juce::Label::backgroundColourId, juce::Colours::black);
@@ -4947,7 +4984,8 @@ void UserChannelStrip::resized()
         if (isExpanded && isMultiChanPeer && numRemoteChannels > 1)
             area.setWidth(56); // 60px column minus 2px margin each side
 
-        nameLabel.setBounds(area.removeFromTop(20));
+        nameLabel.setBounds(area.removeFromTop(18));
+        chordLabel.setBounds(area.removeFromTop(18).reduced(1, 1));
         outputSelector.setBounds(area.removeFromBottom(20));
         auto dbArea   = area.removeFromBottom(16);
         auto ctrlArea = area.removeFromBottom(20);
@@ -5025,6 +5063,7 @@ void UserChannelStrip::resized()
         }
 
         nameLabel.setBounds(area.removeFromLeft(80));
+        chordLabel.setBounds(area.removeFromLeft(58).reduced(2, 6));
         outputSelector.setBounds(area.removeFromRight(60));
         auto ctrlArea = area.removeFromRight(40);
         muteButton.setBounds(ctrlArea.removeFromTop(ctrlArea.getHeight() / 2));
@@ -5235,6 +5274,16 @@ void UserChannelStrip::timerCallback()
             }
         }
     }
+
+    const auto remoteChord = processor.getUserChordLabel(userIndex);
+    const auto remoteChordStats = "CPU " + juce::String(processor.getUserChordCpuPercent(userIndex), 2)
+                                + "%  MEM ~" + juce::String(processor.getUserChordMemoryKb(userIndex)) + " KB";
+    if (chordLabel.getText() != remoteChord)
+    {
+        chordLabel.setText(remoteChord, juce::dontSendNotification);
+        needRepaint = true;
+    }
+    chordLabel.setTooltip("Remote chord: " + remoteChord + "\n" + remoteChordStats);
 
     if (needRepaint)
         repaint();

@@ -1,5 +1,8 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "Chromagram.h"
+#include "ChordDetector.h"
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -262,6 +265,482 @@ private:
 
         return scriptText.substring(contentStart, end);
     }
+};
+
+class LocalChordAnalyzer final
+    : private juce::Thread
+{
+public:
+    LocalChordAnalyzer()
+        : juce::Thread("NINJAMLocalChordAnalyzer")
+    {
+        memoryKb.store(estimateMemoryKb());
+    }
+
+    ~LocalChordAnalyzer() override
+    {
+        stop();
+    }
+
+    void prepare(double newSampleRate)
+    {
+        ready.store(false, std::memory_order_release);
+        stopThread(1000);
+
+        sampleRate = newSampleRate > 1.0 ? newSampleRate : 44100.0;
+        frame.assign((size_t)frameSize, 0.0);
+        averagedChroma.assign(12, 0.0);
+        readBuffer.assign((size_t)frameSize * 4, 0.0f);
+        const int newRingSize = juce::jmax(frameSize * 16, (int)std::round(sampleRate));
+        ringBuffer.assign((size_t)newRingSize, 0.0f);
+        audioFifo = std::make_unique<juce::AbstractFifo>(newRingSize);
+        frameFill = 0;
+        rmsSmoothed = 0.0;
+        samplesSinceCpuUpdate = 0;
+        analysisMsSinceCpuUpdate = 0.0;
+        chromaHistory = {};
+        chromaHistoryWrite = 0;
+        chromaHistorySize = 0;
+        resetChordDecisionState();
+        droppedSamples.store(0, std::memory_order_relaxed);
+        cpuPercent.store(0.0, std::memory_order_relaxed);
+
+        const int roundedRate = juce::jlimit(8000, 192000, (int)std::round(sampleRate));
+        requestedSampleRate.store(roundedRate, std::memory_order_relaxed);
+        configureChromagram(roundedRate);
+        memoryKb.store(estimateMemoryKb(newRingSize), std::memory_order_relaxed);
+
+        ready.store(true, std::memory_order_release);
+        startThread(juce::Thread::Priority::background);
+    }
+
+    void processBlock(const float* input, int numSamples, int inputSampleRate = 0)
+    {
+        processFrames(input, numSamples, 1, inputSampleRate);
+    }
+
+    void processInterleavedBlock(const float* input, int numFrames, int numChannels, int inputSampleRate)
+    {
+        processFrames(input, numFrames, juce::jmax(1, numChannels), inputSampleRate);
+    }
+
+    void processFrames(const float* input, int numFrames, int numChannels, int inputSampleRate)
+    {
+        if (!ready.load(std::memory_order_acquire))
+            return;
+
+        if (input == nullptr || numFrames <= 0 || audioFifo == nullptr || ringBuffer.empty())
+        {
+            markNoInput();
+            return;
+        }
+
+        if (inputSampleRate > 1000)
+            requestedSampleRate.store(juce::jlimit(8000, 192000, inputSampleRate), std::memory_order_relaxed);
+
+        int writableSamples = juce::jmin(numFrames, audioFifo->getFreeSpace());
+        if (writableSamples <= 0)
+        {
+            droppedSamples.fetch_add(numFrames, std::memory_order_relaxed);
+            return;
+        }
+
+        int inputStartFrame = 0;
+        if (writableSamples < numFrames)
+        {
+            inputStartFrame = numFrames - writableSamples;
+            droppedSamples.fetch_add(numFrames - writableSamples, std::memory_order_relaxed);
+        }
+
+        int start1 = 0;
+        int size1 = 0;
+        int start2 = 0;
+        int size2 = 0;
+        audioFifo->prepareToWrite(writableSamples, start1, size1, start2, size2);
+
+        copyMonoFramesToRing(input, inputStartFrame, numChannels, start1, size1);
+        copyMonoFramesToRing(input, inputStartFrame + size1, numChannels, start2, size2);
+
+        audioFifo->finishedWrite(size1 + size2);
+        samplesAvailable.signal();
+    }
+
+    void markNoInput()
+    {
+        chordValid.store(false, std::memory_order_relaxed);
+    }
+
+    void stop()
+    {
+        ready.store(false, std::memory_order_release);
+        signalThreadShouldExit();
+        samplesAvailable.signal();
+        stopThread(1000);
+    }
+
+    bool isPrepared() const
+    {
+        return ready.load(std::memory_order_acquire);
+    }
+
+    juce::String getLabel() const
+    {
+        if (!chordValid.load(std::memory_order_relaxed))
+            return "--";
+
+        const int root = chordRoot.load(std::memory_order_relaxed);
+        const int quality = chordQuality.load(std::memory_order_relaxed);
+        const int intervals = chordIntervals.load(std::memory_order_relaxed);
+        if (root < 0 || root >= 12)
+            return "--";
+
+        static const char* names[] = { "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B" };
+        juce::String suffix;
+
+        switch (quality)
+        {
+            case ChordDetector::Major:       suffix = intervals == 7 ? "maj7" : ""; break;
+            case ChordDetector::Minor:       suffix = intervals == 7 ? "m7" : "m"; break;
+            case ChordDetector::Suspended:   suffix = intervals == 2 ? "sus2" : (intervals == 4 ? "sus4" : "sus"); break;
+            case ChordDetector::Dominant:    suffix = "7"; break;
+            case ChordDetector::Dimished5th: suffix = "dim"; break;
+            case ChordDetector::Augmented5th:suffix = "aug"; break;
+            default:                         suffix = ""; break;
+        }
+
+        return juce::String(names[root]) + suffix;
+    }
+
+    double getCpuPercent() const
+    {
+        return cpuPercent.load(std::memory_order_relaxed);
+    }
+
+    int getMemoryKb() const
+    {
+        return memoryKb.load(std::memory_order_relaxed);
+    }
+
+private:
+    static int estimateMemoryKb(int fifoSamples = 48000)
+    {
+        constexpr int bufferSize = 8192;
+        constexpr int downsampledFrameSize = 512 / 4;
+        const size_t doubleVectors = (size_t)(bufferSize + bufferSize + (bufferSize / 2 + 1)
+                                      + 12 + downsampledFrameSize + 512) * sizeof(double);
+        const size_t kissFftBuffers = (size_t)bufferSize * 2 * sizeof(float) * 2;
+        const size_t fifoBytes = (size_t)juce::jmax(0, fifoSamples) * sizeof(float);
+        const size_t bytes = doubleVectors + kissFftBuffers + fifoBytes + sizeof(ChordDetector) + (64 * 1024);
+        return (int)((bytes + 1023) / 1024);
+    }
+
+    void copyMonoFramesToRing(const float* input, int inputStartFrame, int numChannels, int ringStart, int count)
+    {
+        if (count <= 0)
+            return;
+
+        if (numChannels <= 1)
+        {
+            std::memcpy(ringBuffer.data() + ringStart,
+                        input + inputStartFrame,
+                        (size_t)count * sizeof(float));
+            return;
+        }
+
+        for (int i = 0; i < count; ++i)
+        {
+            const int source = (inputStartFrame + i) * numChannels;
+            ringBuffer[(size_t)(ringStart + i)] = 0.5f * (input[source] + input[source + 1]);
+        }
+    }
+
+    void configureChromagram(int newSampleRate)
+    {
+        analyzerSampleRate = juce::jlimit(8000, 192000, newSampleRate);
+        sampleRate = (double)analyzerSampleRate;
+        chromagram = std::make_unique<Chromagram>(frameSize, analyzerSampleRate);
+        chromagram->setChromaCalculationInterval(chromaCalculationIntervalSamples);
+        frameFill = 0;
+        rmsSmoothed = 0.0;
+        chromaHistory = {};
+        chromaHistoryWrite = 0;
+        chromaHistorySize = 0;
+        resetChordDecisionState();
+    }
+
+    void run() override
+    {
+        while (!threadShouldExit())
+        {
+            if (!readAvailableSamples())
+                samplesAvailable.wait(20);
+        }
+    }
+
+    bool readAvailableSamples()
+    {
+        if (!ready.load(std::memory_order_acquire))
+            return false;
+
+        if (audioFifo == nullptr || ringBuffer.empty() || readBuffer.empty())
+            return false;
+
+        const int requestedRate = requestedSampleRate.load(std::memory_order_relaxed);
+        if (chromagram == nullptr || requestedRate != analyzerSampleRate)
+            configureChromagram(requestedRate);
+
+        const int available = audioFifo->getNumReady();
+        if (available <= 0)
+            return false;
+
+        const int toRead = juce::jmin(available, (int)readBuffer.size());
+        int start1 = 0;
+        int size1 = 0;
+        int start2 = 0;
+        int size2 = 0;
+        audioFifo->prepareToRead(toRead, start1, size1, start2, size2);
+
+        if (size1 > 0)
+            std::memcpy(readBuffer.data(), ringBuffer.data() + start1, (size_t)size1 * sizeof(float));
+        if (size2 > 0)
+            std::memcpy(readBuffer.data() + size1, ringBuffer.data() + start2, (size_t)size2 * sizeof(float));
+
+        audioFifo->finishedRead(size1 + size2);
+
+        const double startMs = juce::Time::getMillisecondCounterHiRes();
+        const int samplesRead = size1 + size2;
+        for (int i = 0; i < samplesRead; ++i)
+        {
+            frame[(size_t)frameFill++] = (double)readBuffer[(size_t)i];
+            if (frameFill >= frameSize)
+            {
+                processFrame();
+                frameFill = 0;
+            }
+        }
+
+        const double elapsedMs = juce::Time::getMillisecondCounterHiRes() - startMs;
+        analysisMsSinceCpuUpdate += juce::jmax(0.0, elapsedMs);
+        samplesSinceCpuUpdate += samplesRead;
+
+        const int updateSamples = juce::jmax(1, (int)std::round(sampleRate));
+        if (samplesSinceCpuUpdate >= updateSamples)
+        {
+            const double realTimeMs = ((double)samplesSinceCpuUpdate / sampleRate) * 1000.0;
+            const double rawCpu = realTimeMs > 0.0 ? (analysisMsSinceCpuUpdate / realTimeMs) * 100.0 : 0.0;
+            const double previous = cpuPercent.load(std::memory_order_relaxed);
+            const double smoothed = previous <= 0.0 ? rawCpu : previous * 0.75 + rawCpu * 0.25;
+            cpuPercent.store(juce::jlimit(0.0, 200.0, smoothed), std::memory_order_relaxed);
+            analysisMsSinceCpuUpdate = 0.0;
+            samplesSinceCpuUpdate = 0;
+        }
+
+        return true;
+    }
+
+    void processFrame()
+    {
+        double energy = 0.0;
+        for (double sample : frame)
+            energy += sample * sample;
+
+        const double frameRms = std::sqrt(energy / (double)frame.size());
+        rmsSmoothed = frameRms > rmsSmoothed ? frameRms : rmsSmoothed * 0.92 + frameRms * 0.08;
+
+        chromagram->processAudioFrame(frame.data());
+        if (!chromagram->isReady())
+            return;
+
+        if (rmsSmoothed < silenceRmsThreshold)
+        {
+            noteInvalidChordFrame();
+            return;
+        }
+
+        auto chroma = chromagram->getChromagram();
+        double chromaTotal = 0.0;
+        for (double value : chroma)
+            chromaTotal += std::abs(value);
+
+        if (chromaTotal <= 1.0e-9)
+        {
+            noteInvalidChordFrame();
+            return;
+        }
+
+        chromaHistory[(size_t)chromaHistoryWrite].fill(0.0);
+        for (int i = 0; i < 12 && i < (int)chroma.size(); ++i)
+            chromaHistory[(size_t)chromaHistoryWrite][(size_t)i] = chroma[(size_t)i];
+        chromaHistoryWrite = (chromaHistoryWrite + 1) % chromaHistoryFrames;
+        chromaHistorySize = juce::jmin(chromaHistorySize + 1, chromaHistoryFrames);
+
+        averagedChroma.assign(12, 0.0);
+        for (int h = 0; h < chromaHistorySize; ++h)
+            for (int i = 0; i < 12; ++i)
+                averagedChroma[(size_t)i] += chromaHistory[(size_t)h][(size_t)i];
+
+        const double scale = 1.0 / (double)juce::jmax(1, chromaHistorySize);
+        for (double& value : averagedChroma)
+            value *= scale;
+
+        if (!hasEnoughHarmonicContent(averagedChroma))
+        {
+            noteInvalidChordFrame();
+            return;
+        }
+
+        chordDetector.detectChord(averagedChroma);
+        if (chordDetector.rootNote < 0 || chordDetector.rootNote >= 12)
+        {
+            noteInvalidChordFrame();
+            return;
+        }
+
+        publishChordCandidate(chordDetector.rootNote, chordDetector.quality, chordDetector.intervals);
+    }
+
+    static int makeChordKey(int root, int quality, int intervals)
+    {
+        return root * 100 + quality * 10 + intervals;
+    }
+
+    void resetChordDecisionState()
+    {
+        pendingChordKey = -1;
+        pendingChordHits = 0;
+        displayedChordKey = -1;
+        invalidChordFrames = 0;
+        chordRoot.store(-1, std::memory_order_relaxed);
+        chordQuality.store(ChordDetector::Major, std::memory_order_relaxed);
+        chordIntervals.store(0, std::memory_order_relaxed);
+        chordValid.store(false, std::memory_order_relaxed);
+    }
+
+    void noteInvalidChordFrame()
+    {
+        pendingChordKey = -1;
+        pendingChordHits = 0;
+
+        if (++invalidChordFrames >= invalidClearThresholdFrames)
+            resetChordDecisionState();
+    }
+
+    static bool hasEnoughHarmonicContent(const std::vector<double>& chroma)
+    {
+        double sum = 0.0;
+        double max1 = 0.0;
+        double max2 = 0.0;
+        double max3 = 0.0;
+
+        for (double value : chroma)
+        {
+            const double v = std::abs(value);
+            sum += v;
+            if (v > max1)
+            {
+                max3 = max2;
+                max2 = max1;
+                max1 = v;
+            }
+            else if (v > max2)
+            {
+                max3 = max2;
+                max2 = v;
+            }
+            else if (v > max3)
+            {
+                max3 = v;
+            }
+        }
+
+        if (sum <= 1.0e-9 || max1 <= 1.0e-9)
+            return false;
+
+        const double mean = sum / 12.0;
+        if (max1 < mean * 1.6)
+            return false;
+
+        if (max2 < max1 * 0.22)
+            return false;
+
+        const double top3Share = (max1 + max2 + max3) / sum;
+        if (top3Share < 0.38)
+            return false;
+
+        int strongPitchClasses = 0;
+        for (double value : chroma)
+            if (std::abs(value) >= max1 * 0.25)
+                ++strongPitchClasses;
+
+        return strongPitchClasses >= 2;
+    }
+
+    void publishChordCandidate(int root, int quality, int intervals)
+    {
+        const int candidateKey = makeChordKey(root, quality, intervals);
+        invalidChordFrames = 0;
+
+        if (candidateKey == pendingChordKey)
+            pendingChordHits = juce::jmin(pendingChordHits + 1, 1000);
+        else
+        {
+            pendingChordKey = candidateKey;
+            pendingChordHits = 1;
+        }
+
+        if (candidateKey == displayedChordKey)
+        {
+            chordValid.store(true, std::memory_order_relaxed);
+            return;
+        }
+
+        if (pendingChordHits < stableCandidateHitThreshold)
+            return;
+
+        displayedChordKey = candidateKey;
+        chordRoot.store(root, std::memory_order_relaxed);
+        chordQuality.store(quality, std::memory_order_relaxed);
+        chordIntervals.store(intervals, std::memory_order_relaxed);
+        chordValid.store(true, std::memory_order_relaxed);
+    }
+
+    static constexpr int frameSize = 512;
+    static constexpr int chromaCalculationIntervalSamples = 4096;
+    static constexpr int chromaHistoryFrames = 8;
+    static constexpr int stableCandidateHitThreshold = 4;
+    static constexpr int invalidClearThresholdFrames = 8;
+    static constexpr double silenceRmsThreshold = 0.001;
+
+    std::unique_ptr<Chromagram> chromagram;
+    std::unique_ptr<juce::AbstractFifo> audioFifo;
+    ChordDetector chordDetector;
+    std::vector<double> frame;
+    std::vector<double> averagedChroma;
+    std::array<std::array<double, 12>, chromaHistoryFrames> chromaHistory {};
+    std::vector<float> ringBuffer;
+    std::vector<float> readBuffer;
+    juce::WaitableEvent samplesAvailable;
+    double sampleRate = 44100.0;
+    double rmsSmoothed = 0.0;
+    double analysisMsSinceCpuUpdate = 0.0;
+    int samplesSinceCpuUpdate = 0;
+    int analyzerSampleRate = 0;
+    int frameFill = 0;
+    int chromaHistoryWrite = 0;
+    int chromaHistorySize = 0;
+    int pendingChordKey = -1;
+    int pendingChordHits = 0;
+    int displayedChordKey = -1;
+    int invalidChordFrames = 0;
+    std::atomic<bool> ready { false };
+    std::atomic<bool> chordValid { false };
+    std::atomic<int> chordRoot { -1 };
+    std::atomic<int> chordQuality { ChordDetector::Major };
+    std::atomic<int> chordIntervals { 0 };
+    std::atomic<double> cpuPercent { 0.0 };
+    std::atomic<int> memoryKb { 0 };
+    std::atomic<int> requestedSampleRate { 44100 };
+    std::atomic<long long> droppedSamples { 0 };
 };
 
 class AsyncChatTranslationWorker final : private juce::Thread
@@ -705,6 +1184,52 @@ namespace
     constexpr const char* sideSignalChatPrefix = "__NINJAM_VST3_SIDESIGNAL__ ";
     constexpr int remoteLatencyUpdateCadenceIntervals = 1;
     constexpr int kSyncSignalChannelIndex = 0;
+    constexpr int intervalSyncRepeatThresholdBpi = 16;
+    constexpr int intervalSyncMarkerStepBeats = 8;
+    constexpr long long intervalSyncMarkerKeyBeatStride = 1024;
+
+    int getIntervalBeatIndexForPosition(int pos, int length, int bpi)
+    {
+        const int safeBpi = juce::jmax(1, bpi);
+        if (length <= 0)
+            return 0;
+
+        const int safePos = juce::jlimit(0, length - 1, pos);
+        const double progress = (double)safePos / (double)length;
+        return juce::jlimit(0, safeBpi - 1, (int)std::floor(progress * (double)safeBpi));
+    }
+
+    int getIntervalSyncMarkerBeatForBeat(int beatIndex, int bpi)
+    {
+        const int safeBpi = juce::jmax(1, bpi);
+        const int safeBeat = juce::jlimit(0, safeBpi - 1, beatIndex);
+        if (safeBpi <= intervalSyncRepeatThresholdBpi)
+            return 0;
+
+        return juce::jlimit(0, safeBpi - 1, (safeBeat / intervalSyncMarkerStepBeats) * intervalSyncMarkerStepBeats);
+    }
+
+    bool isIntervalSyncMarkerBeat(int beatIndex, int bpi)
+    {
+        const int safeBpi = juce::jmax(1, bpi);
+        if (beatIndex < 0 || beatIndex >= safeBpi)
+            return false;
+        if (safeBpi <= intervalSyncRepeatThresholdBpi)
+            return beatIndex == 0;
+
+        return (beatIndex % intervalSyncMarkerStepBeats) == 0;
+    }
+
+    long long makeIntervalSyncMarkerKey(int interval, int markerBeat)
+    {
+        return ((long long)juce::jmax(0, interval) * intervalSyncMarkerKeyBeatStride)
+             + (long long)juce::jlimit(0, (int)intervalSyncMarkerKeyBeatStride - 1, markerBeat);
+    }
+
+    juce::String formatIntervalSyncMarkerBeat(int markerBeat)
+    {
+        return "BPI" + juce::String(juce::jmax(0, markerBeat) + 1);
+    }
 
     juce::String normaliseOpusPeerId(juce::String userId)
     {
@@ -889,7 +1414,11 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
         localChannelDelaySends[(size_t)i].store(0.0f);
         localChannelNames[(size_t)i] = buildDefaultLocalChannelName(i);
     }
-    
+
+    localChordAnalyzer = std::make_unique<LocalChordAnalyzer>();
+    for (auto& analyzer : remoteChordAnalyzers)
+        analyzer = std::make_unique<LocalChordAnalyzer>();
+
     startTimer(20); // Run NINJAM client loop every 20ms
 
     // Set callbacks
@@ -902,6 +1431,8 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
     ninjamClient.IntervalMediaItem_User = this;
     ninjamClient.IntervalChunkCallback = IntervalChunkCallback_cb;
     ninjamClient.IntervalChunkCallbackUser = this;
+    ninjamClient.RemoteChannelAudioTap = RemoteChannelAudioTap_Callback;
+    ninjamClient.RemoteChannelAudioTap_User = this;
     ninjamClient.NewIntervalCallback = NewIntervalCallback_cb;
     ninjamClient.NewIntervalCallbackUser = this;
     opusSyncInstanceId = juce::Uuid().toString();
@@ -1089,7 +1620,7 @@ void NinjamVst3AudioProcessor::setIntervalSyncStatusText(const juce::String& tex
     intervalSyncStatusText = text;
 }
 
-void NinjamVst3AudioProcessor::broadcastIntervalSyncTag(const juce::String& target)
+void NinjamVst3AudioProcessor::broadcastIntervalSyncTag(const juce::String& target, int markerBeatIndex)
 {
     if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
         return;
@@ -1097,7 +1628,8 @@ void NinjamVst3AudioProcessor::broadcastIntervalSyncTag(const juce::String& targ
     const int displayInterval = getDisplayIntervalIndex();
     const int bpi = juce::jmax(1, getBPI());
     const float intervalProgress = juce::jlimit(0.0f, 1.0f, getIntervalProgress());
-    const int beatIndex = juce::jlimit(0, bpi - 1, (int)std::floor(intervalProgress * (float)bpi));
+    const int currentBeatIndex = juce::jlimit(0, bpi - 1, (int)std::floor(intervalProgress * (float)bpi));
+    const int beatIndex = markerBeatIndex >= 0 ? juce::jlimit(0, bpi - 1, markerBeatIndex) : currentBeatIndex;
     const juce::String userId = normaliseOpusPeerId(currentUser);
     const juce::String tag = buildIntervalSyncTag(displayInterval, bpi);
 
@@ -1406,6 +1938,8 @@ juce::String NinjamVst3AudioProcessor::buildIntervalSyncTag(int interval, int le
 
 void NinjamVst3AudioProcessor::invalidateIntervalSyncLatencyState(bool keepRemoteServerLatency)
 {
+    lastBroadcastIntervalTag.store(-1);
+    lastProcessedIntervalMarkerKey.store(-1);
     const juce::ScopedLock lock(intervalSyncAnnouncementLock);
     lastAnnouncedRemoteIntervalByUser.clear();
     localIntervalStartMsByInterval.clear();
@@ -2193,10 +2727,25 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
                 }
                 if (u.numChannels < 1) { u.numChannels = 1; u.channelNames.add(""); }
             }
-            
+
+            if (i >= 0 && i < maxRemoteChordUsers)
+            {
+                auto& analyzer = remoteChordAnalyzers[(size_t)i];
+                if (analyzer && !analyzer->isPrepared())
+                    analyzer->prepare(processingSampleRate);
+            }
+
             users.push_back(u);
         }
     }
+
+    for (int i = numUsers; i < maxRemoteChordUsers; ++i)
+    {
+        auto& analyzer = remoteChordAnalyzers[(size_t)i];
+        if (analyzer && analyzer->isPrepared())
+            analyzer->markNoInput();
+    }
+
     return users;
 }
 
@@ -2555,6 +3104,74 @@ float NinjamVst3AudioProcessor::getLocalChannelPeakRight(int channel) const
     if (channel < 0 || channel >= maxLocalChannels)
         return 0.0f;
     return localChannelPeaksR[(size_t)channel].load();
+}
+
+juce::String NinjamVst3AudioProcessor::getLocalChordLabel() const
+{
+    return localChordAnalyzer ? localChordAnalyzer->getLabel() : "--";
+}
+
+double NinjamVst3AudioProcessor::getLocalChordCpuPercent() const
+{
+    return localChordAnalyzer ? localChordAnalyzer->getCpuPercent() : 0.0;
+}
+
+int NinjamVst3AudioProcessor::getLocalChordMemoryKb() const
+{
+    return localChordAnalyzer ? localChordAnalyzer->getMemoryKb() : 0;
+}
+
+juce::String NinjamVst3AudioProcessor::getUserChordLabel(int userIndex) const
+{
+    if (userIndex < 0 || userIndex >= maxRemoteChordUsers)
+        return "--";
+
+    const auto& analyzer = remoteChordAnalyzers[(size_t)userIndex];
+    return analyzer ? analyzer->getLabel() : "--";
+}
+
+double NinjamVst3AudioProcessor::getUserChordCpuPercent(int userIndex) const
+{
+    if (userIndex < 0 || userIndex >= maxRemoteChordUsers)
+        return 0.0;
+
+    const auto& analyzer = remoteChordAnalyzers[(size_t)userIndex];
+    return analyzer ? analyzer->getCpuPercent() : 0.0;
+}
+
+int NinjamVst3AudioProcessor::getUserChordMemoryKb(int userIndex) const
+{
+    if (userIndex < 0 || userIndex >= maxRemoteChordUsers)
+        return 0;
+
+    const auto& analyzer = remoteChordAnalyzers[(size_t)userIndex];
+    return analyzer ? analyzer->getMemoryKb() : 0;
+}
+
+void NinjamVst3AudioProcessor::RemoteChannelAudioTap_Callback(void* userData,
+                                                              int useridx,
+                                                              const char*,
+                                                              int channelidx,
+                                                              const float* interleaved,
+                                                              int numChannels,
+                                                              int numFrames,
+                                                              int sampleRate)
+{
+    auto* self = static_cast<NinjamVst3AudioProcessor*>(userData);
+    if (self == nullptr || interleaved == nullptr || numFrames <= 0)
+        return;
+
+    if (useridx < 0 || useridx >= maxRemoteChordUsers)
+        return;
+
+    // Channel 0 is the normal per-user mixdown, including the VST3 multichannel
+    // mix slot. Tapping only this channel avoids double-feeding expanded peers.
+    if (channelidx != 0)
+        return;
+
+    auto& analyzer = self->remoteChordAnalyzers[(size_t)useridx];
+    if (analyzer)
+        analyzer->processInterleavedBlock(interleaved, numFrames, numChannels, sampleRate);
 }
 
 void NinjamVst3AudioProcessor::setLocalMonitorEnabled(bool enabled)
@@ -3184,6 +3801,11 @@ void NinjamVst3AudioProcessor::refreshPublicServers()
 NinjamVst3AudioProcessor::~NinjamVst3AudioProcessor()
 {
     stopTimer();
+    ninjamClient.RemoteChannelAudioTap = nullptr;
+    ninjamClient.RemoteChannelAudioTap_User = nullptr;
+    localChordAnalyzer.reset();
+    for (auto& analyzer : remoteChordAnalyzers)
+        analyzer.reset();
     if (asyncChatTranslationWorker)
         asyncChatTranslationWorker->stop();
     asyncChatTranslationWorker.reset();
@@ -3251,6 +3873,12 @@ void NinjamVst3AudioProcessor::prepareToPlay (double sampleRate, int samplesPerB
 {
     intervalSyncSampleCounter.store(0, std::memory_order_relaxed);
     processingSampleRate = sampleRate > 1.0 ? sampleRate : 44100.0;
+    if (localChordAnalyzer)
+        localChordAnalyzer->prepare(processingSampleRate);
+    for (auto& analyzer : remoteChordAnalyzers)
+        if (analyzer && analyzer->isPrepared())
+            analyzer->prepare(processingSampleRate);
+
     juce::dsp::ProcessSpec spec;
     spec.sampleRate = sampleRate;
     spec.maximumBlockSize = (juce::uint32) samplesPerBlock;
@@ -3486,16 +4114,20 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
             status << " tag " << tag;
         setIntervalSyncStatusText(status);
 
-        if (remoteInterval >= 0 && remoteBeat == 0)
+        const int localBpi = juce::jmax(1, getBPI());
+        const int markerBpi = remoteBpi > 0 ? remoteBpi : localBpi;
+        if (remoteInterval >= 0 && isIntervalSyncMarkerBeat(remoteBeat, markerBpi))
         {
             const juce::String localUserKey = normaliseOpusPeerId(currentUser);
             const juce::String senderKey = normaliseOpusPeerId(payloadUserId.isNotEmpty() ? payloadUserId : sender);
             if (senderKey.isNotEmpty() && senderKey != localUserKey)
             {
-                const int localBpi = juce::jmax(1, getBPI());
                 const bool bpiMatches = (remoteBpi <= 0 || remoteBpi == localBpi);
                 if (!bpiMatches)
                     return;
+                const int remoteMarkerBeat = getIntervalSyncMarkerBeatForBeat(remoteBeat, localBpi);
+                const int remoteSourceInterval = remoteIntervalAbsolute >= 0 ? remoteIntervalAbsolute : remoteInterval;
+                const long long remoteMarkerKey = makeIntervalSyncMarkerKey(remoteSourceInterval, remoteMarkerBeat);
                 bool shouldStorePending = false;
                 const juce::String displaySender = sender.isNotEmpty() ? sender : (payloadUserId.isNotEmpty() ? payloadUserId : senderKey);
                 const long long receivedSampleCount = intervalSyncSampleCounter.load(std::memory_order_relaxed);
@@ -3510,11 +4142,11 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                             lastRemoteServerLatencyMsByUser[canonicalSenderKey] = clampedRemoteServerLatencyMs;
                     }
                     auto it = lastAnnouncedRemoteIntervalByUser.find(senderKey);
-                    if (it != lastAnnouncedRemoteIntervalByUser.end() && remoteInterval + 1 < it->second)
+                    if (it != lastAnnouncedRemoteIntervalByUser.end() && remoteMarkerKey + intervalSyncMarkerKeyBeatStride < it->second)
                         remoteLatencyAverageByUser.erase(senderKey);
-                    if (it == lastAnnouncedRemoteIntervalByUser.end() || it->second != remoteInterval)
+                    if (it == lastAnnouncedRemoteIntervalByUser.end() || it->second != remoteMarkerKey)
                     {
-                        lastAnnouncedRemoteIntervalByUser[senderKey] = remoteInterval;
+                        lastAnnouncedRemoteIntervalByUser[senderKey] = remoteMarkerKey;
                         shouldStorePending = true;
                     }
                 }
@@ -3522,13 +4154,17 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                 if (shouldStorePending)
                 {
                     const juce::ScopedLock lock(intervalSyncAnnouncementLock);
-                    auto& pending = pendingRemoteIntervalStartsByUser[senderKey];
+                    const juce::String pendingKey = senderKey + ":" + juce::String((juce::int64)remoteMarkerKey);
+                    auto& pending = pendingRemoteIntervalStartsByUser[pendingKey];
                     pending.remoteInterval = remoteInterval;
                     pending.remoteIntervalAbsolute = remoteIntervalAbsolute;
+                    pending.remoteBeat = remoteMarkerBeat;
+                    pending.remoteBpi = remoteBpi;
                     pending.remoteServerLatencyMs = remoteServerLatencyMs >= 0 ? juce::jlimit(0, 3000, remoteServerLatencyMs) : -1;
+                    pending.senderKey = senderKey;
                     pending.displaySender = displaySender;
                     pending.receivedSampleCount = receivedSampleCount;
-                    vlogStr("[INTTAG] Pending stored from=" + sender + " userId=" + (payloadUserId.isNotEmpty() ? payloadUserId : sender) + " senderKey=" + senderKey + " remoteInterval=" + juce::String(remoteInterval) + " remoteAbs=" + juce::String(remoteIntervalAbsolute) + " samples=" + juce::String(receivedSampleCount));
+                    vlogStr("[INTTAG] Pending stored from=" + sender + " userId=" + (payloadUserId.isNotEmpty() ? payloadUserId : sender) + " senderKey=" + senderKey + " remoteInterval=" + juce::String(remoteInterval) + " remoteAbs=" + juce::String(remoteIntervalAbsolute) + " beat=" + juce::String(remoteMarkerBeat) + " samples=" + juce::String(receivedSampleCount));
                 }
             }
         }
@@ -3932,6 +4568,7 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     monitorSourceRight.fill(-1);
     monitorStereo.fill(false);
 
+    bool fedLocalChordAnalyzer = false;
     float globalLocalMax = 0.0f;
     float globalLocalMaxL = 0.0f;
     float globalLocalMaxR = 0.0f;
@@ -3980,6 +4617,12 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
 
         monitorSourceLeft[(size_t)ch] = leftSource;
         monitorSourceRight[(size_t)ch] = rightSource;
+
+        if (ch == 0 && localChordAnalyzer)
+        {
+            localChordAnalyzer->processBlock(localChannelBuffer.getReadPointer(ch), numSamples);
+            fedLocalChordAnalyzer = true;
+        }
 
         float gain = localChannelGains[(size_t)ch].load();
         if (gain != 1.0f)
@@ -4066,6 +4709,9 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     localPeak.store(globalLocalMax);
     localPeakL.store(globalLocalMaxL);
     localPeakR.store(globalLocalMaxR);
+
+    if (localChordAnalyzer && !fedLocalChordAnalyzer)
+        localChordAnalyzer->markNoInput();
 
     const bool reverbOn = fxReverbEnabled.load();
     const bool delayOn = fxDelayEnabled.load();
@@ -5211,6 +5857,163 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
         setLocalChannelInput(channel, (int)state.getProperty("localInput" + juce::String(channel), -1));
 }
 
+void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarkerBeat, long long localMarkerSampleCount, double intervalDurationMs)
+{
+    if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
+        return;
+
+    const int safeLocalMarkerBeat = juce::jmax(0, localMarkerBeat);
+    const double safeIntervalDurationMs = juce::jmax(1.0, intervalDurationMs);
+
+    for (;;)
+    {
+        juce::String senderKey;
+        PendingRemoteIntervalStart pending;
+        {
+            const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+            if (pendingRemoteIntervalStartsByUser.empty())
+                break;
+            for (auto staleIt = pendingRemoteIntervalStartsByUser.begin(); staleIt != pendingRemoteIntervalStartsByUser.end();)
+            {
+                if (staleIt->second.receivedSampleCount < 0)
+                    staleIt = pendingRemoteIntervalStartsByUser.erase(staleIt);
+                else
+                    ++staleIt;
+            }
+            auto chosenIt = pendingRemoteIntervalStartsByUser.end();
+            for (auto it = pendingRemoteIntervalStartsByUser.begin(); it != pendingRemoteIntervalStartsByUser.end(); ++it)
+            {
+                if (it->second.remoteBeat == safeLocalMarkerBeat && it->second.receivedSampleCount <= localMarkerSampleCount)
+                {
+                    chosenIt = it;
+                    break;
+                }
+            }
+            if (chosenIt == pendingRemoteIntervalStartsByUser.end())
+                break;
+            pending = chosenIt->second;
+            senderKey = pending.senderKey.isNotEmpty()
+                ? pending.senderKey
+                : chosenIt->first.upToFirstOccurrenceOf(":", false, false);
+            pendingRemoteIntervalStartsByUser.erase(chosenIt);
+        }
+        if (pending.receivedSampleCount < 0 || senderKey.isEmpty())
+            continue;
+        const long long elapsedSamples = localMarkerSampleCount - pending.receivedSampleCount;
+        if (elapsedSamples < 0)
+            continue;
+        const double sampleRate = juce::jmax(1.0, getSampleRate());
+        const double elapsedToNextLocalMarkerMs = ((double)elapsedSamples / sampleRate) * 1000.0;
+        const double outlierLimitMs = safeIntervalDurationMs * 2.0;
+        if (!std::isfinite(elapsedToNextLocalMarkerMs) || elapsedToNextLocalMarkerMs < 0.0 || elapsedToNextLocalMarkerMs > outlierLimitMs)
+            continue;
+        const int elapsedMs = (int)std::llround(juce::jlimit(0.0, safeIntervalDurationMs, elapsedToNextLocalMarkerMs));
+        int averageMs = -1;
+        int firmAverageMs = -1;
+        {
+            const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+            auto& avgState = remoteLatencyAverageByUser[senderKey];
+            avgState.lastMeasurementMs = (double)elapsedMs;
+            bool includeInAverage = true;
+            if (avgState.sampleCount >= 3)
+            {
+                const double baselineMs = avgState.firmAverageMs > 0.0 ? avgState.firmAverageMs : avgState.averageMs;
+                const double deltaMs = std::abs((double)elapsedMs - baselineMs);
+                const double spikeThresholdMs = juce::jlimit(5.0, 20.0, baselineMs * 0.30 + 2.0);
+                if (deltaMs > spikeThresholdMs)
+                    includeInAverage = false;
+            }
+            if (includeInAverage)
+            {
+                avgState.sampleCount += 1;
+                avgState.sumMs += (double)elapsedMs;
+                avgState.averageMs = avgState.sumMs / (double)juce::jmax(1, avgState.sampleCount);
+                if (avgState.sampleCount == 1)
+                    avgState.firmAverageMs = (double)elapsedMs;
+                else
+                    avgState.firmAverageMs = (avgState.firmAverageMs * 0.88) + ((double)elapsedMs * 0.12);
+            }
+            if (avgState.sampleCount >= 3)
+            {
+                averageMs = juce::jmax(0, (int)std::llround(avgState.averageMs));
+                firmAverageMs = juce::jmax(0, (int)std::llround(avgState.firmAverageMs));
+            }
+            else if (avgState.lastMeasurementMs >= 0.0)
+            {
+                averageMs = juce::jmax(0, (int)std::llround(avgState.lastMeasurementMs));
+            }
+        }
+        if (firmAverageMs >= 0 || averageMs >= 0)
+        {
+            const double rawDelayMs = (double)(firmAverageMs >= 0 ? firmAverageMs : averageMs);
+            const int senderServerLatencyMs = pending.remoteServerLatencyMs >= 0 ? juce::jmax(0, pending.remoteServerLatencyMs) : 0;
+            const int receiverServerLatencyMs = juce::jmax(0, localServerLatencyMs.load());
+            const int serverRouteLatencyMs = senderServerLatencyMs + receiverServerLatencyMs;
+            const int correctedDelayMs = juce::jmax(0, (int)std::llround(rawDelayMs) + serverRouteLatencyMs);
+            const int sourceInterval = pending.remoteIntervalAbsolute >= 0 ? pending.remoteIntervalAbsolute : pending.remoteInterval;
+            const long long sourceMarkerKey = makeIntervalSyncMarkerKey(sourceInterval, pending.remoteBeat);
+            const juce::String canonicalSenderKey = canonicalDelayUserKey(senderKey);
+            const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+            long long priorAppliedMarker = std::numeric_limits<long long>::min();
+            auto appliedIt = remoteLatencyLastAppliedIntervalByUser.find(senderKey);
+            if (appliedIt != remoteLatencyLastAppliedIntervalByUser.end())
+                priorAppliedMarker = appliedIt->second;
+            bool shouldApply = (appliedIt == remoteLatencyLastAppliedIntervalByUser.end());
+            if (!shouldApply)
+            {
+                const long long markerDelta = sourceMarkerKey - priorAppliedMarker;
+                const bool cadenceReached = markerDelta >= remoteLatencyUpdateCadenceIntervals;
+                const bool markerSequenceReset = sourceMarkerKey + intervalSyncMarkerKeyBeatStride < priorAppliedMarker;
+                shouldApply = cadenceReached || markerSequenceReset;
+            }
+            if (shouldApply)
+            {
+                remoteLatencyFirmDelayMsByUser[senderKey] = correctedDelayMs;
+                if (canonicalSenderKey.isNotEmpty())
+                    remoteLatencyFirmDelayMsByUser[canonicalSenderKey] = correctedDelayMs;
+                lastRemoteServerLatencyMsByUser[senderKey] = senderServerLatencyMs;
+                if (canonicalSenderKey.isNotEmpty())
+                    lastRemoteServerLatencyMsByUser[canonicalSenderKey] = senderServerLatencyMs;
+                remoteLatencyLastAppliedIntervalByUser[senderKey] = sourceMarkerKey;
+                if (canonicalSenderKey.isNotEmpty())
+                    remoteLatencyLastAppliedIntervalByUser[canonicalSenderKey] = sourceMarkerKey;
+                vlogStr("[MCGuard] Applied firm delay for=" + senderKey + " canonical=" + canonicalSenderKey + " delayMs=" + juce::String(correctedDelayMs) + " rawMs=" + juce::String((int)std::llround(rawDelayMs)) + " senderSrv=" + juce::String(senderServerLatencyMs) + " receiverSrv=" + juce::String(receiverServerLatencyMs) + " sourceMarker=" + juce::String((juce::int64)sourceMarkerKey) + " priorApplied=" + juce::String((juce::int64)priorAppliedMarker));
+            }
+        }
+        const juce::String displaySender = pending.displaySender.isNotEmpty() ? pending.displaySender : senderKey;
+        const int displaySenderServerLatencyMs = pending.remoteServerLatencyMs >= 0 ? juce::jmax(0, pending.remoteServerLatencyMs) : 0;
+        const int displayReceiverServerLatencyMs = juce::jmax(0, localServerLatencyMs.load());
+        const int displayServerRouteLatencyMs = displaySenderServerLatencyMs + displayReceiverServerLatencyMs;
+        const int displayCorrectedDelayMs = juce::jmax(0, elapsedMs + displayServerRouteLatencyMs);
+        juce::String line = displaySender + " " + formatIntervalSyncMarkerBeat(pending.remoteBeat)
+            + "->our " + formatIntervalSyncMarkerBeat(safeLocalMarkerBeat) + " " + juce::String(elapsedMs) + "ms";
+        if (firmAverageMs >= 0)
+            line << " avg " << juce::String(firmAverageMs) << "ms";
+        else if (averageMs >= 0)
+            line << " avg " << juce::String(averageMs) << "ms";
+        if (displayServerRouteLatencyMs > 0)
+            line << " srv " << juce::String(displaySenderServerLatencyMs) << "+" << juce::String(displayReceiverServerLatencyMs) << "ms";
+        line << " => " << juce::String(displayCorrectedDelayMs) << "ms";
+        juce::DynamicObject::Ptr reportObj = new juce::DynamicObject();
+        reportObj->setProperty("line", line);
+        reportObj->setProperty("interval", pending.remoteIntervalAbsolute >= 0 ? pending.remoteIntervalAbsolute : pending.remoteInterval);
+        reportObj->setProperty("beatIndex", pending.remoteBeat);
+        reportObj->setProperty("targetUserId", canonicalDelayUserKey(displaySender));
+        reportObj->setProperty("elapsedMs", elapsedMs);
+        if (averageMs >= 0)
+            reportObj->setProperty("avgMs", averageMs);
+        if (firmAverageMs >= 0)
+            reportObj->setProperty("firmMs", firmAverageMs);
+        reportObj->setProperty("senderServerLatencyMs", displaySenderServerLatencyMs);
+        reportObj->setProperty("receiverServerLatencyMs", displayReceiverServerLatencyMs);
+        reportObj->setProperty("serverRouteLatencyMs", displayServerRouteLatencyMs);
+        reportObj->setProperty("correctedDelayMs", displayCorrectedDelayMs);
+        reportObj->setProperty("eventId", "latencyReport:" + senderKey + ":" + juce::String(++sideSignalEventCounter));
+        const juce::String reportPayload = juce::JSON::toString(juce::var(reportObj.get()));
+        sendIntervalSignal("intervalLatencyReport", reportPayload);
+    }
+}
+
 void NinjamVst3AudioProcessor::timerCallback()
 {
     int loopCount = 0;
@@ -5301,13 +6104,6 @@ void NinjamVst3AudioProcessor::timerCallback()
 
         flushOutboundMidiRelayEvents();
         flushOutboundOscRelayEvents();
-
-        const int displayInterval = getDisplayIntervalIndex();
-        if (lastBroadcastIntervalTag.load() != displayInterval)
-        {
-            broadcastIntervalSyncTag();
-            lastBroadcastIntervalTag.store(displayInterval);
-        }
     }
 
     int pos = 0;
@@ -5338,7 +6134,6 @@ void NinjamVst3AudioProcessor::timerCallback()
         {
             intervalIndex.fetch_add(1);
             const int localDisplayInterval = getDisplayIntervalIndex();
-            const long long localIntervalStartSampleCount = intervalSyncSampleCounter.load(std::memory_order_relaxed);
             const double localIntervalStartMs = juce::Time::getMillisecondCounterHiRes();
             {
                 const juce::ScopedLock lock(intervalSyncAnnouncementLock);
@@ -5352,156 +6147,26 @@ void NinjamVst3AudioProcessor::timerCallback()
                         ++it;
                 }
             }
-            if (status == NJClient::NJC_STATUS_OK)
+        }
+        const int localDisplayInterval = getDisplayIntervalIndex();
+        const int currentBeatIndex = getIntervalBeatIndexForPosition(pos, length, localBpi);
+        const int localMarkerBeat = getIntervalSyncMarkerBeatForBeat(currentBeatIndex, localBpi);
+        const long long localMarkerKey = makeIntervalSyncMarkerKey(localDisplayInterval, localMarkerBeat);
+        const bool markerChanged = lastProcessedIntervalMarkerKey.load() != localMarkerKey;
+        if (markerChanged)
+        {
+            lastProcessedIntervalMarkerKey.store(localMarkerKey);
+            if (status == NJClient::NJC_STATUS_OK && currentBeatIndex == localMarkerBeat)
             {
-                const int localBpi = juce::jmax(1, getBPI());
-                const double localBpm = juce::jmax(1.0, (double)getBPM());
+                const long long localMarkerSampleCount = intervalSyncSampleCounter.load(std::memory_order_relaxed);
                 const double intervalDurationMs = (60.0 / localBpm) * (double)localBpi * 1000.0;
-                for (;;)
+                processPendingIntervalSyncMarkers(localMarkerBeat, localMarkerSampleCount, intervalDurationMs);
+                if (lastBroadcastIntervalTag.load() != localMarkerKey)
                 {
-                    juce::String senderKey;
-                    PendingRemoteIntervalStart pending;
-                    {
-                        const juce::ScopedLock lock(intervalSyncAnnouncementLock);
-                        if (pendingRemoteIntervalStartsByUser.empty())
-                            break;
-                        for (auto staleIt = pendingRemoteIntervalStartsByUser.begin(); staleIt != pendingRemoteIntervalStartsByUser.end();)
-                        {
-                            if (staleIt->second.receivedSampleCount < 0)
-                                staleIt = pendingRemoteIntervalStartsByUser.erase(staleIt);
-                            else
-                                ++staleIt;
-                        }
-                        auto chosenIt = pendingRemoteIntervalStartsByUser.end();
-                        for (auto it = pendingRemoteIntervalStartsByUser.begin(); it != pendingRemoteIntervalStartsByUser.end(); ++it)
-                        {
-                            if (it->second.receivedSampleCount <= localIntervalStartSampleCount)
-                            {
-                                chosenIt = it;
-                                break;
-                            }
-                        }
-                        if (chosenIt == pendingRemoteIntervalStartsByUser.end())
-                            break;
-                        senderKey = chosenIt->first;
-                        pending = chosenIt->second;
-                        pendingRemoteIntervalStartsByUser.erase(chosenIt);
-                    }
-                    if (pending.receivedSampleCount < 0)
-                        continue;
-                    const long long elapsedSamples = localIntervalStartSampleCount - pending.receivedSampleCount;
-                    if (elapsedSamples < 0)
-                        continue;
-                    const double sampleRate = juce::jmax(1.0, getSampleRate());
-                    const double elapsedToNextLocalBpi1Ms = ((double)elapsedSamples / sampleRate) * 1000.0;
-                    const double outlierLimitMs = intervalDurationMs * 2.0;
-                    if (!std::isfinite(elapsedToNextLocalBpi1Ms) || elapsedToNextLocalBpi1Ms < 0.0 || elapsedToNextLocalBpi1Ms > outlierLimitMs)
-                        continue;
-                    const int elapsedMs = (int)std::llround(juce::jlimit(0.0, intervalDurationMs, elapsedToNextLocalBpi1Ms));
-                    int averageMs = -1;
-                    int firmAverageMs = -1;
-                    {
-                        const juce::ScopedLock lock(intervalSyncAnnouncementLock);
-                        auto& avgState = remoteLatencyAverageByUser[senderKey];
-                        avgState.lastMeasurementMs = (double)elapsedMs;
-                        bool includeInAverage = true;
-                        if (avgState.sampleCount >= 3)
-                        {
-                            const double baselineMs = avgState.firmAverageMs > 0.0 ? avgState.firmAverageMs : avgState.averageMs;
-                            const double deltaMs = std::abs((double)elapsedMs - baselineMs);
-                            const double spikeThresholdMs = juce::jlimit(5.0, 20.0, baselineMs * 0.30 + 2.0);
-                            if (deltaMs > spikeThresholdMs)
-                                includeInAverage = false;
-                        }
-                        if (includeInAverage)
-                        {
-                            avgState.sampleCount += 1;
-                            avgState.sumMs += (double)elapsedMs;
-                            avgState.averageMs = avgState.sumMs / (double)juce::jmax(1, avgState.sampleCount);
-                            if (avgState.sampleCount == 1)
-                                avgState.firmAverageMs = (double)elapsedMs;
-                            else
-                                avgState.firmAverageMs = (avgState.firmAverageMs * 0.88) + ((double)elapsedMs * 0.12);
-                        }
-                        if (avgState.sampleCount >= 3)
-                        {
-                            averageMs = juce::jmax(0, (int)std::llround(avgState.averageMs));
-                            firmAverageMs = juce::jmax(0, (int)std::llround(avgState.firmAverageMs));
-                        }
-                        else if (avgState.lastMeasurementMs >= 0.0)
-                        {
-                            averageMs = juce::jmax(0, (int)std::llround(avgState.lastMeasurementMs));
-                        }
-                    }
-                    if (firmAverageMs >= 0 || averageMs >= 0)
-                    {
-                        const double rawDelayMs = (double)(firmAverageMs >= 0 ? firmAverageMs : averageMs);
-                        const int senderServerLatencyMs = pending.remoteServerLatencyMs >= 0 ? juce::jmax(0, pending.remoteServerLatencyMs) : 0;
-                        const int receiverServerLatencyMs = juce::jmax(0, localServerLatencyMs.load());
-                        const int serverRouteLatencyMs = senderServerLatencyMs + receiverServerLatencyMs;
-                        const int correctedDelayMs = juce::jmax(0, (int)std::llround(rawDelayMs) + serverRouteLatencyMs);
-                        const int sourceInterval = pending.remoteIntervalAbsolute >= 0 ? pending.remoteIntervalAbsolute : pending.remoteInterval;
-                        const juce::String canonicalSenderKey = canonicalDelayUserKey(senderKey);
-                        const juce::ScopedLock lock(intervalSyncAnnouncementLock);
-                        int priorAppliedInterval = std::numeric_limits<int>::min();
-                        auto appliedIt = remoteLatencyLastAppliedIntervalByUser.find(senderKey);
-                        if (appliedIt != remoteLatencyLastAppliedIntervalByUser.end())
-                            priorAppliedInterval = appliedIt->second;
-                        bool shouldApply = (appliedIt == remoteLatencyLastAppliedIntervalByUser.end());
-                        auto currentDelayIt = remoteLatencyFirmDelayMsByUser.find(senderKey);
-                        if (!shouldApply)
-                        {
-                            const int intervalDelta = sourceInterval - priorAppliedInterval;
-                            const bool cadenceReached = intervalDelta >= remoteLatencyUpdateCadenceIntervals;
-                            shouldApply = cadenceReached;
-                        }
-                        if (shouldApply)
-                        {
-                            remoteLatencyFirmDelayMsByUser[senderKey] = correctedDelayMs;
-                            if (canonicalSenderKey.isNotEmpty())
-                                remoteLatencyFirmDelayMsByUser[canonicalSenderKey] = correctedDelayMs;
-                            lastRemoteServerLatencyMsByUser[senderKey] = senderServerLatencyMs;
-                            if (canonicalSenderKey.isNotEmpty())
-                                lastRemoteServerLatencyMsByUser[canonicalSenderKey] = senderServerLatencyMs;
-                            remoteLatencyLastAppliedIntervalByUser[senderKey] = sourceInterval;
-                            if (canonicalSenderKey.isNotEmpty())
-                                remoteLatencyLastAppliedIntervalByUser[canonicalSenderKey] = sourceInterval;
-                            vlogStr("[MCGuard] Applied firm delay for=" + senderKey + " canonical=" + canonicalSenderKey + " delayMs=" + juce::String(correctedDelayMs) + " rawMs=" + juce::String((int)std::llround(rawDelayMs)) + " senderSrv=" + juce::String(senderServerLatencyMs) + " receiverSrv=" + juce::String(receiverServerLatencyMs) + " sourceInterval=" + juce::String(sourceInterval) + " priorApplied=" + juce::String(priorAppliedInterval));
-                        }
-                    }
-                    const juce::String displaySender = pending.displaySender.isNotEmpty() ? pending.displaySender : senderKey;
-                    const int displaySenderServerLatencyMs = pending.remoteServerLatencyMs >= 0 ? juce::jmax(0, pending.remoteServerLatencyMs) : 0;
-                    const int displayReceiverServerLatencyMs = juce::jmax(0, localServerLatencyMs.load());
-                    const int displayServerRouteLatencyMs = displaySenderServerLatencyMs + displayReceiverServerLatencyMs;
-                    const int displayCorrectedDelayMs = juce::jmax(0, elapsedMs + displayServerRouteLatencyMs);
-                    juce::String line = displaySender + " BPI1->our BPI1 " + juce::String(elapsedMs) + "ms";
-                    if (firmAverageMs >= 0)
-                        line << " avg " << juce::String(firmAverageMs) << "ms";
-                    else if (averageMs >= 0)
-                        line << " avg " << juce::String(averageMs) << "ms";
-                    if (displayServerRouteLatencyMs > 0)
-                        line << " srv " << juce::String(displaySenderServerLatencyMs) << "+" << juce::String(displayReceiverServerLatencyMs) << "ms";
-                    line << " => " << juce::String(displayCorrectedDelayMs) << "ms";
-                    juce::DynamicObject::Ptr reportObj = new juce::DynamicObject();
-                    reportObj->setProperty("line", line);
-                    reportObj->setProperty("interval", pending.remoteIntervalAbsolute >= 0 ? pending.remoteIntervalAbsolute : pending.remoteInterval);
-                    reportObj->setProperty("targetUserId", canonicalDelayUserKey(displaySender));
-                    reportObj->setProperty("elapsedMs", elapsedMs);
-                    if (averageMs >= 0)
-                        reportObj->setProperty("avgMs", averageMs);
-                    if (firmAverageMs >= 0)
-                        reportObj->setProperty("firmMs", firmAverageMs);
-                    reportObj->setProperty("senderServerLatencyMs", displaySenderServerLatencyMs);
-                    reportObj->setProperty("receiverServerLatencyMs", displayReceiverServerLatencyMs);
-                    reportObj->setProperty("serverRouteLatencyMs", displayServerRouteLatencyMs);
-                    reportObj->setProperty("correctedDelayMs", displayCorrectedDelayMs);
-                    reportObj->setProperty("eventId", "latencyReport:" + senderKey + ":" + juce::String(++sideSignalEventCounter));
-                    const juce::String reportPayload = juce::JSON::toString(juce::var(reportObj.get()));
-                    sendIntervalSignal("intervalLatencyReport", reportPayload);
+                    broadcastIntervalSyncTag("*", localMarkerBeat);
+                    lastBroadcastIntervalTag.store(localMarkerKey);
                 }
             }
-            if (status == NJClient::NJC_STATUS_OK)
-                lastBroadcastIntervalTag.store(-1);
         }
         lastIntervalPos.store(pos);
         if (status == NJClient::NJC_STATUS_OK)

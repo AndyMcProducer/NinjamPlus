@@ -548,6 +548,7 @@ private:
     MuteSoloBtnLookAndFeel soloBtnLAF;
     juce::ComboBox outputSelector;
     FaderLookAndFeel faderLookAndFeel;
+    juce::Label chordLabel{ "RemoteChord", "--" };
     juce::Label dbLabel;
     bool showOutputSelector = true;
     
@@ -1054,6 +1055,8 @@ private:
 
     FaderLookAndFeel mixerFaderLookAndFeel;
     juce::Label localFaderLabel{ "Local", "Local" };
+    juce::Label localChordLabel{ "LocalChord", "Chord --" };
+    juce::Label localChordStatsLabel{ "LocalChordStats", "CPU 0.00%  MEM -- KB" };
     LeftClickOnlyTextButton addLocalChannelButton{ "+" };
     LeftClickOnlyTextButton removeLocalChannelButton{ "-" };
     std::array<NonlinearFaderSlider, NinjamVst3AudioProcessor::maxLocalChannels> localFaders;

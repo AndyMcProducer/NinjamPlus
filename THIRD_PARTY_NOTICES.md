@@ -73,6 +73,25 @@ and services you ship.
   - Retain copyright notice, license conditions, and disclaimer in source and
     binary distributions.
 
+### Chord Detector and Chromagram
+
+- Source tree: `third_party/chord-detector/`
+- Upstream: `adamstark/Chord-Detector-and-Chromagram`
+- Active build path: `CMakeLists.txt` compiles the chromagram and chord
+  detector source directly into the plugin for local input analysis.
+- License: GPLv3 or later. The upstream license text is included at
+  `third_party/chord-detector/LICENSE.txt`.
+- Bundled FFT dependency:
+  - `third_party/chord-detector/libs/kiss_fft130/`
+  - License: BSD-style 3-clause license, included at
+    `third_party/chord-detector/libs/kiss_fft130/COPYING`.
+- Attribution and compliance note:
+  - Preserve upstream copyright and license notices in vendored source files.
+  - Include the GPLv3-or-later and Kiss FFT license texts with distributed
+    source and binary packages.
+  - The local copy includes small real-time integration changes for this
+    plugin; keep those changes available with the corresponding source.
+
 ## Local Helper Code And Packaged Assets
 
 ### Advanced VDO Client Helper Pages And Server

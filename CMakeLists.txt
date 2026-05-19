@@ -131,6 +131,9 @@ target_sources(NINJAM_VST3 PRIVATE
     ${WDL_ROOT}/rng.cpp
     ${WDL_ROOT}/resample.cpp # Might be needed
     ${WDL_ROOT}/fft.c
+    third_party/chord-detector/src/Chromagram.cpp
+    third_party/chord-detector/src/ChordDetector.cpp
+    third_party/chord-detector/libs/kiss_fft130/kiss_fft.c
 )
 
 # Include directories
@@ -143,6 +146,8 @@ target_include_directories(NINJAM_VST3 PRIVATE
     ${vorbis_SOURCE_DIR}/include
     ${vorbis_SOURCE_DIR}/lib # for vorbis internal headers if needed
     ${opus_SOURCE_DIR}/include
+    third_party/chord-detector/src
+    third_party/chord-detector/libs/kiss_fft130
     $<$<BOOL:${WIN32}>:${asiosdk_SOURCE_DIR}/common>
     $<$<BOOL:${WIN32}>:${asiosdk_SOURCE_DIR}/host>
 )
@@ -170,6 +175,7 @@ target_compile_definitions(NINJAM_VST3 PRIVATE
     JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
     NINJAM_DISPLAY_VERSION=\"${NINJAM_DISPLAY_VERSION}\"
     WDL_NO_DEFINE_MINMAX
+    USE_KISS_FFT
     _CRT_SECURE_NO_WARNINGS
     _WINSOCK_DEPRECATED_NO_WARNINGS
     JUCE_VST3_CAN_REPLACE_VST2=0
