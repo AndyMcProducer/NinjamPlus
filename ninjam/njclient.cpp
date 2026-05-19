@@ -29,6 +29,7 @@
 #include "njclient.h"
 #include "mpb.h"
 #include "../WDL/pcmfmtcvt.h"
+#include "../WDL/resample.h"
 #include "../WDL/wavwrite.h"
 #include "../WDL/wdlcstring.h"
 
@@ -435,9 +436,14 @@ class DecodeState
   public:
     DecodeState() : decode_fp(0), decode_buf(0), decode_codec(0),
                                            resample_state(0.0),
+                                           resampler_src_srate(0),
+                                           resampler_dest_srate(0),
+                                           resampler_nch(0),
+                                           resampler_active(false),
                                            is_voice_firstchk(false)
     {
       memset(guid,0,sizeof(guid));
+      resampler.SetMode(true,0,true,96,32);
     }
     ~DecodeState()
     {
@@ -456,8 +462,71 @@ class DecodeState
     DecodeMediaBuffer *decode_buf;
     I_NJDecoder *decode_codec;
     double resample_state;
+    WDL_Resampler resampler;
+    WDL_TypedBuf<WDL_ResampleSample> resample_outbuf;
+    int resampler_src_srate;
+    int resampler_dest_srate;
+    int resampler_nch;
+    bool resampler_active;
 
     bool is_voice_firstchk;
+
+    void resetResampler()
+    {
+      resampler.Reset();
+      resample_state=0.0;
+    }
+
+    void configureResampler(int src_srate, int dest_srate, int nch)
+    {
+      if (!src_srate) src_srate=48000;
+      if (!dest_srate) dest_srate=48000;
+      if (nch < 1) nch=1;
+
+      const bool shouldResample = src_srate != dest_srate;
+      if (!shouldResample)
+      {
+        if (resampler_active)
+          resetResampler();
+        resampler_active=false;
+        resampler_src_srate=src_srate;
+        resampler_dest_srate=dest_srate;
+        resampler_nch=nch;
+        return;
+      }
+
+      if (!resampler_active ||
+          resampler_src_srate != src_srate ||
+          resampler_dest_srate != dest_srate ||
+          resampler_nch != nch)
+      {
+        resampler.SetMode(true,0,true,96,32);
+        resampler.SetRates((double)src_srate,(double)dest_srate);
+        resetResampler();
+        resampler_src_srate=src_srate;
+        resampler_dest_srate=dest_srate;
+        resampler_nch=nch;
+        resampler_active=true;
+      }
+    }
+
+    int getResampledInputNeeded(int src_srate, int dest_srate, int dest_len, int nch)
+    {
+      if (!src_srate) src_srate=48000;
+      if (!dest_srate) dest_srate=48000;
+      if (dest_len < 1) return 0;
+      if (nch < 1) nch=1;
+      if (src_srate == dest_srate)
+      {
+        configureResampler(src_srate,dest_srate,nch);
+        return dest_len;
+      }
+
+      configureResampler(src_srate,dest_srate,nch);
+      WDL_ResampleSample *inbuf=0;
+      const int amt=resampler.ResamplePrepare(dest_len,nch,&inbuf);
+      return amt > 0 ? amt : 0;
+    }
 
     void applyOverlap(overlapFadeState *s)
     {
@@ -911,6 +980,8 @@ NJClient::NJClient()
   IntervalChunkCallbackUser=0;
   ChannelMixer=0;
   ChannelMixer_User=0;
+  RemoteChannelAudioTap=0;
+  RemoteChannelAudioTap_User=0;
 
   waveWrite=0;
 #ifndef NJCLIENT_NO_XMIT_SUPPORT
@@ -2534,7 +2605,7 @@ void NJClient::process_samples(float **inbuf, int innch, float **outbuf, int out
           if (m_issoloactive) muteflag = !(user->solomask & (1<<ch));
           else muteflag=(user->mutedmask & (1<<ch)) || user->muted;
 
-          mixInChannel(user,ch,muteflag,
+          mixInChannel(u,user,ch,muteflag,
             user->volume*user->channels[ch].volume,lpan,
               outbuf,user->channels[ch].out_chan_index + m_remote_chanoffs,len,srate,outnch,offset,decay,isPlaying,isSeek,cursessionpos);
         }
@@ -2647,21 +2718,26 @@ void NJClient::process_samples(float **inbuf, int innch, float **outbuf, int out
 
 }
 
-static int resampleLengthNeeded(int src_srate, int dest_srate, int dest_len, double *state)
+static int resampleLengthNeeded(DecodeState *decode_state, int src_srate, int dest_srate, int dest_len, int src_nch, double *state)
 {
   // safety
   if (!src_srate) src_srate=48000;
   if (!dest_srate) dest_srate=48000;
-  if (src_srate == dest_srate) return dest_len;
+  if (src_srate == dest_srate)
+  {
+    if (decode_state) decode_state->configureResampler(src_srate,dest_srate,src_nch);
+    return dest_len;
+  }
+  if (decode_state) return decode_state->getResampledInputNeeded(src_srate,dest_srate,dest_len,src_nch);
   return (int) (((double)src_srate*(double)dest_len/(double)dest_srate)+*state);
 
 }
 
-static void mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // lengths are sample pairs. input is interleaved samples, output not
+static int mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // lengths are sample pairs. input is interleaved samples, output not
                             float **dest, int dest_srate, int dest_nch,
-                            int dest_len, float vol, float pan, double *state, int src_len)
+                            int dest_len, float vol, float pan, double *state, int src_len,
+                            DecodeState *decode_state, int *src_consumed)
 {
-  // this resampling code is terrible, sorry, universe
   int x;
   if (pan < -1.0f) pan=-1.0f;
   else if (pan > 1.0f) pan=1.0f;
@@ -2670,6 +2746,12 @@ static void mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // length
 
   if (!src_srate) src_srate=48000;
   if (!dest_srate) dest_srate=48000;
+  if (src_nch < 1) src_nch=1;
+  if (dest_len < 1 || src_len < 1)
+  {
+    if (src_consumed) *src_consumed=0;
+    return 0;
+  }
 
   double vol1=vol,vol2=vol;
   float *dest1=dest[0];
@@ -2681,6 +2763,64 @@ static void mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // length
     else if (pan > 0.0f) vol1 *= 1.0f-pan;
   }
 
+  int frames_mixed=0;
+
+  if (src_srate != dest_srate && decode_state)
+  {
+    decode_state->configureResampler(src_srate,dest_srate,src_nch);
+    WDL_ResampleSample *inbuf=0;
+    int input_frames=decode_state->resampler.ResamplePrepare(dest_len,src_nch,&inbuf);
+    if (input_frames > src_len) input_frames=src_len;
+    if (input_frames < 0) input_frames=0;
+
+    if (input_frames > 0 && inbuf)
+    {
+      const int input_items=input_frames*src_nch;
+      for (int i=0; i < input_items; ++i)
+        inbuf[i]=(WDL_ResampleSample)src[i];
+    }
+
+    WDL_ResampleSample *rsout=decode_state->resample_outbuf.Resize(dest_len*src_nch,false);
+    const int produced=rsout ? decode_state->resampler.ResampleOut(rsout,input_frames,dest_len,src_nch) : 0;
+    const int outframes=produced > dest_len ? dest_len : produced;
+
+    for (x = 0; x < outframes; x ++)
+    {
+      double ls,rs;
+      if (src_nch == 2)
+      {
+        const int t=x+x;
+        ls=rsout[t];
+        rs=rsout[t+1];
+      }
+      else
+      {
+        ls=rs=rsout[x*src_nch];
+      }
+
+      ls *= vol1;
+      if (ls > 1.0) ls=1.0;
+      else if (ls<-1.0) ls=-1.0;
+
+      *dest1++ +=(float) ls;
+
+      if (dest_nch > 1)
+      {
+        rs *= vol2;
+        if (rs > 1.0) rs=1.0;
+        else if (rs<-1.0) rs=-1.0;
+
+        *dest2++ += (float) rs;
+      }
+    }
+
+    decode_state->resample_state=decode_state->resampler.GetCurrentLatency()*(double)src_srate;
+    if (src_consumed) *src_consumed=input_frames;
+    return outframes;
+  }
+
+  if (decode_state)
+    decode_state->configureResampler(src_srate,dest_srate,src_nch);
 
   double rspos=*state;
   double drspos = 1.0;
@@ -2739,12 +2879,16 @@ static void mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // length
       *dest2++ += (float) rs;
     }
   }
+  const int input_frames_used = src_srate != dest_srate ? (int)rspos : dest_len;
   *state = rspos - (int)rspos;
+  frames_mixed=dest_len;
+  if (src_consumed) *src_consumed=input_frames_used;
+  return frames_mixed;
 }
 
 
 
-void NJClient::mixInChannel(RemoteUser *user, int chanidx,
+void NJClient::mixInChannel(int useridx, RemoteUser *user, int chanidx,
                             bool muted, float vol, float pan, float **outbuf, int out_channel,
                             int len, int srate, int outnch, int offs, double vudecay,
                             bool isPlaying, bool isSeek, double playPos)
@@ -2854,7 +2998,7 @@ void NJClient::mixInChannel(RemoteUser *user, int chanidx,
 
   int needed=0;
   int srcnch=chan->decode_codec->GetNumChannels();
-  while (chan->decode_codec->Available() <= (needed=resampleLengthNeeded(chan->decode_codec->GetSampleRate(),srate,len,&chan->resample_state))*srcnch)
+  while (chan->decode_codec->Available() <= (needed=resampleLengthNeeded(chan,chan->decode_codec->GetSampleRate(),srate,len,srcnch,&chan->resample_state))*srcnch)
   {
     bool done = chan->runDecode(256);
     if (chan->decode_codec->Available() > 0 && chan->is_voice_firstchk)
@@ -2926,6 +3070,7 @@ void NJClient::mixInChannel(RemoteUser *user, int chanidx,
   if (codecavail>0 && codecavail >= needed*srcnch)
   {
     float *sptr=chan->decode_codec->Get();
+    int source_frames_consumed=needed;
 
     // process VU meter, yay for powerful CPUs
     if (!muted && vol > 0.0000001)
@@ -2981,13 +3126,32 @@ void NJClient::mixInChannel(RemoteUser *user, int chanidx,
         use_nch=2;
       }
 
-      mixFloatsNIOutput(sptr,
+      const int mixed_len = mixFloatsNIOutput(sptr,
               chan->decode_codec->GetSampleRate(),
               srcnch,
               tmpbuf,
               srate,use_nch,len_out,
               lvol,pan,&chan->resample_state,
-              chan->decode_codec->Available() / srcnch);
+              chan->decode_codec->Available() / srcnch,
+              chan,&source_frames_consumed);
+      if (mixed_len < len_out)
+        len_out=mixed_len;
+      if (source_frames_consumed < 0) source_frames_consumed=0;
+      if (source_frames_consumed > chan->decode_codec->Available() / srcnch)
+        source_frames_consumed=chan->decode_codec->Available() / srcnch;
+      needed=source_frames_consumed;
+    }
+
+    if (RemoteChannelAudioTap && source_frames_consumed > 0)
+    {
+      RemoteChannelAudioTap(RemoteChannelAudioTap_User,
+                            useridx,
+                            user ? user->name.Get() : NULL,
+                            chanidx,
+                            sptr,
+                            srcnch,
+                            source_frames_consumed,
+                            chan->decode_codec->GetSampleRate());
     }
 
     // advance the queue
@@ -3020,7 +3184,7 @@ void NJClient::mixInChannel(RemoteUser *user, int chanidx,
         writeUserChanLog("v",user,userchan,chanidx);
     }
     if (sessionmode || (chan && chan->decode_codec && (chan->decode_fp||chan->decode_buf)))
-      mixInChannel(user,chanidx,muted,vol,pan,outbuf,out_channel,len-len_out,srate,outnch,offs+len_out,vudecay,
+      mixInChannel(useridx,user,chanidx,muted,vol,pan,outbuf,out_channel,len-len_out,srate,outnch,offs+len_out,vudecay,
         isPlaying,false,playPos + len_out/(double)srate);
   }
 }

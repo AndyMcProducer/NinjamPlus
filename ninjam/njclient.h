@@ -248,6 +248,12 @@ public:
   int (*ChannelMixer)(void *userData, float **inbuf, int in_offset, int innch, int chidx, float *outbuf, int len);
   void *ChannelMixer_User;
 
+  // Passive decoded-remote-audio tap. Called from the audio thread before
+  // remote volume/pan/output routing is applied; implementations must not block.
+  void (*RemoteChannelAudioTap)(void *userData, int useridx, const char *username, int channelidx,
+                                const float *interleaved, int numChannels, int numFrames, int sampleRate);
+  void *RemoteChannelAudioTap_User;
+
   WDL_Mutex m_remotechannel_rd_mutex;
 
   bool is_likely_lobby() const {
@@ -318,7 +324,7 @@ protected:
 
   WDL_PtrList<Local_Channel> m_locchannels;
 
-  void mixInChannel(RemoteUser *user, int chanidx,
+  void mixInChannel(int useridx, RemoteUser *user, int chanidx,
                     bool muted, float vol, float pan, float **outbuf, int out_channel,
                     int len, int srate, int outnch, int offs, double vudecay, bool isPlaying, bool isSeek, double playPos);
 
