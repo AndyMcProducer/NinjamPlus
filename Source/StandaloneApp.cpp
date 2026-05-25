@@ -1,6 +1,7 @@
 #include <JuceHeader.h>
 #include <juce_audio_plugin_client/Standalone/juce_StandaloneFilterWindow.h>
 #include "PluginProcessor.h"
+#include "PluginEditor.h"
 
 #if JucePlugin_Build_Standalone
 
@@ -178,8 +179,7 @@ private:
     bool isResizing = false;
 };
 
-class NinjamStandaloneFilterWindow : public DocumentWindow,
-                                     private Button::Listener
+class NinjamStandaloneFilterWindow : public DocumentWindow
 {
 public:
     using PluginInOuts = StandalonePluginHolder::PluginInOuts;
@@ -192,8 +192,7 @@ public:
                                   const AudioDeviceManager::AudioDeviceSetup* preferredSetupOptions = nullptr,
                                   const Array<PluginInOuts>& constrainToConfiguration = {},
                                   bool autoOpenMidiDevices = false)
-        : DocumentWindow (title, backgroundColour, DocumentWindow::minimiseButton | DocumentWindow::closeButton),
-          optionsButton ("Options")
+        : DocumentWindow (title, backgroundColour, DocumentWindow::minimiseButton | DocumentWindow::closeButton)
     {
         pluginHolder = std::make_unique<NinjamStandalonePluginHolder> (settingsToUse,
                                                                        takeOwnershipOfSettings,
@@ -205,10 +204,7 @@ public:
        #if JUCE_IOS || JUCE_ANDROID
         setTitleBarHeight (0);
        #else
-        setTitleBarButtonsRequired (DocumentWindow::minimiseButton | DocumentWindow::closeButton, false);
-        Component::addAndMakeVisible (optionsButton);
-        optionsButton.addListener (this);
-        optionsButton.setTriggeredOnMouseDown (true);
+        setUsingNativeTitleBar (true);
        #endif
 
         updateContent();
@@ -237,7 +233,6 @@ public:
     void resized() override
     {
         DocumentWindow::resized();
-        optionsButton.setBounds (8, 6, 60, getTitleBarHeight() - 8);
     }
 
 private:
@@ -254,6 +249,15 @@ private:
 
             if (editor != nullptr)
             {
+                if (auto* ninjamEditor = dynamic_cast<NinjamVst3AudioProcessorEditor*> (editor.get()))
+                {
+                    ninjamEditor->setStandaloneOptionsMenuHandler (
+                        [this] (Component* anchorComponent)
+                        {
+                            owner.showStandaloneOptionsMenu (anchorComponent);
+                        });
+                }
+
                 editor->addComponentListener (this);
                 addAndMakeVisible (editor.get());
                 handleMovedOrResized();
@@ -264,6 +268,9 @@ private:
         {
             if (editor != nullptr)
             {
+                if (auto* ninjamEditor = dynamic_cast<NinjamVst3AudioProcessorEditor*> (editor.get()))
+                    ninjamEditor->setStandaloneOptionsMenuHandler ({});
+
                 editor->removeComponentListener (this);
                 if (owner.getPluginHolder() != nullptr && owner.getPluginHolder()->processor != nullptr)
                     owner.getPluginHolder()->processor->editorBeingDeleted (editor.get());
@@ -371,7 +378,7 @@ private:
             button->handleMenuResult (result);
     }
 
-    void buttonClicked (Button*) override
+    void showStandaloneOptionsMenu (Component* anchorComponent)
     {
         PopupMenu m;
         m.addItem (1, TRANS ("Audio/MIDI Settings..."));
@@ -381,11 +388,14 @@ private:
         m.addSeparator();
         m.addItem (4, TRANS ("Reset to default state"));
 
-        m.showMenuAsync (PopupMenu::Options(),
+        auto options = PopupMenu::Options();
+        if (anchorComponent != nullptr)
+            options = options.withTargetComponent (anchorComponent);
+
+        m.showMenuAsync (options,
                          ModalCallbackFunction::forComponent (menuCallback, this));
     }
 
-    TextButton optionsButton;
     std::unique_ptr<NinjamStandalonePluginHolder> pluginHolder;
 };
 

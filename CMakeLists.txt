@@ -62,6 +62,23 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(opus)
 
+# Fetch Ableton Link (header-only CMake integration, with asio-standalone submodule)
+FetchContent_Declare(
+    abletonlink
+    GIT_REPOSITORY https://github.com/Ableton/link.git
+    GIT_TAG        Link-4.0
+    GIT_SHALLOW    TRUE
+    GIT_SUBMODULES modules/asio-standalone
+    GIT_SUBMODULES_RECURSE TRUE
+)
+
+FetchContent_GetProperties(abletonlink)
+if (NOT abletonlink_POPULATED)
+    FetchContent_Populate(abletonlink)
+endif()
+
+include("${abletonlink_SOURCE_DIR}/AbletonLinkConfig.cmake")
+
 set(NINJAM_PLUGIN_FORMATS VST3 Standalone)
 
 if (APPLE)
@@ -160,6 +177,7 @@ target_link_libraries(NINJAM_VST3 PRIVATE
     juce::juce_gui_extra
     juce::juce_dsp
     juce::juce_osc
+    Ableton::Link
     ogg
     vorbis
     vorbisenc

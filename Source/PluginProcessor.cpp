@@ -2,6 +2,13 @@
 #include "PluginEditor.h"
 #include "Chromagram.h"
 #include "ChordDetector.h"
+
+#ifdef interface
+#undef interface
+#endif
+
+#include <ableton/LinkAudio.hpp>
+#include <ableton/link/HostTimeFilter.hpp>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -60,7 +67,7 @@ public:
         signalThreadShouldExit();
         if (listener)
             listener->close();
-        stopThread(2000);
+        stopThread(500);
         listener.reset();
     }
 
@@ -141,7 +148,7 @@ private:
         char buffer[2048] = {};
         while (!threadShouldExit() && requestData.getDataSize() < 65536)
         {
-            if (client.waitUntilReady(true, 1000) <= 0)
+            if (client.waitUntilReady(true, 100) <= 0)
                 break;
 
             const int bytesRead = client.read(buffer, (int) std::size(buffer), false);
@@ -890,11 +897,11 @@ public:
         workAvailable.signal();
     }
 
-    void stop()
+    void stop(int timeoutMs = 1500)
     {
         signalThreadShouldExit();
         workAvailable.signal();
-        stopThread(6000);
+        stopThread(juce::jlimit(100, 6000, timeoutMs));
 
         const juce::ScopedLock lock(queueLock);
         queue.clear();
@@ -1035,7 +1042,7 @@ static bool tryTranslateWithFedilab(const juce::String& text,
     int httpStatusCode = 0;
     auto responseStream = requestUrl.createInputStream(
         juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inPostData)
-            .withConnectionTimeoutMs(5000)
+            .withConnectionTimeoutMs(2000)
             .withNumRedirectsToFollow(2)
             .withStatusCode(&httpStatusCode)
             .withExtraHeaders("User-Agent: NINJAMVST3/1.0\r\nAccept: application/json\r\nContent-Type: application/x-www-form-urlencoded\r\n")
@@ -1107,7 +1114,7 @@ static bool tryTranslateWithGoogleFallback(const juce::String& text,
     int httpStatusCode = 0;
     auto responseStream = requestUrl.createInputStream(
         juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
-            .withConnectionTimeoutMs(4000)
+            .withConnectionTimeoutMs(2000)
             .withNumRedirectsToFollow(2)
             .withStatusCode(&httpStatusCode)
             .withExtraHeaders("User-Agent: NINJAMVST3/1.0\r\nAccept: application/json\r\n")
@@ -1215,6 +1222,37 @@ static int computeJamTabaHostSyncStartPositionSamples(const juce::AudioPlayHead:
     return (int) std::llround(hostInfo.ppqPosition * samplesPerBeat);
 }
 
+static int computeLinkSyncStartPositionSamples(double phaseBeats,
+                                               double quantum,
+                                               double tempoBpm,
+                                               double sampleRate)
+{
+    if (sampleRate <= 1.0
+        || !std::isfinite(phaseBeats)
+        || !std::isfinite(quantum)
+        || quantum <= 0.0
+        || !std::isfinite(tempoBpm)
+        || tempoBpm <= 0.0)
+    {
+        return 0;
+    }
+
+    double wrappedPhase = std::fmod(phaseBeats, quantum);
+    if (wrappedPhase < 0.0)
+        wrappedPhase += quantum;
+
+    constexpr double phaseEpsilon = 1.0e-6;
+    if (wrappedPhase <= phaseEpsilon || (quantum - wrappedPhase) <= phaseEpsilon)
+        return 0;
+
+    const double samplesPerBeat = (60.0 * sampleRate) / tempoBpm;
+    if (!std::isfinite(samplesPerBeat) || samplesPerBeat <= 0.0)
+        return 0;
+
+    const double samplesUntilNextQuantum = (quantum - wrappedPhase) * samplesPerBeat;
+    return -(int) std::llround(samplesUntilNextQuantum);
+}
+
 static int normaliseSignedIntervalPosition(int positionSamples, int intervalLength)
 {
     if (intervalLength <= 0)
@@ -1298,9 +1336,18 @@ namespace
     constexpr const char* sideSignalChatPrefix = "__NINJAM_VST3_SIDESIGNAL__ ";
     constexpr int remoteLatencyUpdateCadenceIntervals = 1;
     constexpr int kSyncSignalChannelIndex = 0;
-    constexpr int intervalSyncRepeatThresholdBpi = 16;
     constexpr int intervalSyncMarkerStepBeats = 8;
     constexpr long long intervalSyncMarkerKeyBeatStride = 1024;
+    constexpr int kLocalInputLinkAudioSentinel = -2000000000;
+
+    juce::String makeShortUserName(juce::String fullName)
+    {
+        fullName = fullName.trim();
+        const int atPos = fullName.indexOfChar('@');
+        if (atPos > 0)
+            fullName = fullName.substring(0, atPos);
+        return fullName;
+    }
 
     int getIntervalBeatIndexForPosition(int pos, int length, int bpi)
     {
@@ -1317,10 +1364,15 @@ namespace
     {
         const int safeBpi = juce::jmax(1, bpi);
         const int safeBeat = juce::jlimit(0, safeBpi - 1, beatIndex);
-        if (safeBpi <= intervalSyncRepeatThresholdBpi)
+        if (safeBpi < intervalSyncMarkerStepBeats)
             return 0;
 
-        return juce::jlimit(0, safeBpi - 1, (safeBeat / intervalSyncMarkerStepBeats) * intervalSyncMarkerStepBeats);
+        const int oneBasedBeat = safeBeat + 1;
+        const int markerOneBasedBeat = (oneBasedBeat / intervalSyncMarkerStepBeats) * intervalSyncMarkerStepBeats;
+        if (markerOneBasedBeat < intervalSyncMarkerStepBeats)
+            return 0;
+
+        return juce::jlimit(0, safeBpi - 1, markerOneBasedBeat - 1);
     }
 
     bool isIntervalSyncMarkerBeat(int beatIndex, int bpi)
@@ -1328,10 +1380,8 @@ namespace
         const int safeBpi = juce::jmax(1, bpi);
         if (beatIndex < 0 || beatIndex >= safeBpi)
             return false;
-        if (safeBpi <= intervalSyncRepeatThresholdBpi)
-            return beatIndex == 0;
 
-        return (beatIndex % intervalSyncMarkerStepBeats) == 0;
+        return getIntervalSyncMarkerBeatForBeat(beatIndex, safeBpi) == beatIndex;
     }
 
     long long makeIntervalSyncMarkerKey(int interval, int markerBeat)
@@ -1489,6 +1539,18 @@ namespace
 
 }
 
+struct NinjamVst3AudioProcessor::LinkTimingState
+{
+    ableton::link::HostTimeFilter<ableton::LinkAudio::Clock> hostTimeFilter;
+    double nextSampleTime = 0.0;
+
+    void reset()
+    {
+        hostTimeFilter.reset();
+        nextSampleTime = 0.0;
+    }
+};
+
 NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
      : AudioProcessor (BusesProperties()
                      .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
@@ -1536,6 +1598,7 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
     }
 
     localChordAnalyzer = std::make_unique<LocalChordAnalyzer>();
+    linkTimingState = std::make_unique<LinkTimingState>();
     for (auto& analyzer : remoteChordAnalyzers)
         analyzer = std::make_unique<LocalChordAnalyzer>();
 
@@ -1568,6 +1631,8 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
 
     videoHelperRootDir = resolveVideoHelperRootDir();
     asyncChatTranslationWorker = std::make_unique<AsyncChatTranslationWorker>(*this);
+    abletonLink = std::make_unique<ableton::LinkAudio>(120.0, getLinkPeerName().toStdString());
+    refreshAbletonLinkActivation();
 }
 
 void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String user, juce::String pass)
@@ -1610,11 +1675,18 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
         serverLatencyProbeFuture.wait();
     serverLatencyProbeInProgress.store(false);
 
+    {
+        const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
+        remoteLinkAudioOutputPairs.clear();
+        remoteLinkAudioSinks.clear();
+    }
+
     applyCodecPreference();
 
     ninjamClient.Connect(host.toRawUTF8(), user.toRawUTF8(), pass.toRawUTF8());
     currentServer = host;
     currentUser = user;
+    refreshAbletonLinkActivation();
 
     // Do NOT reset isTransmitting here — the user may have toggled it before
     // connecting. The NJC_STATUS_OK handler calls syncLocalIntervalChannelConfig()
@@ -1626,6 +1698,7 @@ void NinjamVst3AudioProcessor::disconnectFromServer()
     ninjamClient.Disconnect();
     currentServer = {};
     currentUser = {};
+    refreshAbletonLinkActivation();
     {
         const juce::ScopedLock lock(opusSyncPeerLock);
         opusSyncPeers.clear();
@@ -1640,6 +1713,11 @@ void NinjamVst3AudioProcessor::disconnectFromServer()
         remoteLatencyLastAppliedIntervalByUser.clear();
         remoteLatencyAverageByUser.clear();
         remoteLatencyFirmDelayMsByUser.clear();
+    }
+    {
+        const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
+        remoteLinkAudioOutputPairs.clear();
+        remoteLinkAudioSinks.clear();
     }
     opusSyncAvailable.store(false);
     opusSyncHasLegacyClients.store(false);
@@ -1839,7 +1917,7 @@ void NinjamVst3AudioProcessor::measureServerLatencyAsync()
 
         juce::StreamingSocket socket;
         const double startMs = juce::Time::getMillisecondCounterHiRes();
-        if (!socket.connect(host.toRawUTF8(), port, 1500))
+        if (!socket.connect(host.toRawUTF8(), port, 600))
             return;
 
         const double rttMs = juce::Time::getMillisecondCounterHiRes() - startMs;
@@ -2067,9 +2145,11 @@ void NinjamVst3AudioProcessor::invalidateIntervalSyncLatencyState(bool keepRemot
     pendingTransportProbeSentMsById.clear();
     remoteLatencyLastAppliedIntervalByUser.clear();
     remoteLatencyAverageByUser.clear();
-    remoteLatencyFirmDelayMsByUser.clear();
     if (!keepRemoteServerLatency)
+    {
+        remoteLatencyFirmDelayMsByUser.clear();
         lastRemoteServerLatencyMsByUser.clear();
+    }
 }
 
 void NinjamVst3AudioProcessor::pruneDisconnectedRemoteSyncState()
@@ -2739,15 +2819,24 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
             if (pair >= 0 && pair < maxOutputPairs)
                 reservedPairs.insert(pair);
         }
+
+        const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
+        for (const auto& pair : remoteLinkAudioOutputPairs)
+        {
+            if (pair.second >= 0 && pair.second < maxOutputPairs)
+                reservedPairs.insert(pair.second);
+        }
     }
 
     std::set<int> usedPairsThisCall;
+    std::set<int> activeUserIndexes;
 
     for (int i=0; i<numUsers; ++i)
     {
         const char* name = ninjamClient.GetUserState(i, nullptr, nullptr, nullptr);
         if (name)
         {
+            activeUserIndexes.insert(i);
             UserInfo u;
             u.index = i;
             juce::String fullName = juce::String::fromUTF8(name);
@@ -2756,6 +2845,14 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
                 u.name = fullName.substring(0, atPos);
             else
                 u.name = fullName;
+
+            const juce::String userIdentityKey = canonicalDelayUserKey(u.name);
+            auto identityIt = remoteUserNameByIndex.find(i);
+            if (identityIt == remoteUserNameByIndex.end() || identityIt->second != userIdentityKey)
+            {
+                resetRemoteUserIndexState(i, u.name);
+                remoteUserNameByIndex[i] = userIdentityKey;
+            }
             
             bool sub = false;
             float chVol = 1.0f, chPan = 0.0f;
@@ -2827,7 +2924,27 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
                     setUserVolume(i, baseVol);
             }
 
-            if (spread)
+            int linkOutputPair = -1;
+            {
+                const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
+                auto linkIt = remoteLinkAudioOutputPairs.find(u.name);
+                if (linkIt != remoteLinkAudioOutputPairs.end())
+                    linkOutputPair = linkIt->second;
+            }
+
+            if (linkOutputPair >= 0)
+            {
+                const int desiredChannel = linkOutputPair * 2;
+                if (u.outputChannel != desiredChannel)
+                {
+                    for (int ch = 0; ch < 32; ++ch)
+                        ninjamClient.SetUserChannelState(i, ch, false, false, false, 0, false, 0, false, false, false, false, true, desiredChannel);
+                }
+                u.outputChannel = desiredChannel;
+                u.outputUsesLinkAudio = true;
+                usedPairsThisCall.insert(linkOutputPair);
+            }
+            else if (spread)
             {
                 juce::String shortName = u.name;
                 auto itAssign = userOutputAssignment.find(shortName);
@@ -2956,6 +3073,22 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
             analyzer->markNoInput();
     }
 
+    for (auto it = remoteUserNameByIndex.begin(); it != remoteUserNameByIndex.end();)
+    {
+        const int userIndex = it->first;
+        if (activeUserIndexes.count(userIndex) == 0)
+        {
+            userBaseVolume.erase(userIndex);
+            userPanOverrides.erase(userIndex);
+            userClipEnabled.erase(userIndex);
+            it = remoteUserNameByIndex.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
     return users;
 }
 
@@ -2967,6 +3100,42 @@ void NinjamVst3AudioProcessor::rememberUserVolume(int userIndex, float volume, c
     if (atPos > 0)
         shortName = shortName.substring(0, atPos);
     userVolumeByName[shortName] = volume;
+}
+
+void NinjamVst3AudioProcessor::resetRemoteUserIndexState(int userIndex, const juce::String& userName)
+{
+    const int numUsers = ninjamClient.GetNumUsers();
+    if (userIndex < 0 || userIndex >= numUsers)
+        return;
+
+    userBaseVolume.erase(userIndex);
+    userPanOverrides.erase(userIndex);
+    userClipEnabled.erase(userIndex);
+
+    if (userIndex >= 0 && userIndex < maxRemoteChordUsers)
+    {
+        remoteChordDetectionEnabled[(size_t)userIndex].store(true, std::memory_order_relaxed);
+        remoteChordUserKeys[(size_t)userIndex].clear();
+        auto& analyzer = remoteChordAnalyzers[(size_t)userIndex];
+        if (analyzer && analyzer->isPrepared())
+            analyzer->markNoInput();
+    }
+
+    float baseVol = 1.0f;
+    const juce::String shortName = makeShortUserName(userName);
+    auto byNameIt = userVolumeByName.find(shortName);
+    if (byNameIt != userVolumeByName.end())
+        baseVol = byNameIt->second;
+
+    for (int ch = 0; ch < 32; ++ch)
+    {
+        ninjamClient.SetUserChannelState(userIndex, ch,
+                                         false, false,
+                                         true, baseVol,
+                                         true, 0.0f,
+                                         true, false,
+                                         true, false);
+    }
 }
 
 void NinjamVst3AudioProcessor::setUserOutput(int userIndex, int outputChannelIndex)
@@ -2986,16 +3155,101 @@ void NinjamVst3AudioProcessor::setUserOutput(int userIndex, int outputChannelInd
     const char* name = ninjamClient.GetUserState(userIndex, nullptr, nullptr, nullptr);
     if (name)
     {
-        juce::String fullName = juce::String::fromUTF8(name);
-        int atPos = fullName.indexOfChar('@');
-        juce::String shortName;
-        if (atPos > 0)
-            shortName = fullName.substring(0, atPos);
-        else
-            shortName = fullName;
+        const juce::String shortName = makeShortUserName(juce::String::fromUTF8(name));
+        {
+            const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
+            remoteLinkAudioOutputPairs.erase(shortName);
+            remoteLinkAudioSinks.erase(shortName);
+        }
         int pairIndex = (outputChannelIndex & 1023) / 2;
         userOutputAssignment[shortName] = pairIndex;
     }
+
+    lastLinkAudioEndpointRefreshMs = 0.0;
+    rebuildLinkAudioEndpoints();
+}
+
+bool NinjamVst3AudioProcessor::setUserOutputToLinkAudio(int userIndex)
+{
+    if (!isLinkAudioEnabled() || !isLinkAudioSendEnabled())
+        return false;
+
+    const int numUsers = ninjamClient.GetNumUsers();
+    if (userIndex < 0 || userIndex >= numUsers)
+        return false;
+
+    const char* nameChars = ninjamClient.GetUserState(userIndex, nullptr, nullptr, nullptr);
+    if (nameChars == nullptr || nameChars[0] == 0)
+        return false;
+
+    const juce::String shortName = makeShortUserName(juce::String::fromUTF8(nameChars));
+    const int maxPairs = getTotalNumOutputChannels() / 2;
+    if (maxPairs <= 0)
+        return false;
+
+    std::set<int> usedPairs;
+    for (int otherUser = 0; otherUser < numUsers; ++otherUser)
+    {
+        if (otherUser == userIndex)
+            continue;
+
+        const char* otherNameChars = ninjamClient.GetUserState(otherUser, nullptr, nullptr, nullptr);
+        if (otherNameChars == nullptr || otherNameChars[0] == 0)
+            continue;
+
+        const juce::String otherShortName = makeShortUserName(juce::String::fromUTF8(otherNameChars));
+        int pairIndex = -1;
+        {
+            const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
+            auto linkIt = remoteLinkAudioOutputPairs.find(otherShortName);
+            if (linkIt != remoteLinkAudioOutputPairs.end())
+                pairIndex = linkIt->second;
+        }
+
+        if (pairIndex < 0)
+        {
+            const int outChannel = ninjamClient.GetUserChannelOutput(otherUser, 0);
+            pairIndex = (outChannel & 1023) / 2;
+        }
+
+        if (pairIndex >= 0 && pairIndex < maxPairs)
+            usedPairs.insert(pairIndex);
+    }
+
+    int stagingPair = -1;
+    {
+        const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
+        auto existing = remoteLinkAudioOutputPairs.find(shortName);
+        if (existing != remoteLinkAudioOutputPairs.end())
+            stagingPair = existing->second;
+    }
+
+    if (stagingPair < 0)
+    {
+        for (int candidate = maxPairs - 1; candidate >= 0; --candidate)
+        {
+            if (!usedPairs.count(candidate))
+            {
+                stagingPair = candidate;
+                break;
+            }
+        }
+    }
+
+    if (stagingPair < 0)
+        return false;
+
+    for (int channel = 0; channel < 32; ++channel)
+        ninjamClient.SetUserChannelState(userIndex, channel, false, false, false, 0, false, 0, false, false, false, false, true, stagingPair * 2);
+
+    {
+        const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
+        remoteLinkAudioOutputPairs[shortName] = stagingPair;
+    }
+
+    lastLinkAudioEndpointRefreshMs = 0.0;
+    rebuildLinkAudioEndpoints();
+    return true;
 }
 
 void NinjamVst3AudioProcessor::setUserLevel(int userIndex, float volume, float pan, bool isMuted, bool isSolo)
@@ -3045,7 +3299,7 @@ float NinjamVst3AudioProcessor::getUserPeak(int userIndex, int channelIndex)
     if (userIndex < 0 || userIndex >= numUsers)
         return 0.0f;
 
-    if (isSyncToHostEnabled() && (!hostWasPlaying.load() || syncWaitForInterval.load()))
+    if (isTransportSyncEnabled() && (!hostWasPlaying.load() || syncWaitForInterval.load()))
         return 0.0f;
 
     float maxPeak = 0.0f;
@@ -3167,7 +3421,11 @@ void NinjamVst3AudioProcessor::setUserClipEnabled(int userIndex, bool enabled)
 
 bool NinjamVst3AudioProcessor::isUserClipEnabled(int userIndex) const
 {
-    return true;
+    auto it = userClipEnabled.find(userIndex);
+    if (it != userClipEnabled.end())
+        return it->second;
+
+    return softLimiterEnabled.load();
 }
 
 void NinjamVst3AudioProcessor::setMasterLimiterEnabled(bool shouldEnable)
@@ -3293,6 +3551,24 @@ int NinjamVst3AudioProcessor::getLocalChannelInput(int channel) const
     if (channel < 0 || channel >= maxLocalChannels)
         return 0;
     return localChannelInputs[(size_t)channel].load();
+}
+
+void NinjamVst3AudioProcessor::setLocalChannelUsesLinkAudioInput(int channel, bool shouldUse)
+{
+    if (channel < 0 || channel >= maxLocalChannels)
+        return;
+
+    if (shouldUse)
+        localChannelInputs[(size_t)channel].store(kLocalInputLinkAudioSentinel);
+    else if (localChannelInputs[(size_t)channel].load() == kLocalInputLinkAudioSentinel)
+        localChannelInputs[(size_t)channel].store(0);
+}
+
+bool NinjamVst3AudioProcessor::isLocalChannelUsingLinkAudioInput(int channel) const
+{
+    if (channel < 0 || channel >= maxLocalChannels)
+        return false;
+    return localChannelInputs[(size_t)channel].load() == kLocalInputLinkAudioSentinel;
 }
 
 float NinjamVst3AudioProcessor::getLocalChannelPeak(int channel) const
@@ -3621,7 +3897,7 @@ int NinjamVst3AudioProcessor::getBPI()
 
 float NinjamVst3AudioProcessor::getIntervalProgress()
 {
-    if (isSyncToHostEnabled() && (!hostWasPlaying.load() || syncWaitForInterval.load()))
+    if (isTransportSyncEnabled() && (!hostWasPlaying.load() || syncWaitForInterval.load()))
         return 0.0f;
 
     int pos = 0;
@@ -3629,7 +3905,7 @@ float NinjamVst3AudioProcessor::getIntervalProgress()
     ninjamClient.GetPosition(&pos, &length);
     if (length > 0)
     {
-        if (isSyncToHostEnabled() && hostWasPlaying.load())
+        if (isTransportSyncEnabled() && hostWasPlaying.load())
         {
             int basePos = syncDisplayPositionOffset.load();
             int relativePos = pos - basePos;
@@ -3694,6 +3970,11 @@ void NinjamVst3AudioProcessor::setSpreadOutputsEnabled(bool shouldEnable)
     if (wasEnabled && !shouldEnable)
     {
         userOutputAssignment.clear();
+        {
+            const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
+            remoteLinkAudioOutputPairs.clear();
+            remoteLinkAudioSinks.clear();
+        }
 
         int numUsers = ninjamClient.GetNumUsers();
         for (int userIdx = 0; userIdx < numUsers; ++userIdx)
@@ -4084,6 +4365,12 @@ NinjamVst3AudioProcessor::~NinjamVst3AudioProcessor()
         if (videoLaunchFuture.valid())
             videoLaunchFuture.wait();
     }
+    {
+        const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
+        abletonLinkSource.reset();
+        abletonLinkSink.reset();
+    }
+    abletonLink.reset();
     if (serverLatencyProbeFuture.valid())
         serverLatencyProbeFuture.wait();
     stopAdvancedVideoClient();
@@ -4143,6 +4430,8 @@ void NinjamVst3AudioProcessor::prepareToPlay (double sampleRate, int samplesPerB
 {
     intervalSyncSampleCounter.store(0, std::memory_order_relaxed);
     processingSampleRate = sampleRate > 1.0 ? sampleRate : 44100.0;
+    if (linkTimingState != nullptr)
+        linkTimingState->reset();
     if (localChordAnalyzer)
         localChordAnalyzer->prepare(processingSampleRate);
     for (auto& analyzer : remoteChordAnalyzers)
@@ -4176,10 +4465,19 @@ void NinjamVst3AudioProcessor::prepareToPlay (double sampleRate, int samplesPerB
     fxReverbInputBuffer.setSize(1, juce::jmax(1, samplesPerBlock), false, true, true);
     fxDelayInputBuffer.setSize(1, juce::jmax(1, samplesPerBlock), false, true, true);
     fxReturnBuffer.setSize(2, juce::jmax(1, samplesPerBlock), false, true, true);
+
+    linkAudioMaxNumSamples = (size_t) juce::jmax(8192, samplesPerBlock * 2);
+    {
+        const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
+        if (abletonLinkSink != nullptr)
+            abletonLinkSink->requestMaxNumSamples(linkAudioMaxNumSamples);
+    }
 }
 
 void NinjamVst3AudioProcessor::releaseResources()
 {
+    if (linkTimingState != nullptr)
+        linkTimingState->reset();
 }
 
 bool NinjamVst3AudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -4401,6 +4699,7 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                 bool shouldStorePending = false;
                 const juce::String displaySender = sender.isNotEmpty() ? sender : (payloadUserId.isNotEmpty() ? payloadUserId : senderKey);
                 const long long receivedSampleCount = intervalSyncSampleCounter.load(std::memory_order_relaxed);
+                const double receivedAtMs = juce::Time::getMillisecondCounterHiRes();
                 {
                     const juce::ScopedLock lock(intervalSyncAnnouncementLock);
                     const int clampedRemoteServerLatencyMs = remoteServerLatencyMs >= 0 ? juce::jlimit(0, 3000, remoteServerLatencyMs) : -1;
@@ -4434,7 +4733,8 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                     pending.senderKey = senderKey;
                     pending.displaySender = displaySender;
                     pending.receivedSampleCount = receivedSampleCount;
-                    vlogStr("[INTTAG] Pending stored from=" + sender + " userId=" + (payloadUserId.isNotEmpty() ? payloadUserId : sender) + " senderKey=" + senderKey + " remoteInterval=" + juce::String(remoteInterval) + " remoteAbs=" + juce::String(remoteIntervalAbsolute) + " beat=" + juce::String(remoteMarkerBeat) + " samples=" + juce::String(receivedSampleCount));
+                    pending.receivedAtMs = receivedAtMs;
+                    vlogStr("[INTTAG] Pending stored from=" + sender + " userId=" + (payloadUserId.isNotEmpty() ? payloadUserId : sender) + " senderKey=" + senderKey + " remoteInterval=" + juce::String(remoteInterval) + " remoteAbs=" + juce::String(remoteIntervalAbsolute) + " beat=" + juce::String(remoteMarkerBeat) + " samples=" + juce::String(receivedSampleCount) + " receivedAtMs=" + juce::String(receivedAtMs, 2));
                 }
             }
         }
@@ -4749,7 +5049,45 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
             lastHostPosition = info;
         }
     }
-    int numSamples = buffer.getNumSamples();
+
+    const int numSamples = buffer.getNumSamples();
+    std::chrono::microseconds filteredLinkBufferTime { 0 };
+    if (linkTimingState != nullptr)
+    {
+        filteredLinkBufferTime = linkTimingState->hostTimeFilter.sampleTimeToHostTime(linkTimingState->nextSampleTime);
+        linkTimingState->nextSampleTime += (double) numSamples;
+    }
+
+    const SyncMode syncModeAtBlock = getSyncMode();
+    const bool linkTransportMode = (syncModeAtBlock == SyncMode::abletonLink);
+    const bool anyLinkActive = linkTransportMode || isLinkAudioEnabled();
+    std::optional<ableton::LinkAudio::SessionState> linkSessionState;
+    std::chrono::microseconds linkBufferTime { 0 };
+    const double linkQuantum = juce::jmax(1.0, (double) getBPI());
+    constexpr double linkAudioQuantum = 1.0;
+    bool gotLinkState = false;
+    bool linkPlayingAtBlock = false;
+    double linkTempoAtBlock = 0.0;
+    double linkPhaseAtBlock = 0.0;
+    int linkPeersAtBlock = 0;
+    if (anyLinkActive && abletonLink != nullptr)
+    {
+        linkSessionState.emplace(abletonLink->captureAudioSessionState());
+        linkBufferTime = linkTimingState != nullptr ? filteredLinkBufferTime : abletonLink->clock().micros();
+        linkPlayingAtBlock = linkSessionState->isPlaying();
+        linkTempoAtBlock = linkSessionState->tempo();
+        linkPhaseAtBlock = linkSessionState->phaseAtTime(linkBufferTime, linkQuantum);
+        linkPeersAtBlock = (int) abletonLink->numPeers();
+        gotLinkState = true;
+        {
+            const juce::ScopedLock lock(linkTransportStateLock);
+            lastLinkTempo = linkTempoAtBlock;
+            lastLinkPhaseBeats = linkPhaseAtBlock;
+            lastLinkPeerCount = linkPeersAtBlock;
+            lastLinkIsPlaying = linkPlayingAtBlock;
+        }
+    }
+
     intervalSyncSampleCounter.fetch_add((long long)numSamples, std::memory_order_relaxed);
     const bool useHostMidiForLearn = getMidiLearnInputDeviceId().isEmpty();
     const bool useHostMidiForRelay = getMidiRelayInputDeviceId().isEmpty();
@@ -4805,8 +5143,38 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         totalInputChannels += busChans;
     }
 
-    if (tempInputBuffer.getNumChannels() < totalInputChannels || tempInputBuffer.getNumSamples() < numSamples)
-        tempInputBuffer.setSize(totalInputChannels, numSamples, false, false, true);
+    bool anyLocalUsesLinkAudioInput = false;
+    for (int channel = 0; channel < maxLocalChannels; ++channel)
+    {
+        if (localChannelInputs[(size_t) channel].load() == kLocalInputLinkAudioSentinel)
+        {
+            anyLocalUsesLinkAudioInput = true;
+            break;
+        }
+    }
+
+    std::vector<float> blockLinkAudioSamples;
+    int blockLinkAudioNumChannels = 0;
+    int blockLinkAudioNumFrames = 0;
+    if (isLinkAudioEnabled() && isLinkAudioReceiveEnabled())
+    {
+        const juce::SpinLock::ScopedTryLockType receiveLock(linkAudioReceiveLock);
+        if (receiveLock.isLocked() && pendingLinkAudioReady)
+        {
+            blockLinkAudioSamples.swap(pendingLinkAudioSamples);
+            blockLinkAudioNumChannels = pendingLinkAudioNumChannels;
+            blockLinkAudioNumFrames = pendingLinkAudioNumFrames;
+            pendingLinkAudioNumChannels = 0;
+            pendingLinkAudioNumFrames = 0;
+            pendingLinkAudioReady = false;
+        }
+    }
+
+    const int linkInputChannels = blockLinkAudioNumChannels > 0 ? juce::jlimit(1, 2, blockLinkAudioNumChannels) : 0;
+    const int totalAvailableInputChannels = totalInputChannels + linkInputChannels;
+
+    if (tempInputBuffer.getNumChannels() < totalAvailableInputChannels || tempInputBuffer.getNumSamples() < numSamples)
+        tempInputBuffer.setSize(totalAvailableInputChannels, numSamples, false, false, true);
 
     int inputChanIndex = 0;
     for (int bus = 0; bus < numInputBuses; ++bus)
@@ -4825,12 +5193,30 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         }
     }
 
+    if (linkInputChannels > 0)
+    {
+        for (int channel = 0; channel < linkInputChannels; ++channel)
+            tempInputBuffer.clear(totalInputChannels + channel, 0, numSamples);
+
+        const int framesToCopy = juce::jmin(numSamples, blockLinkAudioNumFrames);
+        for (int sampleIndex = 0; sampleIndex < framesToCopy; ++sampleIndex)
+        {
+            const int sourceOffset = sampleIndex * blockLinkAudioNumChannels;
+            tempInputBuffer.setSample(totalInputChannels, sampleIndex, blockLinkAudioSamples[(size_t) sourceOffset]);
+            if (linkInputChannels > 1)
+            {
+                const int rightSource = sourceOffset + juce::jmin(1, blockLinkAudioNumChannels - 1);
+                tempInputBuffer.setSample(totalInputChannels + 1, sampleIndex, blockLinkAudioSamples[(size_t) rightSource]);
+            }
+        }
+    }
+
     if (localChannelBuffer.getNumChannels() < maxLocalChannels || localChannelBuffer.getNumSamples() < numSamples)
         localChannelBuffer.setSize(maxLocalChannels, numSamples, false, false, true);
 
     int requestedLocal = numLocalChannels.load();
     int actualLocal = juce::jlimit(1, maxLocalChannels, requestedLocal);
-    actualLocal = juce::jmin(actualLocal, totalInputChannels);
+    actualLocal = totalAvailableInputChannels > 0 ? juce::jmin(actualLocal, totalAvailableInputChannels) : 0;
     std::array<int, maxLocalChannels> monitorSourceLeft{};
     std::array<int, maxLocalChannels> monitorSourceRight{};
     std::array<bool, maxLocalChannels> monitorStereo{};
@@ -4848,7 +5234,22 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         int leftSource = -1;
         int rightSource = -1;
 
-        if (srcIndex >= 0)
+        if (srcIndex == kLocalInputLinkAudioSentinel)
+        {
+            const int left = totalInputChannels;
+            const int right = linkInputChannels > 1 ? totalInputChannels + 1 : left;
+
+            localChannelBuffer.clear(ch, 0, numSamples);
+            if (left < totalAvailableInputChannels)
+                localChannelBuffer.addFrom(ch, 0, tempInputBuffer, left, 0, numSamples, linkInputChannels > 1 ? 0.5f : 1.0f);
+            if (linkInputChannels > 1 && right < totalAvailableInputChannels)
+                localChannelBuffer.addFrom(ch, 0, tempInputBuffer, right, 0, numSamples, 0.5f);
+
+            leftSource = linkInputChannels > 0 ? left : -1;
+            rightSource = linkInputChannels > 1 ? right : leftSource;
+            monitorStereo[(size_t)ch] = (linkInputChannels > 1);
+        }
+        else if (srcIndex >= 0)
         {
             if (srcIndex >= totalInputChannels)
                 srcIndex = juce::jlimit(0, totalInputChannels - 1, srcIndex);
@@ -4910,7 +5311,7 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         float localMaxL = 0.0f;
         float localMaxR = 0.0f;
 
-        if (leftSource >= 0 && leftSource < totalInputChannels)
+        if (leftSource >= 0 && leftSource < totalAvailableInputChannels)
         {
             const float* leftData = tempInputBuffer.getReadPointer(leftSource);
             for (int i = 0; i < numSamples; ++i)
@@ -4921,7 +5322,7 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
             }
         }
 
-        if (rightSource >= 0 && rightSource < totalInputChannels)
+        if (rightSource >= 0 && rightSource < totalAvailableInputChannels)
         {
             const float* rightData = tempInputBuffer.getReadPointer(rightSource);
             for (int i = 0; i < numSamples; ++i)
@@ -4943,10 +5344,10 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
             globalLocalMaxR = localMaxR;
     }
 
-    if (totalInputChannels > 0 && numSamples > 0 && actualLocal > 0)
+    if (totalAvailableInputChannels > 0 && numSamples > 0 && actualLocal > 0)
     {
         const int srcL = monitorSourceLeft[0] >= 0 ? monitorSourceLeft[0] : 0;
-        const int srcR = (monitorSourceRight[0] >= 0 && monitorSourceRight[0] < totalInputChannels)
+        const int srcR = (monitorSourceRight[0] >= 0 && monitorSourceRight[0] < totalAvailableInputChannels)
                          ? monitorSourceRight[0] : srcL;
         const float* dev0 = tempInputBuffer.getReadPointer(srcL);
         const float* dev1 = tempInputBuffer.getReadPointer(srcR);
@@ -5183,11 +5584,11 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
             const float gain = localChannelGains[0].load();
 
             localMixBuffer.clear();
-            if (sourceLeft >= 0 && sourceLeft < totalInputChannels)
+            if (sourceLeft >= 0 && sourceLeft < totalAvailableInputChannels)
                 localMixBuffer.copyFrom(0, 0, tempInputBuffer, sourceLeft, 0, numSamples);
-            if (sourceRight >= 0 && sourceRight < totalInputChannels)
+            if (sourceRight >= 0 && sourceRight < totalAvailableInputChannels)
                 localMixBuffer.copyFrom(1, 0, tempInputBuffer, sourceRight, 0, numSamples);
-            else if (sourceLeft >= 0 && sourceLeft < totalInputChannels)
+            else if (sourceLeft >= 0 && sourceLeft < totalAvailableInputChannels)
                 localMixBuffer.copyFrom(1, 0, tempInputBuffer, sourceLeft, 0, numSamples);
 
             if (gain != 1.0f)
@@ -5252,7 +5653,7 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
 
     bool gateForSync = false;
     bool runMonitorOnly = false;
-    if (isSyncToHostEnabled())
+    if (syncModeAtBlock == SyncMode::host)
     {
         bool hostValid = gotHostPosition;
         bool hostPlaying = hostValid && hostInfoAtBlock.isPlaying;
@@ -5288,9 +5689,50 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         }
         runMonitorOnly = gateForSync;
     }
+    else if (syncModeAtBlock == SyncMode::abletonLink)
+    {
+        const bool linkPlaying = gotLinkState && linkPlayingAtBlock;
+        const bool prev = linkWasPlaying.load();
+        const bool waitingForRestart = syncAwaitingHostRestart.load();
+
+        if (!gotLinkState || !linkPlaying)
+        {
+            hostWasPlaying.store(false);
+            linkWasPlaying.store(false);
+            syncAwaitingHostRestart.store(false);
+            syncWaitForInterval.store(false);
+            syncTargetInterval.store(-1);
+            syncDisplayPositionOffset.store(0);
+            gateForSync = true;
+        }
+        else if (waitingForRestart)
+        {
+            hostWasPlaying.store(false);
+            linkWasPlaying.store(false);
+            syncDisplayPositionOffset.store(0);
+            gateForSync = true;
+        }
+        else
+        {
+            hostWasPlaying.store(true);
+            linkWasPlaying.store(true);
+            if (!prev)
+            {
+                const auto startTime = linkSessionState->timeForIsPlaying();
+                const double startPhaseBeats = linkSessionState->phaseAtTime(startTime, linkQuantum);
+                primeLinkTransportStart(startPhaseBeats, linkQuantum, linkTempoAtBlock);
+                syncWaitForInterval.store(false);
+                syncTargetInterval.store(-1);
+                syncDisplayIntervalOffset.store(intervalIndex.load());
+            }
+        }
+
+        runMonitorOnly = gateForSync;
+    }
     else
     {
         hostWasPlaying.store(false);
+        linkWasPlaying.store(false);
         syncWaitForInterval.store(false);
         syncTargetInterval.store(-1);
         syncDisplayIntervalOffset.store(0);
@@ -5306,6 +5748,51 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     float** engineInputs = allowEngineLocalInput ? inputs : nullptr;
     int engineInputChannels = allowEngineLocalInput ? actualInputChannels : 0;
     ninjamClient.AudioProc(engineInputs, engineInputChannels, outputs, actualOutputChannels, numSamples, (int)getSampleRate(), runMonitorOnly);
+
+    if (linkSessionState.has_value() && isLinkAudioEnabled() && isLinkAudioSendEnabled())
+    {
+        const juce::SpinLock::ScopedTryLockType endpointLock(linkAudioEndpointLock);
+        if (endpointLock.isLocked())
+        {
+            const double beatsAtBufferBegin = linkSessionState->beatAtTime(linkBufferTime, linkAudioQuantum);
+            for (auto& pair : remoteLinkAudioOutputPairs)
+            {
+                auto sinkIt = remoteLinkAudioSinks.find(pair.first);
+                if (sinkIt == remoteLinkAudioSinks.end() || sinkIt->second == nullptr)
+                    continue;
+
+                const int leftChannel = pair.second * 2;
+                const int rightChannel = leftChannel + 1;
+                if (leftChannel < 0 || rightChannel >= actualOutputChannels)
+                    continue;
+                if (outputs[leftChannel] == nullptr || outputs[rightChannel] == nullptr)
+                    continue;
+
+                sinkIt->second->requestMaxNumSamples((size_t) juce::jmax(2, numSamples * 2));
+                ableton::LinkAudioSink::BufferHandle sinkBuffer(*sinkIt->second);
+                if (!sinkBuffer || sinkBuffer.samples == nullptr || sinkBuffer.maxNumSamples < (size_t) numSamples * 2u)
+                    continue;
+
+                for (int sampleIndex = 0; sampleIndex < numSamples; ++sampleIndex)
+                {
+                    const float leftSample = juce::jlimit(-1.0f, 1.0f, outputs[leftChannel][sampleIndex]);
+                    const float rightSample = juce::jlimit(-1.0f, 1.0f, outputs[rightChannel][sampleIndex]);
+                    sinkBuffer.samples[(size_t) sampleIndex * 2u] = (int16_t) std::lround(leftSample * 32767.0f);
+                    sinkBuffer.samples[(size_t) sampleIndex * 2u + 1u] = (int16_t) std::lround(rightSample * 32767.0f);
+                }
+
+                sinkBuffer.commit(*linkSessionState,
+                                  beatsAtBufferBegin,
+                                  linkAudioQuantum,
+                                  (size_t) numSamples,
+                                  2u,
+                                  (uint32_t) std::llround(juce::jmax(1.0, getSampleRate())));
+
+                juce::FloatVectorOperations::clear(outputs[leftChannel], numSamples);
+                juce::FloatVectorOperations::clear(outputs[rightChannel], numSamples);
+            }
+        }
+    }
 
     if (monitorEnabled || transmitEnabled)
     {
@@ -5324,10 +5811,10 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
                 const int sourceLeft = monitorSourceLeft[(size_t)ch];
                 const int sourceRight = monitorSourceRight[(size_t)ch];
                 const float gain = localChannelGains[(size_t)ch].load();
-                if (sourceLeft < 0 || sourceLeft >= totalInputChannels)
+                if (sourceLeft < 0 || sourceLeft >= totalAvailableInputChannels)
                     continue;
 
-                if (monitorStereo[(size_t)ch] && sourceRight >= 0 && sourceRight < totalInputChannels)
+                if (monitorStereo[(size_t)ch] && sourceRight >= 0 && sourceRight < totalAvailableInputChannels)
                 {
                     if (outLeft < outChans)
                         mainBus.addFrom(outLeft, 0, tempInputBuffer, sourceLeft, 0, numSamples, gain);
@@ -5374,6 +5861,29 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         masterPeakL.store(0.0f);
         masterPeakR.store(0.0f);
         return;
+    }
+
+    if (linkInputChannels > 0 && !anyLocalUsesLinkAudioInput)
+    {
+        auto mainBus = getBusBuffer(buffer, false, 0);
+        const int outputChannels = mainBus.getNumChannels();
+        if (outputChannels > 0)
+        {
+            const int linkLeft = totalInputChannels;
+            const int linkRight = linkInputChannels > 1 ? totalInputChannels + 1 : linkLeft;
+            if (outputChannels > 1)
+            {
+                mainBus.addFrom(0, 0, tempInputBuffer, linkLeft, 0, numSamples);
+                mainBus.addFrom(1, 0, tempInputBuffer, linkRight, 0, numSamples);
+            }
+            else if (outputChannels == 1)
+            {
+                const float foldGain = linkInputChannels > 1 ? 0.5f : 1.0f;
+                mainBus.addFrom(0, 0, tempInputBuffer, linkLeft, 0, numSamples, foldGain);
+                if (linkInputChannels > 1)
+                mainBus.addFrom(0, 0, tempInputBuffer, linkRight, 0, numSamples, 0.5f);
+            }
+        }
     }
 
     if (numOutputBusesOut > 0 && fxSendActive)
@@ -5458,6 +5968,46 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         maxSampleL = maxSample;
         maxSampleR = maxSample;
     }
+
+    if (linkSessionState.has_value() && isLinkAudioEnabled() && isLinkAudioSendEnabled() && numOutputBusesOut > 0)
+    {
+        const juce::SpinLock::ScopedTryLockType endpointLock(linkAudioEndpointLock);
+        if (endpointLock.isLocked() && abletonLinkSink != nullptr)
+        {
+            abletonLinkSink->requestMaxNumSamples((size_t) juce::jmax(2, numSamples * 2));
+            ableton::LinkAudioSink::BufferHandle sinkBuffer(*abletonLinkSink);
+            if (sinkBuffer)
+            {
+                auto mainBus = getBusBuffer(buffer, false, 0);
+                const int mainBusChannels = mainBus.getNumChannels();
+                if (mainBusChannels > 0)
+                {
+                    const float* left = mainBus.getReadPointer(0);
+                    const float* right = mainBus.getReadPointer(juce::jmin(1, mainBusChannels - 1));
+                    const size_t requiredSamples = (size_t) numSamples * 2u;
+                    if (sinkBuffer.maxNumSamples >= requiredSamples)
+                    {
+                        for (int sampleIndex = 0; sampleIndex < numSamples; ++sampleIndex)
+                        {
+                            const float leftSample = juce::jlimit(-1.0f, 1.0f, left[sampleIndex]);
+                            const float rightSample = juce::jlimit(-1.0f, 1.0f, right[sampleIndex]);
+                            sinkBuffer.samples[(size_t) sampleIndex * 2u] = (int16_t) std::lround(leftSample * 32767.0f);
+                            sinkBuffer.samples[(size_t) sampleIndex * 2u + 1u] = (int16_t) std::lround(rightSample * 32767.0f);
+                        }
+
+                        const double beatsAtBufferBegin = linkSessionState->beatAtTime(linkBufferTime, linkAudioQuantum);
+                        sinkBuffer.commit(*linkSessionState,
+                                          beatsAtBufferBegin,
+                                          linkAudioQuantum,
+                                          (size_t) numSamples,
+                                          2u,
+                                          (uint32_t) std::llround(juce::jmax(1.0, getSampleRate())));
+                    }
+                }
+            }
+        }
+    }
+
     masterPeak.store(maxSample);
     masterPeakL.store(maxSampleL);
     masterPeakR.store(maxSampleR);
@@ -5600,26 +6150,76 @@ void NinjamVst3AudioProcessor::IntervalMediaItem_Callback(void* userData, NJClie
 
 void NinjamVst3AudioProcessor::setSyncToHost(bool shouldSync)
 {
-    syncToHost = shouldSync;
+    setSyncMode(shouldSync ? SyncMode::host : SyncMode::off);
+}
+
+NinjamVst3AudioProcessor::SyncMode NinjamVst3AudioProcessor::getSyncMode() const
+{
+    return syncMode.load(std::memory_order_relaxed);
+}
+
+bool NinjamVst3AudioProcessor::isTransportSyncEnabled() const
+{
+    return getSyncMode() != SyncMode::off;
+}
+
+void NinjamVst3AudioProcessor::setSyncMode(SyncMode newMode)
+{
+    syncMode.store(newMode, std::memory_order_relaxed);
     hostWasPlaying.store(false);
+    linkWasPlaying.store(false);
     bool hostIsPlayingNow = false;
+    bool linkIsPlayingNow = false;
+    double linkPhaseBeats = 0.0;
+    const double linkQuantum = juce::jmax(1.0, (double) getBPI());
+
+    if (newMode == SyncMode::host)
     {
         const juce::ScopedLock lock(transportLock);
         hostIsPlayingNow = lastHostPosition.isPlaying;
     }
-    syncAwaitingHostRestart.store(shouldSync && hostIsPlayingNow);
+
+    refreshAbletonLinkActivation();
+
+    if (newMode == SyncMode::abletonLink && abletonLink != nullptr)
+    {
+        auto sessionState = abletonLink->captureAppSessionState();
+        const auto now = abletonLink->clock().micros();
+        linkIsPlayingNow = sessionState.isPlaying();
+        linkPhaseBeats = sessionState.phaseAtTime(now, linkQuantum);
+        const juce::ScopedLock lock(linkTransportStateLock);
+        lastLinkTempo = sessionState.tempo();
+        lastLinkPhaseBeats = linkPhaseBeats;
+        lastLinkPeerCount = (int) abletonLink->numPeers();
+        lastLinkIsPlaying = linkIsPlayingNow;
+    }
+
+    const bool waitForRestart = (newMode == SyncMode::host && hostIsPlayingNow)
+        || (newMode == SyncMode::abletonLink && linkIsPlayingNow);
+
+    syncAwaitingHostRestart.store(waitForRestart);
     syncWaitForInterval.store(false);
     syncTargetInterval.store(-1);
     syncDisplayIntervalOffset.store(intervalIndex.load());
     syncDisplayPositionOffset.store(0);
 
-    if (shouldSync)
+    if (newMode == SyncMode::host)
         primeSyncTransportStart();
+    else if (newMode == SyncMode::abletonLink && linkIsPlayingNow)
+    {
+        hostWasPlaying.store(false);
+        linkWasPlaying.store(false);
+    }
 }
 
 bool NinjamVst3AudioProcessor::isSyncToHostEnabled() const
 {
-    return syncToHost;
+    return getSyncMode() == SyncMode::host;
+}
+
+bool NinjamVst3AudioProcessor::isAbletonLinkTransportEnabled() const
+{
+    return getSyncMode() == SyncMode::abletonLink;
 }
 
 void NinjamVst3AudioProcessor::setSyncStartCompensationMs(float ms)
@@ -5660,11 +6260,297 @@ void NinjamVst3AudioProcessor::primeSyncTransportStart(const juce::AudioPlayHead
     syncDisplayPositionOffset.store(displayOffset);
 }
 
+void NinjamVst3AudioProcessor::primeLinkTransportStart(double phaseBeats, double quantum, double tempoBpm)
+{
+    ninjamClient.ResetTransportPhase();
+    ninjamClient.ResetLocalBroadcastState();
+
+    int intervalLength = 0;
+    ninjamClient.GetPosition(nullptr, &intervalLength);
+    if (intervalLength <= 0)
+        return;
+
+    int startPositionSamples = computeLinkSyncStartPositionSamples(phaseBeats,
+                                                                   quantum,
+                                                                   tempoBpm,
+                                                                   getSampleRate());
+    startPositionSamples += getSyncStartCompensationSamples();
+
+    const int displayOffset = normaliseSignedIntervalPosition(startPositionSamples, intervalLength);
+    ninjamClient.SetTransportPosition(displayOffset);
+    syncDisplayPositionOffset.store(displayOffset);
+}
+
 bool NinjamVst3AudioProcessor::getHostPosition(juce::AudioPlayHead::CurrentPositionInfo& info) const
 {
     const juce::ScopedLock lock(transportLock);
     info = lastHostPosition;
     return true;
+}
+
+void NinjamVst3AudioProcessor::setLinkAudioEnabled(bool shouldEnable)
+{
+    linkAudioEnabled.store(shouldEnable, std::memory_order_relaxed);
+    refreshAbletonLinkActivation();
+}
+
+bool NinjamVst3AudioProcessor::isLinkAudioEnabled() const
+{
+    return linkAudioEnabled.load(std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::setLinkAudioSendEnabled(bool shouldEnable)
+{
+    linkAudioSendEnabled.store(shouldEnable, std::memory_order_relaxed);
+    rebuildLinkAudioEndpoints();
+}
+
+bool NinjamVst3AudioProcessor::isLinkAudioSendEnabled() const
+{
+    return linkAudioSendEnabled.load(std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::setLinkAudioReceiveEnabled(bool shouldEnable)
+{
+    linkAudioReceiveEnabled.store(shouldEnable, std::memory_order_relaxed);
+    rebuildLinkAudioEndpoints();
+}
+
+bool NinjamVst3AudioProcessor::isLinkAudioReceiveEnabled() const
+{
+    return linkAudioReceiveEnabled.load(std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::setLinkAudioReceiveSelection(const juce::String& channelKey)
+{
+    {
+        const juce::ScopedLock lock(linkAudioSelectionLock);
+        linkAudioReceiveSelection = channelKey.trim();
+    }
+    rebuildLinkAudioEndpoints();
+}
+
+juce::String NinjamVst3AudioProcessor::getLinkAudioReceiveSelection() const
+{
+    const juce::ScopedLock lock(linkAudioSelectionLock);
+    return linkAudioReceiveSelection;
+}
+
+std::vector<NinjamVst3AudioProcessor::LinkAudioChannelInfo> NinjamVst3AudioProcessor::getLinkAudioAvailableChannels() const
+{
+    std::vector<LinkAudioChannelInfo> result;
+    if (abletonLink == nullptr || !isLinkAudioEnabled())
+        return result;
+
+    const juce::String localPeerName = getLinkPeerName();
+    for (const auto& channel : abletonLink->channels())
+    {
+        LinkAudioChannelInfo info;
+        info.name = juce::String::fromUTF8(channel.name.c_str()).trim();
+        info.peerName = juce::String::fromUTF8(channel.peerName.c_str()).trim();
+        if (info.name.isEmpty())
+            info.name = "Audio";
+        if (info.peerName.isEmpty())
+            info.peerName = "Link";
+        if (info.peerName == localPeerName)
+            continue;
+        info.key = buildLinkAudioChannelKey(info.peerName, info.name);
+        result.push_back(std::move(info));
+    }
+
+    return result;
+}
+
+double NinjamVst3AudioProcessor::getLinkTempoBpm() const
+{
+    const juce::ScopedLock lock(linkTransportStateLock);
+    return lastLinkTempo;
+}
+
+bool NinjamVst3AudioProcessor::isLinkTransportPlaying() const
+{
+    const juce::ScopedLock lock(linkTransportStateLock);
+    return lastLinkIsPlaying;
+}
+
+int NinjamVst3AudioProcessor::getLinkPeerCount() const
+{
+    const juce::ScopedLock lock(linkTransportStateLock);
+    return lastLinkPeerCount;
+}
+
+void NinjamVst3AudioProcessor::refreshAbletonLinkActivation()
+{
+    if (abletonLink == nullptr)
+        abletonLink = std::make_unique<ableton::LinkAudio>(120.0, getLinkPeerName().toStdString());
+
+    abletonLink->setPeerName(getLinkPeerName().toStdString());
+
+    const bool transportEnabled = isAbletonLinkTransportEnabled();
+    const bool audioEnabled = isLinkAudioEnabled();
+
+    abletonLink->enable(transportEnabled || audioEnabled);
+    abletonLink->enableStartStopSync(transportEnabled);
+    abletonLink->enableLinkAudio(audioEnabled);
+
+    if (!transportEnabled)
+    {
+        linkWasPlaying.store(false);
+        const juce::ScopedLock lock(linkTransportStateLock);
+        lastLinkIsPlaying = false;
+    }
+
+    lastLinkAudioEndpointRefreshMs = 0.0;
+    rebuildLinkAudioEndpoints();
+}
+
+void NinjamVst3AudioProcessor::rebuildLinkAudioEndpoints()
+{
+    std::unique_ptr<ableton::LinkAudioSink> newSink;
+    std::unique_ptr<ableton::LinkAudioSource> newSource;
+    std::map<juce::String, std::unique_ptr<ableton::LinkAudioSink>> newRemoteSinks;
+
+    if (abletonLink != nullptr && isLinkAudioEnabled())
+    {
+        if (isLinkAudioSendEnabled())
+            newSink = std::make_unique<ableton::LinkAudioSink>(*abletonLink, std::string("Main Mix"), linkAudioMaxNumSamples);
+
+        if (isLinkAudioSendEnabled())
+        {
+            const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
+            for (const auto& pair : remoteLinkAudioOutputPairs)
+            {
+                const std::string channelName = pair.first.trim().isNotEmpty()
+                    ? pair.first.trim().toStdString()
+                    : std::string("Remote");
+                newRemoteSinks.emplace(pair.first,
+                                       std::make_unique<ableton::LinkAudioSink>(*abletonLink, channelName, linkAudioMaxNumSamples));
+            }
+        }
+
+        if (isLinkAudioReceiveEnabled())
+        {
+            const juce::String selectedKey = getLinkAudioReceiveSelection();
+            if (selectedKey.isNotEmpty())
+            {
+                for (const auto& channel : abletonLink->channels())
+                {
+                    const juce::String peerName = juce::String::fromUTF8(channel.peerName.c_str()).trim();
+                    const juce::String channelName = juce::String::fromUTF8(channel.name.c_str()).trim();
+                    if (buildLinkAudioChannelKey(peerName, channelName) != selectedKey)
+                        continue;
+
+                    newSource = std::make_unique<ableton::LinkAudioSource>(
+                        *abletonLink,
+                        channel.id,
+                        [this](ableton::LinkAudioSource::BufferHandle bufferHandle)
+                        {
+                            if (bufferHandle.samples == nullptr)
+                                return;
+
+                            const size_t totalSamples = bufferHandle.info.numChannels * bufferHandle.info.numFrames;
+                            if (totalSamples == 0)
+                                return;
+
+                            const juce::SpinLock::ScopedTryLockType lock(linkAudioReceiveLock);
+                            if (!lock.isLocked())
+                                return;
+
+                            pendingLinkAudioSamples.resize(totalSamples);
+                            for (size_t sampleIndex = 0; sampleIndex < totalSamples; ++sampleIndex)
+                                pendingLinkAudioSamples[sampleIndex] = juce::jlimit(-1.0f, 1.0f, (float) bufferHandle.samples[sampleIndex] / 32768.0f);
+
+                            pendingLinkAudioNumChannels = (int) bufferHandle.info.numChannels;
+                            pendingLinkAudioNumFrames = (int) bufferHandle.info.numFrames;
+                            pendingLinkAudioReady = true;
+                        });
+                    break;
+                }
+            }
+        }
+    }
+
+    {
+        const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
+        abletonLinkSink = std::move(newSink);
+        abletonLinkSource = std::move(newSource);
+        remoteLinkAudioSinks = std::move(newRemoteSinks);
+    }
+
+    {
+        const juce::SpinLock::ScopedLockType receiveLock(linkAudioReceiveLock);
+        if (abletonLinkSource == nullptr)
+        {
+            pendingLinkAudioSamples.clear();
+            pendingLinkAudioNumChannels = 0;
+            pendingLinkAudioNumFrames = 0;
+            pendingLinkAudioReady = false;
+        }
+    }
+}
+
+void NinjamVst3AudioProcessor::mixReceivedLinkAudioIntoBuffer(juce::AudioBuffer<float>& buffer, int numSamples)
+{
+    std::vector<float> receivedSamples;
+    int numChannels = 0;
+    int numFrames = 0;
+
+    {
+        const juce::SpinLock::ScopedTryLockType receiveLock(linkAudioReceiveLock);
+        if (!receiveLock.isLocked() || !pendingLinkAudioReady)
+            return;
+
+        receivedSamples.swap(pendingLinkAudioSamples);
+        numChannels = pendingLinkAudioNumChannels;
+        numFrames = pendingLinkAudioNumFrames;
+        pendingLinkAudioNumChannels = 0;
+        pendingLinkAudioNumFrames = 0;
+        pendingLinkAudioReady = false;
+    }
+
+    if (receivedSamples.empty() || numChannels <= 0 || numFrames <= 0 || getBusCount(false) <= 0)
+        return;
+
+    auto mainBus = getBusBuffer(buffer, false, 0);
+    const int outputChannels = mainBus.getNumChannels();
+    if (outputChannels <= 0)
+        return;
+
+    const int framesToMix = juce::jmin(numSamples, numFrames);
+    if (numChannels == 1)
+    {
+        float* left = mainBus.getWritePointer(0);
+        float* right = mainBus.getWritePointer(juce::jmin(1, outputChannels - 1));
+        for (int sampleIndex = 0; sampleIndex < framesToMix; ++sampleIndex)
+        {
+            const float sample = receivedSamples[(size_t) sampleIndex];
+            left[sampleIndex] += sample;
+            if (outputChannels > 1)
+                right[sampleIndex] += sample;
+        }
+        return;
+    }
+
+    float* left = mainBus.getWritePointer(0);
+    float* right = mainBus.getWritePointer(juce::jmin(1, outputChannels - 1));
+    for (int sampleIndex = 0; sampleIndex < framesToMix; ++sampleIndex)
+    {
+        const size_t baseIndex = (size_t) sampleIndex * (size_t) numChannels;
+        left[sampleIndex] += receivedSamples[baseIndex];
+        if (outputChannels > 1)
+            right[sampleIndex] += receivedSamples[baseIndex + 1];
+    }
+}
+
+juce::String NinjamVst3AudioProcessor::buildLinkAudioChannelKey(const juce::String& peerName, const juce::String& channelName) const
+{
+    return peerName.trim() + "::" + channelName.trim();
+}
+
+juce::String NinjamVst3AudioProcessor::getLinkPeerName() const
+{
+    const juce::String user = currentUser.trim();
+    return user.isNotEmpty() ? (juce::String(JucePlugin_Name) + " " + user) : juce::String(JucePlugin_Name);
 }
 
 void NinjamVst3AudioProcessor::setMtcOutputEnabled(bool shouldEnable)
@@ -5938,7 +6824,7 @@ bool NinjamVst3AudioProcessor::isStandaloneWrapper() const
 int NinjamVst3AudioProcessor::getDisplayIntervalIndex() const
 {
     const int absolute = intervalIndex.load();
-    if (!isSyncToHostEnabled())
+    if (!isTransportSyncEnabled())
         return absolute;
     if (!hostWasPlaying.load())
         return 0;
@@ -5957,7 +6843,7 @@ void NinjamVst3AudioProcessor::emitMidiTimecode(juce::MidiBuffer& midiMessages, 
     const double fps = fpsSetting == 2997 ? 29.97 : (double)fpsSetting;
     const juce::uint8 rateCode = fpsSetting == 24 ? 0x00 : fpsSetting == 25 ? 0x01 : fpsSetting == 2997 ? 0x02 : 0x03;
 
-    const bool waitingForStart = isSyncToHostEnabled() && (!hostWasPlaying.load() || syncWaitForInterval.load());
+    const bool waitingForStart = isTransportSyncEnabled() && (!hostWasPlaying.load() || syncWaitForInterval.load());
     const bool shouldRun = (length > 0) && !waitingForStart;
 
     auto sendLocate = [&midiMessages, rateCode](int sampleOffset, int hours, int minutes, int seconds, int frames)
@@ -6088,7 +6974,12 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     state.setProperty("translateTargetLang", getTranslateTargetLang(), nullptr);
     state.setProperty("fxReverbWetDryMix", (double)getFxReverbWetDryMix(), nullptr);
     state.setProperty("fxDelayWetDryMix", (double)getFxDelayWetDryMix(), nullptr);
+    state.setProperty("syncMode", (int)getSyncMode(), nullptr);
     state.setProperty("syncStartCompensationMs", (double)getSyncStartCompensationMs(), nullptr);
+    state.setProperty("linkAudioEnabled", isLinkAudioEnabled(), nullptr);
+    state.setProperty("linkAudioSendEnabled", isLinkAudioSendEnabled(), nullptr);
+    state.setProperty("linkAudioReceiveEnabled", isLinkAudioReceiveEnabled(), nullptr);
+    state.setProperty("linkAudioReceiveSelection", getLinkAudioReceiveSelection(), nullptr);
     state.setProperty("metronomeMuted", isMetronomeMuted(), nullptr);
     state.setProperty("metronomeVolume", (double)getStoredMetronomeVolume(), nullptr);
     state.setProperty("transmitLocal", isTransmittingLocal(), nullptr);
@@ -6120,7 +7011,12 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setTranslateTargetLang(state.getProperty("translateTargetLang", "system").toString());
     setFxReverbWetDryMix((float)(double)state.getProperty("fxReverbWetDryMix", 1.0));
     setFxDelayWetDryMix((float)(double)state.getProperty("fxDelayWetDryMix", 1.0));
+    setSyncMode((SyncMode) (int) state.getProperty("syncMode", (int) SyncMode::off));
     setSyncStartCompensationMs((float)(double)state.getProperty("syncStartCompensationMs", 0.0));
+    setLinkAudioEnabled((bool)state.getProperty("linkAudioEnabled", false));
+    setLinkAudioSendEnabled((bool)state.getProperty("linkAudioSendEnabled", true));
+    setLinkAudioReceiveEnabled((bool)state.getProperty("linkAudioReceiveEnabled", false));
+    setLinkAudioReceiveSelection(state.getProperty("linkAudioReceiveSelection", "").toString());
     storedMetronomeVolume.store(juce::jlimit(0.0f, 1.0f, (float)(double)state.getProperty("metronomeVolume", 1.0)));
     setMetronomeMuted((bool)state.getProperty("metronomeMuted", false));
     setTransmitLocal((bool)state.getProperty("transmitLocal", false));
@@ -6135,8 +7031,8 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
         return;
 
     const int safeLocalMarkerBeat = juce::jmax(0, localMarkerBeat);
-    const int safeLocalBpi = juce::jmax(1, getBPI());
     const double safeIntervalDurationMs = juce::jmax(1.0, intervalDurationMs);
+    const double localMarkerAtMs = juce::Time::getMillisecondCounterHiRes();
 
     for (;;)
     {
@@ -6148,7 +7044,7 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
                 break;
             for (auto staleIt = pendingRemoteIntervalStartsByUser.begin(); staleIt != pendingRemoteIntervalStartsByUser.end();)
             {
-                if (staleIt->second.receivedSampleCount < 0)
+                if (staleIt->second.receivedSampleCount < 0 && staleIt->second.receivedAtMs <= 0.0)
                     staleIt = pendingRemoteIntervalStartsByUser.erase(staleIt);
                 else
                     ++staleIt;
@@ -6170,13 +7066,21 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
                 : chosenIt->first.upToFirstOccurrenceOf(":", false, false);
             pendingRemoteIntervalStartsByUser.erase(chosenIt);
         }
-        if (pending.receivedSampleCount < 0 || senderKey.isEmpty())
+        if (senderKey.isEmpty() || (pending.receivedSampleCount < 0 && pending.receivedAtMs <= 0.0))
             continue;
-        const long long elapsedSamples = localMarkerSampleCount - pending.receivedSampleCount;
-        if (elapsedSamples < 0)
-            continue;
-        const double sampleRate = juce::jmax(1.0, getSampleRate());
-        const double elapsedToNextLocalMarkerMs = ((double)elapsedSamples / sampleRate) * 1000.0;
+        double elapsedToNextLocalMarkerMs = -1.0;
+        if (pending.receivedAtMs > 0.0 && localMarkerAtMs >= pending.receivedAtMs)
+        {
+            elapsedToNextLocalMarkerMs = localMarkerAtMs - pending.receivedAtMs;
+        }
+        else if (pending.receivedSampleCount >= 0)
+        {
+            const long long elapsedSamples = localMarkerSampleCount - pending.receivedSampleCount;
+            if (elapsedSamples < 0)
+                continue;
+            const double sampleRate = juce::jmax(1.0, getSampleRate());
+            elapsedToNextLocalMarkerMs = ((double)elapsedSamples / sampleRate) * 1000.0;
+        }
         const double outlierLimitMs = safeIntervalDurationMs * 2.0;
         if (!std::isfinite(elapsedToNextLocalMarkerMs) || elapsedToNextLocalMarkerMs < 0.0 || elapsedToNextLocalMarkerMs > outlierLimitMs)
             continue;
@@ -6232,12 +7136,9 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
                     avgState.baseMarkerCorrectedDelayMs = (double)correctedDelayMs;
                     baseMarkerCorrectedDelayMs = correctedDelayMs;
                 }
-                else if (safeLocalBpi > intervalSyncRepeatThresholdBpi && avgState.baseMarkerCorrectedDelayMs >= 0.0)
+                else if (avgState.baseMarkerCorrectedDelayMs >= 0.0)
                 {
                     baseMarkerCorrectedDelayMs = juce::jmax(0, (int)std::llround(avgState.baseMarkerCorrectedDelayMs));
-                    markerOffsetMs = juce::jmax(0, (int)std::llround((safeIntervalDurationMs * (double)pending.remoteBeat) / (double)safeLocalBpi));
-                    correctedDelayMs = juce::jmax(0, baseMarkerCorrectedDelayMs - markerOffsetMs);
-                    derivedFromBaseMarker = true;
                 }
             }
         }
@@ -6366,7 +7267,7 @@ void NinjamVst3AudioProcessor::timerCallback()
             lastOpusSupportBroadcastMs = 0.0;
             localServerLatencyMs.store(-1);
             lastServerLatencyProbeInterval.store(-1);
-            if (!isSyncToHostEnabled())
+            if (!isTransportSyncEnabled())
             {
                 syncWaitForInterval.store(false);
                 syncTargetInterval.store(-1);
@@ -6420,6 +7321,12 @@ void NinjamVst3AudioProcessor::timerCallback()
             lastServerLatencyProbeAttemptMs = nowMs;
         }
 
+        if (isLinkAudioEnabled() && (nowMs - lastLinkAudioEndpointRefreshMs) >= 1000.0)
+        {
+            rebuildLinkAudioEndpoints();
+            lastLinkAudioEndpointRefreshMs = nowMs;
+        }
+
         flushOutboundMidiRelayEvents();
         flushOutboundOscRelayEvents();
     }
@@ -6437,12 +7344,31 @@ void NinjamVst3AudioProcessor::timerCallback()
 
         if (timingChanged)
         {
+            int timingDelayDeltaMs = 0;
+            if (lastLatencyTimingBpi > 0 && lastLatencyTimingBpm > 0.0)
+            {
+                const double previousIntervalDurationMs = (60.0 / lastLatencyTimingBpm) * (double)lastLatencyTimingBpi * 1000.0;
+                const double newIntervalDurationMs = (60.0 / localBpm) * (double)localBpi * 1000.0;
+                if (std::isfinite(previousIntervalDurationMs) && std::isfinite(newIntervalDurationMs)
+                    && previousIntervalDurationMs > 0.0 && newIntervalDurationMs > 0.0)
+                {
+                    timingDelayDeltaMs = (int)std::llround(newIntervalDurationMs - previousIntervalDurationMs);
+                    if (timingDelayDeltaMs != 0)
+                    {
+                        const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+                        for (auto& userDelay : remoteLatencyFirmDelayMsByUser)
+                            userDelay.second = juce::jmax(0, userDelay.second + timingDelayDeltaMs);
+                    }
+                }
+            }
             invalidateIntervalSyncLatencyState(true);
             lastLatencyTimingBpi = localBpi;
             lastLatencyTimingLength = length;
             lastLatencyTimingBpm = localBpm;
             lastBroadcastIntervalTag.store(-1);
             setIntervalSyncStatusText("Interval sync timing changed, recalculating delay...");
+            if (timingDelayDeltaMs != 0)
+                vlogStr("[MCGuard] Timing changed; adjusted preserved video delays by " + juce::String(timingDelayDeltaMs) + "ms while recalculating");
         }
 
         if (status == NJClient::NJC_STATUS_OK)

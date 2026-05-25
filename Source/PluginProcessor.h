@@ -1,14 +1,17 @@
 #pragma once
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include <JuceHeader.h>
 #include <future>
 #include <atomic>
 #include <memory>
-
-// Disable min/max macros before including ninjam headers
-#ifdef WIN32
-#define NOMINMAX
-#endif
 
 #include "ninjam/njclient.h"
 
@@ -16,6 +19,13 @@ class NinjamVst3AudioProcessorEditor;
 class LocalVideoHttpServer;
 class AsyncChatTranslationWorker;
 class LocalChordAnalyzer;
+
+namespace ableton
+{
+class LinkAudio;
+class LinkAudioSink;
+class LinkAudioSource;
+}
 
 class NinjamVst3AudioProcessor : public juce::AudioProcessor,
                                  public juce::Timer
@@ -109,12 +119,14 @@ public:
         bool isMuted;
         bool isSolo;
         int outputChannel; // 0=Main, 2=Out2, etc.
+        bool outputUsesLinkAudio = false;
         int numChannels = 1;          // number of active NINJAM channels for this user
         bool isMultiChanPeer = false;  // has more than 1 NINJAM channel
         juce::StringArray channelNames; // name of each NINJAM channel (index 0..numChannels-1)
     };
     std::vector<UserInfo> getConnectedUsers();
     void setUserOutput(int userIndex, int outputChannelIndex);
+    bool setUserOutputToLinkAudio(int userIndex);
     void setUserLevel(int userIndex, float volume, float pan, bool isMuted, bool isSolo);
     void setUserVolume(int userIndex, float volume);
     float getUserPeak(int userIndex, int channelIndex); // 0=L, 1=R
@@ -160,6 +172,8 @@ public:
     NinjamVst3AudioProcessorEditor* getEditor() const { return (NinjamVst3AudioProcessorEditor*)getActiveEditor(); }
     void setLocalChannelInput(int channel, int inputIndex);
     int getLocalChannelInput(int channel) const;
+    void setLocalChannelUsesLinkAudioInput(int channel, bool shouldUse);
+    bool isLocalChannelUsingLinkAudioInput(int channel) const;
     float getLocalChannelPeak(int channel) const;
     float getLocalChannelPeakLeft(int channel) const;
     float getLocalChannelPeakRight(int channel) const;
@@ -226,15 +240,46 @@ public:
     void launchVideoSessionAsync();
 
     void rememberUserVolume(int userIndex, float volume, const juce::String& name);
+    void resetRemoteUserIndexState(int userIndex, const juce::String& userName);
 
     void setSpreadOutputsEnabled(bool shouldEnable);
     bool isSpreadOutputsEnabled() const;
 
+    enum class SyncMode : int
+    {
+        off = 0,
+        host = 1,
+        abletonLink = 2
+    };
+
+    struct LinkAudioChannelInfo
+    {
+        juce::String key;
+        juce::String name;
+        juce::String peerName;
+    };
+
+    void setSyncMode(SyncMode newMode);
+    SyncMode getSyncMode() const;
+    bool isTransportSyncEnabled() const;
     void setSyncToHost(bool shouldSync);
     bool isSyncToHostEnabled() const;
+    bool isAbletonLinkTransportEnabled() const;
     void setSyncStartCompensationMs(float ms);
     float getSyncStartCompensationMs() const;
     bool getHostPosition(juce::AudioPlayHead::CurrentPositionInfo& info) const;
+    void setLinkAudioEnabled(bool shouldEnable);
+    bool isLinkAudioEnabled() const;
+    void setLinkAudioSendEnabled(bool shouldEnable);
+    bool isLinkAudioSendEnabled() const;
+    void setLinkAudioReceiveEnabled(bool shouldEnable);
+    bool isLinkAudioReceiveEnabled() const;
+    void setLinkAudioReceiveSelection(const juce::String& channelKey);
+    juce::String getLinkAudioReceiveSelection() const;
+    std::vector<LinkAudioChannelInfo> getLinkAudioAvailableChannels() const;
+    double getLinkTempoBpm() const;
+    bool isLinkTransportPlaying() const;
+    int getLinkPeerCount() const;
     void setMtcOutputEnabled(bool shouldEnable);
     bool isMtcOutputEnabled() const;
     void setMtcFrameRate(int fps);
@@ -275,8 +320,15 @@ public:
     juce::String getIntervalSyncStatusText() const;
 
 private:
+    struct LinkTimingState;
     int getSyncStartCompensationSamples() const;
     void primeSyncTransportStart(const juce::AudioPlayHead::CurrentPositionInfo* hostInfo = nullptr);
+    void primeLinkTransportStart(double phaseBeats, double quantum, double tempoBpm);
+    void refreshAbletonLinkActivation();
+    void rebuildLinkAudioEndpoints();
+    void mixReceivedLinkAudioIntoBuffer(juce::AudioBuffer<float>& buffer, int numSamples);
+    juce::String buildLinkAudioChannelKey(const juce::String& peerName, const juce::String& channelName) const;
+    juce::String getLinkPeerName() const;
     NJClient ninjamClient;
     juce::CriticalSection processLock;
     mutable juce::CriticalSection serverListLock;
@@ -364,9 +416,11 @@ private:
     std::map<juce::String, int> userOutputAssignment;
     std::map<int, float> userBaseVolume;
     std::map<juce::String, float> userVolumeByName;
+    std::map<int, juce::String> remoteUserNameByIndex;
 
-    bool syncToHost = false;
+    std::atomic<SyncMode> syncMode { SyncMode::off };
     std::atomic<bool> hostWasPlaying { false };
+    std::atomic<bool> linkWasPlaying { false };
     std::atomic<bool> syncAwaitingHostRestart { false };
     std::atomic<bool> syncWaitForInterval { false };
     std::atomic<int> syncTargetInterval { -1 };
@@ -380,6 +434,30 @@ private:
     int mtcQuarterFramePiece = 0;
     mutable juce::CriticalSection transportLock;
     juce::AudioPlayHead::CurrentPositionInfo lastHostPosition;
+    mutable juce::CriticalSection linkTransportStateLock;
+    double lastLinkTempo = 120.0;
+    double lastLinkPhaseBeats = 0.0;
+    int lastLinkPeerCount = 0;
+    bool lastLinkIsPlaying = false;
+    std::unique_ptr<ableton::LinkAudio> abletonLink;
+    std::unique_ptr<LinkTimingState> linkTimingState;
+    std::atomic<bool> linkAudioEnabled { false };
+    std::atomic<bool> linkAudioSendEnabled { true };
+    std::atomic<bool> linkAudioReceiveEnabled { false };
+    mutable juce::CriticalSection linkAudioSelectionLock;
+    juce::String linkAudioReceiveSelection;
+    juce::SpinLock linkAudioEndpointLock;
+    std::unique_ptr<ableton::LinkAudioSink> abletonLinkSink;
+    std::unique_ptr<ableton::LinkAudioSource> abletonLinkSource;
+    std::map<juce::String, std::unique_ptr<ableton::LinkAudioSink>> remoteLinkAudioSinks;
+    std::map<juce::String, int> remoteLinkAudioOutputPairs;
+    juce::SpinLock linkAudioReceiveLock;
+    std::vector<float> pendingLinkAudioSamples;
+    int pendingLinkAudioNumChannels = 0;
+    int pendingLinkAudioNumFrames = 0;
+    bool pendingLinkAudioReady = false;
+    size_t linkAudioMaxNumSamples = 8192;
+    double lastLinkAudioEndpointRefreshMs = 0.0;
 
     std::atomic<int> intervalIndex { 0 };
     std::atomic<int> lastIntervalPos { 0 };
@@ -416,6 +494,7 @@ private:
         juce::String senderKey;
         juce::String displaySender;
         long long receivedSampleCount = -1;
+        double receivedAtMs = -1.0;
     };
     std::map<juce::String, PendingRemoteIntervalStart> pendingRemoteIntervalStartsByUser;
     std::map<juce::String, int> lastRemoteServerLatencyMsByUser;

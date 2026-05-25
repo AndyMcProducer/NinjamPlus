@@ -773,6 +773,135 @@ private:
     std::map<int, juce::String> learnDeviceByMenuId;
     std::map<int, juce::String> relayDeviceByMenuId;
 };
+
+class LinkAudioOptionsPopupComponent : public juce::Component
+{
+public:
+    LinkAudioOptionsPopupComponent(NinjamVst3AudioProcessor& p)
+        : processor(p)
+    {
+        addAndMakeVisible(enableToggle);
+        enableToggle.setButtonText("Enable Link Audio");
+        enableToggle.setToggleState(processor.isLinkAudioEnabled(), juce::dontSendNotification);
+        enableToggle.onClick = [this]
+        {
+            processor.setLinkAudioEnabled(enableToggle.getToggleState());
+            refreshChannelSelector();
+            refreshStatusText();
+            updateControlEnablement();
+        };
+
+        addAndMakeVisible(sendToggle);
+        sendToggle.setButtonText("Publish Main Mix");
+        sendToggle.setToggleState(processor.isLinkAudioSendEnabled(), juce::dontSendNotification);
+        sendToggle.onClick = [this]
+        {
+            processor.setLinkAudioSendEnabled(sendToggle.getToggleState());
+            refreshStatusText();
+        };
+
+        addAndMakeVisible(receiveToggle);
+        receiveToggle.setButtonText("Receive Remote Audio");
+        receiveToggle.setToggleState(processor.isLinkAudioReceiveEnabled(), juce::dontSendNotification);
+        receiveToggle.onClick = [this]
+        {
+            processor.setLinkAudioReceiveEnabled(receiveToggle.getToggleState());
+            updateControlEnablement();
+        };
+
+        addAndMakeVisible(receiveChannelLabel);
+        receiveChannelLabel.setText("Receive Channel", juce::dontSendNotification);
+
+        addAndMakeVisible(receiveChannelSelector);
+        receiveChannelSelector.onChange = [this]
+        {
+            const int selectedId = receiveChannelSelector.getSelectedId();
+            const auto it = receiveChannelKeyByMenuId.find(selectedId);
+            processor.setLinkAudioReceiveSelection(it != receiveChannelKeyByMenuId.end() ? it->second : juce::String());
+            refreshStatusText();
+        };
+
+        addAndMakeVisible(statusLabel);
+        statusLabel.setJustificationType(juce::Justification::centredLeft);
+
+        refreshChannelSelector();
+        refreshStatusText();
+        updateControlEnablement();
+        setSize(420, 156);
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced(8);
+        enableToggle.setBounds(area.removeFromTop(26));
+        sendToggle.setBounds(area.removeFromTop(26));
+        receiveToggle.setBounds(area.removeFromTop(26));
+
+        auto selectorRow = area.removeFromTop(34);
+        receiveChannelLabel.setBounds(selectorRow.removeFromLeft(130));
+        receiveChannelSelector.setBounds(selectorRow.removeFromTop(24));
+
+        statusLabel.setBounds(area.removeFromTop(28));
+    }
+
+private:
+    void refreshChannelSelector()
+    {
+        const juce::String selectedKey = processor.getLinkAudioReceiveSelection();
+        receiveChannelSelector.clear(juce::dontSendNotification);
+        receiveChannelKeyByMenuId.clear();
+
+        int menuId = 1;
+        receiveChannelSelector.addItem("None", menuId);
+        receiveChannelKeyByMenuId[menuId] = {};
+        int selectedMenuId = selectedKey.isEmpty() ? menuId : 0;
+        ++menuId;
+
+        const auto channels = processor.getLinkAudioAvailableChannels();
+        for (const auto& channel : channels)
+        {
+            juce::String label = channel.name;
+            if (channel.peerName.isNotEmpty())
+                label << " (" << channel.peerName << ")";
+            receiveChannelSelector.addItem(label, menuId);
+            receiveChannelKeyByMenuId[menuId] = channel.key;
+            if (channel.key == selectedKey)
+                selectedMenuId = menuId;
+            ++menuId;
+        }
+
+        if (selectedMenuId == 0)
+            selectedMenuId = 1;
+        receiveChannelSelector.setSelectedId(selectedMenuId, juce::dontSendNotification);
+    }
+
+    void refreshStatusText()
+    {
+        juce::String status;
+        status << "Peers: " << juce::String(processor.getLinkPeerCount())
+               << "   Tempo: " << juce::String(processor.getLinkTempoBpm(), 1)
+               << " BPM";
+        statusLabel.setText(status, juce::dontSendNotification);
+    }
+
+    void updateControlEnablement()
+    {
+        const bool linkEnabled = enableToggle.getToggleState();
+        sendToggle.setEnabled(linkEnabled);
+        receiveToggle.setEnabled(linkEnabled);
+        receiveChannelLabel.setEnabled(linkEnabled && receiveToggle.getToggleState());
+        receiveChannelSelector.setEnabled(linkEnabled && receiveToggle.getToggleState());
+    }
+
+    NinjamVst3AudioProcessor& processor;
+    juce::ToggleButton enableToggle;
+    juce::ToggleButton sendToggle;
+    juce::ToggleButton receiveToggle;
+    juce::Label receiveChannelLabel;
+    juce::ComboBox receiveChannelSelector;
+    juce::Label statusLabel;
+    std::map<int, juce::String> receiveChannelKeyByMenuId;
+};
 }
 
 void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int y, int width, int height,
@@ -1301,15 +1430,41 @@ juce::String buildTranslateTooltip(const juce::String& targetCode)
          + ". Left-click toggles. Right-click for language setup.";
 }
 
-juce::String buildSyncTooltip(float compensationMs)
-{
-#if JucePlugin_Build_Standalone
-    juce::String tooltip = "Click to Sync to Midi Clock";
-#else
-    juce::String tooltip = "Click to Sync to Host (vst)";
-#endif
+constexpr int kLocalInputLinkSelectorId = 1000;
+constexpr int kRemoteOutputLinkSelectorId = 1000;
 
-    tooltip << ". Right-click for sync compensation. Current advance: "
+juce::String buildLinkAudioLocalInputLabel(NinjamVst3AudioProcessor& processor)
+{
+    const juce::String selectedKey = processor.getLinkAudioReceiveSelection();
+    if (!processor.isLinkAudioEnabled())
+        return selectedKey.isNotEmpty() ? "Link In (disabled)" : juce::String();
+
+    if (selectedKey.isEmpty())
+        return "Link In (select channel in Options)";
+
+    for (const auto& channel : processor.getLinkAudioAvailableChannels())
+    {
+        if (channel.key != selectedKey)
+            continue;
+
+        juce::String label = "Link In: " + channel.name;
+        if (channel.peerName.isNotEmpty())
+            label << " (" << channel.peerName << ")";
+        return label;
+    }
+
+    return "Link In";
+}
+
+juce::String buildSyncTooltip(NinjamVst3AudioProcessor::SyncMode syncMode, float compensationMs)
+{
+    juce::String sourceLabel = "Host Transport";
+    if (syncMode == NinjamVst3AudioProcessor::SyncMode::abletonLink)
+        sourceLabel = "Ableton Link";
+
+    juce::String tooltip = "Click to toggle transport sync. Right-click for sync source and compensation. Source: ";
+    tooltip << sourceLabel
+            << ". Current advance: "
             << juce::String(compensationMs, compensationMs < 10.0f ? 1 : 0)
             << " ms.";
     return tooltip;
@@ -1813,7 +1968,6 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     addAndMakeVisible(passLabel);
     addAndMakeVisible(passField);
     passField.setIndents(4, 8);
-    passField.setEnabled(false);
     passField.onTextChange = [this] { markPersistentSettingsDirty(); };
 
     addAndMakeVisible(connectButton);
@@ -1906,6 +2060,9 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
             autoLevelLastAppliedGains.clear();
             autoLevelPeakLevels.clear();
             autoLevelChannelActiveTicks.clear();
+            autoLevelMeasureTicks.clear();
+            autoLevelOverTargetTicks.clear();
+            autoLevelUserNameById.clear();
             autoLevelWorkTickCounter = 0;
         }
         updateAutoLevelButtonColor();
@@ -2138,8 +2295,16 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
             selector.addItem(juce::String(left) + "/" + juce::String(right), stereoBaseId + pair);
         }
 
+        const juce::String linkInputLabel = buildLinkAudioLocalInputLabel(audioProcessor);
+        if (linkInputLabel.isNotEmpty())
+            selector.addItem(linkInputLabel, kLocalInputLinkSelectorId);
+
         int currentInput = audioProcessor.getLocalChannelInput(i);
-        if (currentInput >= 0 && currentInput < totalInputs)
+        if (audioProcessor.isLocalChannelUsingLinkAudioInput(i))
+        {
+            selector.setSelectedId(kLocalInputLinkSelectorId, juce::dontSendNotification);
+        }
+        else if (currentInput >= 0 && currentInput < totalInputs)
         {
             selector.setSelectedId(currentInput + 1, juce::dontSendNotification);
         }
@@ -2178,6 +2343,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
 
             if (id >= 1 && id <= total)
             {
+                audioProcessor.setLocalChannelUsesLinkAudioInput(i, false);
                 audioProcessor.setLocalChannelInput(i, id - 1);
                 applyRemoteMidiRelaySelection(i, id - 1);
                 localInputModeSelectors[(size_t)i].setSelectedId(1, juce::dontSendNotification);
@@ -2185,8 +2351,14 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
             else if (id >= stereoBase && id < stereoBase + numPairsLocal)
             {
                 int pairIndex = id - stereoBase;
+                audioProcessor.setLocalChannelUsesLinkAudioInput(i, false);
                 audioProcessor.setLocalChannelInput(i, -1 - pairIndex);
                 applyRemoteMidiRelaySelection(i, -1 - pairIndex);
+                localInputModeSelectors[(size_t)i].setSelectedId(2, juce::dontSendNotification);
+            }
+            else if (id == kLocalInputLinkSelectorId)
+            {
+                audioProcessor.setLocalChannelUsesLinkAudioInput(i, true);
                 localInputModeSelectors[(size_t)i].setSelectedId(2, juce::dontSendNotification);
             }
         };
@@ -2194,7 +2366,8 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         auto& modeSelector = localInputModeSelectors[(size_t)i];
         modeSelector.addItem("Mono", 1);
         modeSelector.addItem("Stereo", 2);
-        modeSelector.setSelectedId(currentInput < 0 ? 2 : 1, juce::dontSendNotification);
+        modeSelector.setSelectedId(audioProcessor.isLocalChannelUsingLinkAudioInput(i) || currentInput < 0 ? 2 : 1,
+                                   juce::dontSendNotification);
     }
 
     addAndMakeVisible(masterFaderLabel);
@@ -2516,6 +2689,11 @@ NinjamVst3AudioProcessorEditor::~NinjamVst3AudioProcessorEditor()
     juce::LookAndFeel::setDefaultLookAndFeel(nullptr);
 }
 
+void NinjamVst3AudioProcessorEditor::setStandaloneOptionsMenuHandler(std::function<void(juce::Component*)> handler)
+{
+    standaloneOptionsMenuHandler = handler;
+}
+
 void NinjamVst3AudioProcessorEditor::paint (juce::Graphics& g)
 {
     if (backgroundImage.isValid())
@@ -2616,10 +2794,13 @@ void NinjamVst3AudioProcessorEditor::resized()
     userField.setBounds(topRow.removeFromLeft(90));
     topRow.removeFromLeft(6);
     anonymousButton.setBounds(topRow.removeFromLeft(110));
-    topRow.removeFromLeft(6);
-    passLabel.setBounds(topRow.removeFromLeft(52));
-    passField.setBounds(topRow.removeFromLeft(80));
-    topRow.removeFromLeft(6);
+    if (!anonymousButton.getToggleState())
+    {
+        topRow.removeFromLeft(6);
+        passLabel.setBounds(topRow.removeFromLeft(76));
+        passField.setBounds(topRow.removeFromLeft(96));
+        topRow.removeFromLeft(6);
+    }
     connectButton.setBounds(topRow.removeFromLeft(80));
     topRow.removeFromLeft(10);
     statusLabel.setBounds(topRow);
@@ -2894,11 +3075,22 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
 
     int status = audioProcessor.getClient().GetStatus();
     updateHostResizeModeForConnectionStatus(status);
+    const juce::String currentLinkAudioInputLabel = buildLinkAudioLocalInputLabel(audioProcessor);
+    if (currentLinkAudioInputLabel != lastLinkAudioLocalInputLabel)
+    {
+        lastLinkAudioLocalInputLabel = currentLinkAudioInputLabel;
+        refreshLocalInputSelectors();
+    }
     juce::String statusStr;
     switch (status)
     {
         case NJClient::NJC_STATUS_DISCONNECTED: statusStr = "Disconnected"; break;
-        case NJClient::NJC_STATUS_INVALIDAUTH:  statusStr = "Invalid Auth"; break;
+        case NJClient::NJC_STATUS_INVALIDAUTH:
+        {
+            const juce::String errorText = juce::String::fromUTF8(audioProcessor.getClient().GetErrorStr()).trim();
+            statusStr = errorText.containsIgnoreCase("server full") ? "Server Full" : "Invalid Auth";
+            break;
+        }
         case NJClient::NJC_STATUS_CANTCONNECT:  statusStr = "Can't Connect"; break;
         case NJClient::NJC_STATUS_OK:           statusStr = "Connected"; break;
         case NJClient::NJC_STATUS_PRECONNECT:   statusStr = "Connecting..."; break;
@@ -2995,22 +3187,40 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         std::vector<NinjamVst3AudioProcessor::UserInfo> users = audioProcessor.getConnectedUsers();
         if (!users.empty())
         {
-            const float timerIntervalMs = abletonHostEditor ? 900.0f : 300.0f;
-            const float noiseFloor = 0.04f;
-            const float baseTargetLevel = 0.4f;
-            const float attackCoeff  = 1.0f - std::exp(-timerIntervalMs / 200.0f);
-            const float releaseCoeff = 1.0f - std::exp(-timerIntervalMs / 1350.0f);
-            const float longTermDecayCoeff = 1.0f - std::exp(-timerIntervalMs / 2000.0f);
+            const float timerIntervalMs = abletonHostEditor ? 1200.0f : 180.0f;
+            const float noiseFloor = 0.015f;
+            const float targetMasterLevel = 0.630957f; // -4 dBFS
+            const float targetSoloLevel = 0.45f;
+            const float perUserCeiling = 0.56f;
+            const float minGain = 0.05f;
+            const float maxGain = 2.0f;
+            const float peakAttackCoeff = 1.0f - std::exp(-timerIntervalMs / 220.0f);
+            const float peakReleaseCoeff = 1.0f - std::exp(-timerIntervalMs / 2400.0f);
+            const float gainUpCoeff = 1.0f - std::exp(-timerIntervalMs / 2500.0f);
+            const float gainDownCoeff = 1.0f - std::exp(-timerIntervalMs / 450.0f);
+            const float emergencyDownCoeff = 1.0f - std::exp(-timerIntervalMs / 120.0f);
+            const float maxUpStep = juce::jmax(0.012f, (timerIntervalMs / 1000.0f) * 0.30f);
+            const float maxDownStep = juce::jmax(0.08f, (timerIntervalMs / 1000.0f) * 1.50f);
+            const float maxEmergencyDownStep = juce::jmax(0.20f, (timerIntervalMs / 1000.0f) * 4.00f);
 
-            float masterPeak = audioProcessor.getMasterPeak();
-            const float targetMasterLevel = 0.4f;
-            float maxGain = 3.0f;
-            if (masterPeak < 0.25f) maxGain = 4.0f;
-            else if (masterPeak < 0.5f) maxGain = 3.5f;
+            std::map<int, float> observedLevels;
+            int audibleUsers = 0;
+            for (const auto& u : users)
+            {
+                const float peakL = audioProcessor.getUserPeak(u.index, 0);
+                const float peakR = audioProcessor.getUserPeak(u.index, 1);
+                const float currentLevel = juce::jmax(peakL, peakR);
+                observedLevels[u.index] = currentLevel;
+                if (currentLevel >= noiseFloor)
+                    ++audibleUsers;
+            }
 
-            float globalGain = 1.0f;
-            if (masterPeak > 0.0001f)
-                globalGain = juce::jlimit(0.5f, 2.0f, targetMasterLevel / masterPeak);
+            const float targetPerUserLevel = juce::jmin(targetSoloLevel,
+                targetMasterLevel / std::sqrt((float)juce::jmax(1, audibleUsers)));
+            const float masterPeak = audioProcessor.getMasterPeak();
+            float masterReduction = 1.0f;
+            if (masterPeak > targetMasterLevel)
+                masterReduction = juce::jlimit(0.25f, 1.0f, targetMasterLevel / masterPeak);
 
             std::set<int> activeIds;
 
@@ -3019,73 +3229,82 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                 int id = u.index;
                 activeIds.insert(id);
 
-                float peakL = audioProcessor.getUserPeak(id, 0);
-                float peakR = audioProcessor.getUserPeak(id, 1);
-                float currentLevel = juce::jmax(peakL, peakR);
+                juce::String nameKey = u.name.trim().toLowerCase();
+                if (nameKey.isEmpty())
+                    nameKey = juce::String("user-") + juce::String(id);
 
-                bool clipEnabled = audioProcessor.isUserClipEnabled(id);
-                if (clipEnabled)
+                auto nameIt = autoLevelUserNameById.find(id);
+                if (nameIt == autoLevelUserNameById.end() || nameIt->second != nameKey)
                 {
-                    auto softClipLevel = [](float x)
-                    {
-                        const float k = 2.0f;
-                        const float d = std::tanh(k);
-                        const float c = d / k;
-                        const float target = 0.630957f;
-                        float y = std::tanh(k * c * x);
-                        if (d != 0.0f) y = (y / d) * target;
-                        return y;
-                    };
-                    currentLevel = softClipLevel(currentLevel);
+                    autoLevelCurrentGains.erase(id);
+                    autoLevelLastAppliedGains.erase(id);
+                    autoLevelPeakLevels.erase(id);
+                    autoLevelChannelActiveTicks.erase(id);
+                    autoLevelMeasureTicks.erase(id);
+                    autoLevelOverTargetTicks.erase(id);
+                    autoLevelUserNameById[id] = nameKey;
                 }
 
-                if (!autoLevelCurrentGains.count(id))       autoLevelCurrentGains[id] = u.volume;
+                const float currentLevel = observedLevels[id];
+                if (!autoLevelCurrentGains.count(id))
+                    autoLevelCurrentGains[id] = juce::jlimit(minGain, maxGain, u.volume);
                 if (!autoLevelPeakLevels.count(id))         autoLevelPeakLevels[id] = 0.0f;
                 if (!autoLevelChannelActiveTicks.count(id)) autoLevelChannelActiveTicks[id] = 0;
                 else                                         autoLevelChannelActiveTicks[id]++;
 
                 bool isNew = autoLevelChannelActiveTicks[id] < 40;
                 float& longTermPeak = autoLevelPeakLevels[id];
+                int& measureTicks = autoLevelMeasureTicks[id];
+                const bool firstMeasurement = measureTicks == 0;
+                ++measureTicks;
 
-                if (currentLevel >= noiseFloor)
-                    longTermPeak += (currentLevel - longTermPeak) * longTermDecayCoeff;
-                else if (longTermPeak > 0.0f)
-                    longTermPeak -= longTermPeak * (longTermDecayCoeff * 0.5f);
-
-                longTermPeak = juce::jlimit(0.0f, 1.0f, longTermPeak);
-
-                if (longTermPeak < noiseFloor)
+                if (firstMeasurement && currentLevel >= noiseFloor)
+                    longTermPeak = currentLevel;
+                else
                 {
-                    autoLevelCurrentGains[id] += (1.0f - autoLevelCurrentGains[id]) * releaseCoeff;
-                    const float nextGain = autoLevelCurrentGains[id];
-                    const auto appliedIt = autoLevelLastAppliedGains.find(id);
-                    if (appliedIt == autoLevelLastAppliedGains.end()
-                        || std::abs(appliedIt->second - nextGain) >= 0.02f)
-                    {
-                        audioProcessor.rememberUserVolume(id, nextGain, u.name);
-                        audioProcessor.setUserVolume(id, nextGain);
-                        autoLevelLastAppliedGains[id] = nextGain;
-                    }
-                    continue;
+                    const float peakCoeff = currentLevel > longTermPeak ? peakAttackCoeff : peakReleaseCoeff;
+                    longTermPeak += (currentLevel - longTermPeak) * peakCoeff;
                 }
 
-                float targetGain = juce::jlimit(0.1f, maxGain, (baseTargetLevel / longTermPeak) * globalGain);
+                longTermPeak = juce::jlimit(0.0f, 4.0f, longTermPeak);
 
-                float estimatedOutput = currentLevel * targetGain;
-                if (!clipEnabled && estimatedOutput > 0.99f && currentLevel > noiseFloor)
-                    targetGain = juce::jlimit(0.1f, maxGain, 0.95f / currentLevel);
+                float targetGain = 1.0f;
+                if (longTermPeak >= noiseFloor)
+                {
+                    const float safePeak = juce::jmax(juce::jmax(longTermPeak, currentLevel), noiseFloor);
+                    targetGain = targetPerUserLevel / safePeak;
+                    targetGain = juce::jmin(targetGain, perUserCeiling / safePeak);
+                    targetGain *= masterReduction;
+                }
 
-                bool reducing = targetGain < autoLevelCurrentGains[id];
-                float smoothingCoeff = reducing ? releaseCoeff : attackCoeff;
-                if (isNew) smoothingCoeff *= 0.5f;
+                targetGain = juce::jlimit(minGain, maxGain, targetGain);
 
-                autoLevelCurrentGains[id] += (targetGain - autoLevelCurrentGains[id]) * smoothingCoeff;
-                autoLevelCurrentGains[id] = juce::jlimit(0.0f, maxGain, autoLevelCurrentGains[id]);
+                const float currentGain = autoLevelCurrentGains[id];
+                const float currentOutput = currentLevel * currentGain;
+                const bool emergencyReduction = targetGain < currentGain
+                    && currentLevel >= noiseFloor
+                    && currentOutput > targetMasterLevel;
+                if (currentOutput > targetMasterLevel)
+                    ++autoLevelOverTargetTicks[id];
+                else
+                    autoLevelOverTargetTicks[id] = 0;
+
+                const bool reducing = targetGain < currentGain;
+                float smoothingCoeff = reducing ? (emergencyReduction ? emergencyDownCoeff : gainDownCoeff)
+                                                : gainUpCoeff;
+                if (isNew && !reducing)
+                    smoothingCoeff *= 0.35f;
+
+                const float unslewedGain = currentGain + (targetGain - currentGain) * smoothingCoeff;
+                const float maxStep = reducing ? (emergencyReduction ? maxEmergencyDownStep : maxDownStep)
+                                               : maxUpStep;
+                const float slewedDelta = juce::jlimit(-maxStep, maxStep, unslewedGain - currentGain);
+                autoLevelCurrentGains[id] = juce::jlimit(minGain, maxGain, currentGain + slewedDelta);
 
                 const float nextGain = autoLevelCurrentGains[id];
                 const auto appliedIt = autoLevelLastAppliedGains.find(id);
                 if (appliedIt == autoLevelLastAppliedGains.end()
-                    || std::abs(appliedIt->second - nextGain) >= 0.02f)
+                    || std::abs(appliedIt->second - nextGain) >= 0.005f)
                 {
                     audioProcessor.rememberUserVolume(id, nextGain, u.name);
                     audioProcessor.setUserVolume(id, nextGain);
@@ -3101,6 +3320,9 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                     autoLevelLastAppliedGains.erase(id);
                     autoLevelPeakLevels.erase(id);
                     autoLevelChannelActiveTicks.erase(id);
+                    autoLevelMeasureTicks.erase(id);
+                    autoLevelOverTargetTicks.erase(id);
+                    autoLevelUserNameById.erase(id);
                     it = autoLevelCurrentGains.erase(it);
                 }
                 else { ++it; }
@@ -3112,6 +3334,9 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
             autoLevelLastAppliedGains.clear();
             autoLevelPeakLevels.clear();
             autoLevelChannelActiveTicks.clear();
+            autoLevelMeasureTicks.clear();
+            autoLevelOverTargetTicks.clear();
+            autoLevelUserNameById.clear();
         }
     }
 
@@ -3694,7 +3919,11 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
             selectedBitrateId = i + 1;
     bitrateSelector.setSelectedId(selectedBitrateId, juce::dontSendNotification);
 
-    syncButton.setToggleState(audioProcessor.isSyncToHostEnabled(), juce::dontSendNotification);
+    const auto restoredSyncMode = audioProcessor.getSyncMode();
+    if (restoredSyncMode != NinjamVst3AudioProcessor::SyncMode::off)
+        preferredSyncMode = restoredSyncMode;
+    audioProcessor.setSyncMode(NinjamVst3AudioProcessor::SyncMode::off);
+    syncButton.setToggleState(false, juce::dontSendNotification);
     updateSyncButtonColor();
     updateSyncButtonTooltip();
 
@@ -3878,7 +4107,11 @@ void NinjamVst3AudioProcessorEditor::chatPopoutClicked()
 
 void NinjamVst3AudioProcessorEditor::anonymousToggled()
 {
-    passField.setEnabled(!anonymousButton.getToggleState());
+    const bool showPassword = !anonymousButton.getToggleState();
+    passLabel.setVisible(showPassword);
+    passField.setVisible(showPassword);
+    passField.setEnabled(showPassword);
+    resized();
 }
 
 void NinjamVst3AudioProcessorEditor::atToggled()
@@ -3899,12 +4132,64 @@ void NinjamVst3AudioProcessorEditor::showTranslateLanguageMenu(juce::Component& 
 
 void NinjamVst3AudioProcessorEditor::showSyncCompensationMenu(juce::Component& anchorComponent)
 {
-    juce::Component::SafePointer<NinjamVst3AudioProcessorEditor> safeThis(this);
-    showSyncCompensationMenuForButton(audioProcessor, anchorComponent, [safeThis]()
+    static constexpr float presetValuesMs[] = { 0.0f, 5.0f, 10.0f, 15.0f, 20.0f, 25.0f, 32.0f, 40.0f,
+                                                50.0f, 64.0f, 80.0f, 96.0f, 128.0f, 160.0f, 192.0f, 250.0f };
+
+    auto idToMs = std::make_shared<std::map<int, float>>();
+    juce::PopupMenu presetMenu;
+    const float currentMs = audioProcessor.getSyncStartCompensationMs();
+
+    int compensationId = 100;
+    for (float presetMs : presetValuesMs)
     {
-        if (safeThis != nullptr)
-            safeThis->updateSyncButtonTooltip();
-    });
+        ++compensationId;
+        presetMenu.addItem(compensationId,
+                           juce::String(presetMs, presetMs < 10.0f ? 1 : 0) + " ms",
+                           true,
+                           std::abs(currentMs - presetMs) < 0.1f);
+        (*idToMs)[compensationId] = presetMs;
+    }
+
+    const auto activeMode = audioProcessor.getSyncMode();
+    const auto selectedMode = activeMode != NinjamVst3AudioProcessor::SyncMode::off ? activeMode : preferredSyncMode;
+
+    juce::PopupMenu sourceMenu;
+    sourceMenu.addItem(10, "Host Transport", !audioProcessor.isStandaloneWrapper(), selectedMode == NinjamVst3AudioProcessor::SyncMode::host);
+    sourceMenu.addItem(11, "Ableton Link", true, selectedMode == NinjamVst3AudioProcessor::SyncMode::abletonLink);
+
+    juce::PopupMenu menu;
+    menu.addSectionHeader("Transport Sync");
+    menu.addSubMenu("Sync Source", sourceMenu);
+    menu.addSeparator();
+    menu.addSectionHeader("Start Compensation");
+    menu.addSubMenu("Advance NINJAM Start", presetMenu);
+
+    juce::Component::SafePointer<NinjamVst3AudioProcessorEditor> safeThis(this);
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&anchorComponent),
+                       [safeThis, idToMs](int result) mutable
+                       {
+                           if (safeThis == nullptr || result == 0)
+                               return;
+
+                           if (result == 10 || result == 11)
+                           {
+                               safeThis->preferredSyncMode = (result == 11)
+                                   ? NinjamVst3AudioProcessor::SyncMode::abletonLink
+                                   : NinjamVst3AudioProcessor::SyncMode::host;
+                               safeThis->audioProcessor.setSyncMode(safeThis->preferredSyncMode);
+                               safeThis->syncButton.setToggleState(true, juce::dontSendNotification);
+                               safeThis->updateSyncButtonTooltip();
+                               safeThis->updateSyncButtonColor();
+                               return;
+                           }
+
+                           const auto it = idToMs->find(result);
+                           if (it == idToMs->end())
+                               return;
+
+                           safeThis->audioProcessor.setSyncStartCompensationMs(it->second);
+                           safeThis->updateSyncButtonTooltip();
+                       });
 }
 
 void NinjamVst3AudioProcessorEditor::updateTranslateButtonState()
@@ -3922,10 +4207,49 @@ void NinjamVst3AudioProcessorEditor::updateTranslateButtonState()
 void NinjamVst3AudioProcessorEditor::syncToggled()
 {
     bool enabled = syncButton.getToggleState();
-    audioProcessor.setSyncToHost(enabled);
-
     if (!enabled)
+    {
+        audioProcessor.setSyncMode(NinjamVst3AudioProcessor::SyncMode::off);
+        updateSyncButtonTooltip();
         return;
+    }
+
+    auto modeToEnable = preferredSyncMode;
+    if (modeToEnable == NinjamVst3AudioProcessor::SyncMode::off)
+        modeToEnable = audioProcessor.isStandaloneWrapper()
+            ? NinjamVst3AudioProcessor::SyncMode::abletonLink
+            : NinjamVst3AudioProcessor::SyncMode::host;
+
+    preferredSyncMode = modeToEnable;
+    audioProcessor.setSyncMode(modeToEnable);
+
+    if (modeToEnable == NinjamVst3AudioProcessor::SyncMode::abletonLink)
+    {
+        const double linkBpm = audioProcessor.getLinkTempoBpm();
+        const bool linkPlaying = audioProcessor.isLinkTransportPlaying();
+        const float njBpm = audioProcessor.getBPM();
+        juce::String message;
+
+        if (linkBpm > 0.0 && njBpm > 0.0f && std::abs(linkBpm - (double) njBpm) > 0.5)
+        {
+            message << "Ableton Link tempo (" << juce::String(linkBpm, 1)
+                    << ") is different from NINJAM BPM ("
+                    << juce::String(njBpm, 1) << ").\n";
+        }
+
+        if (linkPlaying)
+        {
+            if (message.isNotEmpty())
+                message << "\n";
+            message << "Ableton Link is already playing. NINJAM will join the current Link phase immediately.";
+        }
+
+        if (message.isNotEmpty())
+            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon, "Ableton Link Sync", message);
+
+        updateSyncButtonTooltip();
+        return;
+    }
 
     double hostBpm = 0.0;
     bool hostPlaying = false;
@@ -3963,9 +4287,13 @@ void NinjamVst3AudioProcessorEditor::syncToggled()
     }
 
     if (!anyWarning)
+    {
+        updateSyncButtonTooltip();
         return;
+    }
 
     juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon, "Sync to Host", message);
+    updateSyncButtonTooltip();
 }
 
 void NinjamVst3AudioProcessorEditor::videoClicked()
@@ -4188,8 +4516,16 @@ void NinjamVst3AudioProcessorEditor::refreshLocalInputSelector(int channel)
         selector.addItem(juce::String(left) + "/" + juce::String(right), stereoBaseId + pair);
     }
 
+    const juce::String linkInputLabel = buildLinkAudioLocalInputLabel(audioProcessor);
+    if (linkInputLabel.isNotEmpty())
+        selector.addItem(linkInputLabel, kLocalInputLinkSelectorId);
+
     int currentInput = audioProcessor.getLocalChannelInput(channel);
-    if (currentInput >= 0 && currentInput < total)
+    if (audioProcessor.isLocalChannelUsingLinkAudioInput(channel))
+    {
+        selector.setSelectedId(kLocalInputLinkSelectorId, juce::dontSendNotification);
+    }
+    else if (currentInput >= 0 && currentInput < total)
     {
         selector.setSelectedId(currentInput + 1, juce::dontSendNotification);
     }
@@ -4213,7 +4549,8 @@ void NinjamVst3AudioProcessorEditor::refreshLocalInputSelector(int channel)
     }
 
     if (channel >= 0 && channel < NinjamVst3AudioProcessor::maxLocalChannels)
-        localInputModeSelectors[(size_t)channel].setSelectedId(currentInput < 0 ? 2 : 1, juce::dontSendNotification);
+    localInputModeSelectors[(size_t)channel].setSelectedId(audioProcessor.isLocalChannelUsingLinkAudioInput(channel) || currentInput < 0 ? 2 : 1,
+                                   juce::dontSendNotification);
 }
 
 bool NinjamVst3AudioProcessorEditor::isSidechainInputActive() const
@@ -4642,7 +4979,9 @@ void NinjamVst3AudioProcessorEditor::updateSyncButtonColor()
 
 void NinjamVst3AudioProcessorEditor::updateSyncButtonTooltip()
 {
-    syncButton.setTooltip(buildSyncTooltip(audioProcessor.getSyncStartCompensationMs()));
+    const auto activeMode = audioProcessor.getSyncMode();
+    const auto tooltipMode = activeMode != NinjamVst3AudioProcessor::SyncMode::off ? activeMode : preferredSyncMode;
+    syncButton.setTooltip(buildSyncTooltip(tooltipMode, audioProcessor.getSyncStartCompensationMs()));
 }
 
 void NinjamVst3AudioProcessorEditor::updateFxButtonLabel()
@@ -4679,8 +5018,29 @@ void NinjamVst3AudioProcessorEditor::showFxMenu()
 void NinjamVst3AudioProcessorEditor::showOptionsMenu()
 {
     juce::PopupMenu menu;
+    const auto activeMode = audioProcessor.getSyncMode();
+    const auto selectedMode = activeMode != NinjamVst3AudioProcessor::SyncMode::off ? activeMode : preferredSyncMode;
+
+    juce::PopupMenu syncSourceMenu;
+    syncSourceMenu.addItem(44,
+                           "VST Host",
+                           !audioProcessor.isStandaloneWrapper(),
+                           selectedMode == NinjamVst3AudioProcessor::SyncMode::host);
+    syncSourceMenu.addItem(45,
+                           "Ableton Link",
+                           true,
+                           selectedMode == NinjamVst3AudioProcessor::SyncMode::abletonLink);
+
+    if (standaloneOptionsMenuHandler)
+    {
+        menu.addItem(40, "Standalone Settings...");
+        menu.addSeparator();
+    }
+
     menu.addItem(41, "Midi Settings");
     menu.addItem(42, "Enable Chord Detection", true, audioProcessor.isChordDetectionEnabled());
+    menu.addItem(43, "Ableton Link Audio");
+    menu.addSubMenu("Transport Sync Source", syncSourceMenu);
     if (isAbletonLiveHost() && !audioProcessor.isStandaloneWrapper())
     {
         juce::PopupMenu sizeMenu;
@@ -4695,10 +5055,30 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
         {
             if (result == 0)
                 return;
+            if (result == 40)
+            {
+                if (standaloneOptionsMenuHandler)
+                    standaloneOptionsMenuHandler(&optionsButton);
+                return;
+            }
             if (result == 41)
                 showMidiOptionsPopup();
             if (result == 42)
                 audioProcessor.setChordDetectionEnabled(!audioProcessor.isChordDetectionEnabled());
+            if (result == 43)
+                showLinkAudioOptionsPopup();
+            if (result == 44 || result == 45)
+            {
+                preferredSyncMode = (result == 45)
+                    ? NinjamVst3AudioProcessor::SyncMode::abletonLink
+                    : NinjamVst3AudioProcessor::SyncMode::host;
+
+                if (audioProcessor.isTransportSyncEnabled())
+                    audioProcessor.setSyncMode(preferredSyncMode);
+
+                updateSyncButtonTooltip();
+                updateSyncButtonColor();
+            }
             if (result == 51) setAbletonWindowSizePreset(0);
             if (result == 52) setAbletonWindowSizePreset(1);
             if (result == 53) setAbletonWindowSizePreset(2);
@@ -4733,6 +5113,13 @@ void NinjamVst3AudioProcessorEditor::showDelaySettingsPopup()
 void NinjamVst3AudioProcessorEditor::showMidiOptionsPopup()
 {
     showSettingsCallout(std::make_unique<MidiOptionsPopupComponent>(audioProcessor, [this] { refreshExternalMidiInputDevices(); }),
+                        optionsButton.isShowing() ? static_cast<juce::Component&>(optionsButton)
+                                                  : static_cast<juce::Component&>(fxButton));
+}
+
+void NinjamVst3AudioProcessorEditor::showLinkAudioOptionsPopup()
+{
+    showSettingsCallout(std::make_unique<LinkAudioOptionsPopupComponent>(audioProcessor),
                         optionsButton.isShowing() ? static_cast<juce::Component&>(optionsButton)
                                                   : static_cast<juce::Component&>(fxButton));
 }
@@ -4906,23 +5293,7 @@ UserChannelStrip::UserChannelStrip(NinjamVst3AudioProcessor& p, int userIdx)
     dbLabel.setColour(juce::Label::textColourId, juce::Colours::white);
     dbLabel.setFont(juce::Font(11.0f));
 
-    int totalOutputs = processor.getTotalNumOutputChannels();
-    if (totalOutputs <= 0) totalOutputs = 2;
-    int numPairs = totalOutputs / 2;
-
-    for (int ch = 0; ch < totalOutputs; ++ch)
-        outputSelector.addItem("Out " + juce::String(ch + 1), ch + 1);
-
-    int stereoBaseId = 100;
-    for (int pair = 0; pair < numPairs; ++pair)
-    {
-        int left = pair * 2 + 1;
-        int right = left + 1;
-        outputSelector.addItem("Out " + juce::String(left) + "/" + juce::String(right),
-                               stereoBaseId + pair);
-    }
-
-    outputSelector.onChange = [this] { outputChanged(); };
+    refreshOutputSelectorItems();
 
     // Expand button — shows ">" in list layout for multichan peers
     expandButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff333333));
@@ -4957,6 +5328,41 @@ UserChannelStrip::UserChannelStrip(NinjamVst3AudioProcessor& p, int userIdx)
     }
 
     startTimer(juce::PluginHostType().isAbletonLive() ? 120 : 50);
+}
+
+void UserChannelStrip::refreshOutputSelectorItems()
+{
+    int totalOutputs = processor.getTotalNumOutputChannels();
+    if (totalOutputs <= 0)
+        totalOutputs = 2;
+
+    if (cachedTotalOutputs == totalOutputs)
+        return;
+
+    cachedTotalOutputs = totalOutputs;
+    const int selectedId = outputSelector.getSelectedId();
+    const int numPairs = totalOutputs / 2;
+    const int stereoBaseId = 100;
+
+    outputSelector.onChange = nullptr;
+    outputSelector.clear(juce::dontSendNotification);
+
+    for (int ch = 0; ch < totalOutputs; ++ch)
+        outputSelector.addItem("Out " + juce::String(ch + 1), ch + 1);
+
+    for (int pair = 0; pair < numPairs; ++pair)
+    {
+        const int left = pair * 2 + 1;
+        const int right = left + 1;
+        outputSelector.addItem("Out " + juce::String(left) + "/" + juce::String(right),
+                               stereoBaseId + pair);
+    }
+
+    outputSelector.addItem("Link Out", kRemoteOutputLinkSelectorId);
+    outputSelector.onChange = [this] { outputChanged(); };
+
+    if (selectedId > 0 && outputSelector.indexOfItemId(selectedId) >= 0)
+        outputSelector.setSelectedId(selectedId, juce::dontSendNotification);
 }
 
 UserChannelStrip::~UserChannelStrip()
@@ -5303,6 +5709,26 @@ void UserChannelStrip::setOrientation(bool isHorizontal)
 
 void UserChannelStrip::updateInfo(const NinjamVst3AudioProcessor::UserInfo& info)
 {
+    refreshOutputSelectorItems();
+
+    const bool userChanged = userInfo.name.isNotEmpty() && userInfo.name != info.name;
+    if (userChanged)
+    {
+        currentPeakL = 0.0f;
+        currentPeakR = 0.0f;
+        chordToggleArmed = false;
+        isExpanded = false;
+        expandButton.setButtonText(isHorizontalLayout ? ">" : "v");
+        dbLabel.setText("", juce::dontSendNotification);
+
+        for (int i = 0; i < kMaxRemoteCh; ++i)
+        {
+            perChannelGain[i] = 1.0f;
+            channelPeaks[i] = 0.0f;
+            channelSliders[i].setValue(1.0, juce::dontSendNotification);
+        }
+    }
+
     userIndex = info.index;
     userInfo  = info;
     if (nameLabel.getText() != info.name)
@@ -5326,6 +5752,9 @@ void UserChannelStrip::updateInfo(const NinjamVst3AudioProcessor::UserInfo& info
         muteButton.setToggleState(info.isMuted, juce::dontSendNotification);
     if (soloButton.getToggleState() != info.isSolo)
         soloButton.setToggleState(info.isSolo, juce::dontSendNotification);
+    const bool clipEnabled = processor.isUserClipEnabled(info.index);
+    if (clipButton.getToggleState() != clipEnabled)
+        clipButton.setToggleState(clipEnabled, juce::dontSendNotification);
 
     // Sync multichan state — trigger layout refresh if anything changed
     const int newNCh = juce::jlimit(1, kMaxRemoteCh, info.numChannels);
@@ -5369,20 +5798,27 @@ void UserChannelStrip::updateInfo(const NinjamVst3AudioProcessor::UserInfo& info
     int numPairs    = totalOutputs / 2;
     int stereoBaseId = 100;
 
-    int ch = info.outputChannel;
     int id = 0;
-    bool isMono = (ch & 1024) != 0;
-    int chanIdx  = ch & 1023;
-    if (isMono)
+    if (info.outputUsesLinkAudio)
     {
-        if (chanIdx >= 0 && chanIdx < totalOutputs)
-            id = chanIdx + 1;
+        id = kRemoteOutputLinkSelectorId;
     }
     else
     {
-        int pair = chanIdx / 2;
-        if (pair >= 0 && pair < numPairs)
-            id = stereoBaseId + pair;
+        int ch = info.outputChannel;
+        bool isMono = (ch & 1024) != 0;
+        int chanIdx  = ch & 1023;
+        if (isMono)
+        {
+            if (chanIdx >= 0 && chanIdx < totalOutputs)
+                id = chanIdx + 1;
+        }
+        else
+        {
+            int pair = chanIdx / 2;
+            if (pair >= 0 && pair < numPairs)
+                id = stereoBaseId + pair;
+        }
     }
 
     if (id > 0 && outputSelector.getSelectedId() != id)
@@ -5399,6 +5835,8 @@ void UserChannelStrip::timerCallback()
 {
     if (!isShowing())
         return;
+
+    refreshOutputSelectorItems();
 
     for (auto* c = getParentComponent(); c != nullptr; c = c->getParentComponent())
         if (auto* editor = dynamic_cast<NinjamVst3AudioProcessorEditor*>(c))
@@ -5527,7 +5965,11 @@ void UserChannelStrip::outputChanged()
     int numPairs    = totalOutputs / 2;
     int stereoBaseId = 100;
 
-    if (selectedId >= 1 && selectedId <= totalOutputs)
+    if (selectedId == kRemoteOutputLinkSelectorId)
+    {
+        processor.setUserOutputToLinkAudio(userIndex);
+    }
+    else if (selectedId >= 1 && selectedId <= totalOutputs)
         // Single (mono) channel: set the 1024 mono bit so njclient outputs to one channel only
         processor.setUserOutput(userIndex, (selectedId - 1) | 1024);
     else if (selectedId >= stereoBaseId && selectedId < stereoBaseId + numPairs)
@@ -5648,7 +6090,7 @@ void UserListComponent::updateContent()
             auto strip = std::make_unique<UserChannelStrip>(processor, u.index);
             strip->setOrientation(isHorizontal);
             strip->updateInfo(u);
-            strip->setClipEnabled(processor.isSoftLimiterEnabled());
+            strip->setClipEnabled(processor.isUserClipEnabled(u.index));
             contentComponent.addAndMakeVisible(strip.get());
             strips.push_back(std::move(strip));
         }

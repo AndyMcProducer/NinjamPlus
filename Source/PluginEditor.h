@@ -1,6 +1,7 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include <functional>
 #include "PluginProcessor.h"
 
 class NinjamVst3AudioProcessorEditor;  // forward declaration for LAF classes
@@ -553,6 +554,7 @@ private:
     juce::Label chordLabel{ "RemoteChord", "--" };
     juce::Label dbLabel;
     bool showOutputSelector = true;
+    int cachedTotalOutputs = -1;
     
     float currentPeakL = 0.0f;
     float currentPeakR = 0.0f;
@@ -571,6 +573,7 @@ private:
     juce::Label  channelNameLabels[kMaxRemoteCh]; // shows remote channel names
 
     void applyVolumesToProcessor();
+    void refreshOutputSelectorItems();
     void toggleExpanded();
     void volumeChanged();
     void panChanged();
@@ -992,6 +995,7 @@ public:
     void parentHierarchyChanged() override;
     void mouseDown(const juce::MouseEvent& event) override;
     bool shouldDeferHeavyUiWork() const;
+    void setStandaloneOptionsMenuHandler(std::function<void(juce::Component*)> handler);
     
     juce::Image backgroundImage;
     juce::Image radioKnobImage;
@@ -1032,7 +1036,7 @@ private:
     juce::Label userLabel{ "User", "User:" };
     juce::TextEditor userField;
     LeftClickOnlyToggleButton anonymousButton{ "Anonymous" };
-    juce::Label passLabel{ "Pass", "Pass:" };
+    juce::Label passLabel{ "Password", "Password:" };
     juce::TextEditor passField;
     LeftClickOnlyTextButton connectButton;
     
@@ -1173,6 +1177,7 @@ private:
     void applyRemoteMidiRelaySelection(int channel, int inputIndex);
     void refreshLocalInputSelector(int channel);
     void showMidiOptionsPopup();
+    void showLinkAudioOptionsPopup();
     void refreshExternalMidiInputDevices();
     void handleIncomingMidiMessage(juce::MidiInput* source, const juce::MidiMessage& message) override;
     void syncLearnMappingsToProcessor();
@@ -1249,6 +1254,7 @@ private:
     std::map<int, int> autoLevelChannelActiveTicks;
     std::map<int, int> autoLevelMeasureTicks;
     std::map<int, int> autoLevelOverTargetTicks;
+    std::map<int, juce::String> autoLevelUserNameById;
     std::map<juce::Component*, MidiLearnTarget> midiTargetsByComponent;
     std::map<juce::String, MidiLearnTarget> midiTargetsById;
     std::map<juce::String, MidiSourceMapping> midiSourceByTargetId;
@@ -1258,10 +1264,13 @@ private:
     juce::SpinLock oscEventQueueLock;
     std::vector<PendingOscEvent> pendingOscEvents;
     std::map<int, juce::String> midiRelayTargetByMenuId;
+    std::function<void(juce::Component*)> standaloneOptionsMenuHandler;
+    NinjamVst3AudioProcessor::SyncMode preferredSyncMode = NinjamVst3AudioProcessor::SyncMode::host;
     std::unique_ptr<juce::MidiInput> midiLearnInputDevice;
     std::unique_ptr<juce::MidiInput> midiRelayInputDevice;
     juce::String openedMidiLearnInputDeviceId;
     juce::String openedMidiRelayInputDeviceId;
+    juce::String lastLinkAudioLocalInputLabel;
     double lastPersistentSettingsSaveMs = 0.0;
     double lastVideoBackgroundRepaintMs = 0.0;
     bool persistentSettingsDirty = false;
