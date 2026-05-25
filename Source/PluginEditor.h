@@ -609,7 +609,7 @@ public:
 
         g.setColour(juce::Colours::lightgrey);
         g.setFont(juce::Font(16.0f));
-        g.drawText("Version " + versionText, area.removeFromTop(24), juce::Justification::centredTop);
+        g.drawText("Release " + versionText, area.removeFromTop(24), juce::Justification::centredTop);
 
         area.removeFromTop(10);
 
