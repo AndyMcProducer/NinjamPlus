@@ -1366,6 +1366,7 @@ namespace
     constexpr const char* sideSignalChatPrefix = "__NINJAM_VST3_SIDESIGNAL__ ";
     constexpr int remoteLatencyUpdateCadenceIntervals = 1;
     constexpr int kSyncSignalChannelIndex = 0;
+    constexpr double intervalHelperPayloadMinWriteMs = 100.0;
     constexpr long long intervalSyncMarkerKeyBeatStride = 1024;
     constexpr int kLocalInputLinkAudioSentinel = -2000000000;
     constexpr double linkAudioQuantumBeats = 4.0;
@@ -1622,6 +1623,7 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
     for (auto& analyzer : remoteChordAnalyzers)
         analyzer = std::make_unique<LocalChordAnalyzer>();
 
+    setLatencySamples(0);
     startTimer(20); // Run NINJAM client loop every 20ms
 
     // Set callbacks
@@ -2335,6 +2337,7 @@ bool NinjamVst3AudioProcessor::ensureAdvancedVideoClientStarted()
     if (isAdvancedVideoClientAvailable())
     {
         videoHelperRunning.store(true);
+        lastIntervalHelperPayloadWriteMs = 0.0;
         return true;
     }
 
@@ -2365,6 +2368,7 @@ bool NinjamVst3AudioProcessor::ensureAdvancedVideoClientStarted()
         if (isAdvancedVideoClientAvailable())
         {
             videoHelperRunning.store(true);
+            lastIntervalHelperPayloadWriteMs = 0.0;
             return true;
         }
     }
@@ -2373,6 +2377,7 @@ bool NinjamVst3AudioProcessor::ensureAdvancedVideoClientStarted()
         advancedVideoServer->stop();
     advancedVideoServer.reset();
     videoHelperRunning.store(false);
+    lastIntervalHelperPayloadWriteMs = 0.0;
     return false;
 }
 
@@ -2418,6 +2423,7 @@ void NinjamVst3AudioProcessor::launchVideoSessionAsync()
 void NinjamVst3AudioProcessor::stopAdvancedVideoClient()
 {
     videoHelperRunning.store(false);
+    lastIntervalHelperPayloadWriteMs = 0.0;
     if (advancedVideoServer)
         advancedVideoServer->stop();
     advancedVideoServer.reset();
@@ -7372,6 +7378,7 @@ void NinjamVst3AudioProcessor::timerCallback()
     ninjamClient.GetPosition(&pos, &length);
     if (length > 0)
     {
+        bool forceIntervalHelperPayloadWrite = false;
         const int localBpi = juce::jmax(1, getBPI());
         const double localBpm = juce::jmax(1.0, (double)getBPM());
         const bool timingChanged = lastLatencyTimingBpi != localBpi
@@ -7410,6 +7417,7 @@ void NinjamVst3AudioProcessor::timerCallback()
             lastLatencyTimingBpm = localBpm;
             lastBroadcastIntervalTag.store(-1);
             setIntervalSyncStatusText("Interval sync timing changed, recalculating delay...");
+            forceIntervalHelperPayloadWrite = true;
             if (timingDelayDeltaMs != 0)
                 vlogStr("[MCGuard] Timing changed; adjusted preserved video delays by " + juce::String(timingDelayDeltaMs) + "ms while recalculating");
         }
@@ -7420,6 +7428,7 @@ void NinjamVst3AudioProcessor::timerCallback()
         if (pos < last)
         {
             intervalIndex.fetch_add(1);
+            forceIntervalHelperPayloadWrite = true;
             const int localDisplayInterval = getDisplayIntervalIndex();
             const double localIntervalStartMs = juce::Time::getMillisecondCounterHiRes();
             {
@@ -7445,6 +7454,7 @@ void NinjamVst3AudioProcessor::timerCallback()
             lastProcessedIntervalMarkerKey.store(localMarkerKey);
             if (status == NJClient::NJC_STATUS_OK && currentBeatIndex == localMarkerBeat)
             {
+                forceIntervalHelperPayloadWrite = true;
                 const long long localMarkerSampleCount = intervalSyncSampleCounter.load(std::memory_order_relaxed);
                 const double intervalDurationMs = (60.0 / localBpm) * (double)localBpi * 1000.0;
                 processPendingIntervalSyncMarkers(localMarkerBeat, localMarkerSampleCount, intervalDurationMs);
@@ -7456,8 +7466,17 @@ void NinjamVst3AudioProcessor::timerCallback()
             }
         }
         lastIntervalPos.store(pos);
-        if (status == NJClient::NJC_STATUS_OK)
-            writeIntervalHelperJson(pos, length);
+        if (status == NJClient::NJC_STATUS_OK && videoHelperRunning.load())
+        {
+            const double elapsedSinceHelperWriteMs = nowMs - lastIntervalHelperPayloadWriteMs;
+            if (forceIntervalHelperPayloadWrite
+                || lastIntervalHelperPayloadWriteMs <= 0.0
+                || elapsedSinceHelperWriteMs >= intervalHelperPayloadMinWriteMs)
+            {
+                lastIntervalHelperPayloadWriteMs = nowMs;
+                writeIntervalHelperJson(pos, length);
+            }
+        }
     }
 }
 

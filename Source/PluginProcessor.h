@@ -551,6 +551,7 @@ private:
     juce::File videoHelperRootDir;
     mutable juce::CriticalSection intervalHelperPayloadLock;
     juce::String intervalHelperPayload { "[]" };
+    double lastIntervalHelperPayloadWriteMs = 0.0;
     std::atomic<bool> videoHelperRunning { false };
     std::atomic<bool> videoLaunchInProgress { false };
     juce::CriticalSection videoLaunchWorkerLock;

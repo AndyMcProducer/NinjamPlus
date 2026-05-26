@@ -170,7 +170,7 @@ struct WinVideoReader : public juce::Thread
         if (frameWidth <= 0 || frameHeight <= 0) return false;
 
         nextFrameDeadlineMs = juce::Time::getMillisecondCounterHiRes();
-        startThread (juce::Thread::Priority::normal);
+        startThread (juce::Thread::Priority::background);
         return true;
     }
 
@@ -3374,7 +3374,9 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
     if (videoFrameReader != nullptr)
     {
         auto frame = videoFrameReader->getLatestFrame();
-        const double minimumBackgroundRepaintMs = abletonHostEditor ? 250.0 : 0.0;
+        const bool abletonLinkSensitive = audioProcessor.isAbletonLinkTransportEnabled()
+            || audioProcessor.isLinkAudioEnabled();
+        const double minimumBackgroundRepaintMs = (abletonHostEditor || abletonLinkSensitive) ? 250.0 : 0.0;
         if (frame.isValid()
             && (minimumBackgroundRepaintMs <= 0.0
                 || nowMs - lastVideoBackgroundRepaintMs >= minimumBackgroundRepaintMs))
