@@ -422,6 +422,7 @@ private:
     std::atomic<SyncMode> syncMode { SyncMode::off };
     std::atomic<bool> hostWasPlaying { false };
     std::atomic<bool> linkWasPlaying { false };
+    std::atomic<bool> lastHostPositionValid { false };
     std::atomic<bool> syncAwaitingHostRestart { false };
     std::atomic<bool> syncWaitForInterval { false };
     std::atomic<int> syncTargetInterval { -1 };

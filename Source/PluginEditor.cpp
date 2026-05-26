@@ -1202,6 +1202,12 @@ public:
         listBox.setModel(this);
         listBox.setRowHeight(24);
 
+        addAndMakeVisible(statusLabel);
+        statusLabel.setJustificationType(juce::Justification::centred);
+        statusLabel.setColour(juce::Label::textColourId, juce::Colours::white);
+        statusLabel.setText("Loading servers...", juce::dontSendNotification);
+        statusLabel.setInterceptsMouseClicks(false, false);
+
         addAndMakeVisible(refreshButton);
         refreshButton.setButtonText("Refresh");
         refreshButton.onClick = [this] { refreshServers(); };
@@ -1230,6 +1236,7 @@ public:
         controls.removeFromLeft(8);
         connectButton.setBounds(controls.removeFromLeft(120));
         listBox.setBounds(area);
+        statusLabel.setBounds(area);
     }
 
     int getNumRows() override { return (int)servers.size(); }
@@ -1262,6 +1269,7 @@ public:
 private:
     NinjamVst3AudioProcessor& processor;
     juce::ListBox listBox;
+    juce::Label statusLabel;
     juce::TextButton refreshButton;
     juce::TextButton connectButton;
     std::vector<NinjamVst3AudioProcessor::PublicServerInfo> servers;
@@ -1277,6 +1285,8 @@ private:
 
         refreshButton.setEnabled(false);
         refreshButton.setButtonText("Refreshing...");
+        statusLabel.setText("Refreshing servers...", juce::dontSendNotification);
+        statusLabel.setVisible(true);
 
         auto safeThis = juce::Component::SafePointer<ServerListComponent>(this);
         std::thread([safeThis]
@@ -1294,6 +1304,9 @@ private:
 
                 safeThis->servers = std::move(fetched);
                 safeThis->listBox.updateContent();
+                safeThis->statusLabel.setText(safeThis->servers.empty() ? "No servers found" : "",
+                                              juce::dontSendNotification);
+                safeThis->statusLabel.setVisible(safeThis->servers.empty());
                 safeThis->repaint();
                 safeThis->refreshButton.setButtonText("Refresh");
                 safeThis->refreshButton.setEnabled(true);

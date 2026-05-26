@@ -7,6 +7,7 @@
 #undef interface
 #endif
 
+#include "jnetlib/httpget.h"
 #include <ableton/LinkAudio.hpp>
 #include <ableton/link/HostTimeFilter.hpp>
 #include <ableton/util/FloatIntConversion.hpp>
@@ -1179,6 +1180,49 @@ static bool tryTranslateWithGoogleFallback(const juce::String& text,
     return true;
 }
 
+static bool copyPlayHeadPositionToCurrentInfo(juce::AudioPlayHead& playHead,
+                                              juce::AudioPlayHead::CurrentPositionInfo& info)
+{
+    const auto position = playHead.getPosition();
+    if (!position)
+        return false;
+
+    info.resetToDefault();
+
+    if (const auto sig = position->getTimeSignature())
+    {
+        info.timeSigNumerator = sig->numerator;
+        info.timeSigDenominator = sig->denominator;
+    }
+
+    if (const auto loop = position->getLoopPoints())
+    {
+        info.ppqLoopStart = loop->ppqStart;
+        info.ppqLoopEnd = loop->ppqEnd;
+    }
+
+    if (const auto frame = position->getFrameRate())
+        info.frameRate = *frame;
+    if (const auto timeInSeconds = position->getTimeInSeconds())
+        info.timeInSeconds = *timeInSeconds;
+    if (const auto lastBarStartPpq = position->getPpqPositionOfLastBarStart())
+        info.ppqPositionOfLastBarStart = *lastBarStartPpq;
+    if (const auto ppqPosition = position->getPpqPosition())
+        info.ppqPosition = *ppqPosition;
+    if (const auto originTime = position->getEditOriginTime())
+        info.editOriginTime = *originTime;
+    if (const auto bpm = position->getBpm())
+        info.bpm = *bpm;
+    if (const auto timeInSamples = position->getTimeInSamples())
+        info.timeInSamples = *timeInSamples;
+
+    info.isPlaying = position->getIsPlaying();
+    info.isRecording = position->getIsRecording();
+    info.isLooping = position->getIsLooping();
+
+    return true;
+}
+
 static int computeJamTabaHostSyncStartPositionSamples(const juce::AudioPlayHead::CurrentPositionInfo& hostInfo,
                                                       double sampleRate)
 {
@@ -1210,6 +1254,11 @@ static int computeJamTabaHostSyncStartPositionSamples(const juce::AudioPlayHead:
                 if (cursorPosInMeasure < 0.0)
                     cursorPosInMeasure += barLengthInQuarterNotes;
             }
+
+            constexpr double hostSyncStartGraceMs = 80.0;
+            const double startGraceBeats = (hostSyncStartGraceMs / 1000.0) * hostInfo.bpm / 60.0;
+            if (cursorPosInMeasure <= juce::jmax(1.0e-8, startGraceBeats))
+                return 0;
 
             if (cursorPosInMeasure > 1.0e-8)
             {
@@ -4332,18 +4381,53 @@ void NinjamVst3AudioProcessor::refreshPublicServers()
         result.push_back(info);
     }
 #else
-    juce::URL url("https://ninbot.com/app/servers.php");
-    auto options = juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
-                       .withConnectionTimeoutMs(8000)
-                       .withNumRedirectsToFollow(5);
+    JNL_HTTPGet request(JNL_CONNECTION_AUTODNS, 16384, nullptr);
+    request.addheader("User-Agent: NINJAMplus/1.0");
+    request.addheader("Accept: application/json,*/*");
+    request.connect("http://ninbot.com/app/servers.php");
 
-    std::unique_ptr<juce::InputStream> stream = url.createInputStream(options);
-    if (stream == nullptr)
+    juce::MemoryOutputStream response;
+    const double deadlineMs = juce::Time::getMillisecondCounterHiRes() + 8000.0;
+    char buffer[4096] = {};
+
+    for (;;)
+    {
+        const int runResult = request.run();
+
+        for (;;)
+        {
+            const int available = request.bytes_available();
+            if (available <= 0)
+                break;
+
+            const int bytesToRead = juce::jmin(available, (int)sizeof(buffer));
+            const int bytesRead = request.get_bytes(buffer, bytesToRead);
+            if (bytesRead <= 0)
+                break;
+
+            response.write(buffer, (size_t)bytesRead);
+            if (response.getDataSize() > 4 * 1024 * 1024)
+                return;
+        }
+
+        if (runResult == -1)
+            return;
+        if (runResult == 1)
+            break;
+        if (juce::Time::getMillisecondCounterHiRes() >= deadlineMs)
+            return;
+
+        juce::Thread::sleep(10);
+    }
+
+    const int replyCode = request.getreplycode();
+    if (replyCode != 0 && (replyCode < 200 || replyCode >= 300))
+        return;
+    if (response.getDataSize() == 0)
         return;
 
-    juce::String jsonText = stream->readEntireStreamAsString();
-    if (jsonText.isEmpty())
-        return;
+    juce::String jsonText = juce::String::fromUTF8(static_cast<const char*>(response.getData()),
+                                                   (int)response.getDataSize());
 
     juce::var root;
     juce::Result parseError = juce::JSON::parse(jsonText, root);
@@ -5096,13 +5180,22 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     if (auto* playHead = getPlayHead())
     {
         juce::AudioPlayHead::CurrentPositionInfo info;
-        if (playHead->getCurrentPosition(info))
+        if (copyPlayHeadPositionToCurrentInfo(*playHead, info))
         {
             gotHostPosition = true;
             hostInfoAtBlock = info;
             const juce::ScopedLock lock(transportLock);
             lastHostPosition = info;
+            lastHostPositionValid.store(true, std::memory_order_relaxed);
         }
+        else
+        {
+            lastHostPositionValid.store(false, std::memory_order_relaxed);
+        }
+    }
+    else
+    {
+        lastHostPositionValid.store(false, std::memory_order_relaxed);
     }
 
     const int numSamples = buffer.getNumSamples();
@@ -5412,6 +5505,14 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
             globalLocalMaxR = localMaxR;
     }
 
+    for (int ch = actualLocal; ch < maxLocalChannels; ++ch)
+    {
+        localChannelBuffer.clear(ch, 0, numSamples);
+        localChannelPeaks[(size_t)ch].store(0.0f);
+        localChannelPeaksL[(size_t)ch].store(0.0f);
+        localChannelPeaksR[(size_t)ch].store(0.0f);
+    }
+
     localPeak.store(globalLocalMax);
     localPeakL.store(globalLocalMaxL);
     localPeakR.store(globalLocalMaxR);
@@ -5600,11 +5701,12 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     int actualInputChannels;
     if (multiChanAuto)
     {
-        const int n = juce::jmin(actualLocal, 30);
+        // syncLocalIntervalChannelConfig advertises this slot as the legacy Vorbis mixdown.
+        const int n = juce::jlimit(1, maxLocalChannels, numLocalChannels.load());
         for (int i = 0; i < n; ++i)
             inputs[i] = localChannelBuffer.getWritePointer(i);
-        inputs[n] = fxTransmitBuffer.getWritePointer(0);
-        inputs[n + 1] = localMixBuffer.getWritePointer(0);
+        inputs[n] = localMixBuffer.getWritePointer(0);
+        inputs[n + 1] = fxTransmitBuffer.getWritePointer(0);
         actualInputChannels = n + 2;
     }
     else
@@ -6224,7 +6326,8 @@ void NinjamVst3AudioProcessor::setSyncMode(SyncMode newMode)
     if (newMode == SyncMode::host)
     {
         const juce::ScopedLock lock(transportLock);
-        hostIsPlayingNow = lastHostPosition.isPlaying;
+        hostIsPlayingNow = lastHostPositionValid.load(std::memory_order_relaxed)
+            && lastHostPosition.isPlaying;
     }
 
     refreshAbletonLinkActivation();
@@ -6332,6 +6435,9 @@ void NinjamVst3AudioProcessor::primeLinkTransportStart(double phaseBeats, double
 bool NinjamVst3AudioProcessor::getHostPosition(juce::AudioPlayHead::CurrentPositionInfo& info) const
 {
     const juce::ScopedLock lock(transportLock);
+    if (!lastHostPositionValid.load(std::memory_order_relaxed))
+        return false;
+
     info = lastHostPosition;
     return true;
 }
