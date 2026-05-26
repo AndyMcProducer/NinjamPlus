@@ -1366,7 +1366,6 @@ namespace
     constexpr const char* sideSignalChatPrefix = "__NINJAM_VST3_SIDESIGNAL__ ";
     constexpr int remoteLatencyUpdateCadenceIntervals = 1;
     constexpr int kSyncSignalChannelIndex = 0;
-    constexpr int intervalSyncMarkerStepBeats = 8;
     constexpr long long intervalSyncMarkerKeyBeatStride = 1024;
     constexpr int kLocalInputLinkAudioSentinel = -2000000000;
     constexpr double linkAudioQuantumBeats = 4.0;
@@ -1391,19 +1390,9 @@ namespace
         return juce::jlimit(0, safeBpi - 1, (int)std::floor(progress * (double)safeBpi));
     }
 
-    int getIntervalSyncMarkerBeatForBeat(int beatIndex, int bpi)
+    int getIntervalSyncMarkerBeatForBeat(int, int)
     {
-        const int safeBpi = juce::jmax(1, bpi);
-        const int safeBeat = juce::jlimit(0, safeBpi - 1, beatIndex);
-        if (safeBpi < intervalSyncMarkerStepBeats)
-            return 0;
-
-        const int oneBasedBeat = safeBeat + 1;
-        const int markerOneBasedBeat = (oneBasedBeat / intervalSyncMarkerStepBeats) * intervalSyncMarkerStepBeats;
-        if (markerOneBasedBeat < intervalSyncMarkerStepBeats)
-            return 0;
-
-        return juce::jlimit(0, safeBpi - 1, markerOneBasedBeat - 1);
+        return 0;
     }
 
     bool isIntervalSyncMarkerBeat(int beatIndex, int bpi)
@@ -1412,7 +1401,7 @@ namespace
         if (beatIndex < 0 || beatIndex >= safeBpi)
             return false;
 
-        return getIntervalSyncMarkerBeatForBeat(beatIndex, safeBpi) == beatIndex;
+        return beatIndex == 0;
     }
 
     long long makeIntervalSyncMarkerKey(int interval, int markerBeat)
@@ -1695,6 +1684,8 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
         remoteLatencyLastAppliedIntervalByUser.clear();
         remoteLatencyAverageByUser.clear();
         remoteLatencyFirmDelayMsByUser.clear();
+        remoteVideoBufferRefreshIdByUser.clear();
+        videoBufferRefreshCounter = 0;
     }
     opusSyncAvailable.store(false);
     opusSyncHasLegacyClients.store(false);
@@ -1744,6 +1735,8 @@ void NinjamVst3AudioProcessor::disconnectFromServer()
         remoteLatencyLastAppliedIntervalByUser.clear();
         remoteLatencyAverageByUser.clear();
         remoteLatencyFirmDelayMsByUser.clear();
+        remoteVideoBufferRefreshIdByUser.clear();
+        videoBufferRefreshCounter = 0;
     }
     {
         const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
@@ -2179,6 +2172,8 @@ void NinjamVst3AudioProcessor::invalidateIntervalSyncLatencyState(bool keepRemot
     if (!keepRemoteServerLatency)
     {
         remoteLatencyFirmDelayMsByUser.clear();
+        remoteVideoBufferRefreshIdByUser.clear();
+        videoBufferRefreshCounter = 0;
         lastRemoteServerLatencyMsByUser.clear();
     }
 }
@@ -2245,6 +2240,14 @@ void NinjamVst3AudioProcessor::pruneDisconnectedRemoteSyncState()
     {
         if (!isActiveUserKey(it->first))
             it = remoteLatencyFirmDelayMsByUser.erase(it);
+        else
+            ++it;
+    }
+
+    for (auto it = remoteVideoBufferRefreshIdByUser.begin(); it != remoteVideoBufferRefreshIdByUser.end();)
+    {
+        if (!isActiveUserKey(it->first))
+            it = remoteVideoBufferRefreshIdByUser.erase(it);
         else
             ++it;
     }
@@ -2641,6 +2644,7 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
 
         int bufferMs = -1;
         int remoteServerLatencyMs = -1;
+        juce::uint64 bufferRefreshId = 0;
         {
             const juce::ScopedLock lock(intervalSyncAnnouncementLock);
             auto firmIt = remoteLatencyFirmDelayMsByUser.find(senderKey);
@@ -2660,6 +2664,15 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
                 auto canonicalServerIt = lastRemoteServerLatencyMsByUser.find(canonicalUserKey);
                 if (canonicalServerIt != lastRemoteServerLatencyMsByUser.end())
                     remoteServerLatencyMs = juce::jmax(0, canonicalServerIt->second);
+            }
+            auto refreshIt = remoteVideoBufferRefreshIdByUser.find(senderKey);
+            if (refreshIt != remoteVideoBufferRefreshIdByUser.end())
+                bufferRefreshId = refreshIt->second;
+            if (bufferRefreshId == 0 && canonicalUserKey.isNotEmpty())
+            {
+                auto canonicalRefreshIt = remoteVideoBufferRefreshIdByUser.find(canonicalUserKey);
+                if (canonicalRefreshIt != remoteVideoBufferRefreshIdByUser.end())
+                    bufferRefreshId = canonicalRefreshIt->second;
             }
             if (bufferMs < 0)
             {
@@ -2716,6 +2729,11 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
                 userObj->setProperty("senderServerLatencyMs", (double)remoteServerLatencyMs);
             if (localServerRouteLatencyMs >= 0)
                 userObj->setProperty("receiverServerLatencyMs", (double)localServerRouteLatencyMs);
+            if (bufferRefreshId != 0)
+            {
+                userObj->setProperty("refreshBuffer", true);
+                userObj->setProperty("bufferRefreshEventId", "videoBufferRefresh:" + canonicalUserKey + ":" + juce::String((juce::int64)bufferRefreshId));
+            }
         }
         entries.add(juce::var(userObj.get()));
     }
@@ -7078,9 +7096,6 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
         int averageMs = -1;
         int firmAverageMs = -1;
         int correctedDelayMs = -1;
-        int markerOffsetMs = 0;
-        bool derivedFromBaseMarker = false;
-        int baseMarkerCorrectedDelayMs = -1;
         const int senderServerLatencyMs = pending.remoteServerLatencyMs >= 0 ? juce::jmax(0, pending.remoteServerLatencyMs) : 0;
         const int receiverServerLatencyMs = juce::jmax(0, localServerLatencyMs.load());
         const int serverRouteLatencyMs = senderServerLatencyMs + receiverServerLatencyMs;
@@ -7120,16 +7135,6 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
             {
                 const double rawDelayMs = (double)(firmAverageMs >= 0 ? firmAverageMs : averageMs);
                 correctedDelayMs = juce::jmax(0, (int)std::llround(rawDelayMs) + serverRouteLatencyMs);
-
-                if (pending.remoteBeat == 0)
-                {
-                    avgState.baseMarkerCorrectedDelayMs = (double)correctedDelayMs;
-                    baseMarkerCorrectedDelayMs = correctedDelayMs;
-                }
-                else if (avgState.baseMarkerCorrectedDelayMs >= 0.0)
-                {
-                    baseMarkerCorrectedDelayMs = juce::jmax(0, (int)std::llround(avgState.baseMarkerCorrectedDelayMs));
-                }
             }
         }
         if (correctedDelayMs >= 0)
@@ -7164,9 +7169,6 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
                 vlogStr("[MCGuard] Applied firm delay for=" + senderKey
                     + " canonical=" + canonicalSenderKey
                     + " delayMs=" + juce::String(correctedDelayMs)
-                    + " baseMs=" + juce::String(baseMarkerCorrectedDelayMs)
-                    + " markerOffsetMs=" + juce::String(markerOffsetMs)
-                    + " derived=" + juce::String(derivedFromBaseMarker ? 1 : 0)
                     + " senderSrv=" + juce::String(senderServerLatencyMs)
                     + " receiverSrv=" + juce::String(receiverServerLatencyMs)
                     + " sourceMarker=" + juce::String((juce::int64)sourceMarkerKey)
@@ -7188,8 +7190,6 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
             line << " avg " << juce::String(averageMs) << "ms";
         if (displayServerRouteLatencyMs > 0)
             line << " srv " << juce::String(displaySenderServerLatencyMs) << "+" << juce::String(displayReceiverServerLatencyMs) << "ms";
-        if (derivedFromBaseMarker)
-            line << " base " << juce::String(baseMarkerCorrectedDelayMs) << "-" << juce::String(markerOffsetMs) << "ms";
         line << " => " << juce::String(displayCorrectedDelayMs) << "ms";
         juce::DynamicObject::Ptr reportObj = new juce::DynamicObject();
         reportObj->setProperty("line", line);
@@ -7205,11 +7205,6 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
         reportObj->setProperty("receiverServerLatencyMs", displayReceiverServerLatencyMs);
         reportObj->setProperty("serverRouteLatencyMs", displayServerRouteLatencyMs);
         reportObj->setProperty("correctedDelayMs", displayCorrectedDelayMs);
-        reportObj->setProperty("derivedFromBaseMarker", derivedFromBaseMarker);
-        if (baseMarkerCorrectedDelayMs >= 0)
-            reportObj->setProperty("baseMarkerCorrectedDelayMs", baseMarkerCorrectedDelayMs);
-        if (markerOffsetMs > 0)
-            reportObj->setProperty("markerOffsetMs", markerOffsetMs);
         reportObj->setProperty("eventId", "latencyReport:" + senderKey + ":" + juce::String(++sideSignalEventCounter));
         const juce::String reportPayload = juce::JSON::toString(juce::var(reportObj.get()));
         sendIntervalSignal("intervalLatencyReport", reportPayload);
@@ -7386,19 +7381,26 @@ void NinjamVst3AudioProcessor::timerCallback()
         if (timingChanged)
         {
             int timingDelayDeltaMs = 0;
-            if (lastLatencyTimingBpi > 0 && lastLatencyTimingBpm > 0.0)
+            const bool hadPreviousTiming = lastLatencyTimingBpi > 0 && lastLatencyTimingBpm > 0.0;
+            if (hadPreviousTiming)
             {
                 const double previousIntervalDurationMs = (60.0 / lastLatencyTimingBpm) * (double)lastLatencyTimingBpi * 1000.0;
                 const double newIntervalDurationMs = (60.0 / localBpm) * (double)localBpi * 1000.0;
                 if (std::isfinite(previousIntervalDurationMs) && std::isfinite(newIntervalDurationMs)
                     && previousIntervalDurationMs > 0.0 && newIntervalDurationMs > 0.0)
-                {
                     timingDelayDeltaMs = (int)std::llround(newIntervalDurationMs - previousIntervalDurationMs);
-                    if (timingDelayDeltaMs != 0)
+            }
+            if (hadPreviousTiming)
+            {
+                const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+                if (!remoteLatencyFirmDelayMsByUser.empty())
+                {
+                    const auto refreshId = ++videoBufferRefreshCounter;
+                    for (auto& userDelay : remoteLatencyFirmDelayMsByUser)
                     {
-                        const juce::ScopedLock lock(intervalSyncAnnouncementLock);
-                        for (auto& userDelay : remoteLatencyFirmDelayMsByUser)
+                        if (timingDelayDeltaMs != 0)
                             userDelay.second = juce::jmax(0, userDelay.second + timingDelayDeltaMs);
+                        remoteVideoBufferRefreshIdByUser[userDelay.first] = refreshId;
                     }
                 }
             }

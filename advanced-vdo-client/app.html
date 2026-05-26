@@ -162,6 +162,9 @@
             targetIdByUser: {},
             labelByStreamId: {},
             lastAppliedBufferByUser: {},
+            lastBufferRefreshIdByUser: {},
+            bufferRefreshTimersByUser: {},
+            bufferRefreshPendingUntilByUser: {},
             latencyMsByUser: {},
             latencyUpdatedAtByUser: {},
             rosterTimerId: 0
@@ -229,6 +232,8 @@
                 String(data.videoClockMs ?? ''),
                 String(data.timecode ?? ''),
                 String(data.eventId ?? ''),
+                String(data.bufferRefreshEventId ?? ''),
+                String(data.refreshBuffer ? 1 : 0),
                 String(data.voiceChatMode ? 1 : 0),
                 (typeof bufferMs === 'number' && isFinite(bufferMs)) ? String(Math.round(bufferMs)) : ''
             ].join('|');
@@ -580,6 +585,61 @@
             return sent;
         }
 
+        function sendTargetedRefresh(userKey) {
+            const targetId = vdoState.targetIdByUser[userKey];
+            const streamId = vdoState.streamIdByUser[userKey];
+            if (!targetId && !streamId) {
+                return false;
+            }
+            let sent = false;
+            function sendRefresh(targetKey, targetValue) {
+                const msg = { refresh: true };
+                msg[targetKey] = targetValue;
+                sent = postToVdo(msg) || sent;
+                const actionMsg = { action: 'refresh' };
+                actionMsg[targetKey] = targetValue;
+                sent = postToVdo(actionMsg) || sent;
+            }
+            if (targetId) {
+                sendRefresh('UUID', targetId);
+                sendRefresh('target', targetId);
+            }
+            if (streamId) {
+                sendRefresh('streamID', streamId);
+                if (!targetId) {
+                    sendRefresh('target', streamId);
+                }
+            }
+            return sent;
+        }
+
+        function scheduleBufferRefresh(userKey, refreshEventId) {
+            const key = normalizeUserId(userKey);
+            const eventId = String(refreshEventId || '');
+            if (!key || !eventId || vdoState.lastBufferRefreshIdByUser[key] === eventId) {
+                return false;
+            }
+            if (!vdoState.targetIdByUser[key] && !vdoState.streamIdByUser[key]) {
+                return false;
+            }
+            vdoState.lastBufferRefreshIdByUser[key] = eventId;
+            if (vdoState.bufferRefreshTimersByUser[key]) {
+                clearTimeout(vdoState.bufferRefreshTimersByUser[key]);
+            }
+            vdoState.bufferRefreshPendingUntilByUser[key] = Date.now() + 150;
+            sendTargetedRefresh(key);
+            vdoState.bufferRefreshTimersByUser[key] = setTimeout(function () {
+                delete vdoState.bufferRefreshTimersByUser[key];
+                delete vdoState.bufferRefreshPendingUntilByUser[key];
+                const desiredBufferMs = getDesiredBufferMs(key);
+                if (sendTargetedBuffer(key, desiredBufferMs)) {
+                    vdoState.lastAppliedBufferByUser[key] = desiredBufferMs;
+                }
+                updateSyncStatus();
+            }, 150);
+            return true;
+        }
+
         function requestVdoRoster() {
             if (!vdoState.iframeLoaded) {
                 return;
@@ -597,6 +657,10 @@
                 if (hasTarget) {
                     linkedUsers += 1;
                 } else {
+                    continue;
+                }
+                const pendingUntil = vdoState.bufferRefreshPendingUntilByUser[userKey] || 0;
+                if (pendingUntil > Date.now()) {
                     continue;
                 }
                 const desiredBufferMs = getDesiredBufferMs(userKey);
@@ -656,6 +720,12 @@
                 delete vdoState.streamIdByUser[userKey];
                 delete vdoState.targetIdByUser[userKey];
                 delete vdoState.lastAppliedBufferByUser[userKey];
+                delete vdoState.lastBufferRefreshIdByUser[userKey];
+                if (vdoState.bufferRefreshTimersByUser[userKey]) {
+                    clearTimeout(vdoState.bufferRefreshTimersByUser[userKey]);
+                }
+                delete vdoState.bufferRefreshTimersByUser[userKey];
+                delete vdoState.bufferRefreshPendingUntilByUser[userKey];
                 delete vdoState.latencyMsByUser[userKey];
                 delete vdoState.latencyUpdatedAtByUser[userKey];
                 changed = true;
@@ -697,6 +767,12 @@
                     delete vdoState.lastAppliedBufferByUser[userKey];
                 }
 
+                delete vdoState.lastBufferRefreshIdByUser[userKey];
+                if (vdoState.bufferRefreshTimersByUser[userKey]) {
+                    clearTimeout(vdoState.bufferRefreshTimersByUser[userKey]);
+                }
+                delete vdoState.bufferRefreshTimersByUser[userKey];
+                delete vdoState.bufferRefreshPendingUntilByUser[userKey];
                 delete vdoState.latencyMsByUser[userKey];
                 delete vdoState.latencyUpdatedAtByUser[userKey];
                 changed = true;
@@ -733,14 +809,18 @@
                 : ((typeof data.measuredAudioDelayMs === 'number')
                     ? data.measuredAudioDelayMs
                     : (typeof data.bufferTotalMs === 'number' ? data.bufferTotalMs : NaN));
+            const userKey = data.userId || data.userKey || '';
             ninjamSync.setRemoteTimecode(
-                data.userId || data.userKey || '',
+                userKey,
                 data.interval,
                 data.timecode,
                 receiverBufferMs,
                 buildUserSampleKey(data, receiverBufferMs),
                 data.voiceChatMode
             );
+            if (data.refreshBuffer && data.bufferRefreshEventId) {
+                scheduleBufferRefresh(userKey, data.bufferRefreshEventId);
+            }
             return false;
         }
 

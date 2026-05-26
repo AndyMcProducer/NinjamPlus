@@ -285,6 +285,8 @@
                 String(msg.videoClockMs ?? ''),
                 String(msg.timecode ?? ''),
                 String(msg.eventId ?? ''),
+                String(msg.bufferRefreshEventId ?? ''),
+                String(msg.refreshBuffer ? 1 : 0),
                 isFinite(bufferVal) ? String(Math.round(bufferVal)) : ''
             ].join('|');
         }

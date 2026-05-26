@@ -557,6 +557,8 @@ private:
     std::future<void> videoLaunchFuture;
     std::unique_ptr<LocalVideoHttpServer> advancedVideoServer;
     std::map<juce::String, int> remoteLatencyFirmDelayMsByUser;
+    std::map<juce::String, juce::uint64> remoteVideoBufferRefreshIdByUser;
+    juce::uint64 videoBufferRefreshCounter = 0;
 
     std::atomic<bool> opusSyncAvailable { false };
     std::atomic<bool> opusSyncHasLegacyClients { false };
@@ -600,7 +602,6 @@ private:
         double averageMs = 0.0;
         double firmAverageMs = 0.0;
         double lastMeasurementMs = -1.0;
-        double baseMarkerCorrectedDelayMs = -1.0;
     };
     std::map<juce::String, RemoteLatencyAverageState> remoteLatencyAverageByUser;
     juce::CriticalSection opusSyncPeerLock;
