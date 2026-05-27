@@ -258,6 +258,20 @@
             return Object.keys(keys).sort();
         }
 
+        function resetBufferApplicationState(userKey) {
+            const key = normalizeUserId(userKey);
+            if (!key) {
+                return;
+            }
+            delete vdoState.lastAppliedBufferByUser[key];
+            delete vdoState.lastBufferRefreshIdByUser[key];
+            if (vdoState.bufferRefreshTimersByUser[key]) {
+                clearTimeout(vdoState.bufferRefreshTimersByUser[key]);
+            }
+            delete vdoState.bufferRefreshTimersByUser[key];
+            delete vdoState.bufferRefreshPendingUntilByUser[key];
+        }
+
         function resolveUserKeyFromLabel(label) {
             const normalizedLabel = normalizeUserId(label);
             if (!normalizedLabel) {
@@ -319,6 +333,9 @@
                 || vdoState.targetIdByUser[userKey] !== targetId;
             vdoState.streamIdByUser[userKey] = cleanStreamId;
             vdoState.targetIdByUser[userKey] = targetId;
+            if (changed) {
+                resetBufferApplicationState(userKey);
+            }
             return changed;
         }
 
@@ -335,7 +352,7 @@
                 if (vdoState.streamIdByUser[userKey] === cleanStreamId) {
                     delete vdoState.streamIdByUser[userKey];
                     delete vdoState.targetIdByUser[userKey];
-                    delete vdoState.lastAppliedBufferByUser[userKey];
+                    resetBufferApplicationState(userKey);
                     changed = true;
                 }
             }
@@ -391,6 +408,61 @@
             return Math.max(0, Math.min(6000, value));
         }
 
+        function getMessageNumber(data, keyNames) {
+            if (!data || typeof data !== 'object') {
+                return NaN;
+            }
+            for (let i = 0; i < keyNames.length; i++) {
+                const value = data[keyNames[i]];
+                if (typeof value === 'number' && isFinite(value)) {
+                    return value;
+                }
+            }
+            return NaN;
+        }
+
+        function getNonNegativeMessageMs(data, keyNames) {
+            const value = getMessageNumber(data, keyNames);
+            return (isFinite(value) && value >= 0) ? value : NaN;
+        }
+
+        function resolveIncomingBufferMs(data) {
+            const measuredAudioDelayMs = getNonNegativeMessageMs(data, ['measuredAudioDelayMs', 'audioDelayMs']);
+            const senderServerLatencyMs = getNonNegativeMessageMs(data, ['senderServerLatencyMs', 'remoteServerLatencyMs']);
+            const receiverServerLatencyMs = getNonNegativeMessageMs(data, ['receiverServerLatencyMs', 'localServerLatencyMs']);
+            if (isFinite(measuredAudioDelayMs) && (isFinite(senderServerLatencyMs) || isFinite(receiverServerLatencyMs))) {
+                const sender = isFinite(senderServerLatencyMs) ? senderServerLatencyMs : 0;
+                const receiver = isFinite(receiverServerLatencyMs) ? receiverServerLatencyMs : 0;
+                return Math.max(minimumBufferMs, Math.round(measuredAudioDelayMs - sender - receiver));
+            }
+
+            const receiverBufferMs = getNonNegativeMessageMs(data, ['receiverBufferMs']);
+            if (isFinite(receiverBufferMs)) {
+                return Math.max(minimumBufferMs, Math.round(receiverBufferMs));
+            }
+
+            const bufferTotalMs = getNonNegativeMessageMs(data, ['bufferTotalMs']);
+            if (isFinite(bufferTotalMs)) {
+                return Math.max(minimumBufferMs, Math.round(bufferTotalMs));
+            }
+
+            if (isFinite(measuredAudioDelayMs)) {
+                return Math.max(minimumBufferMs, Math.round(measuredAudioDelayMs));
+            }
+
+            return NaN;
+        }
+
+        function getIncomingVdoLatencyMs(data) {
+            const latencyMs = getNonNegativeMessageMs(data, [
+                'cameraSendLatencyMs', 'vdoCameraLatencyMs', 'vdoSendLatencyMs',
+                'cameraLatencyMs', 'videoSendLatencyMs', 'senderVideoLatencyMs',
+                'sendLatencyMs', 'senderLatencyMs', 'captureLatencyMs', 'captureDelayMs',
+                'encodeLatencyMs', 'encoderLatencyMs', 'encodeDelayMs', 'encoderDelayMs'
+            ]);
+            return isFinite(latencyMs) ? clampLatencyMs(latencyMs) : NaN;
+        }
+
         function resolveUserKeyFromPeerIds(streamId, targetId, label) {
             const cleanTargetId = String(targetId || '').trim();
             if (cleanTargetId) {
@@ -419,41 +491,23 @@
 
         function extractLatencyMsFromNode(node) {
             const directMs = getNumericProperty(node, [
-                'latencyMs', 'delayMs', 'currentDelayMs', 'audioDelayMs', 'videoDelayMs',
-                'bufferDelayMs', 'jitterBufferMs', 'googCurrentDelayMs', 'googJitterBufferMs',
-                'playoutDelayMs', 'targetDelayMs', 'receiverDelayMs'
+                'cameraSendLatencyMs', 'vdoCameraLatencyMs', 'vdoSendLatencyMs',
+                'cameraLatencyMs', 'videoSendLatencyMs', 'senderVideoLatencyMs',
+                'sendLatencyMs', 'senderLatencyMs', 'captureLatencyMs', 'captureDelayMs',
+                'encodeLatencyMs', 'encoderLatencyMs', 'encodeDelayMs', 'encoderDelayMs'
             ]);
             if (isFinite(directMs)) {
                 return clampLatencyMs(directMs);
             }
 
-            const jitterDelaySeconds = getNumericProperty(node, ['jitterBufferDelay']);
-            const jitterEmittedCount = getNumericProperty(node, ['jitterBufferEmittedCount']);
-            if (isFinite(jitterDelaySeconds) && isFinite(jitterEmittedCount) && jitterEmittedCount > 0) {
-                return clampLatencyMs((jitterDelaySeconds / jitterEmittedCount) * 1000.0);
-            }
-
             const directSeconds = getNumericProperty(node, [
-                'audioCurrentDelay', 'currentDelay', 'jitterBufferTargetDelay',
-                'jitterBufferMinimumDelay', 'playoutDelay'
+                'cameraSendLatency', 'vdoCameraLatency', 'vdoSendLatency',
+                'cameraLatency', 'videoSendLatency', 'senderVideoLatency',
+                'sendLatency', 'senderLatency', 'captureLatency', 'captureDelay',
+                'encodeLatency', 'encoderLatency', 'encodeDelay', 'encoderDelay'
             ]);
             if (isFinite(directSeconds)) {
                 return clampLatencyMs(directSeconds * 1000.0);
-            }
-
-            const genericLatency = getNumericProperty(node, ['latency', 'audioLatency', 'videoLatency', 'bufferDelay']);
-            if (isFinite(genericLatency)) {
-                return clampLatencyMs(genericLatency > 20 ? genericLatency : (genericLatency * 1000.0));
-            }
-
-            const rttSeconds = getNumericProperty(node, ['currentRoundTripTime', 'roundTripTime', 'totalRoundTripTime', 'rtt']);
-            if (isFinite(rttSeconds)) {
-                return clampLatencyMs((rttSeconds * 1000.0) * 0.5);
-            }
-
-            const googRttMs = getNumericProperty(node, ['googRtt', 'googRttMs']);
-            if (isFinite(googRttMs)) {
-                return clampLatencyMs(googRttMs * 0.5);
             }
 
             return NaN;
@@ -546,10 +600,7 @@
             const safeBase = (typeof baseBuffer === 'number' && isFinite(baseBuffer) && baseBuffer >= 0)
                 ? Math.round(baseBuffer)
                 : appState.requestedBufferMs;
-            // The plugin already exports the total sync buffer we want VDO to use.
-            // Subtracting VDO's own reported playback latency here undercuts that
-            // value and can collapse a correct large delay to a small base amount.
-            return Math.max(minimumBufferMs, safeBase + getManualOffsetMs(userKey));
+            return Math.max(minimumBufferMs, safeBase - getEstimatedVdoLatencyMs(userKey) + getManualOffsetMs(userKey));
         }
 
         function postToVdo(message) {
@@ -640,6 +691,15 @@
             return true;
         }
 
+        function scheduleBufferChangeRefresh(userKey, desiredBufferMs) {
+            const key = normalizeUserId(userKey);
+            if (!key) {
+                return false;
+            }
+            const eventId = 'auto:' + Math.round(desiredBufferMs) + ':' + Date.now();
+            return scheduleBufferRefresh(key, eventId);
+        }
+
         function requestVdoRoster() {
             if (!vdoState.iframeLoaded) {
                 return;
@@ -665,6 +725,12 @@
                 }
                 const desiredBufferMs = getDesiredBufferMs(userKey);
                 if (!force && vdoState.lastAppliedBufferByUser[userKey] === desiredBufferMs) {
+                    continue;
+                }
+                const lastAppliedBuffer = vdoState.lastAppliedBufferByUser[userKey];
+                const hasAppliedBuffer = typeof lastAppliedBuffer === 'number' && isFinite(lastAppliedBuffer);
+                if (hasAppliedBuffer && lastAppliedBuffer !== desiredBufferMs) {
+                    scheduleBufferChangeRefresh(userKey, desiredBufferMs);
                     continue;
                 }
                 if (sendTargetedBuffer(userKey, desiredBufferMs)) {
@@ -804,12 +870,12 @@
             if (data.type !== 'remoteTimecode' && data.type !== 'videoTimecode') {
                 return false;
             }
-            const receiverBufferMs = typeof data.receiverBufferMs === 'number'
-                ? data.receiverBufferMs
-                : ((typeof data.measuredAudioDelayMs === 'number')
-                    ? data.measuredAudioDelayMs
-                    : (typeof data.bufferTotalMs === 'number' ? data.bufferTotalMs : NaN));
+            const receiverBufferMs = resolveIncomingBufferMs(data);
             const userKey = data.userId || data.userKey || '';
+            const incomingVdoLatencyMs = getIncomingVdoLatencyMs(data);
+            if (isFinite(incomingVdoLatencyMs)) {
+                setEstimatedVdoLatencyMs(userKey, incomingVdoLatencyMs);
+            }
             ninjamSync.setRemoteTimecode(
                 userKey,
                 data.interval,
@@ -936,12 +1002,13 @@
 
             const detailedLatencyByUser = collectDetailedStateLatencyByUser(data);
             const detailedUsers = Object.keys(detailedLatencyByUser);
+            let latencyChanged = false;
             for (let i = 0; i < detailedUsers.length; i++) {
                 const userKey = detailedUsers[i];
-                setEstimatedVdoLatencyMs(userKey, detailedLatencyByUser[userKey]);
+                latencyChanged = setEstimatedVdoLatencyMs(userKey, detailedLatencyByUser[userKey]) || latencyChanged;
             }
 
-            if (changed) {
+            if (changed || latencyChanged) {
                 applyPeerBuffers(true);
             } else {
                 updateSyncStatus();

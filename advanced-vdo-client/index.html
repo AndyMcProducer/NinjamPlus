@@ -232,6 +232,61 @@
             return (typeof v === 'number' && isFinite(v) && v >= 0) ? (String(Math.round(v)) + 'ms') : '--';
         }
 
+        function getMessageNumber(msg, keyNames) {
+            if (!msg || typeof msg !== 'object') {
+                return NaN;
+            }
+            for (let i = 0; i < keyNames.length; i++) {
+                const value = msg[keyNames[i]];
+                if (typeof value === 'number' && isFinite(value)) {
+                    return value;
+                }
+            }
+            return NaN;
+        }
+
+        function getNonNegativeMessageMs(msg, keyNames) {
+            const value = getMessageNumber(msg, keyNames);
+            return (isFinite(value) && value >= 0) ? value : NaN;
+        }
+
+        function resolveIncomingBufferMs(msg) {
+            const measuredAudioDelayMs = getNonNegativeMessageMs(msg, ['measuredAudioDelayMs', 'audioDelayMs']);
+            const senderServerLatencyMs = getNonNegativeMessageMs(msg, ['senderServerLatencyMs', 'remoteServerLatencyMs']);
+            const receiverServerLatencyMs = getNonNegativeMessageMs(msg, ['receiverServerLatencyMs', 'localServerLatencyMs']);
+            if (isFinite(measuredAudioDelayMs) && (isFinite(senderServerLatencyMs) || isFinite(receiverServerLatencyMs))) {
+                const sender = isFinite(senderServerLatencyMs) ? senderServerLatencyMs : 0;
+                const receiver = isFinite(receiverServerLatencyMs) ? receiverServerLatencyMs : 0;
+                return Math.max(0, Math.round(measuredAudioDelayMs - sender - receiver));
+            }
+
+            const receiverBufferMs = getNonNegativeMessageMs(msg, ['receiverBufferMs']);
+            if (isFinite(receiverBufferMs)) {
+                return Math.max(0, Math.round(receiverBufferMs));
+            }
+
+            const bufferTotalMs = getNonNegativeMessageMs(msg, ['bufferTotalMs']);
+            if (isFinite(bufferTotalMs)) {
+                return Math.max(0, Math.round(bufferTotalMs));
+            }
+
+            if (isFinite(measuredAudioDelayMs)) {
+                return Math.max(0, Math.round(measuredAudioDelayMs));
+            }
+
+            return NaN;
+        }
+
+        function getIncomingVdoLatencyMs(msg) {
+            const latencyMs = getNonNegativeMessageMs(msg, [
+                'cameraSendLatencyMs', 'vdoCameraLatencyMs', 'vdoSendLatencyMs',
+                'cameraLatencyMs', 'videoSendLatencyMs', 'senderVideoLatencyMs',
+                'sendLatencyMs', 'senderLatencyMs', 'captureLatencyMs', 'captureDelayMs',
+                'encodeLatencyMs', 'encoderLatencyMs', 'encodeDelayMs', 'encoderDelayMs'
+            ]);
+            return isFinite(latencyMs) ? Math.max(0, Math.min(6000, Math.round(latencyMs))) : NaN;
+        }
+
         function getUserLatencyText(userId) {
             const measured = getMeasuredBufferMs(userId);
             const debug = getLatencyDebug(userId);
@@ -241,7 +296,9 @@
             const sender = fmtMeasured(debug.senderServerLatencyMs);
             const receiver = fmtMeasured(debug.receiverServerLatencyMs);
             const total = fmtMeasured(measured !== null ? measured : debug.bufferMs);
-            return 'base ' + total + ' | srv ' + sender + ' + ' + receiver;
+            const vdoLatency = fmtMeasured(debug.vdoLatencyMs);
+            const vdoText = debug.vdoLatencyMs !== null ? (' | vdo ' + vdoLatency) : '';
+            return 'base ' + total + ' | srv ' + sender + ' + ' + receiver + vdoText;
         }
 
         function pushOffsetToFrame(userId) {
@@ -413,18 +470,14 @@
                     changed = true;
                 }
                 const normalizedUserId = normalizeUserId(userId);
-                const bufferVal = (typeof msg.receiverBufferMs === 'number')
-                    ? msg.receiverBufferMs
-                    : ((typeof msg.measuredAudioDelayMs === 'number')
-                        ? msg.measuredAudioDelayMs
-                        : ((typeof msg.bufferTotalMs === 'number')
-                            ? msg.bufferTotalMs
-                            : NaN));
-                const senderServerLatencyMs = (typeof msg.senderServerLatencyMs === 'number') ? msg.senderServerLatencyMs : NaN;
-                const receiverServerLatencyMs = (typeof msg.receiverServerLatencyMs === 'number') ? msg.receiverServerLatencyMs : NaN;
+                const bufferVal = resolveIncomingBufferMs(msg);
+                const senderServerLatencyMs = getNonNegativeMessageMs(msg, ['senderServerLatencyMs', 'remoteServerLatencyMs']);
+                const receiverServerLatencyMs = getNonNegativeMessageMs(msg, ['receiverServerLatencyMs', 'localServerLatencyMs']);
+                const vdoLatencyMs = getIncomingVdoLatencyMs(msg);
                 const sampleKey = buildUserSampleKey(msg, bufferVal)
                     + '|' + (isFinite(senderServerLatencyMs) ? String(Math.round(senderServerLatencyMs)) : '')
-                    + '|' + (isFinite(receiverServerLatencyMs) ? String(Math.round(receiverServerLatencyMs)) : '');
+                    + '|' + (isFinite(receiverServerLatencyMs) ? String(Math.round(receiverServerLatencyMs)) : '')
+                    + '|' + (isFinite(vdoLatencyMs) ? String(Math.round(vdoLatencyMs)) : '');
                 if (userLastSampleKey[normalizedUserId] === sampleKey) {
                     continue;
                 }
@@ -435,6 +488,7 @@
                     latencyDebugByUser[normalizedUserId] = {
                         senderServerLatencyMs: (isFinite(senderServerLatencyMs) && senderServerLatencyMs >= 0) ? Math.round(senderServerLatencyMs) : null,
                         receiverServerLatencyMs: (isFinite(receiverServerLatencyMs) && receiverServerLatencyMs >= 0) ? Math.round(receiverServerLatencyMs) : null,
+                        vdoLatencyMs: (isFinite(vdoLatencyMs) && vdoLatencyMs >= 0) ? Math.round(vdoLatencyMs) : null,
                         bufferMs: Math.round(bufferVal)
                     };
                     updated = true;
