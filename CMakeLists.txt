@@ -62,6 +62,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(opus)
 
+# Fetch signalsmith-stretch from its upstream repository so CI and local builds
+# always obtain the header/source directly during CMake configure.
+FetchContent_Declare(
+    signalsmith_stretch
+    GIT_REPOSITORY https://github.com/signalsmith-audio/signalsmith-stretch.git
+)
+FetchContent_MakeAvailable(signalsmith_stretch)
+
 # Fetch Ableton Link (header-only CMake integration, with asio-standalone submodule)
 FetchContent_Declare(
     abletonlink
@@ -170,8 +178,7 @@ target_include_directories(NINJAM_VST3 PRIVATE
     third_party/chord-detector/src
     third_party/chord-detector/libs/kiss_fft130
     third_party/chord-detector
-    ${CMAKE_SOURCE_DIR}/third_party/signalsmith-stretch
-    ${CMAKE_SOURCE_DIR}/third_party/signalsmith-stretch/include
+    ${signalsmith_stretch_SOURCE_DIR}/include
     third_party/signalsmith-linear/include
     $<$<BOOL:${WIN32}>:${asiosdk_SOURCE_DIR}/common>
     $<$<BOOL:${WIN32}>:${asiosdk_SOURCE_DIR}/host>
