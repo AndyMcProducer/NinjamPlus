@@ -169,9 +169,28 @@ target_include_directories(NINJAM_VST3 PRIVATE
     ${opus_SOURCE_DIR}/include
     third_party/chord-detector/src
     third_party/chord-detector/libs/kiss_fft130
+    third_party/signalsmith-stretch
+    third_party/signalsmith-stretch/include
+    third_party/signalsmith-linear/include
     $<$<BOOL:${WIN32}>:${asiosdk_SOURCE_DIR}/common>
     $<$<BOOL:${WIN32}>:${asiosdk_SOURCE_DIR}/host>
 )
+
+find_path(AUBIO_INCLUDE_DIR
+    NAMES aubio.h aubio/aubio.h)
+find_library(AUBIO_LIBRARY
+    NAMES aubio libaubio)
+if (AUBIO_INCLUDE_DIR AND AUBIO_LIBRARY)
+    target_include_directories(NINJAM_VST3 PRIVATE ${AUBIO_INCLUDE_DIR})
+    target_link_libraries(NINJAM_VST3 PRIVATE ${AUBIO_LIBRARY})
+    target_compile_definitions(NINJAM_VST3 PRIVATE NINJAMPLUS_HAS_AUBIO=1)
+else()
+    target_compile_definitions(NINJAM_VST3 PRIVATE NINJAMPLUS_HAS_AUBIO=0)
+endif()
+
+if (MSVC)
+    target_compile_options(NINJAM_VST3 PRIVATE /bigobj)
+endif()
 
 # Link libraries
 target_link_libraries(NINJAM_VST3 PRIVATE

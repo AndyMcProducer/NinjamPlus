@@ -146,6 +146,17 @@ public:
                                     const juce::Slider::SliderStyle, juce::Slider&) override;
 };
 
+class SamplePadsButtonLookAndFeel : public juce::LookAndFeel_V4
+{
+public:
+    void drawButtonBackground(juce::Graphics& g, juce::Button& button,
+                              const juce::Colour& backgroundColour,
+                              bool shouldDrawButtonAsHighlighted,
+                              bool shouldDrawButtonAsDown) override;
+    void drawButtonText(juce::Graphics&, juce::TextButton&,
+                        bool, bool) override {}
+};
+
 class NonlinearFaderSlider : public juce::Slider
 {
 public:
@@ -425,6 +436,13 @@ private:
     void clampScroll();
     void loadPreviewIfNeeded(int entryIndex);
     int getTextWidthForLayout() const;
+    int getTextLineHeight() const;
+    int getEntryTextHeight(const Entry& entry, int textRightEdge) const;
+    int layoutEntryText(const Entry& entry,
+                        int y,
+                        int textRightEdge,
+                        juce::Graphics* graphics,
+                        std::vector<PaintedLink>* links = nullptr) const;
     int getMediaTileHeight(const Entry& entry, int textWidth) const;
     juce::Rectangle<int> getMediaTileBounds(const Entry& entry, int y, int textWidth) const;
     int estimateContentHeight() const;
@@ -686,7 +704,7 @@ public:
         : versionText(versionString)
     {
         setOpaque(true);
-        setSize(420, 180);
+        setSize(460, 230);
     }
     
     void paint(juce::Graphics& g) override
@@ -710,10 +728,19 @@ public:
         area.removeFromTop(10);
 
         g.setFont(juce::Font(14.0f));
-        g.drawFittedText("Low-latency collaborative jamming with interval sync, video sync, and chord detection.",
-                         area,
+        g.drawFittedText("Low-latency collaborative jamming with interval sync, video sync, chord detection, and sample pads.",
+                         area.removeFromTop(58),
                          juce::Justification::centredTop,
                          3);
+
+        area.removeFromTop(8);
+
+        g.setFont(juce::Font(12.0f));
+        g.setColour(juce::Colours::lightgrey.withAlpha(0.82f));
+        g.drawFittedText("Sample pad time-stretch uses Signalsmith Stretch and Signalsmith Linear (MIT).",
+                         area,
+                         juce::Justification::centredTop,
+                         2);
     }
     
 private:
@@ -729,7 +756,7 @@ public:
         auto popup = new AboutPopup(versionString);
         setContentOwned(popup, true);
         setResizable(false, false);
-        setSize(420, 180);
+        setSize(460, 230);
         centreAroundComponent(nullptr, getWidth(), getHeight());
     }
     
@@ -1092,6 +1119,12 @@ public:
     void mouseDown(const juce::MouseEvent& event) override;
     bool shouldDeferHeavyUiWork() const;
     void setStandaloneOptionsMenuHandler(std::function<void(juce::Component*)> handler);
+    void armSamplePadMidiLearn(int padIndex);
+    void forgetSamplePadMidiLearn(int padIndex);
+    void armSamplePadOscLearn(int padIndex);
+    void forgetSamplePadOscLearn(int padIndex);
+    bool hasSamplePadMidiLearn(int padIndex) const;
+    bool hasSamplePadOscLearn(int padIndex) const;
     
     juce::Image backgroundImage;
     juce::Image radioKnobImage;
@@ -1116,6 +1149,7 @@ public:
     SyncIconLookAndFeel syncIconLAF;
     ATButtonLookAndFeel atBtnLAF;
     ATButtonLookAndFeel chatBtnLAF;
+    SamplePadsButtonLookAndFeel samplePadsBtnLAF;
     OutlinedLabelLookAndFeel outlinedLabelLAF;
     
 private:
@@ -1157,6 +1191,7 @@ private:
     juce::ComboBox backgroundSelector{ "Background" };
     LeftClickOnlyToggleButton videoBgToggle{ "Video BG" };
     LeftClickOnlyTextButton videoButton{ "Video Room" };
+    LeftClickOnlyTextButton samplePadsButton{ "" };
     LeftClickOnlyTextButton chatButton{ "Chat" };
     
     // Chat
@@ -1247,6 +1282,7 @@ private:
     void syncToggled();
     void chatToggled();
     void chatPopoutClicked();
+    void showSamplePadsWindow();
     void videoClicked();
 
     void serverListClicked();
@@ -1287,6 +1323,10 @@ private:
     juce::String buildPersistentSettingsFingerprint(bool includeProcessorState) const;
     void setChatWindowColourKey(const juce::String& key, bool markDirty);
     void applyChatWindowColourToDisplays();
+    void setAbletonChatWindowSizePreset(int presetIndex);
+    void openChatPopoutWindow(const juce::StringArray& history,
+                              const juce::StringArray& senders,
+                              const juce::String& draftText);
     void savePersistentSettingsToDisk(bool includeProcessorState = true);
     void loadPersistentSettingsFromDisk();
     void clearLearnMappings();
@@ -1334,13 +1374,16 @@ private:
 
     std::unique_ptr<juce::DocumentWindow> serverListWindow;
     std::unique_ptr<juce::DocumentWindow> chatWindow;
+    std::unique_ptr<juce::DocumentWindow> samplePadsWindow;
 
     bool autoLevelEnabled = false;
     bool chatPoppedOut = false;
+    bool chatPopoutOpenPending = false;
     bool pendingDeferredResizeLayout = false;
     bool applyingDeferredResizeLayout = false;
     bool hostResizeLockedForConnection = false;
     int abletonWindowSizePreset = 1;
+    int abletonChatWindowSizePreset = 1;
     std::unique_ptr<juce::DialogWindow> aboutWindow;
     double lastResizeEventMs = 0.0;
     double suppressHeavyUiUntilMs = 0.0;
@@ -1369,8 +1412,10 @@ private:
     NinjamVst3AudioProcessor::SyncMode preferredSyncMode = NinjamVst3AudioProcessor::SyncMode::host;
     std::unique_ptr<juce::MidiInput> midiLearnInputDevice;
     std::unique_ptr<juce::MidiInput> midiRelayInputDevice;
+    std::unique_ptr<juce::MidiInput> samplePadsMidiInputDevice;
     juce::String openedMidiLearnInputDeviceId;
     juce::String openedMidiRelayInputDeviceId;
+    juce::String openedSamplePadsMidiInputDeviceId;
     juce::String lastLinkAudioLocalInputLabel;
     double lastPersistentSettingsSaveMs = 0.0;
     double lastVideoBackgroundRepaintMs = 0.0;

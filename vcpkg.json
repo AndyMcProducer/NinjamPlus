@@ -2,6 +2,7 @@
   "name": "ninjam-vst3",
   "version": "1.0.0",
   "dependencies": [
+    "aubio",
     {
       "name": "ffmpeg",
       "features": [

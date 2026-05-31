@@ -92,6 +92,42 @@ and services you ship.
   - The local copy includes small real-time integration changes for this
     plugin; keep those changes available with the corresponding source.
 
+### Signalsmith Stretch
+
+- Source tree: `third_party/signalsmith-stretch/`
+- Upstream: `Signalsmith-Audio/signalsmith-stretch`
+- Version included: commit `57b93f4`
+- License: MIT. The upstream license text is included at
+  `third_party/signalsmith-stretch/LICENSE.txt`.
+- Active build path: `CMakeLists.txt` adds the include paths for sample-pad
+  BPM sync and time-stretching.
+- Attribution note:
+  - Retain the copyright notice, license text, and disclaimer in source and
+    binary distributions.
+
+### Signalsmith Linear
+
+- Source tree: `third_party/signalsmith-linear/`
+- Upstream: `Signalsmith-Audio/linear`
+- Version included: commit `5668673`
+- License: MIT. The upstream license text is included at
+  `third_party/signalsmith-linear/LICENSE.txt`.
+- Active build path: used by Signalsmith Stretch through the
+  `signalsmith-linear/*` headers.
+- Attribution note:
+  - Retain the copyright notice, license text, and disclaimer in source and
+    binary distributions.
+
+### Aubio (Optional System Dependency)
+
+- Source is not vendored in this repository.
+- Active build path: `CMakeLists.txt` detects an installed aubio library and
+  defines `NINJAMPLUS_HAS_AUBIO=1` only when both headers and library are
+  available.
+- Attribution and compliance note:
+  - If a release links aubio, add the exact aubio version, license terms, and
+    distribution obligations for that build before shipping.
+
 ## Local Helper Code And Packaged Assets
 
 ### Advanced VDO Client Helper Pages And Server
