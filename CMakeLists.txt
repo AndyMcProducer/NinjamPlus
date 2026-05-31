@@ -68,7 +68,10 @@ FetchContent_Declare(
     signalsmith_stretch
     GIT_REPOSITORY https://github.com/signalsmith-audio/signalsmith-stretch.git
 )
-FetchContent_MakeAvailable(signalsmith_stretch)
+FetchContent_GetProperties(signalsmith_stretch)
+if (NOT signalsmith_stretch_POPULATED)
+    FetchContent_Populate(signalsmith_stretch)
+endif()
 
 # Fetch Ableton Link (header-only CMake integration, with asio-standalone submodule)
 FetchContent_Declare(
