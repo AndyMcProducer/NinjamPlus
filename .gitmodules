@@ -1,3 +1,6 @@
 [submodule "ninjam"]
 	path = ninjam
 	url = https://github.com/AndyMcProducer/ninjamplus.git
+[submodule "third_party/signalsmith-stretch"]
+	path = third_party/signalsmith-stretch
+	url = https://github.com/signalsmith-audio/signalsmith-stretch.git
