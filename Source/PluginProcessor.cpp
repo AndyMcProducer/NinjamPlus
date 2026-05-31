@@ -2,7 +2,7 @@
 #include "PluginEditor.h"
 #include "Chromagram.h"
 #include "ChordDetector.h"
-#include "signalsmith-stretch/signalsmith-stretch.h"
+#include "chord-detector/signalsmith-stretch/signalsmith-stretch.h"
 
 #ifndef NINJAMPLUS_HAS_AUBIO
  #define NINJAMPLUS_HAS_AUBIO 0
