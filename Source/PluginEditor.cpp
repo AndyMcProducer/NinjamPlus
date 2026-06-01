@@ -725,7 +725,7 @@ public:
         addAndMakeVisible(padsDeviceLabel);
         padsDeviceLabel.setText("Pads MIDI Device", juce::dontSendNotification);
         addAndMakeVisible(padsDeviceSelector);
-        populateSelector(padsDeviceSelector, padsDeviceByMenuId, processor.getSamplePadsMidiInputDeviceId());
+        populatePadsSelector(padsDeviceSelector, padsDeviceByMenuId, processor.getSamplePadsMidiInputDeviceId());
         padsDeviceSelector.onChange = [this]
         {
             const int selected = padsDeviceSelector.getSelectedId();
@@ -779,6 +779,39 @@ private:
         selector.addItem("Host MIDI / Any", menuId);
         idByMenuId[menuId] = {};
         int selectedMenuId = selectedDeviceId.isEmpty() ? menuId : 0;
+        ++menuId;
+
+        const auto devices = juce::MidiInput::getAvailableDevices();
+        for (const auto& device : devices)
+        {
+            selector.addItem(device.name, menuId);
+            idByMenuId[menuId] = device.identifier;
+            if (device.identifier == selectedDeviceId)
+                selectedMenuId = menuId;
+            ++menuId;
+        }
+
+        if (selectedMenuId == 0)
+            selectedMenuId = 1;
+        selector.setSelectedId(selectedMenuId, juce::dontSendNotification);
+    }
+
+    static void populatePadsSelector(juce::ComboBox& selector,
+                                     std::map<int, juce::String>& idByMenuId,
+                                     const juce::String& selectedDeviceId)
+    {
+        selector.clear(juce::dontSendNotification);
+        idByMenuId.clear();
+        int menuId = 1;
+        selector.addItem("Host MIDI / Any", menuId);
+        idByMenuId[menuId] = {};
+        int selectedMenuId = selectedDeviceId.isEmpty() ? menuId : 0;
+        ++menuId;
+
+        selector.addItem("Remote MIDI Relay", menuId);
+        idByMenuId[menuId] = NinjamVst3AudioProcessor::samplePadsMidiInputRelayId;
+        if (selectedDeviceId == NinjamVst3AudioProcessor::samplePadsMidiInputRelayId)
+            selectedMenuId = menuId;
         ++menuId;
 
         const auto devices = juce::MidiInput::getAvailableDevices();
@@ -862,6 +895,25 @@ private:
         inputByMenuId[menuId] = NinjamVst3AudioProcessor::looperInputLocalChannel;
         int selectedMenuId = selectedInput == NinjamVst3AudioProcessor::looperInputLocalChannel ? menuId : 0;
         ++menuId;
+
+        selector.addItem("Sample Pads", menuId);
+        inputByMenuId[menuId] = NinjamVst3AudioProcessor::looperInputSamplePads;
+        if (selectedInput == NinjamVst3AudioProcessor::looperInputSamplePads)
+            selectedMenuId = menuId;
+        ++menuId;
+
+        for (const auto& user : processor.getConnectedUsers())
+        {
+            if (user.name.isEmpty())
+                continue;
+
+            const int inputValue = NinjamVst3AudioProcessor::looperInputForRemoteUser(user.index);
+            selector.addItem("User " + user.name, menuId);
+            inputByMenuId[menuId] = inputValue;
+            if (selectedInput == inputValue)
+                selectedMenuId = menuId;
+            ++menuId;
+        }
 
         int totalInputs = processor.getTotalNumInputChannels();
         if (totalInputs <= 0)
@@ -3001,6 +3053,16 @@ static juce::Rectangle<int> chatPopoutSizeForPreset(int presetIndex)
     return { 0, 0, 520, 420 };
 }
 
+static juce::Rectangle<int> abletonEditorWindowSizeForPreset(int presetIndex)
+{
+    presetIndex = juce::jlimit(0, 2, presetIndex);
+    if (presetIndex == 0)
+        return { 0, 0, 1100, 540 };
+    if (presetIndex == 2)
+        return { 0, 0, 1380, 700 };
+    return { 0, 0, 1240, 600 };
+}
+
 class ChatWindow : public juce::DocumentWindow
 {
 public:
@@ -4033,6 +4095,12 @@ private:
         int selectedMenuId = selectedDeviceId.isEmpty() ? menuId : 0;
         ++menuId;
 
+        selector.addItem("Remote MIDI Relay", menuId);
+        idByMenuId[menuId] = NinjamVst3AudioProcessor::samplePadsMidiInputRelayId;
+        if (selectedDeviceId == NinjamVst3AudioProcessor::samplePadsMidiInputRelayId)
+            selectedMenuId = menuId;
+        ++menuId;
+
         const auto devices = juce::MidiInput::getAvailableDevices();
         for (const auto& device : devices)
         {
@@ -4061,6 +4129,25 @@ private:
         inputByMenuId[menuId] = NinjamVst3AudioProcessor::looperInputLocalChannel;
         int selectedMenuId = selectedInput == NinjamVst3AudioProcessor::looperInputLocalChannel ? menuId : 0;
         ++menuId;
+
+        selector.addItem("Sample Pads", menuId);
+        inputByMenuId[menuId] = NinjamVst3AudioProcessor::looperInputSamplePads;
+        if (selectedInput == NinjamVst3AudioProcessor::looperInputSamplePads)
+            selectedMenuId = menuId;
+        ++menuId;
+
+        for (const auto& user : processor.getConnectedUsers())
+        {
+            if (user.name.isEmpty())
+                continue;
+
+            const int inputValue = NinjamVst3AudioProcessor::looperInputForRemoteUser(user.index);
+            selector.addItem("User " + user.name, menuId);
+            inputByMenuId[menuId] = inputValue;
+            if (selectedInput == inputValue)
+                selectedMenuId = menuId;
+            ++menuId;
+        }
 
         int totalInputs = processor.getTotalNumInputChannels();
         if (totalInputs <= 0)
@@ -4103,12 +4190,25 @@ private:
 
         const int looperInput = processor.getSamplePadLooperInput();
         const int totalInputs = processor.getTotalNumInputChannels();
-        if (force || looperInput != displayedLooperInput || totalInputs != displayedTotalInputs)
+        const juce::String looperUsersFingerprint = buildLooperUsersFingerprint(processor);
+        if (force
+            || looperInput != displayedLooperInput
+            || totalInputs != displayedTotalInputs
+            || looperUsersFingerprint != displayedLooperUsersFingerprint)
         {
             displayedLooperInput = looperInput;
             displayedTotalInputs = totalInputs;
+            displayedLooperUsersFingerprint = looperUsersFingerprint;
             populateLooperInputSelector(looperInputSelector, looperInputByMenuId, processor);
         }
+    }
+
+    static juce::String buildLooperUsersFingerprint(NinjamVst3AudioProcessor& processor)
+    {
+        juce::StringArray parts;
+        for (const auto& user : processor.getConnectedUsers())
+            parts.add(juce::String(user.index) + ":" + user.name);
+        return parts.joinIntoString("|");
     }
 
     void updateLimiterButtonColour()
@@ -4260,6 +4360,7 @@ private:
     juce::String displayedPadsMidiDeviceId;
     int displayedLooperInput = NinjamVst3AudioProcessor::looperInputLocalChannel;
     int displayedTotalInputs = -1;
+    juce::String displayedLooperUsersFingerprint;
     juce::Array<juce::File> bankFolders;
     std::unique_ptr<juce::FileChooser> bankChooser;
     NonlinearFaderSlider volumeSlider;
@@ -4277,11 +4378,14 @@ public:
                      NinjamVst3AudioProcessorEditor& editor,
                      bool abletonHostedWindow,
                      int abletonSamplerWindowSizePreset,
+                     juce::Rectangle<int> savedWindowBounds,
                      std::function<void()> onPadsMidiChangedCallback,
                      std::function<void(int)> onSamplerSizePresetChangedCallback,
+                     std::function<void(juce::Rectangle<int>, bool)> onBoundsChangedCallback,
                      std::function<void()> onClosedCallback)
         : DocumentWindow("NINJAM Sample Pads", juce::Colours::black, DocumentWindow::closeButton),
           onClosed(std::move(onClosedCallback)),
+          onBoundsChanged(std::move(onBoundsChangedCallback)),
           abletonHosted(abletonHostedWindow)
     {
         setUsingNativeTitleBar(!abletonHosted);
@@ -4302,7 +4406,16 @@ public:
         {
             setResizable(true, true);
             setResizeLimits(560, 360, 1100, 760);
-            centreWithSize(680, 450);
+            if (savedWindowBounds.getWidth() >= 560 && savedWindowBounds.getHeight() >= 360)
+            {
+                savedWindowBounds.setSize(juce::jlimit(560, 1100, savedWindowBounds.getWidth()),
+                                          juce::jlimit(360, 760, savedWindowBounds.getHeight()));
+                setBounds(savedWindowBounds);
+            }
+            else
+            {
+                centreWithSize(680, 450);
+            }
         }
         setVisible(true);
     }
@@ -4322,6 +4435,7 @@ public:
 
     void closeButtonPressed() override
     {
+        notifyBoundsChanged(true);
         setVisible(false);
         auto callback = onClosed;
         juce::MessageManager::callAsync([callback = std::move(callback)]
@@ -4331,8 +4445,27 @@ public:
         });
     }
 
+    void moved() override
+    {
+        DocumentWindow::moved();
+        notifyBoundsChanged(false);
+    }
+
+    void resized() override
+    {
+        DocumentWindow::resized();
+        notifyBoundsChanged(false);
+    }
+
 private:
+    void notifyBoundsChanged(bool saveNow)
+    {
+        if (!abletonHosted && onBoundsChanged && getWidth() > 0 && getHeight() > 0)
+            onBoundsChanged(getBounds(), saveNow);
+    }
+
     std::function<void()> onClosed;
+    std::function<void(juce::Rectangle<int>, bool)> onBoundsChanged;
     bool abletonHosted = false;
 };
 
@@ -5385,7 +5518,6 @@ void CustomKnobLookAndFeel::drawRotarySlider(juce::Graphics& g, int x, int y, in
 NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioProcessor& p)
     : AudioProcessorEditor (&p), audioProcessor (p), intervalDisplay(p), userList(p)
 {
-    setSize (1080, 600);
     setResizable(true, true);
     setResizeLimits(900, 500, 2200, 1500);
     const bool settingsFileReady = renewSettingsFileIfCorrupt(makeSettingsOptions(), this);
@@ -6095,9 +6227,6 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         repaint();
     };
 
-    if (isAbletonLiveHost() && !audioProcessor.isStandaloneWrapper())
-        setAbletonWindowSizePreset(abletonWindowSizePreset);
-
     addAndMakeVisible(intervalDisplay);
     registerMidiLearnTarget(metronomeSlider, "metronome.level", false);
     registerMidiLearnTarget(transmitButton, "button.transmit", true);
@@ -6159,13 +6288,28 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     lastSavedUiSettingsFingerprint = buildPersistentSettingsFingerprint(false);
     persistentSettingsDirty = false;
 
+    startTimer((!audioProcessor.isStandaloneWrapper() && isAbletonLiveHost()) ? 50 : 30);
+
     if (!audioProcessor.isStandaloneWrapper() && isAbletonLiveHost())
-        setAbletonWindowSizePreset(abletonWindowSizePreset);
+    {
+        abletonWindowSizePreset = juce::jlimit(0, 2, abletonWindowSizePreset);
+        const auto targetSize = abletonEditorWindowSizeForPreset(abletonWindowSizePreset);
+        pendingDeferredResizeLayout = false;
+        applyingDeferredResizeLayout = false;
+        setResizable(false, false);
+        setResizeLimits(targetSize.getWidth(),
+                        targetSize.getHeight(),
+                        targetSize.getWidth(),
+                        targetSize.getHeight());
+        suppressHeavyUiUntilMs = juce::Time::getMillisecondCounterHiRes() + 400.0;
+        hostResizeLockedForConnection = true;
+        setSize(targetSize.getWidth(), targetSize.getHeight());
+    }
     else
+    {
         setSize(getWidth() > 0 ? getWidth() : 1080,
                 getHeight() > 0 ? getHeight() : 600);
-
-    startTimer((!audioProcessor.isStandaloneWrapper() && isAbletonLiveHost()) ? 50 : 30);
+    }
 }
 
 NinjamVst3AudioProcessorEditor::~NinjamVst3AudioProcessorEditor()
@@ -6365,13 +6509,20 @@ void NinjamVst3AudioProcessorEditor::paintOverChildren(juce::Graphics& g)
 
 void NinjamVst3AudioProcessorEditor::resized()
 {
+    if (getWidth() <= 0 || getHeight() <= 0)
+        return;
+
     if (!audioProcessor.isStandaloneWrapper() && isAbletonLiveHost() && !applyingDeferredResizeLayout)
     {
-        if (getWidth() == lastLaidOutEditorWidth && getHeight() == lastLaidOutEditorHeight)
+        const bool hasCompletedInitialLayout = lastLaidOutEditorWidth > 0 && lastLaidOutEditorHeight > 0;
+        if (hasCompletedInitialLayout)
+        {
+            if (getWidth() == lastLaidOutEditorWidth && getHeight() == lastLaidOutEditorHeight)
+                return;
+            pendingDeferredResizeLayout = true;
+            lastResizeEventMs = juce::Time::getMillisecondCounterHiRes();
             return;
-        pendingDeferredResizeLayout = true;
-        lastResizeEventMs = juce::Time::getMillisecondCounterHiRes();
-        return;
+        }
     }
 
     auto area = getLocalBounds().reduced(10);
@@ -7485,6 +7636,7 @@ juce::String NinjamVst3AudioProcessorEditor::buildPersistentSettingsFingerprint(
     parts.add(juce::String(abletonWindowSizePreset));
     parts.add(juce::String(abletonChatWindowSizePreset));
     parts.add(juce::String(abletonSamplerWindowSizePreset));
+    parts.add(samplePadsWindowBoundsValid ? samplePadsWindowBounds.toString() : juce::String());
     parts.add(audioProcessor.getLocalChatColourKey());
     parts.add(chatWindowColourKey);
 
@@ -7527,6 +7679,14 @@ void NinjamVst3AudioProcessorEditor::savePersistentSettingsToDisk(bool includePr
     props.setValue("abletonWindowSizePreset", abletonWindowSizePreset);
     props.setValue("abletonChatWindowSizePreset", abletonChatWindowSizePreset);
     props.setValue("abletonSamplerWindowSizePreset", abletonSamplerWindowSizePreset);
+    props.setValue("samplePadsWindowBoundsValid", samplePadsWindowBoundsValid);
+    if (samplePadsWindowBoundsValid)
+    {
+        props.setValue("samplePadsWindowX", samplePadsWindowBounds.getX());
+        props.setValue("samplePadsWindowY", samplePadsWindowBounds.getY());
+        props.setValue("samplePadsWindowW", samplePadsWindowBounds.getWidth());
+        props.setValue("samplePadsWindowH", samplePadsWindowBounds.getHeight());
+    }
     props.setValue("chatColourKey", audioProcessor.getLocalChatColourKey());
     props.setValue("chatWindowColourKey", chatWindowColourKey);
 
@@ -7605,8 +7765,14 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
     abletonWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonWindowSizePreset", abletonWindowSizePreset));
     abletonChatWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonChatWindowSizePreset", abletonChatWindowSizePreset));
     abletonSamplerWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonSamplerWindowSizePreset", abletonSamplerWindowSizePreset));
-    if (isAbletonLiveHost() && !audioProcessor.isStandaloneWrapper())
-        setAbletonWindowSizePreset(abletonWindowSizePreset);
+    samplePadsWindowBoundsValid = props.getBoolValue("samplePadsWindowBoundsValid", false);
+    if (samplePadsWindowBoundsValid)
+    {
+        samplePadsWindowBounds = juce::Rectangle<int>(props.getIntValue("samplePadsWindowX", 0),
+                                                      props.getIntValue("samplePadsWindowY", 0),
+                                                      juce::jlimit(560, 1100, props.getIntValue("samplePadsWindowW", 680)),
+                                                      juce::jlimit(360, 760, props.getIntValue("samplePadsWindowH", 450)));
+    }
 
     transmitButton.setToggleState(audioProcessor.isTransmittingLocal(), juce::dontSendNotification);
     updateTransmitButtonColor();
@@ -7896,6 +8062,9 @@ void NinjamVst3AudioProcessorEditor::showSamplePadsWindow()
                                                               *editorPtr,
                                                               abletonHostedWindow,
                                                               editorPtr->abletonSamplerWindowSizePreset,
+                                                              editorPtr->samplePadsWindowBoundsValid
+                                                                  ? editorPtr->samplePadsWindowBounds
+                                                                  : juce::Rectangle<int>(),
                                                               [callbackSafeThis]
                                                               {
                                                                   if (callbackSafeThis != nullptr)
@@ -7905,6 +8074,11 @@ void NinjamVst3AudioProcessorEditor::showSamplePadsWindow()
                                                               {
                                                                   if (callbackSafeThis != nullptr)
                                                                       callbackSafeThis->setAbletonSamplerWindowSizePreset(preset);
+                                                              },
+                                                              [callbackSafeThis](juce::Rectangle<int> bounds, bool saveNow)
+                                                              {
+                                                                  if (callbackSafeThis != nullptr)
+                                                                      callbackSafeThis->rememberSamplePadsWindowBounds(bounds, saveNow);
                                                               },
                                                               [callbackSafeThis]
                                                               {
@@ -8600,18 +8774,16 @@ void NinjamVst3AudioProcessorEditor::setAbletonWindowSizePreset(int presetIndex)
 
     abletonWindowSizePreset = juce::jlimit(0, 2, presetIndex);
 
-    int targetWidth = 1240;
-    int targetHeight = 600;
-    if (abletonWindowSizePreset == 0) targetWidth = 1100;
-    if (abletonWindowSizePreset == 0) targetHeight = 540;
-    if (abletonWindowSizePreset == 2) targetWidth = 1380;
-    if (abletonWindowSizePreset == 2) targetHeight = 700;
+    const auto targetSize = abletonEditorWindowSizeForPreset(abletonWindowSizePreset);
 
     pendingDeferredResizeLayout = false;
     applyingDeferredResizeLayout = false;
     setResizable(false, false);
-    setResizeLimits(targetWidth, targetHeight, targetWidth, targetHeight);
-    setSize(targetWidth, targetHeight);
+    setResizeLimits(targetSize.getWidth(),
+                    targetSize.getHeight(),
+                    targetSize.getWidth(),
+                    targetSize.getHeight());
+    setSize(targetSize.getWidth(), targetSize.getHeight());
     suppressHeavyUiUntilMs = juce::Time::getMillisecondCounterHiRes() + 400.0;
     hostResizeLockedForConnection = true;
 
@@ -8651,6 +8823,25 @@ void NinjamVst3AudioProcessorEditor::setAbletonSamplerWindowSizePreset(int prese
     juce::PropertiesFile props(popts);
     props.setValue("abletonSamplerWindowSizePreset", abletonSamplerWindowSizePreset);
     props.saveIfNeeded();
+}
+
+void NinjamVst3AudioProcessorEditor::rememberSamplePadsWindowBounds(juce::Rectangle<int> bounds, bool saveNow)
+{
+    if (bounds.getWidth() < 100 || bounds.getHeight() < 100)
+        return;
+
+    bounds.setSize(juce::jlimit(560, 1100, bounds.getWidth()),
+                   juce::jlimit(360, 760, bounds.getHeight()));
+
+    if (samplePadsWindowBoundsValid && samplePadsWindowBounds == bounds && !saveNow)
+        return;
+
+    samplePadsWindowBounds = bounds;
+    samplePadsWindowBoundsValid = true;
+    markPersistentSettingsDirty();
+
+    if (saveNow)
+        savePersistentSettingsToDisk(false);
 }
 
 void NinjamVst3AudioProcessorEditor::updateHostResizeModeForConnectionStatus(int status)
@@ -9006,6 +9197,7 @@ void NinjamVst3AudioProcessorEditor::refreshExternalMidiInputDevices()
     const juce::String desiredLearnId = audioProcessor.getMidiLearnInputDeviceId();
     const juce::String desiredRelayId = audioProcessor.getMidiRelayInputDeviceId();
     const juce::String desiredPadsId = audioProcessor.getSamplePadsMidiInputDeviceId();
+    const bool desiredPadsRelay = desiredPadsId == NinjamVst3AudioProcessor::samplePadsMidiInputRelayId;
 
     if (desiredLearnId != openedMidiLearnInputDeviceId)
     {
@@ -9040,6 +9232,13 @@ void NinjamVst3AudioProcessorEditor::refreshExternalMidiInputDevices()
                 openedMidiRelayInputDeviceId = desiredRelayId;
             }
         }
+    }
+
+    if (desiredPadsRelay)
+    {
+        samplePadsMidiInputDevice.reset();
+        openedSamplePadsMidiInputDeviceId = desiredPadsId;
+        return;
     }
 
     if (desiredPadsId.isNotEmpty()

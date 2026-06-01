@@ -2108,6 +2108,7 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
         const juce::ScopedLock lock(opusSyncPeerLock);
         opusSyncPeers.clear();
     }
+    clearRemoteAudioTapBuffers();
     {
         const juce::ScopedLock lock(intervalSyncAnnouncementLock);
         lastAnnouncedRemoteIntervalByUser.clear();
@@ -2154,6 +2155,7 @@ void NinjamVst3AudioProcessor::disconnectFromServer()
     ninjamClient.Disconnect();
     currentServer = {};
     currentUser = {};
+    clearRemoteAudioTapBuffers();
     refreshAbletonLinkActivation();
     {
         const juce::ScopedLock lock(opusSyncPeerLock);
@@ -4267,6 +4269,55 @@ int NinjamVst3AudioProcessor::getUserChordMemoryKb(int userIndex) const
     return analyzer ? analyzer->getMemoryKb() : 0;
 }
 
+void NinjamVst3AudioProcessor::clearRemoteAudioTapBuffers()
+{
+    const juce::SpinLock::ScopedLockType lock(remoteAudioTapLock);
+    for (int user = 0; user < maxRemoteChordUsers; ++user)
+    {
+        remoteAudioTapBuffers[(size_t)user].setSize(0, 0);
+        remoteAudioTapWritePositions[(size_t)user] = 0;
+        remoteAudioTapAvailableSamples[(size_t)user] = 0;
+    }
+}
+
+bool NinjamVst3AudioProcessor::copyRemoteUserAudioForLooper(int userIndex, int numSamples)
+{
+    if (userIndex < 0 || userIndex >= maxRemoteChordUsers || numSamples <= 0)
+        return false;
+
+    if (samplePadRemoteLooperInputBuffer.getNumChannels() < 2
+        || samplePadRemoteLooperInputBuffer.getNumSamples() < numSamples)
+    {
+        samplePadRemoteLooperInputBuffer.setSize(2, numSamples, false, true, true);
+    }
+    samplePadRemoteLooperInputBuffer.clear();
+
+    const juce::SpinLock::ScopedLockType lock(remoteAudioTapLock);
+    auto& source = remoteAudioTapBuffers[(size_t)userIndex];
+    const int capacity = source.getNumSamples();
+    const int available = juce::jmin(numSamples, remoteAudioTapAvailableSamples[(size_t)userIndex]);
+    if (source.getNumChannels() < 2 || capacity <= 0 || available <= 0)
+        return false;
+
+    int sourcePosition = remoteAudioTapWritePositions[(size_t)userIndex] - available;
+    while (sourcePosition < 0)
+        sourcePosition += capacity;
+
+    int targetPosition = numSamples - available;
+    int remaining = available;
+    while (remaining > 0)
+    {
+        const int chunk = juce::jmin(remaining, capacity - sourcePosition);
+        samplePadRemoteLooperInputBuffer.copyFrom(0, targetPosition, source, 0, sourcePosition, chunk);
+        samplePadRemoteLooperInputBuffer.copyFrom(1, targetPosition, source, 1, sourcePosition, chunk);
+        targetPosition += chunk;
+        sourcePosition = (sourcePosition + chunk) % capacity;
+        remaining -= chunk;
+    }
+
+    return true;
+}
+
 void NinjamVst3AudioProcessor::RemoteChannelAudioTap_Callback(void* userData,
                                                               int useridx,
                                                               const char*,
@@ -4287,6 +4338,38 @@ void NinjamVst3AudioProcessor::RemoteChannelAudioTap_Callback(void* userData,
     // mix slot. Tapping only this channel avoids double-feeding expanded peers.
     if (channelidx != 0)
         return;
+
+    {
+        const juce::SpinLock::ScopedLockType lock(self->remoteAudioTapLock);
+        auto& buffer = self->remoteAudioTapBuffers[(size_t)useridx];
+        if (buffer.getNumChannels() < 2 || buffer.getNumSamples() != remoteAudioTapBufferSamples)
+        {
+            buffer.setSize(2, remoteAudioTapBufferSamples, false, true, true);
+            buffer.clear();
+            self->remoteAudioTapWritePositions[(size_t)useridx] = 0;
+            self->remoteAudioTapAvailableSamples[(size_t)useridx] = 0;
+        }
+
+        const int framesToCopy = juce::jmin(numFrames, remoteAudioTapBufferSamples);
+        const int sourceStart = numFrames - framesToCopy;
+        int writePosition = self->remoteAudioTapWritePositions[(size_t)useridx];
+        for (int frame = 0; frame < framesToCopy; ++frame)
+        {
+            const int sourceFrame = sourceStart + frame;
+            const int sourceOffset = sourceFrame * numChannels;
+            const float left = interleaved[sourceOffset];
+            const float right = numChannels > 1 ? interleaved[sourceOffset + 1] : left;
+            buffer.setSample(0, writePosition, left);
+            buffer.setSample(1, writePosition, right);
+            if (++writePosition >= remoteAudioTapBufferSamples)
+                writePosition = 0;
+        }
+
+        self->remoteAudioTapWritePositions[(size_t)useridx] = writePosition;
+        self->remoteAudioTapAvailableSamples[(size_t)useridx] =
+            juce::jmin(remoteAudioTapBufferSamples,
+                       self->remoteAudioTapAvailableSamples[(size_t)useridx] + framesToCopy);
+    }
 
     auto& analyzer = self->remoteChordAnalyzers[(size_t)useridx];
     if (analyzer == nullptr)
@@ -4967,31 +5050,54 @@ void NinjamVst3AudioProcessor::refreshPublicServers()
 
 NinjamVst3AudioProcessor::~NinjamVst3AudioProcessor()
 {
-    stopTimer();
-    ninjamClient.RemoteChannelAudioTap = nullptr;
-    ninjamClient.RemoteChannelAudioTap_User = nullptr;
+    beginStandaloneShutdown();
     localChordAnalyzer.reset();
     for (auto& analyzer : remoteChordAnalyzers)
         analyzer.reset();
-    if (asyncChatTranslationWorker)
-        asyncChatTranslationWorker->stop();
     asyncChatTranslationWorker.reset();
     {
         const juce::ScopedLock launchLock(videoLaunchWorkerLock);
         if (videoLaunchFuture.valid())
             videoLaunchFuture.wait();
     }
+    abletonLink.reset();
+    if (serverLatencyProbeFuture.valid())
+        serverLatencyProbeFuture.wait();
+    JNL::close_socketlib();
+}
+
+void NinjamVst3AudioProcessor::beginStandaloneShutdown()
+{
+    stopTimer();
+    ninjamClient.LicenseAgreementCallback = nullptr;
+    ninjamClient.LicenseAgreement_User = nullptr;
+    ninjamClient.ChatMessage_Callback = nullptr;
+    ninjamClient.ChatMessage_User = nullptr;
+    ninjamClient.IntervalMediaItem_Callback = nullptr;
+    ninjamClient.IntervalMediaItem_User = nullptr;
+    ninjamClient.IntervalChunkCallback = nullptr;
+    ninjamClient.IntervalChunkCallbackUser = nullptr;
+    ninjamClient.NewIntervalCallback = nullptr;
+    ninjamClient.NewIntervalCallbackUser = nullptr;
+    ninjamClient.RemoteChannelAudioTap = nullptr;
+    ninjamClient.RemoteChannelAudioTap_User = nullptr;
+
+    ninjamClient.Disconnect();
+
+    if (asyncChatTranslationWorker)
+        asyncChatTranslationWorker->stop(250);
+
     {
         const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
         abletonLinkSource.reset();
         abletonLinkSink.reset();
+        remoteLinkAudioSinks.clear();
+        remoteLinkAudioOutputPairs.clear();
     }
-    abletonLink.reset();
-    if (serverLatencyProbeFuture.valid())
-        serverLatencyProbeFuture.wait();
+
+    linkAudioReceiveRing.reset();
+    clearRemoteAudioTapBuffers();
     stopAdvancedVideoClient();
-    ninjamClient.Disconnect();
-    JNL::close_socketlib();
 }
 
 const juce::String NinjamVst3AudioProcessor::getName() const
@@ -5082,7 +5188,9 @@ void NinjamVst3AudioProcessor::prepareToPlay (double sampleRate, int samplesPerB
     fxDelayInputBuffer.setSize(1, juce::jmax(1, samplesPerBlock), false, true, true);
     fxReturnBuffer.setSize(2, juce::jmax(1, samplesPerBlock), false, true, true);
     samplePadsRenderBuffer.setSize(2, juce::jmax(1, samplesPerBlock), false, true, true);
+    samplePadsOneShotRenderBuffer.setSize(2, juce::jmax(1, samplesPerBlock), false, true, true);
     samplePadsRenderBuffer.clear();
+    samplePadsOneShotRenderBuffer.clear();
     samplePadsPeak.store(0.0f, std::memory_order_relaxed);
 
     linkAudioMaxNumSamples = (size_t) juce::jmax(8192, samplesPerBlock * 2);
@@ -6400,7 +6508,25 @@ void NinjamVst3AudioProcessor::processSamplePadLooperRecording(int numSamples,
     const float* srcL = nullptr;
     const float* srcR = nullptr;
     const int input = samplePadLooperInput.load(std::memory_order_relaxed);
-    if (input == looperInputLocalChannel)
+    if (input == looperInputSamplePads)
+    {
+        if (samplePadsOneShotRenderBuffer.getNumChannels() >= 2
+            && samplePadsOneShotRenderBuffer.getNumSamples() >= numSamples)
+        {
+            srcL = samplePadsOneShotRenderBuffer.getReadPointer(0);
+            srcR = samplePadsOneShotRenderBuffer.getReadPointer(1);
+        }
+    }
+    else if (isLooperInputRemoteUser(input))
+    {
+        const int remoteUserIndex = remoteUserIndexForLooperInput(input);
+        if (copyRemoteUserAudioForLooper(remoteUserIndex, numSamples))
+        {
+            srcL = samplePadRemoteLooperInputBuffer.getReadPointer(0);
+            srcR = samplePadRemoteLooperInputBuffer.getReadPointer(1);
+        }
+    }
+    else if (input == looperInputLocalChannel)
     {
         // Prefer explicit source indices for stereo local capture when provided by caller.
         if (localLeftIndex >= 0 && localLeftIndex < totalAvailableInputChannels
@@ -6705,13 +6831,18 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
 
     if (samplePadsRenderBuffer.getNumChannels() < 2 || samplePadsRenderBuffer.getNumSamples() < numSamples)
         samplePadsRenderBuffer.setSize(2, numSamples, false, true, true);
+    if (samplePadsOneShotRenderBuffer.getNumChannels() < 2 || samplePadsOneShotRenderBuffer.getNumSamples() < numSamples)
+        samplePadsOneShotRenderBuffer.setSize(2, numSamples, false, true, true);
     samplePadsRenderBuffer.clear();
+    samplePadsOneShotRenderBuffer.clear();
 
     const double targetRate = processingSampleRate > 1.0 ? processingSampleRate : juce::jmax(1.0, getSampleRate());
     const double safeSamplesPerBeat = juce::jmax(1.0, samplesPerBeat);
     const double blockEndBeat = blockStartBeat + (double)numSamples / safeSamplesPerBeat;
     float* outL = samplePadsRenderBuffer.getWritePointer(0);
     float* outR = samplePadsRenderBuffer.getWritePointer(1);
+    float* oneShotOutL = samplePadsOneShotRenderBuffer.getWritePointer(0);
+    float* oneShotOutR = samplePadsOneShotRenderBuffer.getWritePointer(1);
 
     {
         const juce::ScopedLock lock(samplePadsLock);
@@ -6817,8 +6948,12 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
                     const int index0 = juce::jlimit(0, length - 1, (int)std::floor(pos));
                     const int index1 = juce::jmin(index0 + 1, length - 1);
                     const float frac = (float)(pos - (double)index0);
-                    outL[i] += srcL[index0] + (srcL[index1] - srcL[index0]) * frac;
-                    outR[i] += srcR[index0] + (srcR[index1] - srcR[index0]) * frac;
+                    const float sampleL = srcL[index0] + (srcL[index1] - srcL[index0]) * frac;
+                    const float sampleR = srcR[index0] + (srcR[index1] - srcR[index0]) * frac;
+                    outL[i] += sampleL;
+                    outR[i] += sampleR;
+                    oneShotOutL[i] += sampleL;
+                    oneShotOutR[i] += sampleR;
 
                     pos += reverse ? -step : step;
                     if (reverse)
@@ -6855,6 +6990,7 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
     for (int ch = 0; ch < 2; ++ch)
     {
         float* data = samplePadsRenderBuffer.getWritePointer(ch);
+        float* oneShotData = samplePadsOneShotRenderBuffer.getWritePointer(ch);
         for (int i = 0; i < numSamples; ++i)
         {
             float v = data[i] * volume;
@@ -6862,6 +6998,12 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
                 v = juce::jlimit(-limiterThreshold, limiterThreshold, v);
 
             data[i] = v;
+
+            float oneShotV = oneShotData[i] * volume;
+            if (limiter)
+                oneShotV = juce::jlimit(-limiterThreshold, limiterThreshold, oneShotV);
+            oneShotData[i] = oneShotV;
+
             peak = juce::jmax(peak, std::abs(v));
         }
     }
@@ -7824,6 +7966,16 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
 
         if (ch == 0)
         {
+            const bool looperCapturesSamplePads =
+                samplePadLooperInput.load(std::memory_order_relaxed) == looperInputSamplePads;
+            if (looperCapturesSamplePads)
+            {
+                samplePadsActiveThisBlock = renderSamplePads(numSamples,
+                                                             samplePadBlockStartBeat,
+                                                             samplePadSamplesPerBeat,
+                                                             samplePadBpi);
+            }
+
             processSamplePadLooperRecording(numSamples,
                                             samplePadBlockStartBeat,
                                             samplePadSamplesPerBeat,
@@ -7831,10 +7983,14 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
                                             totalAvailableInputChannels,
                                             leftSource,
                                             rightSource);
-            samplePadsActiveThisBlock = renderSamplePads(numSamples,
-                                                         samplePadBlockStartBeat,
-                                                         samplePadSamplesPerBeat,
-                                                         samplePadBpi);
+            if (!looperCapturesSamplePads)
+            {
+                samplePadsActiveThisBlock = renderSamplePads(numSamples,
+                                                             samplePadBlockStartBeat,
+                                                             samplePadSamplesPerBeat,
+                                                             samplePadBpi);
+            }
+
             if (samplePadsActiveThisBlock)
             {
                 const float* padL = samplePadsRenderBuffer.getReadPointer(0);
@@ -9364,8 +9520,12 @@ void NinjamVst3AudioProcessor::injectInboundMidiRelayEvents(juce::MidiBuffer& mi
         events.swap(pendingInboundMidiRelayEvents);
     }
 
+    const bool relayFeedsSamplePads = getSamplePadsMidiInputDeviceId() == samplePadsMidiInputRelayId;
     for (const auto& event : events)
     {
+        if (relayFeedsSamplePads && !event.isController)
+            handleSamplePadMidiNote(event.number, event.isNoteOn);
+
         if (event.isController)
             midiMessages.addEvent(juce::MidiMessage::controllerEvent(event.midiChannel, event.number, event.value), 0);
         else if (event.isNoteOn)

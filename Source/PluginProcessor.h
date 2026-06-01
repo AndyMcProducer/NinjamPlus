@@ -223,6 +223,16 @@ public:
     // Sample pads
     static constexpr int numSamplePads = 16;
     static constexpr int looperInputLocalChannel = -10000;
+    static constexpr int looperInputSamplePads = -10001;
+    static constexpr int looperInputRemoteUserBase = -20000;
+    static constexpr const char* samplePadsMidiInputRelayId = "__pads_relay__";
+    static int looperInputForRemoteUser(int userIndex) { return looperInputRemoteUserBase - juce::jmax(0, userIndex); }
+    static int remoteUserIndexForLooperInput(int inputIndex) { return looperInputRemoteUserBase - inputIndex; }
+    static bool isLooperInputRemoteUser(int inputIndex)
+    {
+        const int userIndex = remoteUserIndexForLooperInput(inputIndex);
+        return inputIndex <= looperInputRemoteUserBase && userIndex >= 0 && userIndex < maxRemoteChordUsers;
+    }
     bool loadSamplePad(int padIndex, const juce::File& file);
     void clearSamplePad(int padIndex);
     void undoSamplePadClear(int padIndex);
@@ -267,6 +277,7 @@ public:
     juce::StringArray getSamplePadBankNames() const;
     bool saveSamplePadBank(const juce::String& bankName, juce::String& errorMessage);
     bool loadSamplePadBank(const juce::File& bankDirectory, juce::String& errorMessage);
+    void beginStandaloneShutdown();
 
     // NINJAM callbacks
     static int LicenseAgreementCallback(void* userData, const char* licensetext);
@@ -546,10 +557,17 @@ private:
     mutable juce::CriticalSection samplePadsLock;
     std::array<SamplePadState, numSamplePads> samplePads;
     juce::AudioBuffer<float> samplePadsRenderBuffer;
+    juce::AudioBuffer<float> samplePadsOneShotRenderBuffer;
+    juce::AudioBuffer<float> samplePadRemoteLooperInputBuffer;
     std::atomic<float> samplePadsVolume { 1.0f };
     std::atomic<bool> samplePadsLimiterEnabled { false };
     std::atomic<float> samplePadsPeak { 0.0f };
     std::atomic<int> samplePadLooperInput { looperInputLocalChannel };
+    static constexpr int remoteAudioTapBufferSamples = 32768;
+    juce::SpinLock remoteAudioTapLock;
+    std::array<juce::AudioBuffer<float>, maxRemoteChordUsers> remoteAudioTapBuffers;
+    std::array<int, maxRemoteChordUsers> remoteAudioTapWritePositions {};
+    std::array<int, maxRemoteChordUsers> remoteAudioTapAvailableSamples {};
     bool samplePadTransportInitialised = false;
     int samplePadLastTransportPosition = 0;
     long long samplePadTransportInterval = 0;
@@ -834,6 +852,8 @@ private:
     void flushOutboundMidiRelayEvents();
     void flushOutboundOscRelayEvents();
     void injectInboundMidiRelayEvents(juce::MidiBuffer& midiMessages);
+    void clearRemoteAudioTapBuffers();
+    bool copyRemoteUserAudioForLooper(int userIndex, int numSamples);
     void updateSamplePadTransport(int transportPosition, int transportLength, int bpi);
     double getSamplePadBlockStartBeat(int transportPosition, int transportLength, int bpi, double& samplesPerBeat);
     void updateSamplePadMidiHolds();

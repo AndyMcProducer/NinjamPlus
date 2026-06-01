@@ -225,7 +225,14 @@ public:
     void closeButtonPressed() override
     {
         if (pluginHolder != nullptr)
+        {
+            pluginHolder->stopPlaying();
+            if (auto* processor = dynamic_cast<NinjamVst3AudioProcessor*> (getAudioProcessor()))
+                processor->beginStandaloneShutdown();
             pluginHolder->savePluginState();
+        }
+
+        clearContentComponent();
 
         JUCEApplicationBase::quit();
     }

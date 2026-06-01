@@ -1325,6 +1325,7 @@ private:
     void applyChatWindowColourToDisplays();
     void setAbletonChatWindowSizePreset(int presetIndex);
     void setAbletonSamplerWindowSizePreset(int presetIndex);
+    void rememberSamplePadsWindowBounds(juce::Rectangle<int> bounds, bool saveNow);
     void openChatPopoutWindow(const juce::StringArray& history,
                               const juce::StringArray& senders,
                               const juce::String& draftText);
@@ -1386,6 +1387,8 @@ private:
     int abletonWindowSizePreset = 1;
     int abletonChatWindowSizePreset = 1;
     int abletonSamplerWindowSizePreset = 1;
+    juce::Rectangle<int> samplePadsWindowBounds { 0, 0, 680, 450 };
+    bool samplePadsWindowBoundsValid = false;
     std::unique_ptr<juce::DialogWindow> aboutWindow;
     double lastResizeEventMs = 0.0;
     double suppressHeavyUiUntilMs = 0.0;
