@@ -1744,6 +1744,61 @@ namespace
         return "Pad " + juce::String(padIndex + 1);
     }
 
+    static juce::File getNinjamplusSettingsDirectory()
+    {
+        juce::PropertiesFile::Options options;
+        options.applicationName = JucePlugin_Name;
+        options.filenameSuffix = ".settings";
+        options.osxLibrarySubFolder = "Application Support";
+#if JUCE_WINDOWS
+        options.folderName = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+                                 .getChildFile("NINJAMplus")
+                                 .getFullPathName();
+#elif JUCE_LINUX || JUCE_BSD
+        options.folderName = "~/.config";
+#else
+        options.folderName = JucePlugin_Name;
+#endif
+        return options.getDefaultFile().getParentDirectory();
+    }
+
+    static juce::String sanitiseSamplePadBankName(const juce::String& name)
+    {
+        juce::String safe = name.trim();
+        safe = safe.retainCharacters("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-");
+        safe = safe.trim();
+        while (safe.contains("  "))
+            safe = safe.replace("  ", " ");
+        return safe.substring(0, 48);
+    }
+
+    static bool writeSamplePadWavFile(const juce::File& file,
+                                      const juce::AudioBuffer<float>& buffer,
+                                      double sampleRate)
+    {
+        if (buffer.getNumSamples() <= 0)
+            return false;
+
+        file.getParentDirectory().createDirectory();
+        juce::WavAudioFormat wavFormat;
+        std::unique_ptr<juce::FileOutputStream> stream(file.createOutputStream());
+        if (stream == nullptr || stream->failedToOpen())
+            return false;
+
+        std::unique_ptr<juce::AudioFormatWriter> writer(
+            wavFormat.createWriterFor(stream.get(),
+                                      juce::jmax(1.0, sampleRate),
+                                      (unsigned int)juce::jmax(1, buffer.getNumChannels()),
+                                      24,
+                                      {},
+                                      0));
+        if (writer == nullptr)
+            return false;
+
+        stream.release();
+        return writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples());
+    }
+
     inline double positiveModulo(double value, double divisor)
     {
         if (divisor <= 0.0)
@@ -1755,12 +1810,82 @@ namespace
         return result;
     }
 
-    inline bool isPowerOfTwoInt(int value)
+    static int quantiseSamplePadFreeLoopBeats(double capturedBeats)
     {
-        return value > 0 && (value & (value - 1)) == 0;
+        constexpr int beatsPerBar = 4;
+        constexpr double nextBarCommitBeat = 1.0;
+
+        if (!std::isfinite(capturedBeats) || capturedBeats <= 0.0)
+            return beatsPerBar;
+
+        const int completedBars = juce::jmax(0, (int)std::floor(capturedBeats / (double)beatsPerBar));
+        const double beatsIntoNextBar = capturedBeats - (double)completedBars * (double)beatsPerBar;
+        int bars = juce::jmax(1, completedBars);
+
+        // Give short overruns after the bar line a one-beat grace window, then commit to the next bar.
+        if (completedBars > 0 && beatsIntoNextBar >= nextBarCommitBeat)
+            bars = completedBars + 1;
+
+        return juce::jmax(beatsPerBar, bars * beatsPerBar);
     }
 
-    static double detectLoopBpmWithAubio(const juce::AudioBuffer<float>& buffer, double sampleRate)
+    static double nextSamplePadGridBeat(double currentBeat, int bpi)
+    {
+        constexpr double gridBeats = 4.0;
+        const double safeBpi = (double)juce::jmax(1, bpi);
+        const double intervalStart = std::floor(currentBeat / safeBpi) * safeBpi;
+        const double beatInInterval = juce::jlimit(0.0, safeBpi, currentBeat - intervalStart);
+        const double nextGridOffset = std::floor(beatInInterval / gridBeats) * gridBeats + gridBeats;
+        return intervalStart + (nextGridOffset < safeBpi ? nextGridOffset : safeBpi);
+    }
+
+    static double nextSamplePadIntervalStartBeat(double currentBeat, int bpi)
+    {
+        const double safeBpi = (double)juce::jmax(1, bpi);
+        double candidate = std::floor(currentBeat / safeBpi) * safeBpi + safeBpi;
+        if (candidate <= currentBeat + 0.0001)
+            candidate += safeBpi;
+        return candidate;
+    }
+
+    static double nextSamplePadVisibleIntervalStartBeat(double currentBeat, int bpi)
+    {
+        constexpr double minimumOrangeLeadBeats = 1.0;
+        const double safeBpi = (double)juce::jmax(1, bpi);
+        double candidate = nextSamplePadIntervalStartBeat(currentBeat, bpi);
+        if (candidate - currentBeat < minimumOrangeLeadBeats)
+            candidate += safeBpi;
+        return candidate;
+    }
+
+    static constexpr double samplePadPressDebounceMs = 120.0;
+
+    static int samplePadIndexForMidiNoteNumber(int noteNumber)
+    {
+        if (noteNumber >= 36 && noteNumber < 36 + NinjamVst3AudioProcessor::numSamplePads)
+            return noteNumber - 36;
+        if (noteNumber >= 0 && noteNumber < NinjamVst3AudioProcessor::numSamplePads)
+            return noteNumber;
+        return -1;
+    }
+
+    static double normaliseDetectedTempoBpm(double bpm)
+    {
+        if (!std::isfinite(bpm) || bpm <= 1.0)
+            return 0.0;
+
+        constexpr double minUsefulBpm = 70.0;
+        constexpr double maxUsefulBpm = 170.0;
+
+        while (bpm < minUsefulBpm)
+            bpm *= 2.0;
+        while (bpm > maxUsefulBpm)
+            bpm *= 0.5;
+
+        return (bpm >= minUsefulBpm && bpm <= maxUsefulBpm) ? bpm : 0.0;
+    }
+
+    static double detectSampleBpmWithAubio(const juce::AudioBuffer<float>& buffer, double sampleRate)
     {
 #if NINJAMPLUS_HAS_AUBIO
         const int numSamples = buffer.getNumSamples();
@@ -1785,6 +1910,7 @@ namespace
 
         const float* left = buffer.getReadPointer(0);
         const float* right = buffer.getNumChannels() > 1 ? buffer.getReadPointer(1) : left;
+        int detectedBeats = 0;
         for (int pos = 0; pos < numSamples; pos += (int)hopSize)
         {
             for (uint_t i = 0; i < hopSize; ++i)
@@ -1794,66 +1920,29 @@ namespace
                 fvec_set_sample(input, (smpl_t)sample, i);
             }
             aubio_tempo_do(tempo, input, output);
+            if (fvec_get_sample(output, 0) != 0.0f)
+                ++detectedBeats;
         }
 
         const double bpm = (double)aubio_tempo_get_bpm(tempo);
+        const double confidence = (double)aubio_tempo_get_confidence(tempo);
         del_aubio_tempo(tempo);
         del_fvec(input);
         del_fvec(output);
 
-        return std::isfinite(bpm) && bpm >= 35.0 && bpm <= 260.0 ? bpm : 0.0;
+        const double normalisedBpm = normaliseDetectedTempoBpm(bpm);
+        const double durationSeconds = (double)numSamples / sampleRate;
+        if (normalisedBpm <= 1.0
+            || !std::isfinite(confidence)
+            || confidence < 0.10
+            || (durationSeconds >= 3.0 && detectedBeats < 2))
+            return 0.0;
+
+        return normalisedBpm;
 #else
         juce::ignoreUnused(buffer, sampleRate);
         return 0.0;
 #endif
-    }
-
-    static double estimateLoopBpmFromLength(int numSamples, double sampleRate, double targetBpm, int bpi)
-    {
-        if (numSamples <= 0 || sampleRate <= 1.0 || targetBpm <= 1.0)
-            return 0.0;
-
-        const double durationSeconds = (double)numSamples / sampleRate;
-        const double targetBeatCount = durationSeconds * targetBpm / 60.0;
-        if (!std::isfinite(targetBeatCount) || targetBeatCount <= 0.0)
-            return 0.0;
-
-        std::vector<int> candidates { 1, 2, 4, 8, 16, 32, 64, 128 };
-        const int safeBpi = juce::jlimit(1, 256, bpi);
-        candidates.push_back(safeBpi);
-        candidates.push_back(safeBpi * 2);
-        candidates.push_back(safeBpi * 4);
-        if (safeBpi > 1) candidates.push_back(safeBpi / 2);
-        if (safeBpi > 3) candidates.push_back(safeBpi / 4);
-
-        std::sort(candidates.begin(), candidates.end());
-        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
-
-        double bestScore = std::numeric_limits<double>::max();
-        int bestBeats = 0;
-        for (int beats : candidates)
-        {
-            if (beats <= 0)
-                continue;
-
-            const double bpm = (double)beats * 60.0 / durationSeconds;
-            if (!std::isfinite(bpm) || bpm < 25.0 || bpm > 320.0)
-                continue;
-
-            double score = std::abs(std::log((double)beats / targetBeatCount));
-            if (!isPowerOfTwoInt(beats) && beats != safeBpi && (safeBpi <= 0 || beats % safeBpi != 0))
-                score += 0.18;
-            if (bpm < 55.0 || bpm > 220.0)
-                score += 0.12;
-
-            if (score < bestScore)
-            {
-                bestScore = score;
-                bestBeats = beats;
-            }
-        }
-
-        return bestBeats > 0 ? (double)bestBeats * 60.0 / durationSeconds : targetBpm;
     }
 
     static juce::AudioBuffer<float> stretchLoopWithSignalsmith(const juce::AudioBuffer<float>& source,
@@ -1984,10 +2073,10 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
     ninjamClient.NewIntervalCallback = NewIntervalCallback_cb;
     ninjamClient.NewIntervalCallbackUser = this;
     opusSyncInstanceId = juce::Uuid().toString();
-    
+
     // Default Metronome
     ninjamClient.config_metronome = 1.0f; // -12dB or similar? 1.0 is 0dB
-    
+
     // Ensure disconnected state
     ninjamClient.Disconnect();
 
@@ -3345,7 +3434,7 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
                 resetRemoteUserIndexState(i, u.name);
                 remoteUserNameByIndex[i] = userIdentityKey;
             }
-            
+
             bool sub = false;
             float chVol = 1.0f, chPan = 0.0f;
             bool chMute = false, chSolo = false;
@@ -3850,10 +3939,10 @@ juce::String NinjamVst3AudioProcessor::getVersionString() const
 {
     static juce::String cachedVersion;
     static bool cached = false;
-    
+
     if (cached)
         return cachedVersion;
-    
+
     juce::String version = NINJAM_DISPLAY_VERSION;
 
     auto runGit = [](const juce::String& command) -> juce::String
@@ -3890,7 +3979,7 @@ juce::String NinjamVst3AudioProcessor::getVersionString() const
         if (appendPlus)
             version += "+";
     }
-    
+
     cachedVersion = version;
     cached = true;
     return cachedVersion;
@@ -5037,6 +5126,8 @@ bool NinjamVst3AudioProcessor::loadSamplePad(int padIndex, const juce::File& fil
     if (!readRightChannel)
         loaded.copyFrom(1, 0, loaded, 0, 0, samplesToRead);
 
+    const double detectedBpm = detectSampleBpmWithAubio(loaded, sourceRate);
+
     {
         const juce::ScopedLock lock(samplePadsLock);
         auto& pad = samplePads[(size_t)padIndex];
@@ -5047,14 +5138,35 @@ bool NinjamVst3AudioProcessor::loadSamplePad(int padIndex, const juce::File& fil
         pad.file = file;
         pad.sourceSampleRate = sourceRate;
         pad.originalSourceSampleRate = sourceRate;
-        pad.sourceBpm = 0.0;
+        pad.sourceBpm = detectedBpm;
         pad.lastSyncedTargetBpm = 0.0;
         pad.bpmSyncApplied = false;
-        pad.bpmSyncEnabled.store(true, std::memory_order_relaxed);
+        pad.bpmSyncEnabled.store(detectedBpm > 1.0, std::memory_order_relaxed);
         pad.recordedLoop = false;
         pad.loopLengthBeats = 0;
+        pad.recordLoopLengthBeatsOverride = 0;
         pad.playing.store(false, std::memory_order_relaxed);
         pad.playbackScheduled.store(false, std::memory_order_relaxed);
+        for (auto& voice : pad.oneShotVoices)
+        {
+            voice.active = false;
+            voice.position = 0.0;
+        }
+        pad.nextOneShotVoice = 0;
+        pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
+        pad.recordArmed.store(false, std::memory_order_relaxed);
+        pad.recordPendingStart.store(false, std::memory_order_relaxed);
+        pad.recordPendingStop.store(false, std::memory_order_relaxed);
+        pad.recordStartScheduled.store(false, std::memory_order_relaxed);
+        pad.recording.store(false, std::memory_order_relaxed);
+        pad.recordAutoStopAtScheduledEnd = false;
+        pad.recordMatchBpiCanvas = false;
+        pad.recordScheduledStartBeat = 0.0;
+        pad.recordScheduledStopBeat = 0.0;
+        pad.midiHoldActive = false;
+        pad.midiHoldActionTriggered = false;
+        pad.midiPadDown = false;
+        pad.midiHoldStartMs = 0.0;
         pad.position.store(0.0, std::memory_order_relaxed);
     }
 
@@ -5068,10 +5180,33 @@ void NinjamVst3AudioProcessor::clearSamplePad(int padIndex)
 
     const juce::ScopedLock lock(samplePadsLock);
     auto& pad = samplePads[(size_t)padIndex];
+    if (pad.sample.getNumSamples() > 0)
+    {
+        pad.undoClearSample = pad.sample;
+        pad.undoClearOriginalSample = pad.originalSample;
+        pad.undoClearName = pad.name;
+        pad.undoClearFile = pad.file;
+        pad.undoClearSourceSampleRate = pad.sourceSampleRate;
+        pad.undoClearOriginalSourceSampleRate = pad.originalSourceSampleRate;
+        pad.undoClearSourceBpm = pad.sourceBpm;
+        pad.undoClearLastSyncedTargetBpm = pad.lastSyncedTargetBpm;
+        pad.undoClearNameIsCustom = pad.nameIsCustom;
+        pad.undoClearBpmSyncApplied = pad.bpmSyncApplied;
+        pad.undoClearLoop = pad.loop.load(std::memory_order_relaxed);
+        pad.undoClearReverse = pad.reverse.load(std::memory_order_relaxed);
+        pad.undoClearMatchBpi = pad.matchBpi.load(std::memory_order_relaxed);
+        pad.undoClearBpmSyncEnabled = pad.bpmSyncEnabled.load(std::memory_order_relaxed);
+        pad.undoClearLoopAnchorBeat = pad.loopAnchorBeat;
+        pad.undoClearRecordedStartBeatInInterval = pad.recordedStartBeatInInterval;
+        pad.undoClearLoopLengthBeats = pad.loopLengthBeats;
+        pad.undoClearRecordedLoop = pad.recordedLoop;
+        pad.canUndoClear = true;
+    }
+
     pad.sample.setSize(0, 0);
     pad.originalSample.setSize(0, 0);
-    if (!pad.nameIsCustom)
-        pad.name.clear();
+    pad.name.clear();
+    pad.nameIsCustom = false;
     pad.file = juce::File{};
     pad.sourceSampleRate = 44100.0;
     pad.originalSourceSampleRate = 44100.0;
@@ -5084,19 +5219,104 @@ void NinjamVst3AudioProcessor::clearSamplePad(int padIndex)
     pad.bpmSyncEnabled.store(true, std::memory_order_relaxed);
     pad.playing.store(false, std::memory_order_relaxed);
     pad.playbackScheduled.store(false, std::memory_order_relaxed);
+    for (auto& voice : pad.oneShotVoices)
+    {
+        voice.active = false;
+        voice.position = 0.0;
+    }
+    pad.nextOneShotVoice = 0;
+    pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
     pad.recordArmed.store(false, std::memory_order_relaxed);
     pad.recordPendingStart.store(false, std::memory_order_relaxed);
     pad.recordPendingStop.store(false, std::memory_order_relaxed);
+    pad.recordStartScheduled.store(false, std::memory_order_relaxed);
     pad.recording.store(false, std::memory_order_relaxed);
     pad.position.store(0.0, std::memory_order_relaxed);
     pad.loopLengthBeats = 0;
+    pad.recordLoopLengthBeatsOverride = 0;
     pad.loopAnchorBeat = 0.0;
     pad.recordedStartBeatInInterval = 0.0;
     pad.scheduledStartBeat = 0.0;
+    pad.recordScheduledStartBeat = 0.0;
+    pad.recordScheduledStopBeat = 0.0;
+    pad.recordAutoStopAtScheduledEnd = false;
+    pad.recordMatchBpiCanvas = false;
     pad.recordedLoop = false;
     pad.recordBuffer.setSize(0, 0);
     pad.recordWritePosition = 0;
     pad.recordStartBeat = 0.0;
+    pad.midiHoldActive = false;
+    pad.midiHoldActionTriggered = false;
+    pad.midiPadDown = false;
+    pad.midiHoldStartMs = 0.0;
+}
+
+void NinjamVst3AudioProcessor::undoSamplePadClear(int padIndex)
+{
+    if (!isValidSamplePadIndex(padIndex))
+        return;
+
+    const juce::ScopedLock lock(samplePadsLock);
+    auto& pad = samplePads[(size_t)padIndex];
+    if (!pad.canUndoClear || pad.undoClearSample.getNumSamples() <= 0)
+        return;
+
+    pad.sample = pad.undoClearSample;
+    pad.originalSample = pad.undoClearOriginalSample;
+    pad.name = pad.undoClearName;
+    pad.file = pad.undoClearFile;
+    pad.sourceSampleRate = pad.undoClearSourceSampleRate;
+    pad.originalSourceSampleRate = pad.undoClearOriginalSourceSampleRate;
+    pad.sourceBpm = pad.undoClearSourceBpm;
+    pad.lastSyncedTargetBpm = pad.undoClearLastSyncedTargetBpm;
+    pad.nameIsCustom = pad.undoClearNameIsCustom;
+    pad.bpmSyncApplied = pad.undoClearBpmSyncApplied;
+    pad.loop.store(pad.undoClearLoop, std::memory_order_relaxed);
+    pad.reverse.store(pad.undoClearReverse, std::memory_order_relaxed);
+    pad.matchBpi.store(pad.undoClearMatchBpi, std::memory_order_relaxed);
+    pad.bpmSyncEnabled.store(pad.undoClearBpmSyncEnabled, std::memory_order_relaxed);
+    pad.loopAnchorBeat = pad.undoClearLoopAnchorBeat;
+    pad.recordedStartBeatInInterval = pad.undoClearRecordedStartBeatInInterval;
+    pad.loopLengthBeats = pad.undoClearLoopLengthBeats;
+    pad.recordedLoop = pad.undoClearRecordedLoop;
+
+    pad.playing.store(false, std::memory_order_relaxed);
+    pad.playbackScheduled.store(false, std::memory_order_relaxed);
+    for (auto& voice : pad.oneShotVoices)
+    {
+        voice.active = false;
+        voice.position = 0.0;
+    }
+    pad.nextOneShotVoice = 0;
+    pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
+    pad.recordArmed.store(false, std::memory_order_relaxed);
+    pad.recordPendingStart.store(false, std::memory_order_relaxed);
+    pad.recordPendingStop.store(false, std::memory_order_relaxed);
+    pad.recordStartScheduled.store(false, std::memory_order_relaxed);
+    pad.recording.store(false, std::memory_order_relaxed);
+    pad.position.store(0.0, std::memory_order_relaxed);
+    pad.recordBuffer.setSize(0, 0);
+    pad.recordWritePosition = 0;
+    pad.recordStartBeat = 0.0;
+    pad.recordScheduledStartBeat = 0.0;
+    pad.recordScheduledStopBeat = 0.0;
+    pad.recordLoopLengthBeatsOverride = 0;
+    pad.recordAutoStopAtScheduledEnd = false;
+    pad.recordMatchBpiCanvas = false;
+    pad.midiHoldActive = false;
+    pad.midiHoldActionTriggered = false;
+    pad.midiPadDown = false;
+    pad.midiHoldStartMs = 0.0;
+}
+
+bool NinjamVst3AudioProcessor::canUndoSamplePadClear(int padIndex) const
+{
+    if (!isValidSamplePadIndex(padIndex))
+        return false;
+
+    const juce::ScopedLock lock(samplePadsLock);
+    const auto& pad = samplePads[(size_t)padIndex];
+    return pad.canUndoClear && pad.undoClearSample.getNumSamples() > 0;
 }
 
 void NinjamVst3AudioProcessor::triggerSamplePad(int padIndex)
@@ -5106,6 +5326,11 @@ void NinjamVst3AudioProcessor::triggerSamplePad(int padIndex)
 
     const juce::ScopedLock lock(samplePadsLock);
     auto& pad = samplePads[(size_t)padIndex];
+    const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    if (nowMs - pad.lastAcceptedPressMs < samplePadPressDebounceMs)
+        return;
+    pad.lastAcceptedPressMs = nowMs;
+    pad.triggerFlashCounter.fetch_add(1, std::memory_order_relaxed);
     const int length = pad.sample.getNumSamples();
     if (pad.recording.load(std::memory_order_relaxed))
     {
@@ -5113,14 +5338,81 @@ void NinjamVst3AudioProcessor::triggerSamplePad(int padIndex)
         return;
     }
 
+    if (pad.recordStartScheduled.load(std::memory_order_relaxed))
+    {
+        const int bpi = juce::jmax(1, getBPI());
+        const bool matchBpi = pad.matchBpi.load(std::memory_order_relaxed);
+        pad.recordScheduledStartBeat = 0.0;
+        pad.recordScheduledStopBeat = 0.0;
+        pad.recordLoopLengthBeatsOverride = matchBpi ? bpi : 0;
+        pad.recordAutoStopAtScheduledEnd = false;
+        pad.recordMatchBpiCanvas = false;
+        pad.recordPendingStart.store(true, std::memory_order_relaxed);
+        pad.recordPendingStop.store(false, std::memory_order_relaxed);
+        pad.recordStartScheduled.store(false, std::memory_order_relaxed);
+        pad.playing.store(false, std::memory_order_relaxed);
+        pad.playbackScheduled.store(false, std::memory_order_relaxed);
+        for (auto& voice : pad.oneShotVoices)
+        {
+            voice.active = false;
+            voice.position = 0.0;
+        }
+        pad.nextOneShotVoice = 0;
+        pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
+        return;
+    }
+
     if (pad.recordArmed.load(std::memory_order_relaxed))
     {
-        pad.recordPendingStart.store(true, std::memory_order_relaxed);
+        const int bpi = juce::jmax(1, getBPI());
+        const double currentBeat = (double)intervalIndex.load(std::memory_order_relaxed) * (double)bpi
+            + (double)juce::jlimit(0.0f, 1.0f, getIntervalProgress()) * (double)bpi;
+        const double candidate = nextSamplePadGridBeat(currentBeat, bpi);
+        const bool matchBpi = pad.matchBpi.load(std::memory_order_relaxed);
+
+        pad.recordScheduledStartBeat = candidate;
+        pad.recordScheduledStopBeat = 0.0;
+        pad.recordLoopLengthBeatsOverride = matchBpi ? bpi : 0;
+        pad.recordAutoStopAtScheduledEnd = false;
+        pad.recordMatchBpiCanvas = false;
+        pad.recordPendingStart.store(false, std::memory_order_relaxed);
+        pad.recordPendingStop.store(false, std::memory_order_relaxed);
+        pad.recordStartScheduled.store(true, std::memory_order_relaxed);
+        pad.playing.store(false, std::memory_order_relaxed);
+        pad.playbackScheduled.store(false, std::memory_order_relaxed);
+        for (auto& voice : pad.oneShotVoices)
+        {
+            voice.active = false;
+            voice.position = 0.0;
+        }
+        pad.nextOneShotVoice = 0;
+        pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
         return;
     }
 
     if (length <= 0)
         return;
+
+    const bool oneShotMode = !pad.loop.load(std::memory_order_relaxed) && !pad.recordedLoop;
+    if (oneShotMode)
+    {
+        const bool reverse = pad.reverse.load(std::memory_order_relaxed);
+        pad.playing.store(false, std::memory_order_relaxed);
+        pad.playbackScheduled.store(false, std::memory_order_relaxed);
+        pad.position.store(reverse ? juce::jmax(0.0, (double)length - 1.0) : 0.0, std::memory_order_relaxed);
+
+        auto& voice = pad.oneShotVoices[(size_t)pad.nextOneShotVoice];
+        voice.active = true;
+        voice.position = reverse ? juce::jmax(0.0, (double)length - 1.0) : 0.0;
+        pad.nextOneShotVoice = (pad.nextOneShotVoice + 1) % samplePadOneShotVoiceCount;
+
+        int activeVoices = 0;
+        for (const auto& candidateVoice : pad.oneShotVoices)
+            if (candidateVoice.active)
+                ++activeVoices;
+        pad.activeOneShotVoices.store(activeVoices, std::memory_order_relaxed);
+        return;
+    }
 
     if (pad.playing.load(std::memory_order_relaxed)
         || pad.playbackScheduled.load(std::memory_order_relaxed))
@@ -5169,8 +5461,17 @@ void NinjamVst3AudioProcessor::stopSamplePad(int padIndex)
     if (!isValidSamplePadIndex(padIndex))
         return;
 
-    samplePads[(size_t)padIndex].playing.store(false, std::memory_order_relaxed);
-    samplePads[(size_t)padIndex].playbackScheduled.store(false, std::memory_order_relaxed);
+    const juce::ScopedLock lock(samplePadsLock);
+    auto& pad = samplePads[(size_t)padIndex];
+    pad.playing.store(false, std::memory_order_relaxed);
+    pad.playbackScheduled.store(false, std::memory_order_relaxed);
+    for (auto& voice : pad.oneShotVoices)
+    {
+        voice.active = false;
+        voice.position = 0.0;
+    }
+    pad.nextOneShotVoice = 0;
+    pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
 }
 
 void NinjamVst3AudioProcessor::setSamplePadRecordArmed(int padIndex, bool shouldArm)
@@ -5178,14 +5479,98 @@ void NinjamVst3AudioProcessor::setSamplePadRecordArmed(int padIndex, bool should
     if (!isValidSamplePadIndex(padIndex))
         return;
 
+    const juce::ScopedLock lock(samplePadsLock);
     auto& pad = samplePads[(size_t)padIndex];
     pad.recordArmed.store(shouldArm, std::memory_order_relaxed);
     if (!shouldArm)
     {
         pad.recordPendingStart.store(false, std::memory_order_relaxed);
+        pad.recordStartScheduled.store(false, std::memory_order_relaxed);
+        pad.recordLoopLengthBeatsOverride = 0;
+        pad.recordAutoStopAtScheduledEnd = false;
+        pad.recordMatchBpiCanvas = false;
+        pad.midiHoldActive = false;
+        pad.midiHoldActionTriggered = false;
+        pad.midiPadDown = false;
+        pad.midiHoldStartMs = 0.0;
         if (pad.recording.load(std::memory_order_relaxed))
             pad.recordPendingStop.store(true, std::memory_order_relaxed);
     }
+}
+
+void NinjamVst3AudioProcessor::armSamplePadLooper(int padIndex, bool matchBpi)
+{
+    if (!isValidSamplePadIndex(padIndex))
+        return;
+
+    const juce::ScopedLock lock(samplePadsLock);
+    auto& pad = samplePads[(size_t)padIndex];
+    if (pad.recording.load(std::memory_order_relaxed))
+        return;
+
+    pad.matchBpi.store(matchBpi, std::memory_order_relaxed);
+    pad.loop.store(true, std::memory_order_relaxed);
+    pad.recordArmed.store(true, std::memory_order_relaxed);
+    pad.recordPendingStart.store(false, std::memory_order_relaxed);
+    pad.recordPendingStop.store(false, std::memory_order_relaxed);
+    pad.recordScheduledStartBeat = 0.0;
+    pad.recordScheduledStopBeat = 0.0;
+    pad.recordLoopLengthBeatsOverride = 0;
+    pad.recordAutoStopAtScheduledEnd = false;
+    pad.recordMatchBpiCanvas = false;
+    pad.midiHoldActive = false;
+    pad.midiHoldActionTriggered = false;
+    pad.midiPadDown = false;
+    pad.midiHoldStartMs = 0.0;
+    pad.recordStartScheduled.store(false, std::memory_order_relaxed);
+    for (auto& voice : pad.oneShotVoices)
+    {
+        voice.active = false;
+        voice.position = 0.0;
+    }
+    pad.nextOneShotVoice = 0;
+    pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::scheduleSamplePadBpiRecordStartAtNextInterval(int padIndex)
+{
+    if (!isValidSamplePadIndex(padIndex))
+        return;
+
+    const int bpi = juce::jmax(1, getBPI());
+    const double currentBeat = (double)intervalIndex.load(std::memory_order_relaxed) * (double)bpi
+        + (double)juce::jlimit(0.0f, 1.0f, getIntervalProgress()) * (double)bpi;
+    const double candidate = nextSamplePadVisibleIntervalStartBeat(currentBeat, bpi);
+
+    const juce::ScopedLock lock(samplePadsLock);
+    auto& pad = samplePads[(size_t)padIndex];
+    if (pad.recording.load(std::memory_order_relaxed))
+        return;
+
+    pad.matchBpi.store(true, std::memory_order_relaxed);
+    pad.loop.store(true, std::memory_order_relaxed);
+    pad.recordArmed.store(true, std::memory_order_relaxed);
+    pad.recordPendingStart.store(false, std::memory_order_relaxed);
+    pad.recordPendingStop.store(false, std::memory_order_relaxed);
+    pad.recordScheduledStartBeat = candidate;
+    pad.recordScheduledStopBeat = 0.0;
+    pad.recordLoopLengthBeatsOverride = bpi;
+    pad.recordAutoStopAtScheduledEnd = false;
+    pad.recordMatchBpiCanvas = false;
+    pad.midiHoldActive = false;
+    pad.midiHoldActionTriggered = false;
+    pad.midiPadDown = false;
+    pad.midiHoldStartMs = 0.0;
+    pad.recordStartScheduled.store(true, std::memory_order_relaxed);
+    pad.playing.store(false, std::memory_order_relaxed);
+    pad.playbackScheduled.store(false, std::memory_order_relaxed);
+    for (auto& voice : pad.oneShotVoices)
+    {
+        voice.active = false;
+        voice.position = 0.0;
+    }
+    pad.nextOneShotVoice = 0;
+    pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
 }
 
 bool NinjamVst3AudioProcessor::isSamplePadRecordArmed(int padIndex) const
@@ -5235,6 +5620,61 @@ void NinjamVst3AudioProcessor::resyncSamplePadToNinjamBpm(int padIndex)
     resyncSamplePadToBpm(padIndex, (double)getBPM(), true);
 }
 
+void NinjamVst3AudioProcessor::syncSamplePadLoopToBeat(int padIndex)
+{
+    if (!isValidSamplePadIndex(padIndex))
+        return;
+
+    const double targetBpm = juce::jmax(1.0, (double)getBPM());
+    juce::AudioBuffer<float> original;
+    double sourceRate = 44100.0;
+
+    {
+        const juce::ScopedLock lock(samplePadsLock);
+        auto& pad = samplePads[(size_t)padIndex];
+        if (pad.sample.getNumSamples() <= 0 || pad.recording.load(std::memory_order_relaxed))
+            return;
+
+        if (pad.originalSample.getNumSamples() <= 0)
+        {
+            pad.originalSample = pad.sample;
+            pad.originalSourceSampleRate = pad.sourceSampleRate;
+        }
+
+        original = pad.originalSample;
+        sourceRate = pad.originalSourceSampleRate > 1.0 ? pad.originalSourceSampleRate : pad.sourceSampleRate;
+    }
+
+    if (original.getNumSamples() <= 0 || sourceRate <= 1.0 || targetBpm <= 1.0)
+        return;
+
+    const double durationSeconds = (double)original.getNumSamples() / sourceRate;
+    if (durationSeconds <= 0.0 || !std::isfinite(durationSeconds))
+        return;
+
+    const double capturedBeatsAtCurrentTempo = durationSeconds * targetBpm / 60.0;
+    const int loopBeats = quantiseSamplePadFreeLoopBeats(capturedBeatsAtCurrentTempo);
+    const double inferredSourceBpm = 60.0 * (double)loopBeats / durationSeconds;
+    if (inferredSourceBpm <= 1.0 || !std::isfinite(inferredSourceBpm))
+        return;
+
+    {
+        const juce::ScopedLock lock(samplePadsLock);
+        auto& pad = samplePads[(size_t)padIndex];
+        if (pad.sample.getNumSamples() <= 0 || pad.recording.load(std::memory_order_relaxed))
+            return;
+
+        pad.sourceBpm = inferredSourceBpm;
+        pad.loopLengthBeats = loopBeats;
+        pad.loop.store(true, std::memory_order_relaxed);
+        pad.bpmSyncEnabled.store(true, std::memory_order_relaxed);
+        pad.bpmSyncApplied = false;
+        pad.lastSyncedTargetBpm = 0.0;
+    }
+
+    resyncSamplePadToBpm(padIndex, targetBpm, true);
+}
+
 void NinjamVst3AudioProcessor::undoSamplePadBpmResync(int padIndex)
 {
     if (!isValidSamplePadIndex(padIndex))
@@ -5250,6 +5690,13 @@ void NinjamVst3AudioProcessor::undoSamplePadBpmResync(int padIndex)
     pad.lastSyncedTargetBpm = 0.0;
     pad.bpmSyncApplied = false;
     pad.bpmSyncEnabled.store(false, std::memory_order_relaxed);
+    for (auto& voice : pad.oneShotVoices)
+    {
+        voice.active = false;
+        voice.position = 0.0;
+    }
+    pad.nextOneShotVoice = 0;
+    pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
     const int length = pad.sample.getNumSamples();
     if (length > 0)
         pad.position.store(juce::jlimit(0.0, (double)length - 1.0, pad.position.load(std::memory_order_relaxed)),
@@ -5271,7 +5718,21 @@ void NinjamVst3AudioProcessor::setSamplePadLoopEnabled(int padIndex, bool should
     if (!isValidSamplePadIndex(padIndex))
         return;
 
-    samplePads[(size_t)padIndex].loop.store(shouldLoop, std::memory_order_relaxed);
+    {
+        const juce::ScopedLock lock(samplePadsLock);
+        auto& pad = samplePads[(size_t)padIndex];
+        pad.loop.store(shouldLoop, std::memory_order_relaxed);
+        if (shouldLoop)
+        {
+            for (auto& voice : pad.oneShotVoices)
+            {
+                voice.active = false;
+                voice.position = 0.0;
+            }
+            pad.nextOneShotVoice = 0;
+            pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
+        }
+    }
     if (shouldLoop)
         resyncSamplePadToBpm(padIndex, (double)getBPM(), false);
 }
@@ -5343,18 +5804,125 @@ void NinjamVst3AudioProcessor::setSamplePadName(int padIndex, const juce::String
     }
 }
 
+int NinjamVst3AudioProcessor::getSamplePadLoopLengthBeats(int padIndex) const
+{
+    if (!isValidSamplePadIndex(padIndex))
+        return 0;
+
+    const juce::ScopedLock lock(samplePadsLock);
+    const auto& pad = samplePads[(size_t)padIndex];
+    if (pad.sample.getNumSamples() <= 0 || !pad.loop.load(std::memory_order_relaxed))
+        return 0;
+
+    return juce::jmax(0, pad.loopLengthBeats);
+}
+
+float NinjamVst3AudioProcessor::getSamplePadLoopProgress(int padIndex) const
+{
+    if (!isValidSamplePadIndex(padIndex))
+        return 0.0f;
+
+    const juce::ScopedLock lock(samplePadsLock);
+    const auto& pad = samplePads[(size_t)padIndex];
+    const int length = pad.sample.getNumSamples();
+    if (length <= 1 || !pad.playing.load(std::memory_order_relaxed))
+        return 0.0f;
+
+    const double denominator = juce::jmax(1.0, (double)length - 1.0);
+    double progress = pad.position.load(std::memory_order_relaxed) / denominator;
+    if (pad.reverse.load(std::memory_order_relaxed))
+        progress = 1.0 - progress;
+
+    return juce::jlimit(0.0f, 1.0f, (float)progress);
+}
+
+int NinjamVst3AudioProcessor::getSamplePadTriggerFlashCounter(int padIndex) const
+{
+    if (!isValidSamplePadIndex(padIndex))
+        return 0;
+
+    return samplePads[(size_t)padIndex].triggerFlashCounter.load(std::memory_order_relaxed);
+}
+
 bool NinjamVst3AudioProcessor::triggerSamplePadForMidiNote(int noteNumber)
 {
-    int padIndex = -1;
-    if (noteNumber >= 36 && noteNumber < 36 + numSamplePads)
-        padIndex = noteNumber - 36;
-    else if (noteNumber >= 0 && noteNumber < numSamplePads)
-        padIndex = noteNumber;
+    const int padIndex = samplePadIndexForMidiNoteNumber(noteNumber);
 
     if (!isValidSamplePadIndex(padIndex))
         return false;
 
     triggerSamplePad(padIndex);
+    return true;
+}
+
+bool NinjamVst3AudioProcessor::handleSamplePadMidiNote(int noteNumber, bool isNoteOn)
+{
+    return handleSamplePadMidiPadState(samplePadIndexForMidiNoteNumber(noteNumber), isNoteOn);
+}
+
+bool NinjamVst3AudioProcessor::handleSamplePadMidiPadState(int padIndex, bool isDown)
+{
+    if (!isValidSamplePadIndex(padIndex))
+        return false;
+
+    if (!isDown)
+    {
+        bool shouldTrigger = false;
+        bool shouldArmNormalLooper = false;
+        {
+            const juce::ScopedLock lock(samplePadsLock);
+            auto& pad = samplePads[(size_t)padIndex];
+            if (!pad.midiPadDown && !pad.midiHoldActive)
+                return true;
+            if (!pad.midiHoldActive)
+            {
+                pad.midiPadDown = false;
+                return true;
+            }
+
+            const double bpm = juce::jmax(1.0, (double)getBPM());
+            const double twoBeatHoldMs = 2.0 * 60000.0 / bpm;
+            const double heldMs = juce::Time::getMillisecondCounterHiRes() - pad.midiHoldStartMs;
+            shouldArmNormalLooper = !pad.midiHoldActionTriggered && heldMs >= twoBeatHoldMs;
+            shouldTrigger = !pad.midiHoldActionTriggered && !shouldArmNormalLooper;
+            pad.midiPadDown = false;
+            pad.midiHoldActive = false;
+            pad.midiHoldActionTriggered = false;
+            pad.midiHoldStartMs = 0.0;
+        }
+        if (shouldArmNormalLooper)
+            armSamplePadLooper(padIndex, false);
+        if (shouldTrigger)
+            triggerSamplePad(padIndex);
+        return true;
+    }
+
+    bool shouldTriggerImmediately = false;
+    {
+        const juce::ScopedLock lock(samplePadsLock);
+        auto& pad = samplePads[(size_t)padIndex];
+        if (pad.midiPadDown)
+            return true;
+
+        pad.midiPadDown = true;
+        pad.triggerFlashCounter.fetch_add(1, std::memory_order_relaxed);
+
+        if (pad.recording.load(std::memory_order_relaxed)
+            || pad.recordStartScheduled.load(std::memory_order_relaxed))
+        {
+            shouldTriggerImmediately = true;
+        }
+        else
+        {
+            pad.midiHoldActive = true;
+            pad.midiHoldActionTriggered = false;
+            pad.midiHoldStartMs = juce::Time::getMillisecondCounterHiRes();
+        }
+    }
+
+    if (shouldTriggerImmediately)
+        triggerSamplePad(padIndex);
+
     return true;
 }
 
@@ -5383,6 +5951,272 @@ float NinjamVst3AudioProcessor::getSamplePadPeak() const
     return samplePadsPeak.load(std::memory_order_relaxed);
 }
 
+juce::File NinjamVst3AudioProcessor::getSamplePadBanksDirectory() const
+{
+    auto dir = getNinjamplusSettingsDirectory().getChildFile("samples");
+    dir.createDirectory();
+    return dir;
+}
+
+juce::File NinjamVst3AudioProcessor::getSamplePadBankDirectory(const juce::String& bankName) const
+{
+    const auto safeName = sanitiseSamplePadBankName(bankName);
+    if (safeName.isEmpty())
+        return {};
+
+    return getSamplePadBanksDirectory().getChildFile(safeName);
+}
+
+juce::StringArray NinjamVst3AudioProcessor::getSamplePadBankNames() const
+{
+    juce::StringArray names;
+    const auto banksDir = getSamplePadBanksDirectory();
+    const auto dirs = banksDir.findChildFiles(juce::File::findDirectories, false);
+    for (const auto& dir : dirs)
+        if (dir.getChildFile("pad.cfg").existsAsFile())
+            names.add(dir.getFileName());
+
+    names.sort(true);
+    return names;
+}
+
+bool NinjamVst3AudioProcessor::saveSamplePadBank(const juce::String& bankName, juce::String& errorMessage)
+{
+    errorMessage.clear();
+    const auto safeName = sanitiseSamplePadBankName(bankName);
+    if (safeName.isEmpty())
+    {
+        errorMessage = "Enter a bank name.";
+        return false;
+    }
+
+    const auto bankDir = getSamplePadBankDirectory(safeName);
+    if (!bankDir.createDirectory())
+    {
+        errorMessage = "Could not create bank folder:\n" + bankDir.getFullPathName();
+        return false;
+    }
+
+    struct PadSnapshot
+    {
+        bool hasSample = false;
+        juce::AudioBuffer<float> sample;
+        juce::String name;
+        bool nameIsCustom = false;
+        bool loop = false;
+        bool reverse = false;
+        bool matchBpi = false;
+        bool bpmSyncEnabled = true;
+        bool recordedLoop = false;
+        bool bpmSyncApplied = false;
+        int loopLengthBeats = 0;
+        double sourceSampleRate = 44100.0;
+        double sourceBpm = 0.0;
+        double lastSyncedTargetBpm = 0.0;
+    };
+
+    std::array<PadSnapshot, numSamplePads> snapshots;
+    {
+        const juce::ScopedLock lock(samplePadsLock);
+        for (int pad = 0; pad < numSamplePads; ++pad)
+        {
+            const auto& source = samplePads[(size_t)pad];
+            auto& snapshot = snapshots[(size_t)pad];
+            snapshot.hasSample = source.sample.getNumSamples() > 0;
+            if (snapshot.hasSample)
+                snapshot.sample = source.sample;
+            snapshot.name = source.name;
+            snapshot.nameIsCustom = source.nameIsCustom;
+            snapshot.loop = source.loop.load(std::memory_order_relaxed);
+            snapshot.reverse = source.reverse.load(std::memory_order_relaxed);
+            snapshot.matchBpi = source.matchBpi.load(std::memory_order_relaxed);
+            snapshot.bpmSyncEnabled = source.bpmSyncEnabled.load(std::memory_order_relaxed);
+            snapshot.recordedLoop = source.recordedLoop;
+            snapshot.bpmSyncApplied = source.bpmSyncApplied;
+            snapshot.loopLengthBeats = source.loopLengthBeats;
+            snapshot.sourceSampleRate = source.sourceSampleRate > 1.0 ? source.sourceSampleRate : 44100.0;
+            snapshot.sourceBpm = source.sourceBpm;
+            snapshot.lastSyncedTargetBpm = source.lastSyncedTargetBpm;
+        }
+    }
+
+    juce::DynamicObject::Ptr root = new juce::DynamicObject();
+    root->setProperty("version", 1);
+    root->setProperty("name", safeName);
+    root->setProperty("savedAt", juce::Time::getCurrentTime().toISO8601(true));
+
+    juce::Array<juce::var> padArray;
+    for (int pad = 0; pad < numSamplePads; ++pad)
+    {
+        const auto& snapshot = snapshots[(size_t)pad];
+        juce::DynamicObject::Ptr padObj = new juce::DynamicObject();
+        padObj->setProperty("index", pad);
+        padObj->setProperty("hasSample", snapshot.hasSample);
+        padObj->setProperty("name", snapshot.name);
+        padObj->setProperty("nameIsCustom", snapshot.nameIsCustom);
+        padObj->setProperty("loop", snapshot.loop);
+        padObj->setProperty("reverse", snapshot.reverse);
+        padObj->setProperty("matchBpi", snapshot.matchBpi);
+        padObj->setProperty("bpmSyncEnabled", snapshot.bpmSyncEnabled);
+        padObj->setProperty("recordedLoop", snapshot.recordedLoop);
+        padObj->setProperty("bpmSyncApplied", snapshot.bpmSyncApplied);
+        padObj->setProperty("loopLengthBeats", snapshot.loopLengthBeats);
+        padObj->setProperty("sourceSampleRate", snapshot.sourceSampleRate);
+
+        double sourceBpm = snapshot.sourceBpm;
+        if (snapshot.loopLengthBeats > 0
+            && snapshot.sample.getNumSamples() > 0
+            && snapshot.sourceSampleRate > 1.0)
+        {
+            const double durationSeconds = (double)snapshot.sample.getNumSamples() / snapshot.sourceSampleRate;
+            if (durationSeconds > 0.0)
+                sourceBpm = 60.0 * (double)snapshot.loopLengthBeats / durationSeconds;
+        }
+        else if (snapshot.bpmSyncApplied && snapshot.lastSyncedTargetBpm > 1.0)
+        {
+            sourceBpm = snapshot.lastSyncedTargetBpm;
+        }
+        padObj->setProperty("sourceBpm", sourceBpm);
+
+        if (snapshot.hasSample)
+        {
+            const juce::String sampleName = "pad" + juce::String(pad + 1).paddedLeft('0', 2) + ".wav";
+            const auto sampleFile = bankDir.getChildFile(sampleName);
+            if (!writeSamplePadWavFile(sampleFile, snapshot.sample, snapshot.sourceSampleRate))
+            {
+                errorMessage = "Could not write sample:\n" + sampleFile.getFullPathName();
+                return false;
+            }
+            padObj->setProperty("sample", sampleName);
+        }
+
+        padArray.add(juce::var(padObj.get()));
+    }
+
+    root->setProperty("pads", juce::var(padArray));
+
+    const auto cfgFile = bankDir.getChildFile("pad.cfg");
+    if (!cfgFile.replaceWithText(juce::JSON::toString(juce::var(root.get()), true)))
+    {
+        errorMessage = "Could not write bank config:\n" + cfgFile.getFullPathName();
+        return false;
+    }
+
+    return true;
+}
+
+bool NinjamVst3AudioProcessor::loadSamplePadBank(const juce::File& bankDirectory, juce::String& errorMessage)
+{
+    errorMessage.clear();
+    if (!bankDirectory.isDirectory())
+    {
+        errorMessage = "Choose a sample bank folder.";
+        return false;
+    }
+
+    const auto cfgFile = bankDirectory.getChildFile("pad.cfg");
+    if (!cfgFile.existsAsFile())
+    {
+        errorMessage = "No pad.cfg found in:\n" + bankDirectory.getFullPathName();
+        return false;
+    }
+
+    juce::var rootVar;
+    const auto parseResult = juce::JSON::parse(cfgFile.loadFileAsString(), rootVar);
+    if (parseResult.failed())
+    {
+        errorMessage = "Could not parse pad.cfg:\n" + parseResult.getErrorMessage();
+        return false;
+    }
+
+    auto* rootObj = rootVar.getDynamicObject();
+    if (rootObj == nullptr)
+    {
+        errorMessage = "pad.cfg is not a bank config.";
+        return false;
+    }
+
+    auto* pads = rootObj->getProperty("pads").getArray();
+    if (pads == nullptr)
+    {
+        errorMessage = "pad.cfg does not contain pad data.";
+        return false;
+    }
+
+    for (int pad = 0; pad < numSamplePads; ++pad)
+        clearSamplePad(pad);
+
+    for (const auto& padVar : *pads)
+    {
+        auto* padObj = padVar.getDynamicObject();
+        if (padObj == nullptr)
+            continue;
+
+        const int padIndex = (int)padObj->getProperty("index");
+        if (!isValidSamplePadIndex(padIndex))
+            continue;
+
+        const bool hasSample = (bool)padObj->getProperty("hasSample");
+        const juce::String sampleName = padObj->getProperty("sample").toString();
+        if (hasSample && sampleName.isNotEmpty())
+        {
+            const auto sampleFile = bankDirectory.getChildFile(sampleName);
+            if (!loadSamplePad(padIndex, sampleFile))
+            {
+                errorMessage = "Could not load sample:\n" + sampleFile.getFullPathName();
+                return false;
+            }
+        }
+
+        const juce::ScopedLock lock(samplePadsLock);
+        auto& pad = samplePads[(size_t)padIndex];
+        pad.name = padObj->getProperty("name").toString();
+        pad.nameIsCustom = (bool)padObj->getProperty("nameIsCustom");
+        pad.loop.store((bool)padObj->getProperty("loop"), std::memory_order_relaxed);
+        pad.reverse.store((bool)padObj->getProperty("reverse"), std::memory_order_relaxed);
+        pad.matchBpi.store((bool)padObj->getProperty("matchBpi"), std::memory_order_relaxed);
+        pad.bpmSyncEnabled.store((bool)padObj->getProperty("bpmSyncEnabled"), std::memory_order_relaxed);
+        pad.recordedLoop = (bool)padObj->getProperty("recordedLoop");
+        pad.bpmSyncApplied = false;
+        pad.loopLengthBeats = (int)padObj->getProperty("loopLengthBeats");
+        const double sourceBpm = (double)padObj->getProperty("sourceBpm");
+        if (sourceBpm > 1.0 && std::isfinite(sourceBpm))
+            pad.sourceBpm = sourceBpm;
+        pad.lastSyncedTargetBpm = 0.0;
+        pad.originalSample = pad.sample;
+        pad.originalSourceSampleRate = pad.sourceSampleRate;
+        pad.playing.store(false, std::memory_order_relaxed);
+        pad.playbackScheduled.store(false, std::memory_order_relaxed);
+        for (auto& voice : pad.oneShotVoices)
+        {
+            voice.active = false;
+            voice.position = 0.0;
+        }
+        pad.nextOneShotVoice = 0;
+        pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
+        pad.recordArmed.store(false, std::memory_order_relaxed);
+        pad.recordPendingStart.store(false, std::memory_order_relaxed);
+        pad.recordPendingStop.store(false, std::memory_order_relaxed);
+        pad.recordStartScheduled.store(false, std::memory_order_relaxed);
+        pad.recording.store(false, std::memory_order_relaxed);
+        pad.recordScheduledStartBeat = 0.0;
+        pad.recordScheduledStopBeat = 0.0;
+        pad.recordLoopLengthBeatsOverride = 0;
+        pad.recordAutoStopAtScheduledEnd = false;
+        pad.recordMatchBpiCanvas = false;
+        pad.recordBuffer.setSize(0, 0);
+        pad.recordWritePosition = 0;
+        pad.recordStartBeat = 0.0;
+        pad.midiHoldActive = false;
+        pad.midiHoldActionTriggered = false;
+        pad.midiPadDown = false;
+        pad.midiHoldStartMs = 0.0;
+        pad.position.store(0.0, std::memory_order_relaxed);
+    }
+
+    return true;
+}
+
 void NinjamVst3AudioProcessor::resyncLoopedSamplePadsToBpm(double targetBpm)
 {
     if (targetBpm <= 1.0 || !std::isfinite(targetBpm))
@@ -5406,7 +6240,6 @@ void NinjamVst3AudioProcessor::resyncSamplePadToBpm(int padIndex, double targetB
         const juce::ScopedLock lock(samplePadsLock);
         auto& pad = samplePads[(size_t)padIndex];
         if (pad.sample.getNumSamples() <= 0
-            || !pad.loop.load(std::memory_order_relaxed)
             || !pad.bpmSyncEnabled.load(std::memory_order_relaxed)
             || pad.recording.load(std::memory_order_relaxed))
             return;
@@ -5431,9 +6264,7 @@ void NinjamVst3AudioProcessor::resyncSamplePadToBpm(int padIndex, double targetB
 
     if (sourceBpm <= 1.0 || !std::isfinite(sourceBpm))
     {
-        sourceBpm = detectLoopBpmWithAubio(original, sourceRate);
-        if (sourceBpm <= 1.0)
-            sourceBpm = estimateLoopBpmFromLength(original.getNumSamples(), sourceRate, targetBpm, getBPI());
+        sourceBpm = detectSampleBpmWithAubio(original, sourceRate);
     }
 
     if (sourceBpm <= 1.0 || !std::isfinite(sourceBpm))
@@ -5448,7 +6279,6 @@ void NinjamVst3AudioProcessor::resyncSamplePadToBpm(int padIndex, double targetB
     const juce::ScopedLock lock(samplePadsLock);
     auto& pad = samplePads[(size_t)padIndex];
     if (pad.sample.getNumSamples() <= 0
-        || !pad.loop.load(std::memory_order_relaxed)
         || !pad.bpmSyncEnabled.load(std::memory_order_relaxed)
         || pad.recording.load(std::memory_order_relaxed))
         return;
@@ -5458,6 +6288,13 @@ void NinjamVst3AudioProcessor::resyncSamplePadToBpm(int padIndex, double targetB
     pad.sourceBpm = sourceBpm;
     pad.lastSyncedTargetBpm = targetBpm;
     pad.bpmSyncApplied = true;
+    for (auto& voice : pad.oneShotVoices)
+    {
+        voice.active = false;
+        voice.position = 0.0;
+    }
+    pad.nextOneShotVoice = 0;
+    pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
     const int length = pad.sample.getNumSamples();
     pad.position.store(juce::jlimit(0.0, juce::jmax(0.0, (double)length - 1.0),
                                     pad.position.load(std::memory_order_relaxed)),
@@ -5501,6 +6338,52 @@ double NinjamVst3AudioProcessor::getSamplePadBlockStartBeat(int transportPositio
         ? juce::jlimit(0.0, (double)safeBpi, (double)transportPosition / samplesPerBeat)
         : 0.0;
     return (double)samplePadTransportInterval * (double)safeBpi + beatInInterval;
+}
+
+void NinjamVst3AudioProcessor::updateSamplePadMidiHolds()
+{
+    const int bpi = juce::jmax(1, getBPI());
+    const double bpm = juce::jmax(1.0, (double)getBPM());
+    const double fourBeatHoldMs = 4.0 * 60000.0 / bpm;
+    const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    const double currentBeat = (double)intervalIndex.load(std::memory_order_relaxed) * (double)bpi
+        + (double)juce::jlimit(0.0f, 1.0f, getIntervalProgress()) * (double)bpi;
+    const double candidate = nextSamplePadVisibleIntervalStartBeat(currentBeat, bpi);
+
+    const juce::ScopedLock lock(samplePadsLock);
+    for (auto& pad : samplePads)
+    {
+        if (!pad.midiHoldActive
+            || pad.midiHoldActionTriggered
+            || nowMs - pad.midiHoldStartMs < fourBeatHoldMs
+            || pad.recording.load(std::memory_order_relaxed)
+            || pad.recordStartScheduled.load(std::memory_order_relaxed))
+        {
+            continue;
+        }
+
+        pad.matchBpi.store(true, std::memory_order_relaxed);
+        pad.loop.store(true, std::memory_order_relaxed);
+        pad.recordArmed.store(true, std::memory_order_relaxed);
+        pad.recordPendingStart.store(false, std::memory_order_relaxed);
+        pad.recordPendingStop.store(false, std::memory_order_relaxed);
+        pad.recordScheduledStartBeat = candidate;
+        pad.recordScheduledStopBeat = 0.0;
+        pad.recordLoopLengthBeatsOverride = bpi;
+        pad.recordAutoStopAtScheduledEnd = false;
+        pad.recordMatchBpiCanvas = false;
+        pad.recordStartScheduled.store(true, std::memory_order_relaxed);
+        pad.playing.store(false, std::memory_order_relaxed);
+        pad.playbackScheduled.store(false, std::memory_order_relaxed);
+        for (auto& voice : pad.oneShotVoices)
+        {
+            voice.active = false;
+            voice.position = 0.0;
+        }
+        pad.nextOneShotVoice = 0;
+        pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
+        pad.midiHoldActionTriggered = true;
+    }
 }
 
 void NinjamVst3AudioProcessor::processSamplePadLooperRecording(int numSamples,
@@ -5579,33 +6462,108 @@ void NinjamVst3AudioProcessor::processSamplePadLooperRecording(int numSamples,
     const juce::ScopedLock lock(samplePadsLock);
     for (auto& pad : samplePads)
     {
-        if (pad.recordPendingStart.exchange(false, std::memory_order_relaxed))
+        bool startedThisBlock = false;
+        int recordCopyStart = 0;
+
+        auto beginRecording = [&](double startBeat, int startSample)
         {
-            const int initialCapacity = juce::jmax(numSamples * 4, (int)std::ceil(safeSamplesPerBeat * (double)safeBpi));
+            const bool matchBpi = pad.matchBpi.load(std::memory_order_relaxed);
+            const int expectedBeats = matchBpi
+                ? safeBpi
+                : pad.recordLoopLengthBeatsOverride > 0
+                    ? pad.recordLoopLengthBeatsOverride
+                    : safeBpi;
+            const int initialCapacity = matchBpi
+                ? juce::jmax(1, (int)std::llround(safeSamplesPerBeat * (double)safeBpi))
+                : juce::jmax(numSamples * 4,
+                              (int)std::ceil(safeSamplesPerBeat * (double)expectedBeats) + numSamples);
             pad.recordBuffer.setSize(2, initialCapacity, false, true, true);
             pad.recordBuffer.clear();
             pad.recordWritePosition = 0;
-            pad.recordStartBeat = blockStartBeat;
-            pad.recordedStartBeatInInterval = positiveModulo(blockStartBeat, (double)safeBpi);
+            pad.recordStartBeat = startBeat;
+            pad.recordedStartBeatInInterval = positiveModulo(startBeat, (double)safeBpi);
+            pad.recordMatchBpiCanvas = matchBpi;
             pad.recording.store(true, std::memory_order_relaxed);
             pad.recordArmed.store(true, std::memory_order_relaxed);
             pad.playing.store(false, std::memory_order_relaxed);
             pad.playbackScheduled.store(false, std::memory_order_relaxed);
-        }
+            pad.recordStartScheduled.store(false, std::memory_order_relaxed);
+            for (auto& voice : pad.oneShotVoices)
+            {
+                voice.active = false;
+                voice.position = 0.0;
+            }
+            pad.nextOneShotVoice = 0;
+            pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
+            startedThisBlock = true;
+            recordCopyStart = juce::jlimit(0, numSamples, startSample);
+        };
 
-        if (pad.recordPendingStop.exchange(false, std::memory_order_relaxed)
-            && pad.recording.load(std::memory_order_relaxed))
+        auto appendRecordingSamples = [&](int sourceOffset, int samplesToAppend)
+        {
+            if (samplesToAppend <= 0)
+                return;
+
+            if (pad.recordMatchBpiCanvas)
+            {
+                const int targetSamples = pad.recordBuffer.getNumSamples();
+                if (targetSamples <= 0)
+                    return;
+
+                int remaining = samplesToAppend;
+                int sourcePosition = sourceOffset;
+                while (remaining > 0)
+                {
+                    const double sourceBeat = blockStartBeat + (double)sourcePosition / safeSamplesPerBeat;
+                    const double beatPhase = positiveModulo(sourceBeat, (double)safeBpi);
+                    int targetOffset = (int)std::llround((beatPhase / (double)safeBpi) * (double)targetSamples);
+                    targetOffset = targetSamples > 0 ? targetOffset % targetSamples : 0;
+                    const int chunk = juce::jmin(remaining, targetSamples - targetOffset);
+                    if (chunk <= 0)
+                        break;
+
+                    pad.recordBuffer.copyFrom(0, targetOffset, srcL + sourcePosition, chunk);
+                    pad.recordBuffer.copyFrom(1, targetOffset, srcR + sourcePosition, chunk);
+                    sourcePosition += chunk;
+                    remaining -= chunk;
+                    pad.recordWritePosition += chunk;
+                }
+                return;
+            }
+
+            const int writePos = pad.recordWritePosition;
+            const int requiredSamples = writePos + samplesToAppend;
+            if (pad.recordBuffer.getNumSamples() < requiredSamples)
+            {
+                const int newSize = juce::jmax(requiredSamples, pad.recordBuffer.getNumSamples() * 2 + samplesToAppend);
+                pad.recordBuffer.setSize(2, newSize, true, true, false);
+            }
+
+            pad.recordBuffer.copyFrom(0, writePos, srcL + sourceOffset, samplesToAppend);
+            pad.recordBuffer.copyFrom(1, writePos, srcR + sourceOffset, samplesToAppend);
+            pad.recordWritePosition = requiredSamples;
+        };
+
+        auto finishRecording = [&](double currentBeat)
         {
             const int capturedSamples = pad.recordWritePosition;
             if (capturedSamples > 0)
             {
+                const bool matchBpi = pad.matchBpi.load(std::memory_order_relaxed);
+                const bool matchBpiCanvas = pad.recordMatchBpiCanvas;
                 const double capturedBeats = juce::jmax(1.0 / safeSamplesPerBeat, (double)capturedSamples / safeSamplesPerBeat);
-                const int quantisedBeats = juce::jmax(1, (int)std::llround(capturedBeats));
+                const int quantisedBeats = matchBpiCanvas
+                    ? safeBpi
+                    : pad.recordLoopLengthBeatsOverride > 0
+                        ? pad.recordLoopLengthBeatsOverride
+                        : matchBpi
+                            ? juce::jmax(1, (int)std::llround(capturedBeats))
+                            : quantiseSamplePadFreeLoopBeats(capturedBeats);
                 const int targetSamples = juce::jmax(1, (int)std::llround((double)quantisedBeats * safeSamplesPerBeat));
                 juce::AudioBuffer<float> loopBuffer(2, targetSamples);
                 loopBuffer.clear();
 
-                const int samplesToCopy = juce::jmin(capturedSamples, targetSamples);
+                const int samplesToCopy = juce::jmin(pad.recordBuffer.getNumSamples(), targetSamples);
                 loopBuffer.copyFrom(0, 0, pad.recordBuffer, 0, 0, samplesToCopy);
                 loopBuffer.copyFrom(1, 0, pad.recordBuffer, 1, 0, samplesToCopy);
 
@@ -5621,55 +6579,116 @@ void NinjamVst3AudioProcessor::processSamplePadLooperRecording(int numSamples,
                 pad.loop.store(true, std::memory_order_relaxed);
                 pad.recordedLoop = true;
                 pad.loopLengthBeats = quantisedBeats;
-                pad.loopAnchorBeat = pad.recordStartBeat;
-                pad.recordedStartBeatInInterval = positiveModulo(pad.recordStartBeat, (double)safeBpi);
-                pad.position.store(0.0, std::memory_order_relaxed);
-                pad.playing.store(false, std::memory_order_relaxed);
+                pad.loopAnchorBeat = matchBpiCanvas
+                    ? std::floor(pad.recordStartBeat / (double)safeBpi) * (double)safeBpi
+                    : pad.recordStartBeat;
+                pad.recordedStartBeatInInterval = matchBpiCanvas
+                    ? 0.0
+                    : positiveModulo(pad.recordStartBeat, (double)safeBpi);
 
-                const double currentBeat = blockEndBeat;
-                if (pad.matchBpi.load(std::memory_order_relaxed))
+                if (matchBpiCanvas)
                 {
+                    const double phase = positiveModulo(currentBeat, (double)safeBpi) / (double)safeBpi;
+                    const double position = phase * (double)targetSamples;
+                    if (pad.reverse.load(std::memory_order_relaxed))
+                        pad.position.store(juce::jlimit(0.0, (double)targetSamples - 1.0, (double)targetSamples - 1.0 - position),
+                                           std::memory_order_relaxed);
+                    else
+                        pad.position.store(juce::jlimit(0.0, (double)targetSamples - 1.0, position),
+                                           std::memory_order_relaxed);
+                    pad.playing.store(true, std::memory_order_relaxed);
+                    pad.playbackScheduled.store(false, std::memory_order_relaxed);
+                }
+                else if (matchBpi)
+                {
+                    pad.position.store(0.0, std::memory_order_relaxed);
+                    pad.playing.store(false, std::memory_order_relaxed);
                     double interval = std::floor(currentBeat / (double)safeBpi);
                     double candidate = interval * (double)safeBpi + pad.recordedStartBeatInInterval;
-                    if (candidate <= currentBeat + 0.0001)
+                    if (candidate < currentBeat - 0.0001)
                         candidate += (double)safeBpi;
                     pad.scheduledStartBeat = candidate;
+                    pad.playbackScheduled.store(true, std::memory_order_relaxed);
                 }
                 else
                 {
+                    pad.position.store(0.0, std::memory_order_relaxed);
+                    pad.playing.store(false, std::memory_order_relaxed);
                     const double loopLengthBeats = (double)quantisedBeats;
                     double loops = std::ceil((currentBeat - pad.loopAnchorBeat) / loopLengthBeats);
                     if (!std::isfinite(loops) || loops < 0.0)
                         loops = 0.0;
                     double candidate = pad.loopAnchorBeat + loops * loopLengthBeats;
-                    if (candidate <= currentBeat + 0.0001)
+                    if (candidate < currentBeat - 0.0001)
                         candidate += loopLengthBeats;
                     pad.scheduledStartBeat = candidate;
+                    pad.playbackScheduled.store(true, std::memory_order_relaxed);
                 }
-                pad.playbackScheduled.store(true, std::memory_order_relaxed);
             }
 
             pad.recording.store(false, std::memory_order_relaxed);
             pad.recordArmed.store(false, std::memory_order_relaxed);
+            pad.recordStartScheduled.store(false, std::memory_order_relaxed);
             pad.recordBuffer.setSize(0, 0);
             pad.recordWritePosition = 0;
+            pad.recordLoopLengthBeatsOverride = 0;
+            pad.recordScheduledStartBeat = 0.0;
+            pad.recordScheduledStopBeat = 0.0;
+            pad.recordAutoStopAtScheduledEnd = false;
+            pad.recordMatchBpiCanvas = false;
+        };
+
+        if (!pad.recording.load(std::memory_order_relaxed))
+        {
+            if (pad.recordPendingStart.exchange(false, std::memory_order_relaxed))
+                beginRecording(blockStartBeat, 0);
+            else if (pad.recordStartScheduled.load(std::memory_order_relaxed)
+                     && pad.recordScheduledStartBeat < blockEndBeat)
+            {
+                constexpr double missedScheduledStartToleranceBeats = 0.02;
+                if (pad.recordScheduledStartBeat < blockStartBeat - missedScheduledStartToleranceBeats)
+                {
+                    pad.recordScheduledStartBeat = nextSamplePadVisibleIntervalStartBeat(blockStartBeat, safeBpi);
+                }
+                else
+                {
+                    const int startSample = juce::jlimit(0, numSamples,
+                        (int)std::llround((pad.recordScheduledStartBeat - blockStartBeat) * safeSamplesPerBeat));
+                    beginRecording(pad.recordScheduledStartBeat, startSample);
+                }
+            }
+        }
+
+        const bool manualStopRequested = pad.recordPendingStop.exchange(false, std::memory_order_relaxed);
+        if (manualStopRequested && pad.recording.load(std::memory_order_relaxed) && !startedThisBlock)
+        {
+            finishRecording(blockStartBeat);
             continue;
         }
 
         if (!pad.recording.load(std::memory_order_relaxed))
             continue;
 
-        const int writePos = pad.recordWritePosition;
-        const int requiredSamples = writePos + numSamples;
-        if (pad.recordBuffer.getNumSamples() < requiredSamples)
+        int recordCopyEnd = numSamples;
+        bool autoStopReached = false;
+        double stopBeat = blockEndBeat;
+        if (pad.recordAutoStopAtScheduledEnd
+            && pad.recordScheduledStopBeat > 0.0
+            && pad.recordScheduledStopBeat <= blockEndBeat + 0.0001)
         {
-            const int newSize = juce::jmax(requiredSamples, pad.recordBuffer.getNumSamples() * 2 + numSamples);
-            pad.recordBuffer.setSize(2, newSize, true, true, false);
+            recordCopyEnd = juce::jlimit(recordCopyStart, numSamples,
+                (int)std::llround((pad.recordScheduledStopBeat - blockStartBeat) * safeSamplesPerBeat));
+            autoStopReached = true;
+            stopBeat = pad.recordScheduledStopBeat;
         }
 
-        pad.recordBuffer.copyFrom(0, writePos, srcL, numSamples);
-        pad.recordBuffer.copyFrom(1, writePos, srcR, numSamples);
-        pad.recordWritePosition = requiredSamples;
+        appendRecordingSamples(recordCopyStart, recordCopyEnd - recordCopyStart);
+
+        if (manualStopRequested || autoStopReached)
+        {
+            finishRecording(manualStopRequested ? blockEndBeat : stopBeat);
+            continue;
+        }
     }
 }
 
@@ -5698,30 +6717,17 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
         const juce::ScopedLock lock(samplePadsLock);
         for (auto& pad : samplePads)
         {
-            int startSample = 0;
-            if (!pad.playing.load(std::memory_order_relaxed))
-            {
-                if (!pad.playbackScheduled.load(std::memory_order_relaxed)
-                    || pad.scheduledStartBeat >= blockEndBeat)
-                    continue;
-
-                startSample = juce::jlimit(0, numSamples - 1,
-                                           (int)std::llround((pad.scheduledStartBeat - blockStartBeat) * safeSamplesPerBeat));
-                pad.playbackScheduled.store(false, std::memory_order_relaxed);
-                pad.position.store(pad.reverse.load(std::memory_order_relaxed)
-                    ? juce::jmax(0.0, (double)pad.sample.getNumSamples() - 1.0)
-                    : 0.0,
-                    std::memory_order_relaxed);
-                pad.playing.store(true, std::memory_order_relaxed);
-            }
-
-            if (!pad.playing.load(std::memory_order_relaxed))
-                continue;
-
             const int length = pad.sample.getNumSamples();
             if (length <= 0)
             {
                 pad.playing.store(false, std::memory_order_relaxed);
+                for (auto& voice : pad.oneShotVoices)
+                {
+                    voice.active = false;
+                    voice.position = 0.0;
+                }
+                pad.nextOneShotVoice = 0;
+                pad.activeOneShotVoices.store(0, std::memory_order_relaxed);
                 continue;
             }
 
@@ -5731,53 +6737,114 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
             const bool loop = pad.loop.load(std::memory_order_relaxed);
             const double lengthD = (double)length;
             const double step = juce::jmax(0.000001, pad.sourceSampleRate / targetRate);
-            double pos = juce::jlimit(0.0, juce::jmax(0.0, lengthD - 1.0), pad.position.load(std::memory_order_relaxed));
-            bool stillPlaying = true;
 
-            for (int i = startSample; i < numSamples; ++i)
+            int startSample = 0;
+            bool mainVoiceActive = pad.playing.load(std::memory_order_relaxed);
+            if (!mainVoiceActive
+                && pad.playbackScheduled.load(std::memory_order_relaxed)
+                && pad.scheduledStartBeat < blockEndBeat)
             {
-                const int index0 = juce::jlimit(0, length - 1, (int)std::floor(pos));
-                const int index1 = juce::jmin(index0 + 1, length - 1);
-                const float frac = (float)(pos - (double)index0);
-                outL[i] += srcL[index0] + (srcL[index1] - srcL[index0]) * frac;
-                outR[i] += srcR[index0] + (srcR[index1] - srcR[index0]) * frac;
+                startSample = juce::jlimit(0, numSamples - 1,
+                                           (int)std::llround((pad.scheduledStartBeat - blockStartBeat) * safeSamplesPerBeat));
+                pad.playbackScheduled.store(false, std::memory_order_relaxed);
+                pad.position.store(reverse ? juce::jmax(0.0, lengthD - 1.0) : 0.0, std::memory_order_relaxed);
+                pad.playing.store(true, std::memory_order_relaxed);
+                mainVoiceActive = true;
+            }
 
-                pos += reverse ? -step : step;
-                if (reverse)
+            if (mainVoiceActive)
+            {
+                double pos = juce::jlimit(0.0, juce::jmax(0.0, lengthD - 1.0), pad.position.load(std::memory_order_relaxed));
+                bool stillPlaying = true;
+
+                for (int i = startSample; i < numSamples; ++i)
                 {
-                    if (pos < 0.0)
+                    const int index0 = juce::jlimit(0, length - 1, (int)std::floor(pos));
+                    const int index1 = juce::jmin(index0 + 1, length - 1);
+                    const float frac = (float)(pos - (double)index0);
+                    outL[i] += srcL[index0] + (srcL[index1] - srcL[index0]) * frac;
+                    outR[i] += srcR[index0] + (srcR[index1] - srcR[index0]) * frac;
+
+                    pos += reverse ? -step : step;
+                    if (reverse)
+                    {
+                        if (pos < 0.0)
+                        {
+                            if (loop)
+                            {
+                                while (pos < 0.0)
+                                    pos += lengthD;
+                            }
+                            else
+                            {
+                                pos = 0.0;
+                                stillPlaying = false;
+                                break;
+                            }
+                        }
+                    }
+                    else if (pos >= lengthD)
                     {
                         if (loop)
                         {
-                            while (pos < 0.0)
-                                pos += lengthD;
+                            while (pos >= lengthD)
+                                pos -= lengthD;
                         }
                         else
                         {
-                            pos = 0.0;
+                            pos = juce::jmax(0.0, lengthD - 1.0);
                             stillPlaying = false;
                             break;
                         }
                     }
                 }
-                else if (pos >= lengthD)
+
+                pad.position.store(pos, std::memory_order_relaxed);
+                pad.playing.store(stillPlaying, std::memory_order_relaxed);
+            }
+
+            int activeOneShotVoices = 0;
+            for (auto& voice : pad.oneShotVoices)
+            {
+                if (!voice.active)
+                    continue;
+
+                double pos = juce::jlimit(0.0, juce::jmax(0.0, lengthD - 1.0), voice.position);
+                bool stillActive = true;
+
+                for (int i = 0; i < numSamples; ++i)
                 {
-                    if (loop)
+                    const int index0 = juce::jlimit(0, length - 1, (int)std::floor(pos));
+                    const int index1 = juce::jmin(index0 + 1, length - 1);
+                    const float frac = (float)(pos - (double)index0);
+                    outL[i] += srcL[index0] + (srcL[index1] - srcL[index0]) * frac;
+                    outR[i] += srcR[index0] + (srcR[index1] - srcR[index0]) * frac;
+
+                    pos += reverse ? -step : step;
+                    if (reverse)
                     {
-                        while (pos >= lengthD)
-                            pos -= lengthD;
+                        if (pos < 0.0)
+                        {
+                            pos = 0.0;
+                            stillActive = false;
+                            break;
+                        }
                     }
-                    else
+                    else if (pos >= lengthD)
                     {
                         pos = juce::jmax(0.0, lengthD - 1.0);
-                        stillPlaying = false;
+                        stillActive = false;
                         break;
                     }
                 }
+
+                voice.position = pos;
+                voice.active = stillActive;
+                if (stillActive)
+                    ++activeOneShotVoices;
             }
 
-            pad.position.store(pos, std::memory_order_relaxed);
-            pad.playing.store(stillPlaying, std::memory_order_relaxed);
+            pad.activeOneShotVoices.store(activeOneShotVoices, std::memory_order_relaxed);
         }
     }
 
@@ -5836,10 +6903,10 @@ int NinjamVst3AudioProcessor::LicenseAgreementCallback(void* userData, const cha
     // Since this is called from Run(), which we call from timerCallback (UI thread),
     // we can show a message box.
     // However, for automation/testing, we might want to auto-accept.
-    
+
     // Simple auto-accept for this proof of concept:
     juce::Logger::writeToLog("License Agreement Requested: " + juce::String(licensetext));
-    return 1; 
+    return 1;
 }
 
 void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, const juce::String& type, const juce::String& payload)
@@ -6431,7 +7498,7 @@ void NinjamVst3AudioProcessor::ChatMessage_Callback(void* userData, NJClient* in
 
         if (shouldTranslateBody)
             self->enqueueAsyncTranslation(line, lineSender, linePrefix, lineBody);
-        
+
         // Also log
         juce::Logger::writeToLog("NINJAM Chat: " + line);
     }
@@ -6535,8 +7602,8 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
                 event.value = msg.getVelocity();
                 event.normalized = msg.isNoteOn() ? ((float)event.value / 127.0f) : 0.0f;
                 event.isNoteOn = msg.isNoteOn();
-                if (useHostMidiForSamplePads && event.isNoteOn)
-                    triggerSamplePadForMidiNote(event.number);
+                if (useHostMidiForSamplePads)
+                    handleSamplePadMidiNote(event.number, event.isNoteOn);
                 if (useHostMidiForLearn)
                     pendingMidiControllerEvents.push_back(event);
                 if (useHostMidiForRelay)
@@ -6548,6 +7615,7 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         if (pendingOutboundMidiRelayEvents.size() > 512)
             pendingOutboundMidiRelayEvents.erase(pendingOutboundMidiRelayEvents.begin(), pendingOutboundMidiRelayEvents.begin() + (long long)(pendingOutboundMidiRelayEvents.size() - 512));
     }
+    updateSamplePadMidiHolds();
     injectInboundMidiRelayEvents(midiMessages);
 
     int totalInputChannels = 0;

@@ -1324,6 +1324,7 @@ private:
     void setChatWindowColourKey(const juce::String& key, bool markDirty);
     void applyChatWindowColourToDisplays();
     void setAbletonChatWindowSizePreset(int presetIndex);
+    void setAbletonSamplerWindowSizePreset(int presetIndex);
     void openChatPopoutWindow(const juce::StringArray& history,
                               const juce::StringArray& senders,
                               const juce::String& draftText);
@@ -1384,6 +1385,7 @@ private:
     bool hostResizeLockedForConnection = false;
     int abletonWindowSizePreset = 1;
     int abletonChatWindowSizePreset = 1;
+    int abletonSamplerWindowSizePreset = 1;
     std::unique_ptr<juce::DialogWindow> aboutWindow;
     double lastResizeEventMs = 0.0;
     double suppressHeavyUiUntilMs = 0.0;

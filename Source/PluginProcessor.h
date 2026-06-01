@@ -13,6 +13,7 @@
 #include <atomic>
 #include <memory>
 #include <deque>
+#include <array>
 
 #include "ninjam/njclient.h"
 
@@ -224,17 +225,23 @@ public:
     static constexpr int looperInputLocalChannel = -10000;
     bool loadSamplePad(int padIndex, const juce::File& file);
     void clearSamplePad(int padIndex);
+    void undoSamplePadClear(int padIndex);
+    bool canUndoSamplePadClear(int padIndex) const;
     void triggerSamplePad(int padIndex);
     void stopSamplePad(int padIndex);
     void setSamplePadRecordArmed(int padIndex, bool shouldArm);
+    void armSamplePadLooper(int padIndex, bool matchBpi);
+    void scheduleSamplePadBpiRecordStartAtNextInterval(int padIndex);
     bool isSamplePadRecordArmed(int padIndex) const;
     bool isSamplePadRecording(int padIndex) const;
     bool isSamplePadPlaying(int padIndex) const;
+    bool isSamplePadWaitingForBpiLoop(int padIndex) const;
     void setSamplePadMatchBpiEnabled(int padIndex, bool shouldEnable);
     bool isSamplePadMatchBpiEnabled(int padIndex) const;
     void setSamplePadBpmSyncEnabled(int padIndex, bool shouldEnable);
     bool isSamplePadBpmSyncEnabled(int padIndex) const;
     void resyncSamplePadToNinjamBpm(int padIndex);
+    void syncSamplePadLoopToBeat(int padIndex);
     void undoSamplePadBpmResync(int padIndex);
     bool canUndoSamplePadBpmResync(int padIndex) const;
     void setSamplePadLoopEnabled(int padIndex, bool shouldLoop);
@@ -244,12 +251,22 @@ public:
     bool hasSamplePadSample(int padIndex) const;
     juce::String getSamplePadName(int padIndex) const;
     void setSamplePadName(int padIndex, const juce::String& name);
+    int getSamplePadLoopLengthBeats(int padIndex) const;
+    float getSamplePadLoopProgress(int padIndex) const;
+    int getSamplePadTriggerFlashCounter(int padIndex) const;
     bool triggerSamplePadForMidiNote(int noteNumber);
+    bool handleSamplePadMidiNote(int noteNumber, bool isNoteOn);
+    bool handleSamplePadMidiPadState(int padIndex, bool isDown);
     void setSamplePadVolume(float gain);
     float getSamplePadVolume() const;
     void setSamplePadLimiterEnabled(bool shouldEnable);
     bool isSamplePadLimiterEnabled() const;
     float getSamplePadPeak() const;
+    juce::File getSamplePadBanksDirectory() const;
+    juce::File getSamplePadBankDirectory(const juce::String& bankName) const;
+    juce::StringArray getSamplePadBankNames() const;
+    bool saveSamplePadBank(const juce::String& bankName, juce::String& errorMessage);
+    bool loadSamplePadBank(const juce::File& bankDirectory, juce::String& errorMessage);
 
     // NINJAM callbacks
     static int LicenseAgreementCallback(void* userData, const char* licensetext);
@@ -450,18 +467,41 @@ private:
     int fxDelayWritePosition = 0;
     double processingSampleRate = 44100.0;
 
+    static constexpr int samplePadOneShotVoiceCount = 4;
+
+    struct SamplePadOneShotVoice
+    {
+        bool active = false;
+        double position = 0.0;
+    };
+
     struct SamplePadState
     {
         juce::AudioBuffer<float> sample;
         juce::AudioBuffer<float> originalSample;
+        juce::AudioBuffer<float> undoClearSample;
+        juce::AudioBuffer<float> undoClearOriginalSample;
         juce::String name;
+        juce::String undoClearName;
         juce::File file;
+        juce::File undoClearFile;
         double sourceSampleRate = 44100.0;
         double originalSourceSampleRate = 44100.0;
         double sourceBpm = 0.0;
         double lastSyncedTargetBpm = 0.0;
+        double undoClearSourceSampleRate = 44100.0;
+        double undoClearOriginalSourceSampleRate = 44100.0;
+        double undoClearSourceBpm = 0.0;
+        double undoClearLastSyncedTargetBpm = 0.0;
         bool nameIsCustom = false;
         bool bpmSyncApplied = false;
+        bool undoClearNameIsCustom = false;
+        bool undoClearBpmSyncApplied = false;
+        bool undoClearLoop = false;
+        bool undoClearReverse = false;
+        bool undoClearMatchBpi = false;
+        bool undoClearBpmSyncEnabled = true;
+        bool canUndoClear = false;
         std::atomic<bool> loop { false };
         std::atomic<bool> reverse { false };
         std::atomic<bool> matchBpi { false };
@@ -471,13 +511,32 @@ private:
         std::atomic<bool> recordArmed { false };
         std::atomic<bool> recordPendingStart { false };
         std::atomic<bool> recordPendingStop { false };
+        std::atomic<bool> recordStartScheduled { false };
         std::atomic<bool> recording { false };
         std::atomic<double> position { 0.0 };
+        std::atomic<int> activeOneShotVoices { 0 };
+        std::atomic<int> triggerFlashCounter { 0 };
+        std::array<SamplePadOneShotVoice, samplePadOneShotVoiceCount> oneShotVoices;
+        int nextOneShotVoice = 0;
+        bool midiHoldActive = false;
+        bool midiHoldActionTriggered = false;
+        bool midiPadDown = false;
+        double midiHoldStartMs = 0.0;
+        double lastAcceptedPressMs = -1000.0;
         double scheduledStartBeat = 0.0;
+        double recordScheduledStartBeat = 0.0;
+        double recordScheduledStopBeat = 0.0;
         double loopAnchorBeat = 0.0;
+        double undoClearLoopAnchorBeat = 0.0;
         double recordedStartBeatInInterval = 0.0;
+        double undoClearRecordedStartBeatInInterval = 0.0;
         int loopLengthBeats = 0;
+        int recordLoopLengthBeatsOverride = 0;
+        int undoClearLoopLengthBeats = 0;
         bool recordedLoop = false;
+        bool recordAutoStopAtScheduledEnd = false;
+        bool recordMatchBpiCanvas = false;
+        bool undoClearRecordedLoop = false;
         juce::AudioBuffer<float> recordBuffer;
         int recordWritePosition = 0;
         double recordStartBeat = 0.0;
@@ -777,6 +836,7 @@ private:
     void injectInboundMidiRelayEvents(juce::MidiBuffer& midiMessages);
     void updateSamplePadTransport(int transportPosition, int transportLength, int bpi);
     double getSamplePadBlockStartBeat(int transportPosition, int transportLength, int bpi, double& samplesPerBeat);
+    void updateSamplePadMidiHolds();
     void processSamplePadLooperRecording(int numSamples,
                                          double blockStartBeat,
                                          double samplesPerBeat,
@@ -803,5 +863,18 @@ inline bool NinjamVst3AudioProcessor::isSamplePadPlaying(int padIndex) const
 {
     if (padIndex < 0 || padIndex >= numSamplePads)
         return false;
-    return samplePads[(size_t)padIndex].playing.load();
+
+    const auto& pad = samplePads[(size_t)padIndex];
+    return pad.playing.load(std::memory_order_relaxed)
+        || pad.activeOneShotVoices.load(std::memory_order_relaxed) > 0;
+}
+
+inline bool NinjamVst3AudioProcessor::isSamplePadWaitingForBpiLoop(int padIndex) const
+{
+    if (padIndex < 0 || padIndex >= numSamplePads)
+        return false;
+
+    const auto& pad = samplePads[(size_t)padIndex];
+    return pad.recordStartScheduled.load(std::memory_order_relaxed)
+        && pad.matchBpi.load(std::memory_order_relaxed);
 }

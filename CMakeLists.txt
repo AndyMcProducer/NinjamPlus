@@ -188,10 +188,13 @@ target_include_directories(NINJAM_VST3 PRIVATE
     $<$<BOOL:${WIN32}>:${asiosdk_SOURCE_DIR}/host>
 )
 
+set(NINJAMPLUS_LOCAL_AUBIO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/local_deps/aubio-install")
 find_path(AUBIO_INCLUDE_DIR
-    NAMES aubio.h aubio/aubio.h)
+    NAMES aubio.h aubio/aubio.h
+    HINTS "${NINJAMPLUS_LOCAL_AUBIO_ROOT}/include")
 find_library(AUBIO_LIBRARY
-    NAMES aubio libaubio)
+    NAMES aubio libaubio
+    HINTS "${NINJAMPLUS_LOCAL_AUBIO_ROOT}/lib")
 if (AUBIO_INCLUDE_DIR AND AUBIO_LIBRARY)
     target_include_directories(NINJAM_VST3 PRIVATE ${AUBIO_INCLUDE_DIR})
     target_link_libraries(NINJAM_VST3 PRIVATE ${AUBIO_LIBRARY})

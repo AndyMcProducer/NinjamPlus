@@ -2,6 +2,7 @@
 #include "PluginEditor.h"
 #include "lice/lice.h"
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
@@ -3085,10 +3086,54 @@ static bool isSupportedSamplePadFile(const juce::File& file)
         || ext == ".flac" || ext == ".ogg" || ext == ".mp3";
 }
 
+static juce::Rectangle<int> samplePadsWindowSizeForPreset(int presetIndex)
+{
+    presetIndex = juce::jlimit(0, 2, presetIndex);
+    if (presetIndex == 0)
+        return { 0, 0, 760, 500 };
+    if (presetIndex == 2)
+        return { 0, 0, 1040, 680 };
+    return { 0, 0, 880, 580 };
+}
+
 static juce::String getSamplePadLearnTargetId(int padIndex)
 {
     return "samplepad.trigger." + juce::String(padIndex + 1);
 }
+
+class WidePopupComboBox : public juce::ComboBox
+{
+public:
+    void setPopupMinimumWidth(int width) { popupMinimumWidth = width; }
+
+    void showPopup() override
+    {
+        juce::PopupMenu menu;
+        const int selectedId = getSelectedId();
+
+        for (int i = 0; i < getNumItems(); ++i)
+        {
+            const int itemId = getItemId(i);
+            menu.addItem(itemId, getItemText(i), isItemEnabled(itemId), itemId == selectedId);
+        }
+
+        if (menu.getNumItems() == 0)
+            menu.addItem(1, "No banks", false, false);
+
+        juce::Component::SafePointer<WidePopupComboBox> safeThis(this);
+        menu.showMenuAsync(juce::PopupMenu::Options()
+                               .withTargetComponent(this)
+                               .withMinimumWidth(juce::jmax(getWidth(), popupMinimumWidth)),
+                           [safeThis](int result)
+                           {
+                               if (safeThis != nullptr && result != 0)
+                                   safeThis->setSelectedId(result);
+                           });
+    }
+
+private:
+    int popupMinimumWidth = 220;
+};
 
 class SamplePadToggleLookAndFeel : public juce::LookAndFeel_V4
 {
@@ -3098,7 +3143,9 @@ public:
     {
         const bool active = button.getToggleState();
         auto bounds = button.getLocalBounds().toFloat().reduced(1.0f);
-        const auto base = active ? juce::Colour(0xff49d5ff) : juce::Colour(0xff2f3337);
+        const auto base = active
+            ? (button.getName() == "record" ? juce::Colour(0xffff3b3b) : juce::Colour(0xff49d5ff))
+            : juce::Colour(0xff2f3337);
         juce::ColourGradient grad(base.brighter(active ? 0.4f : 0.18f), bounds.getX(), bounds.getY(),
                                   base.darker(active ? 0.15f : 0.45f), bounds.getX(), bounds.getBottom(), false);
         g.setGradientFill(grad);
@@ -3112,18 +3159,13 @@ public:
                            : juce::Colours::white.withAlpha(0.88f));
         if (button.getName() == "record")
         {
-            g.setColour(active ? juce::Colour(0xffff3b3b) : juce::Colour(0xff9b2020));
+            g.setColour(active ? juce::Colours::white.withAlpha(0.94f) : juce::Colour(0xff9b2020));
             g.fillEllipse(icon.reduced(3.5f));
-            g.setColour(juce::Colours::white.withAlpha(active ? 0.92f : 0.55f));
+            g.setColour(active ? juce::Colours::black.withAlpha(0.35f)
+                               : juce::Colours::white.withAlpha(0.55f));
             g.drawEllipse(icon.reduced(3.5f), 1.2f);
         }
         else if (button.getName() == "matchbpi")
-        {
-            g.setFont(juce::Font(9.5f, juce::Font::bold));
-            g.drawFittedText("B", icon.toNearestInt(), juce::Justification::centred, 1);
-            g.drawRoundedRectangle(icon.reduced(1.0f), 3.0f, 1.1f);
-        }
-        else if (button.getName() == "loop")
         {
             juce::Path path;
             path.addCentredArc(icon.getCentreX(), icon.getCentreY(), icon.getWidth() * 0.34f, icon.getHeight() * 0.34f,
@@ -3141,6 +3183,28 @@ public:
                               icon.getX() + 3.0f, icon.getCentreY() - 1.0f,
                               icon.getX() - 2.0f, icon.getCentreY() + 2.0f);
             g.fillPath(headB);
+        }
+        else if (button.getName() == "loop")
+        {
+            const float cx = icon.getCentreX();
+            const float cy = icon.getCentreY();
+            const float w = icon.getWidth();
+            const float h = icon.getHeight();
+            juce::Path infinity;
+            infinity.startNewSubPath(cx, cy);
+            infinity.cubicTo(cx - w * 0.16f, cy - h * 0.36f,
+                             icon.getX(), cy - h * 0.36f,
+                             icon.getX(), cy);
+            infinity.cubicTo(icon.getX(), cy + h * 0.36f,
+                             cx - w * 0.16f, cy + h * 0.36f,
+                             cx, cy);
+            infinity.cubicTo(cx + w * 0.16f, cy - h * 0.36f,
+                             icon.getRight(), cy - h * 0.36f,
+                             icon.getRight(), cy);
+            infinity.cubicTo(icon.getRight(), cy + h * 0.36f,
+                             cx + w * 0.16f, cy + h * 0.36f,
+                             cx, cy);
+            g.strokePath(infinity, juce::PathStrokeType(2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
         }
         else
         {
@@ -3177,7 +3241,8 @@ public:
         nameLabel.setColour(juce::Label::textColourId, juce::Colours::white.withAlpha(0.94f));
         nameLabel.setColour(juce::Label::backgroundColourId, juce::Colours::transparentBlack);
         nameLabel.setColour(juce::Label::outlineColourId, juce::Colours::transparentBlack);
-        nameLabel.setTooltip("Double-click to rename pad");
+        nameLabel.setTooltip("Right-click to rename pad");
+        nameLabel.setInterceptsMouseClicks(false, false);
         nameLabel.onTextChange = [this]
         {
             processor.setSamplePadName(padIndex, nameLabel.getText());
@@ -3225,6 +3290,7 @@ public:
         };
         addAndMakeVisible(reverseButton);
 
+        lastTriggerFlashCounter = processor.getSamplePadTriggerFlashCounter(padIndex);
         refreshFromProcessor();
     }
 
@@ -3242,12 +3308,49 @@ public:
         auto bounds = getLocalBounds().toFloat().reduced(1.0f);
         const bool loaded = processor.hasSamplePadSample(padIndex);
         const bool recording = processor.isSamplePadRecording(padIndex);
-        const bool armed = processor.isSamplePadRecordArmed(padIndex);
+        const bool playing = processor.isSamplePadPlaying(padIndex);
+        const bool waitingForBpiLoop = processor.isSamplePadWaitingForBpiLoop(padIndex);
         const bool hover = isMouseOverOrDragging();
 
-        auto top = recording ? juce::Colour(0xffb65a5a) : (loaded ? juce::Colour(0xff8f969d) : juce::Colour(0xff70767d));
-        auto mid = recording ? juce::Colour(0xff6d3030) : (loaded ? juce::Colour(0xff555b61) : juce::Colour(0xff444a50));
+        const double nowMs = juce::Time::getMillisecondCounterHiRes();
+        const float phase = (float)(nowMs * 0.001 * 2.0f * juce::MathConstants<double>::pi * 1.2 + padIndex * 0.37);
+        const float pulse = 0.5f + 0.5f * std::sin(phase);
+
+        bool activeTint = false;
+        juce::Colour activeTop;
+        juce::Colour activeMid;
+        juce::Colour activeGlow;
+        if (recording)
+        {
+            activeTint = true;
+            activeTop = juce::Colour(0xffdf4f4f);
+            activeMid = juce::Colour(0xff7a2424);
+            activeGlow = juce::Colour(0xffff5454);
+        }
+        else if (waitingForBpiLoop)
+        {
+            activeTint = true;
+            activeTop = juce::Colour(0xffffad45);
+            activeMid = juce::Colour(0xff8b4b12);
+            activeGlow = juce::Colour(0xffff9f2f);
+        }
+        else if (playing)
+        {
+            activeTint = true;
+            activeTop = juce::Colour(0xff62de72);
+            activeMid = juce::Colour(0xff246d35);
+            activeGlow = juce::Colour(0xff55f06f);
+        }
+
+        auto top = activeTint ? activeTop : (loaded ? juce::Colour(0xff8f969d) : juce::Colour(0xff70767d));
+        auto mid = activeTint ? activeMid : (loaded ? juce::Colour(0xff555b61) : juce::Colour(0xff444a50));
         auto bottom = juce::Colour(0xff25292d);
+        if (activeTint)
+        {
+            top = top.brighter(0.06f + 0.18f * pulse);
+            mid = mid.brighter(0.02f + 0.12f * pulse);
+            bottom = bottom.interpolatedWith(activeGlow, 0.10f + 0.15f * pulse);
+        }
         if (hover)
         {
             top = top.brighter(0.12f);
@@ -3283,26 +3386,18 @@ public:
             }
         }
 
-        // Pulsing / outline logic: recording (red) > armed (orange when match-BPI) > playing (green) > static
+        // Pulsing / outline logic: recording (red) > waiting for BPI loop (orange) > playing (green) > static
         float outlineThickness = loaded ? 1.8f : 1.2f;
         juce::Colour outlineColour;
         float outlineAlpha = 1.0f;
-
-        const bool playing = processor.isSamplePadPlaying(padIndex);
-
-        // compute a simple time-based pulse (0..1) using a global clock so we don't need extra timers
-        const double nowMs = juce::Time::getMillisecondCounterHiRes();
-        const float phase = (float)(nowMs * 0.001 * 2.0f * juce::MathConstants<double>::pi * 1.2 + padIndex * 0.37);
-        const float pulse = 0.5f + 0.5f * std::sin(phase);
 
         if (recording)
         {
             outlineColour = juce::Colour(0xffff5454);
             outlineAlpha = 0.55f + 0.45f * pulse;
         }
-        else if (armed && processor.isSamplePadMatchBpiEnabled(padIndex) && !recording)
+        else if (waitingForBpiLoop)
         {
-            // armed and waiting for BPI start -> orange pulse
             outlineColour = juce::Colour(0xffffa040);
             outlineAlpha = 0.46f + 0.44f * pulse;
         }
@@ -3320,10 +3415,16 @@ public:
         g.setColour(outlineColour.withAlpha(outlineAlpha));
         g.drawRoundedRectangle(bounds, 8.0f, outlineThickness);
 
+        if (activeTint)
+        {
+            g.setColour(activeGlow.withAlpha(0.08f + 0.18f * pulse));
+            g.fillRoundedRectangle(bounds.reduced(3.0f), 7.0f);
+        }
+
         g.setColour(juce::Colours::black.withAlpha(0.18f));
         g.fillRoundedRectangle(bounds.reduced(7.0f).withTrimmedTop(bounds.getHeight() * 0.52f), 5.0f);
 
-        const double now = juce::Time::getMillisecondCounterHiRes();
+        const double now = nowMs;
         if (hitGlowUntilMs > now)
         {
             const float amount = (float)juce::jlimit(0.0, 1.0, (hitGlowUntilMs - now) / hitGlowDurationMs);
@@ -3331,6 +3432,35 @@ public:
             g.fillRoundedRectangle(bounds.reduced(3.0f), 8.0f);
             g.setColour(juce::Colours::white.withAlpha(0.55f * amount));
             g.drawRoundedRectangle(bounds.reduced(2.0f), 8.0f, 2.2f);
+        }
+
+        const int loopBeats = processor.getSamplePadLoopLengthBeats(padIndex);
+        if (loopBeats > 0)
+        {
+            const float progress = processor.getSamplePadLoopProgress(padIndex);
+            const float remaining = playing ? juce::jlimit(0.0f, 1.0f, 1.0f - progress) : 1.0f;
+            auto indicator = juce::Rectangle<float>(bounds.getRight() - 31.0f,
+                                                    bounds.getBottom() - 30.0f,
+                                                    23.0f,
+                                                    23.0f);
+            const auto centre = indicator.getCentre();
+            const float radius = juce::jmin(indicator.getWidth(), indicator.getHeight()) * 0.39f;
+
+            g.setColour(juce::Colours::black.withAlpha(0.35f));
+            g.fillEllipse(indicator);
+            g.setColour(juce::Colours::white.withAlpha(0.18f));
+            g.drawEllipse(indicator.reduced(1.0f), 1.1f);
+
+            juce::Path remainingArc;
+            const float startAngle = -juce::MathConstants<float>::halfPi;
+            const float endAngle = startAngle + juce::MathConstants<float>::twoPi * remaining;
+            remainingArc.addCentredArc(centre.x, centre.y, radius, radius, 0.0f, startAngle, endAngle, true);
+            g.setColour((activeTint ? activeGlow : juce::Colour(0xff82d9ff)).withAlpha(playing ? 0.92f : 0.55f));
+            g.strokePath(remainingArc, juce::PathStrokeType(2.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+            g.setColour(juce::Colours::white.withAlpha(0.92f));
+            g.setFont(juce::Font(loopBeats >= 100 ? 7.0f : 8.5f, juce::Font::bold));
+            g.drawFittedText(juce::String(loopBeats), indicator.toNearestInt().reduced(3), juce::Justification::centred, 1);
         }
     }
 
@@ -3347,7 +3477,9 @@ public:
         matchBpiButton.setBounds(top.removeFromRight(21).reduced(1));
 
         auto bottom = area.removeFromBottom(22);
-        nameLabel.setBounds(bottom.reduced(2, 0));
+        auto nameArea = bottom.reduced(2, 0);
+        nameArea.removeFromRight(28);
+        nameLabel.setBounds(nameArea);
     }
 
     bool isInterestedInFileDrag(const juce::StringArray& files) override
@@ -3375,16 +3507,33 @@ public:
     {
         if (e.mods.isPopupMenu() || e.mods.isRightButtonDown())
         {
+            if (nameLabel.getBounds().contains(e.getPosition()))
+            {
+                nameLabel.setInterceptsMouseClicks(true, true);
+                nameLabel.setEditable(true, false);
+                nameLabel.showEditor();
+                return;
+            }
+
             showPadMenu(e.getScreenPosition());
             return;
         }
 
         if (e.mods.isLeftButtonDown())
         {
+            if (processor.isSamplePadRecording(padIndex) || processor.isSamplePadWaitingForBpiLoop(padIndex))
+            {
+                processor.triggerSamplePad(padIndex);
+                pulseHitGlow();
+                repaint();
+                mouseDownActive = false;
+                return;
+            }
+
             // start hold detection; short/long press handled on mouseUp / refreshFromProcessor
             mouseDownActive = true;
+            mouseHoldActionTriggered = false;
             mouseDownAtMs = juce::Time::getMillisecondCounterHiRes();
-            holdTriggered = false;
         }
     }
 
@@ -3396,7 +3545,32 @@ public:
         if (!mouseDownActive)
             return;
 
-        if (!holdTriggered)
+        if (mouseHoldActionTriggered)
+        {
+            mouseDownActive = false;
+            mouseHoldActionTriggered = false;
+            return;
+        }
+
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        const double heldMs = now - mouseDownAtMs;
+        if (processor.isSamplePadRecording(padIndex) || processor.isSamplePadWaitingForBpiLoop(padIndex))
+        {
+            processor.triggerSamplePad(padIndex);
+            pulseHitGlow();
+            repaint();
+            mouseDownActive = false;
+            return;
+        }
+
+        const double bpm = juce::jmax(1.0, (double)processor.getBPM());
+        const double twoBeatHoldMs = 2.0 * 60000.0 / bpm;
+        if (heldMs >= twoBeatHoldMs)
+        {
+            processor.armSamplePadLooper(padIndex, false);
+            refreshFromProcessor();
+        }
+        else
         {
             // short click -> trigger pad
             processor.triggerSamplePad(padIndex);
@@ -3405,18 +3579,16 @@ public:
         }
 
         mouseDownActive = false;
-        holdTriggered = false;
     }
 
     void mouseDoubleClick(const juce::MouseEvent& e) override
     {
         if (e.mods.isLeftButtonDown())
         {
-            // Only open editor when double-clicking the name label
-            if (nameLabel.getBounds().contains(e.getPosition()))
+            if (processor.getSamplePadLoopLengthBeats(padIndex) > 0)
             {
-                nameLabel.setEditable(true, false);
-                nameLabel.showEditor();
+                processor.clearSamplePad(padIndex);
+                refreshFromProcessor();
             }
         }
     }
@@ -3427,23 +3599,34 @@ public:
             nameLabel.setText(processor.getSamplePadName(padIndex), juce::dontSendNotification);
         // If the editor was closed, ensure single-click editing is disabled again
         if (!nameLabel.isBeingEdited() && nameLabel.isEditable())
+        {
             nameLabel.setEditable(false, false);
+            nameLabel.setInterceptsMouseClicks(false, false);
+        }
+
+        if (mouseDownActive && !mouseHoldActionTriggered)
+        {
+            const double bpm = juce::jmax(1.0, (double)processor.getBPM());
+            const double fourBeatHoldMs = 4.0 * 60000.0 / bpm;
+            if (juce::Time::getMillisecondCounterHiRes() - mouseDownAtMs >= fourBeatHoldMs)
+            {
+                processor.scheduleSamplePadBpiRecordStartAtNextInterval(padIndex);
+                mouseHoldActionTriggered = true;
+            }
+        }
+
         recordButton.setToggleState(processor.isSamplePadRecordArmed(padIndex)
                                         || processor.isSamplePadRecording(padIndex),
                                     juce::dontSendNotification);
         matchBpiButton.setToggleState(processor.isSamplePadMatchBpiEnabled(padIndex), juce::dontSendNotification);
         loopButton.setToggleState(processor.isSamplePadLoopEnabled(padIndex), juce::dontSendNotification);
         reverseButton.setToggleState(processor.isSamplePadReverseEnabled(padIndex), juce::dontSendNotification);
-        // Handle hold-to-arm: parent SamplePadsComponent runs a 24Hz timer and calls this
-        if (mouseDownActive && !holdTriggered)
+
+        const int triggerFlashCounter = processor.getSamplePadTriggerFlashCounter(padIndex);
+        if (triggerFlashCounter != lastTriggerFlashCounter)
         {
-            const double now = juce::Time::getMillisecondCounterHiRes();
-            if (now - mouseDownAtMs >= holdThresholdMs)
-            {
-                holdTriggered = true;
-                processor.setSamplePadRecordArmed(padIndex, true);
-                recordButton.setToggleState(true, juce::dontSendNotification);
-            }
+            lastTriggerFlashCounter = triggerFlashCounter;
+            pulseHitGlow();
         }
 
         repaint();
@@ -3461,6 +3644,8 @@ private:
         menu.addItem(4, "Auto BPM Sync", hasSample, processor.isSamplePadBpmSyncEnabled(padIndex));
         menu.addItem(5, "Resync to NINJAM BPM", hasSample && processor.isSamplePadLoopEnabled(padIndex));
         menu.addItem(6, "Undo BPM Resync", processor.canUndoSamplePadBpmResync(padIndex));
+        menu.addItem(7, "Sync to Beat", hasSample && processor.isSamplePadLoopEnabled(padIndex));
+        menu.addItem(8, "Undo Clear", processor.canUndoSamplePadClear(padIndex));
         menu.addSeparator();
         menu.addItem(10, "MIDI Learn");
         menu.addItem(11, "MIDI Forget", editor.hasSamplePadMidiLearn(padIndex));
@@ -3505,6 +3690,16 @@ private:
                                    safeThis->processor.undoSamplePadBpmResync(safeThis->padIndex);
                                    safeThis->refreshFromProcessor();
                                }
+                               else if (result == 7)
+                               {
+                                   safeThis->processor.syncSamplePadLoopToBeat(safeThis->padIndex);
+                                   safeThis->refreshFromProcessor();
+                               }
+                               else if (result == 8)
+                               {
+                                   safeThis->processor.undoSamplePadClear(safeThis->padIndex);
+                                   safeThis->refreshFromProcessor();
+                               }
                                else if (result == 10)
                                    safeThis->editor.armSamplePadMidiLearn(safeThis->padIndex);
                                else if (result == 11)
@@ -3542,6 +3737,10 @@ private:
                                                    "Sample load failed",
                                                    "That sample could not be loaded.");
         }
+        else
+        {
+            processor.resyncSamplePadToNinjamBpm(padIndex);
+        }
         refreshFromProcessor();
     }
 
@@ -3571,19 +3770,30 @@ private:
     std::unique_ptr<juce::FileChooser> chooser;
     static constexpr double hitGlowDurationMs = 240.0;
     double hitGlowUntilMs = 0.0;
+    int lastTriggerFlashCounter = 0;
     // Hold-to-arm state
     double mouseDownAtMs = 0.0;
     bool mouseDownActive = false;
-    bool holdTriggered = false;
-    static constexpr double holdThresholdMs = 2000.0;
+    bool mouseHoldActionTriggered = false;
 };
 
 class SamplePadsComponent : public juce::Component,
                             private juce::Timer
 {
 public:
-    SamplePadsComponent(NinjamVst3AudioProcessor& p, NinjamVst3AudioProcessorEditor& editorIn)
-        : processor(p), editor(editorIn)
+    SamplePadsComponent(NinjamVst3AudioProcessor& p,
+                        NinjamVst3AudioProcessorEditor& editorIn,
+                        bool abletonHostedWindow,
+                        int samplerWindowSizePreset,
+                        std::function<void()> onPadsMidiChangedCallback,
+                        std::function<void(int)> onSamplerSizePresetChangedCallback)
+        : processor(p),
+          editor(editorIn),
+          abletonHosted(abletonHostedWindow),
+          currentSamplerSizePreset(juce::jlimit(0, 2, samplerWindowSizePreset)),
+          onPadsMidiChanged(std::move(onPadsMidiChangedCallback)),
+          onSamplerSizePresetChanged(std::move(onSamplerSizePresetChangedCallback)),
+          bpiCounter(p)
     {
         for (int pad = 0; pad < NinjamVst3AudioProcessor::numSamplePads; ++pad)
         {
@@ -3591,6 +3801,82 @@ public:
             addAndMakeVisible(component.get());
             pads[(size_t)pad] = std::move(component);
         }
+
+        padsMidiLabel.setText("MIDI:", juce::dontSendNotification);
+        padsMidiLabel.setJustificationType(juce::Justification::centredLeft);
+        padsMidiLabel.setFont(juce::Font(12.0f, juce::Font::bold));
+        padsMidiLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+        addAndMakeVisible(padsMidiLabel);
+
+        padsMidiSelector.setTooltip("Pads MIDI input");
+        addAndMakeVisible(padsMidiSelector);
+        padsMidiSelector.onChange = [this]
+        {
+            const int selected = padsMidiSelector.getSelectedId();
+            const auto it = padsMidiDeviceByMenuId.find(selected);
+            processor.setSamplePadsMidiInputDeviceId(it != padsMidiDeviceByMenuId.end() ? it->second : juce::String());
+            displayedPadsMidiDeviceId = processor.getSamplePadsMidiInputDeviceId();
+            if (onPadsMidiChanged)
+                onPadsMidiChanged();
+        };
+
+        looperInputLabel.setText("Input:", juce::dontSendNotification);
+        looperInputLabel.setJustificationType(juce::Justification::centredLeft);
+        looperInputLabel.setFont(juce::Font(12.0f, juce::Font::bold));
+        looperInputLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+        addAndMakeVisible(looperInputLabel);
+
+        looperInputSelector.setTooltip("Looper recording input");
+        addAndMakeVisible(looperInputSelector);
+        looperInputSelector.onChange = [this]
+        {
+            const int selected = looperInputSelector.getSelectedId();
+            const auto it = looperInputByMenuId.find(selected);
+            processor.setSamplePadLooperInput(it != looperInputByMenuId.end()
+                ? it->second
+                : NinjamVst3AudioProcessor::looperInputLocalChannel);
+            displayedLooperInput = processor.getSamplePadLooperInput();
+        };
+
+        bankLabel.setText("Bank:", juce::dontSendNotification);
+        bankLabel.setJustificationType(juce::Justification::centredLeft);
+        bankLabel.setFont(juce::Font(12.0f, juce::Font::bold));
+        bankLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+        addAndMakeVisible(bankLabel);
+
+        bankSelector.setTextWhenNothingSelected("Select bank");
+        bankSelector.setTooltip("Saved sample pad banks");
+        bankSelector.setPopupMinimumWidth(240);
+        addAndMakeVisible(bankSelector);
+
+        for (int i = 0; i < 3; ++i)
+        {
+            auto& button = samplerSizeButtons[(size_t)i];
+            button.setButtonText(i == 0 ? "S" : i == 1 ? "M" : "L");
+            button.setTooltip("Sampler window size");
+            button.setVisible(abletonHosted);
+            button.onClick = [this, i]
+            {
+                currentSamplerSizePreset = i;
+                updateSamplerSizeButtons();
+                if (onSamplerSizePresetChanged)
+                    onSamplerSizePresetChanged(i);
+            };
+            addAndMakeVisible(button);
+        }
+        updateSamplerSizeButtons();
+
+        loadBankButton.setButtonText("Load");
+        loadBankButton.setTooltip("Load selected bank or choose a bank folder");
+        loadBankButton.onClick = [this] { loadSelectedBank(); };
+        addAndMakeVisible(loadBankButton);
+
+        saveBankButton.setButtonText("Save");
+        saveBankButton.setTooltip("Save current pads as a bank");
+        saveBankButton.onClick = [this] { showSaveBankDialog(); };
+        addAndMakeVisible(saveBankButton);
+        refreshQuickSelectors(true);
+        refreshBankList({});
 
         volumeSlider.setSliderStyle(juce::Slider::LinearVertical);
         volumeSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
@@ -3624,6 +3910,14 @@ public:
         };
         addAndMakeVisible(limiterButton);
         updateLimiterButtonColour();
+
+        bpiLabel.setJustificationType(juce::Justification::centredLeft);
+        bpiLabel.setFont(juce::Font(12.0f, juce::Font::bold));
+        bpiLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+        bpiLabel.setColour(juce::Label::backgroundColourId, juce::Colours::transparentBlack);
+        bpiLabel.setColour(juce::Label::outlineColourId, juce::Colours::transparentBlack);
+        addAndMakeVisible(bpiLabel);
+        addAndMakeVisible(bpiCounter);
 
         startTimerHz(24);
     }
@@ -3662,6 +3956,36 @@ public:
         peakMeter.setBounds(meterArea.reduced(2, 8));
         volumeSlider.setBounds(controls.reduced(6, 2));
 
+        auto bankRow = area.removeFromTop(30);
+        area.removeFromTop(8);
+        saveBankButton.setBounds(bankRow.removeFromRight(50).reduced(2, 1));
+        loadBankButton.setBounds(bankRow.removeFromRight(50).reduced(2, 1));
+        if (abletonHosted)
+        {
+            bankRow.removeFromRight(4);
+            for (int i = 2; i >= 0; --i)
+                samplerSizeButtons[(size_t)i].setBounds(bankRow.removeFromRight(24).reduced(2, 1));
+        }
+        bankRow.removeFromRight(4);
+
+        const int availableHeaderWidth = bankRow.getWidth();
+        const int midiComboWidth = juce::jlimit(78, 112, availableHeaderWidth / 5);
+        const int inputComboWidth = juce::jlimit(70, 94, availableHeaderWidth / 6);
+        padsMidiLabel.setBounds(bankRow.removeFromLeft(50));
+        padsMidiSelector.setBounds(bankRow.removeFromLeft(midiComboWidth).reduced(2, 1));
+        bankRow.removeFromLeft(6);
+        looperInputLabel.setBounds(bankRow.removeFromLeft(54));
+        looperInputSelector.setBounds(bankRow.removeFromLeft(inputComboWidth).reduced(2, 1));
+        bankRow.removeFromLeft(10);
+        bankLabel.setBounds(bankRow.removeFromLeft(50));
+        const int bankSelectorWidth = juce::jmin(bankRow.getWidth(), abletonHosted ? 104 : 124);
+        bankSelector.setBounds(bankRow.removeFromLeft(bankSelectorWidth).reduced(2, 1));
+
+        auto bpiArea = area.removeFromBottom(28);
+        area.removeFromBottom(8);
+        bpiLabel.setBounds(bpiArea.removeFromLeft(72));
+        bpiCounter.setBounds(bpiArea.reduced(2, 5));
+
         const int cols = 4;
         const int rows = (NinjamVst3AudioProcessor::numSamplePads + cols - 1) / cols;
         const int gap = 10;
@@ -3684,9 +4008,107 @@ private:
     void timerCallback() override
     {
         peakMeter.setPeak(processor.getSamplePadPeak());
+        const int bpi = juce::jmax(1, processor.getBPI());
+        const int beat = juce::jlimit(1, bpi, 1 + (int)std::floor(juce::jlimit(0.0f, 0.9999f, processor.getIntervalProgress()) * (float)bpi));
+        const juce::String bpiText = "BPI " + juce::String(beat) + "/" + juce::String(bpi);
+        if (bpiLabel.getText() != bpiText)
+            bpiLabel.setText(bpiText, juce::dontSendNotification);
+        bpiCounter.repaint();
+        refreshQuickSelectors(false);
         for (auto& pad : pads)
             if (pad != nullptr)
                 pad->refreshFromProcessor();
+    }
+
+    static void populatePadsMidiSelector(juce::ComboBox& selector,
+                                         std::map<int, juce::String>& idByMenuId,
+                                         const juce::String& selectedDeviceId)
+    {
+        selector.clear(juce::dontSendNotification);
+        idByMenuId.clear();
+
+        int menuId = 1;
+        selector.addItem("Host / Any", menuId);
+        idByMenuId[menuId] = {};
+        int selectedMenuId = selectedDeviceId.isEmpty() ? menuId : 0;
+        ++menuId;
+
+        const auto devices = juce::MidiInput::getAvailableDevices();
+        for (const auto& device : devices)
+        {
+            selector.addItem(device.name, menuId);
+            idByMenuId[menuId] = device.identifier;
+            if (device.identifier == selectedDeviceId)
+                selectedMenuId = menuId;
+            ++menuId;
+        }
+
+        if (selectedMenuId == 0)
+            selectedMenuId = 1;
+        selector.setSelectedId(selectedMenuId, juce::dontSendNotification);
+    }
+
+    static void populateLooperInputSelector(juce::ComboBox& selector,
+                                            std::map<int, int>& inputByMenuId,
+                                            NinjamVst3AudioProcessor& processor)
+    {
+        selector.clear(juce::dontSendNotification);
+        inputByMenuId.clear();
+
+        int menuId = 1;
+        const int selectedInput = processor.getSamplePadLooperInput();
+        selector.addItem("Local 1", menuId);
+        inputByMenuId[menuId] = NinjamVst3AudioProcessor::looperInputLocalChannel;
+        int selectedMenuId = selectedInput == NinjamVst3AudioProcessor::looperInputLocalChannel ? menuId : 0;
+        ++menuId;
+
+        int totalInputs = processor.getTotalNumInputChannels();
+        if (totalInputs <= 0)
+            totalInputs = 2;
+        for (int ch = 0; ch < totalInputs; ++ch)
+        {
+            selector.addItem("In " + juce::String(ch + 1), menuId);
+            inputByMenuId[menuId] = ch;
+            if (selectedInput == ch)
+                selectedMenuId = menuId;
+            ++menuId;
+        }
+
+        const int numPairs = totalInputs / 2;
+        for (int pair = 0; pair < numPairs; ++pair)
+        {
+            const int left = pair * 2 + 1;
+            const int right = left + 1;
+            const int inputValue = -1 - pair;
+            selector.addItem(juce::String(left) + "/" + juce::String(right), menuId);
+            inputByMenuId[menuId] = inputValue;
+            if (selectedInput == inputValue)
+                selectedMenuId = menuId;
+            ++menuId;
+        }
+
+        if (selectedMenuId == 0)
+            selectedMenuId = 1;
+        selector.setSelectedId(selectedMenuId, juce::dontSendNotification);
+    }
+
+    void refreshQuickSelectors(bool force)
+    {
+        const auto padsMidiDeviceId = processor.getSamplePadsMidiInputDeviceId();
+        if (force || padsMidiDeviceId != displayedPadsMidiDeviceId)
+        {
+            displayedPadsMidiDeviceId = padsMidiDeviceId;
+            populatePadsMidiSelector(padsMidiSelector, padsMidiDeviceByMenuId, padsMidiDeviceId);
+        }
+
+        const int looperInput = processor.getSamplePadLooperInput();
+        const int totalInputs = processor.getTotalNumInputChannels();
+        if (force || looperInput != displayedLooperInput || totalInputs != displayedTotalInputs)
+        {
+            displayedLooperInput = looperInput;
+            displayedTotalInputs = totalInputs;
+            populateLooperInputSelector(looperInputSelector, looperInputByMenuId, processor);
+        }
     }
 
     void updateLimiterButtonColour()
@@ -3699,14 +4121,153 @@ private:
         limiterButton.setColour(juce::TextButton::textColourOffId, juce::Colours::lightgrey);
     }
 
+    void updateSamplerSizeButtons()
+    {
+        for (int i = 0; i < 3; ++i)
+        {
+            auto& button = samplerSizeButtons[(size_t)i];
+            const bool selected = i == currentSamplerSizePreset;
+            const auto colour = selected ? juce::Colour(0xff49d5ff) : juce::Colour(0xff2f3337);
+            button.setColour(juce::TextButton::buttonColourId, colour);
+            button.setColour(juce::TextButton::buttonOnColourId, colour);
+            button.setColour(juce::TextButton::textColourOnId, selected ? juce::Colours::black : juce::Colours::white);
+            button.setColour(juce::TextButton::textColourOffId, selected ? juce::Colours::black : juce::Colours::lightgrey);
+        }
+    }
+
+    void refreshBankList(const juce::String& selectBankName)
+    {
+        bankFolders.clear();
+        bankSelector.clear(juce::dontSendNotification);
+
+        const auto bankNames = processor.getSamplePadBankNames();
+        for (int i = 0; i < bankNames.size(); ++i)
+        {
+            bankSelector.addItem(bankNames[i], i + 1);
+            bankFolders.add(processor.getSamplePadBankDirectory(bankNames[i]));
+        }
+
+        if (selectBankName.isNotEmpty())
+        {
+            for (int i = 0; i < bankNames.size(); ++i)
+            {
+                if (bankNames[i] == selectBankName)
+                {
+                    bankSelector.setSelectedId(i + 1, juce::dontSendNotification);
+                    break;
+                }
+            }
+        }
+    }
+
+    void loadSelectedBank()
+    {
+        const int selected = bankSelector.getSelectedItemIndex();
+        if (selected >= 0 && selected < bankFolders.size())
+        {
+            loadBankFolder(bankFolders[selected]);
+            return;
+        }
+
+        bankChooser = std::make_unique<juce::FileChooser>("Load sample pad bank",
+                                                          processor.getSamplePadBanksDirectory(),
+                                                          "*");
+        juce::Component::SafePointer<SamplePadsComponent> safeThis(this);
+        bankChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+                                 [safeThis](const juce::FileChooser& chooser)
+                                 {
+                                     if (safeThis == nullptr)
+                                         return;
+
+                                     const auto folder = chooser.getResult();
+                                     if (folder.isDirectory())
+                                         safeThis->loadBankFolder(folder);
+                                 });
+    }
+
+    void loadBankFolder(const juce::File& folder)
+    {
+        juce::String error;
+        if (!processor.loadSamplePadBank(folder, error))
+        {
+            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                   "Bank load failed",
+                                                   error);
+            return;
+        }
+
+        refreshBankList(folder.getFileName());
+        for (auto& pad : pads)
+            if (pad != nullptr)
+                pad->refreshFromProcessor();
+    }
+
+    void showSaveBankDialog()
+    {
+        auto* alert = new juce::AlertWindow("Save Sample Bank",
+                                            "Enter a folder name for this pad bank.",
+                                            juce::AlertWindow::QuestionIcon);
+        const auto selectedName = bankSelector.getText().trim();
+        alert->addTextEditor("bankName", selectedName.isNotEmpty() ? selectedName : "New Bank", "Bank:");
+        alert->addButton("Save", 1, juce::KeyPress(juce::KeyPress::returnKey));
+        alert->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+
+        juce::Component::SafePointer<SamplePadsComponent> safeThis(this);
+        alert->enterModalState(true,
+                               juce::ModalCallbackFunction::create(
+                                   [safeThis, alert](int result)
+                                   {
+                                       std::unique_ptr<juce::AlertWindow> alertOwner(alert);
+                                       if (safeThis == nullptr || result != 1)
+                                           return;
+
+                                       const auto bankName = alert->getTextEditorContents("bankName").trim();
+                                       juce::String error;
+                                       if (!safeThis->processor.saveSamplePadBank(bankName, error))
+                                       {
+                                           juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                                                  "Bank save failed",
+                                                                                  error);
+                                           return;
+                                       }
+
+                                       safeThis->refreshBankList(bankName);
+                                   }),
+                               false);
+    }
+
     NinjamVst3AudioProcessor& processor;
     NinjamVst3AudioProcessorEditor& editor;
+    bool abletonHosted = false;
+    int currentSamplerSizePreset = 1;
+    std::function<void()> onPadsMidiChanged;
+    std::function<void(int)> onSamplerSizePresetChanged;
     std::array<std::unique_ptr<SamplePadComponent>, NinjamVst3AudioProcessor::numSamplePads> pads;
     FaderLookAndFeel faderLookAndFeel;
+    juce::Label padsMidiLabel;
+    juce::ComboBox padsMidiSelector;
+    juce::Label looperInputLabel;
+    juce::ComboBox looperInputSelector;
+    juce::Label bankLabel;
+    WidePopupComboBox bankSelector;
+    std::array<LeftClickOnlyTextButton, 3> samplerSizeButtons { LeftClickOnlyTextButton{ "S" },
+                                                                LeftClickOnlyTextButton{ "M" },
+                                                                LeftClickOnlyTextButton{ "L" } };
+    LeftClickOnlyTextButton loadBankButton{ "Load" };
+    LeftClickOnlyTextButton saveBankButton{ "Save" };
+    std::map<int, juce::String> padsMidiDeviceByMenuId;
+    std::map<int, int> looperInputByMenuId;
+    juce::String displayedPadsMidiDeviceId;
+    int displayedLooperInput = NinjamVst3AudioProcessor::looperInputLocalChannel;
+    int displayedTotalInputs = -1;
+    juce::Array<juce::File> bankFolders;
+    std::unique_ptr<juce::FileChooser> bankChooser;
     NonlinearFaderSlider volumeSlider;
     juce::Label volumeLabel;
     MasterPeakMeter peakMeter;
     LeftClickOnlyTextButton limiterButton{ "Limiter" };
+    juce::Label bpiLabel;
+    IntervalDisplayComponent bpiCounter;
 };
 
 class SamplePadsWindow : public juce::DocumentWindow
@@ -3715,18 +4276,27 @@ public:
     SamplePadsWindow(NinjamVst3AudioProcessor& p,
                      NinjamVst3AudioProcessorEditor& editor,
                      bool abletonHostedWindow,
+                     int abletonSamplerWindowSizePreset,
+                     std::function<void()> onPadsMidiChangedCallback,
+                     std::function<void(int)> onSamplerSizePresetChangedCallback,
                      std::function<void()> onClosedCallback)
         : DocumentWindow("NINJAM Sample Pads", juce::Colours::black, DocumentWindow::closeButton),
           onClosed(std::move(onClosedCallback)),
           abletonHosted(abletonHostedWindow)
     {
         setUsingNativeTitleBar(!abletonHosted);
-        setContentOwned(new SamplePadsComponent(p, editor), true);
+        setContentOwned(new SamplePadsComponent(p,
+                                                editor,
+                                                abletonHosted,
+                                                abletonSamplerWindowSizePreset,
+                                                std::move(onPadsMidiChangedCallback),
+                                                std::move(onSamplerSizePresetChangedCallback)), true);
         if (abletonHosted)
         {
+            const auto initialSize = samplePadsWindowSizeForPreset(abletonSamplerWindowSizePreset);
             setResizable(false, false);
-            setResizeLimits(640, 420, 640, 420);
-            centreWithSize(640, 420);
+            setResizeLimits(initialSize.getWidth(), initialSize.getHeight(), initialSize.getWidth(), initialSize.getHeight());
+            centreWithSize(initialSize.getWidth(), initialSize.getHeight());
         }
         else
         {
@@ -3735,6 +4305,19 @@ public:
             centreWithSize(680, 450);
         }
         setVisible(true);
+    }
+
+    void applyAbletonSizePreset(int presetIndex)
+    {
+        if (!abletonHosted)
+            return;
+
+        const auto size = samplePadsWindowSizeForPreset(presetIndex);
+        const auto centre = getBounds().getCentre();
+        setResizeLimits(size.getWidth(), size.getHeight(), size.getWidth(), size.getHeight());
+        setSize(size.getWidth(), size.getHeight());
+        if (centre.x != 0 || centre.y != 0)
+            setCentrePosition(centre.x, centre.y);
     }
 
     void closeButtonPressed() override
@@ -4990,7 +5573,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     updateFxButtonLabel();
     addAndMakeVisible(optionsButton);
     optionsButton.onClick = [this] { showOptionsMenu(); };
-    
+
     addAndMakeVisible(aboutButton);
     aboutButton.setTooltip("About NINJAMplus");
     aboutButton.onClick = [this] { showAboutWindow(); };
@@ -5575,6 +6158,12 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     lastPersistentSettingsSaveMs = juce::Time::getMillisecondCounterHiRes();
     lastSavedUiSettingsFingerprint = buildPersistentSettingsFingerprint(false);
     persistentSettingsDirty = false;
+
+    if (!audioProcessor.isStandaloneWrapper() && isAbletonLiveHost())
+        setAbletonWindowSizePreset(abletonWindowSizePreset);
+    else
+        setSize(getWidth() > 0 ? getWidth() : 1080,
+                getHeight() > 0 ? getHeight() : 600);
 
     startTimer((!audioProcessor.isStandaloneWrapper() && isAbletonLiveHost()) ? 50 : 30);
 }
@@ -6636,8 +7225,8 @@ void NinjamVst3AudioProcessorEditor::applyMidiMappings()
                 if (pair.first.startsWith("samplepad.trigger."))
                 {
                     const int padIndex = pair.first.fromLastOccurrenceOf(".", false, false).getIntValue() - 1;
-                    if (binaryState == 1 && mapping.lastBinaryState != 1)
-                        audioProcessor.triggerSamplePad(padIndex);
+                    if (binaryState != mapping.lastBinaryState)
+                        audioProcessor.handleSamplePadMidiPadState(padIndex, binaryState == 1);
                     mapping.lastBinaryState = binaryState;
                     continue;
                 }
@@ -6895,6 +7484,7 @@ juce::String NinjamVst3AudioProcessorEditor::buildPersistentSettingsFingerprint(
     parts.add(spreadOutputsButton.getToggleState() ? "1" : "0");
     parts.add(juce::String(abletonWindowSizePreset));
     parts.add(juce::String(abletonChatWindowSizePreset));
+    parts.add(juce::String(abletonSamplerWindowSizePreset));
     parts.add(audioProcessor.getLocalChatColourKey());
     parts.add(chatWindowColourKey);
 
@@ -6936,6 +7526,7 @@ void NinjamVst3AudioProcessorEditor::savePersistentSettingsToDisk(bool includePr
     props.setValue("spreadOutputs", spreadOutputsButton.getToggleState());
     props.setValue("abletonWindowSizePreset", abletonWindowSizePreset);
     props.setValue("abletonChatWindowSizePreset", abletonChatWindowSizePreset);
+    props.setValue("abletonSamplerWindowSizePreset", abletonSamplerWindowSizePreset);
     props.setValue("chatColourKey", audioProcessor.getLocalChatColourKey());
     props.setValue("chatWindowColourKey", chatWindowColourKey);
 
@@ -7013,6 +7604,7 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
 
     abletonWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonWindowSizePreset", abletonWindowSizePreset));
     abletonChatWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonChatWindowSizePreset", abletonChatWindowSizePreset));
+    abletonSamplerWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonSamplerWindowSizePreset", abletonSamplerWindowSizePreset));
     if (isAbletonLiveHost() && !audioProcessor.isStandaloneWrapper())
         setAbletonWindowSizePreset(abletonWindowSizePreset);
 
@@ -7284,6 +7876,8 @@ void NinjamVst3AudioProcessorEditor::showSamplePadsWindow()
 {
     if (samplePadsWindow)
     {
+        if (auto* samplerWindow = dynamic_cast<SamplePadsWindow*>(samplePadsWindow.get()))
+            samplerWindow->applyAbletonSizePreset(abletonSamplerWindowSizePreset);
         samplePadsWindow->setVisible(true);
         samplePadsWindow->toFront(false);
         return;
@@ -7301,6 +7895,17 @@ void NinjamVst3AudioProcessorEditor::showSamplePadsWindow()
         editorPtr->samplePadsWindow.reset(new SamplePadsWindow(editorPtr->audioProcessor,
                                                               *editorPtr,
                                                               abletonHostedWindow,
+                                                              editorPtr->abletonSamplerWindowSizePreset,
+                                                              [callbackSafeThis]
+                                                              {
+                                                                  if (callbackSafeThis != nullptr)
+                                                                      callbackSafeThis->refreshExternalMidiInputDevices();
+                                                              },
+                                                              [callbackSafeThis](int preset)
+                                                              {
+                                                                  if (callbackSafeThis != nullptr)
+                                                                      callbackSafeThis->setAbletonSamplerWindowSizePreset(preset);
+                                                              },
                                                               [callbackSafeThis]
                                                               {
                                                                   if (callbackSafeThis != nullptr)
@@ -8032,6 +8637,22 @@ void NinjamVst3AudioProcessorEditor::setAbletonChatWindowSizePreset(int presetIn
     props.saveIfNeeded();
 }
 
+void NinjamVst3AudioProcessorEditor::setAbletonSamplerWindowSizePreset(int presetIndex)
+{
+    if (audioProcessor.isStandaloneWrapper() || !isAbletonLiveHost())
+        return;
+
+    abletonSamplerWindowSizePreset = juce::jlimit(0, 2, presetIndex);
+
+    if (auto* samplerWindow = dynamic_cast<SamplePadsWindow*>(samplePadsWindow.get()))
+        samplerWindow->applyAbletonSizePreset(abletonSamplerWindowSizePreset);
+
+    auto popts = makeSettingsOptions();
+    juce::PropertiesFile props(popts);
+    props.setValue("abletonSamplerWindowSizePreset", abletonSamplerWindowSizePreset);
+    props.saveIfNeeded();
+}
+
 void NinjamVst3AudioProcessorEditor::updateHostResizeModeForConnectionStatus(int status)
 {
     if (audioProcessor.isStandaloneWrapper())
@@ -8485,8 +9106,8 @@ void NinjamVst3AudioProcessorEditor::handleIncomingMidiMessage(juce::MidiInput* 
         return;
     }
 
-    if (forPads && event.isNoteOn && !event.isController)
-        audioProcessor.triggerSamplePadForMidiNote(event.number);
+    if (forPads && !event.isController)
+        audioProcessor.handleSamplePadMidiNote(event.number, event.isNoteOn);
 
     audioProcessor.enqueueExternalMidiControllerEvent(event, forLearn, forRelay);
 }
