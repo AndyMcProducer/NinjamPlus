@@ -5072,7 +5072,7 @@ void NinjamVst3AudioProcessor::clearSamplePad(int padIndex)
     pad.originalSample.setSize(0, 0);
     if (!pad.nameIsCustom)
         pad.name.clear();
-    pad.file = {};
+    pad.file = juce::File{};
     pad.sourceSampleRate = 44100.0;
     pad.originalSourceSampleRate = 44100.0;
     pad.sourceBpm = 0.0;
@@ -5611,7 +5611,7 @@ void NinjamVst3AudioProcessor::processSamplePadLooperRecording(int numSamples,
 
                 pad.sample = std::move(loopBuffer);
                 pad.originalSample = pad.sample;
-                pad.file = {};
+                pad.file = juce::File{};
                 pad.sourceSampleRate = juce::jmax(1.0, processingSampleRate);
                 pad.originalSourceSampleRate = pad.sourceSampleRate;
                 pad.sourceBpm = juce::jmax(1.0, (double)getBPM());
