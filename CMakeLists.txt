@@ -67,6 +67,7 @@ FetchContent_MakeAvailable(opus)
 FetchContent_Declare(
     signalsmith_stretch
     GIT_REPOSITORY https://github.com/signalsmith-audio/signalsmith-stretch.git
+    GIT_TAG        57b93f4e9206a089a45387eaa39bdc9f310d3308
 )
 FetchContent_GetProperties(signalsmith_stretch)
 if (NOT signalsmith_stretch_POPULATED)
