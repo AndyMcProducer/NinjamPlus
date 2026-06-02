@@ -583,6 +583,20 @@ public:
     explicit DelaySettingsPopupComponent(NinjamVst3AudioProcessor& p)
         : processor(p)
     {
+        addAndMakeVisible(typeLabel);
+        typeLabel.setText("Delay Type", juce::dontSendNotification);
+        addAndMakeVisible(typeSelector);
+        typeSelector.addItem("Standard", 1);
+        typeSelector.addItem("Frippertronics", 2);
+        typeSelector.setSelectedId(processor.getFxDelayMode() == NinjamVst3AudioProcessor::FxDelayMode::frippertronics ? 2 : 1,
+                                   juce::dontSendNotification);
+        typeSelector.onChange = [this]
+        {
+            processor.setFxDelayMode(typeSelector.getSelectedId() == 2
+                ? NinjamVst3AudioProcessor::FxDelayMode::frippertronics
+                : NinjamVst3AudioProcessor::FxDelayMode::standard);
+        };
+
         addAndMakeVisible(modeLabel);
         modeLabel.setText("Time Mode", juce::dontSendNotification);
         addAndMakeVisible(modeSelector);
@@ -600,7 +614,7 @@ public:
         addAndMakeVisible(timeMsSlider);
         timeMsSlider.setSliderStyle(juce::Slider::LinearHorizontal);
         timeMsSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 52, 18);
-        timeMsSlider.setRange(20.0, 2000.0, 1.0);
+        timeMsSlider.setRange(20.0, 10000.0, 1.0);
         timeMsSlider.setValue(processor.getFxDelayTimeMs(), juce::dontSendNotification);
         timeMsSlider.onValueChange = [this] { processor.setFxDelayTimeMs((float)timeMsSlider.getValue()); };
 
@@ -645,12 +659,13 @@ public:
         feedbackSlider.onValueChange = [this] { processor.setFxDelayFeedback((float)feedbackSlider.getValue()); };
 
         updateEnabledState();
-        setSize(360, 220);
+        setSize(360, 254);
     }
 
     void resized() override
     {
         auto area = getLocalBounds().reduced(8);
+        layoutRow(area, typeLabel, typeSelector);
         layoutRow(area, modeLabel, modeSelector);
         layoutRow(area, timeMsLabel, timeMsSlider);
         layoutRow(area, syncLabel, syncSelector);
@@ -676,6 +691,8 @@ private:
     }
 
     NinjamVst3AudioProcessor& processor;
+    juce::Label typeLabel;
+    juce::ComboBox typeSelector;
     juce::Label modeLabel;
     juce::ComboBox modeSelector;
     juce::Label timeMsLabel;
@@ -3152,15 +3169,28 @@ static juce::Rectangle<int> samplePadsWindowSizeForPreset(int presetIndex)
 {
     presetIndex = juce::jlimit(0, 2, presetIndex);
     if (presetIndex == 0)
-        return { 0, 0, 760, 500 };
+        return { 0, 0, 900, 540 };
     if (presetIndex == 2)
-        return { 0, 0, 1040, 680 };
-    return { 0, 0, 880, 580 };
+        return { 0, 0, 1200, 740 };
+    return { 0, 0, 1040, 640 };
 }
 
 static juce::String getSamplePadLearnTargetId(int padIndex)
 {
     return "samplepad.trigger." + juce::String(padIndex + 1);
+}
+
+static juce::String getSampleFxKnobLearnTargetId(int slotIndex)
+{
+    return "samplepad.fx.amount." + juce::String(slotIndex + 1);
+}
+
+static int getSampleFxKnobSlotFromLearnTargetId(const juce::String& targetId)
+{
+    if (!targetId.startsWith("samplepad.fx.amount."))
+        return -1;
+
+    return targetId.fromLastOccurrenceOf(".", false, false).getIntValue() - 1;
 }
 
 class WidePopupComboBox : public juce::ComboBox
@@ -3195,6 +3225,88 @@ public:
 
 private:
     int popupMinimumWidth = 220;
+};
+
+class SampleFxKnobSlider : public LeftClickOnlySlider
+{
+public:
+    using LeftClickOnlySlider::LeftClickOnlySlider;
+
+    std::function<void(const juce::MouseEvent&)> onRouteMouseDown;
+    std::function<void(const juce::MouseEvent&)> onRouteMouseDrag;
+    std::function<void(const juce::MouseEvent&)> onRouteMouseUp;
+    std::function<void(const juce::MouseEvent&)> onPopupMenuRequest;
+    std::function<void()> onControlInteraction;
+
+    void mouseDown(const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu() || e.mods.isRightButtonDown())
+        {
+            if (onPopupMenuRequest)
+                onPopupMenuRequest(e);
+            return;
+        }
+
+        routeInteractionActive = e.mods.isLeftButtonDown() && e.mods.isShiftDown();
+        if (routeInteractionActive)
+        {
+            if (onRouteMouseDown)
+                onRouteMouseDown(e);
+            return;
+        }
+
+        if (e.mods.isLeftButtonDown() && onControlInteraction)
+            onControlInteraction();
+        LeftClickOnlySlider::mouseDown(e);
+    }
+
+    void mouseDrag(const juce::MouseEvent& e) override
+    {
+        if (routeInteractionActive)
+        {
+            if (onRouteMouseDrag)
+                onRouteMouseDrag(e);
+            return;
+        }
+
+        LeftClickOnlySlider::mouseDrag(e);
+    }
+
+    void mouseUp(const juce::MouseEvent& e) override
+    {
+        if (routeInteractionActive)
+        {
+            if (onRouteMouseUp)
+                onRouteMouseUp(e);
+            routeInteractionActive = false;
+            return;
+        }
+
+        LeftClickOnlySlider::mouseUp(e);
+    }
+
+private:
+    bool routeInteractionActive = false;
+};
+
+class PopupTextButton : public LeftClickOnlyTextButton
+{
+public:
+    using LeftClickOnlyTextButton::LeftClickOnlyTextButton;
+
+    std::function<void(const juce::MouseEvent&)> onPopupMenuRequest;
+
+    void mouseDown(const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu() || e.mods.isRightButtonDown())
+        {
+            if (onPopupMenuRequest)
+                onPopupMenuRequest(e);
+            return;
+        }
+
+        LeftClickOnlyTextButton::mouseDown(e);
+    }
 };
 
 class SamplePadToggleLookAndFeel : public juce::LookAndFeel_V4
@@ -3268,6 +3380,11 @@ public:
                              cx, cy);
             g.strokePath(infinity, juce::PathStrokeType(2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
         }
+        else if (button.getName() == "duckroute")
+        {
+            g.setFont(juce::Font(12.0f, juce::Font::bold));
+            g.drawFittedText("D", icon.toNearestInt().expanded(1), juce::Justification::centred, 1);
+        }
         else
         {
             juce::Path arrow;
@@ -3290,10 +3407,16 @@ class SamplePadComponent : public juce::Component,
                            private juce::Timer
 {
 public:
+    using FxRouteDragCallback = std::function<void(int, juce::Point<int>, bool)>;
+
     SamplePadComponent(NinjamVst3AudioProcessor& p,
                        NinjamVst3AudioProcessorEditor& editorIn,
-                       int padIndexIn)
-        : processor(p), editor(editorIn), padIndex(padIndexIn)
+                       int padIndexIn,
+                       FxRouteDragCallback fxRouteDragCallback = {})
+        : processor(p),
+          editor(editorIn),
+          padIndex(padIndexIn),
+          onFxRouteDrag(std::move(fxRouteDragCallback))
     {
         setRepaintsOnMouseActivity(true);
 
@@ -3352,6 +3475,21 @@ public:
         };
         addAndMakeVisible(reverseButton);
 
+        duckRouteButton.setName("duckroute");
+        duckRouteButton.setButtonText("D");
+        duckRouteButton.setClickingTogglesState(true);
+        duckRouteButton.setTooltip("Route this pad through the sampler duck");
+        duckRouteButton.setLookAndFeel(&toggleLookAndFeel);
+        duckRouteButton.onClick = [this]
+        {
+            const bool enabled = duckRouteButton.getToggleState();
+            processor.setSamplePadDuckRouteEnabled(padIndex, enabled);
+            if (enabled)
+                processor.setSamplePadDuckEnabled(true);
+            refreshFromProcessor();
+        };
+        addAndMakeVisible(duckRouteButton);
+
         lastTriggerFlashCounter = processor.getSamplePadTriggerFlashCounter(padIndex);
         refreshFromProcessor();
     }
@@ -3363,6 +3501,7 @@ public:
         matchBpiButton.setLookAndFeel(nullptr);
         loopButton.setLookAndFeel(nullptr);
         reverseButton.setLookAndFeel(nullptr);
+        duckRouteButton.setLookAndFeel(nullptr);
     }
 
     void paint(juce::Graphics& g) override
@@ -3501,7 +3640,7 @@ public:
         {
             const float progress = processor.getSamplePadLoopProgress(padIndex);
             const float remaining = playing ? juce::jlimit(0.0f, 1.0f, 1.0f - progress) : 1.0f;
-            auto indicator = juce::Rectangle<float>(bounds.getRight() - 31.0f,
+            auto indicator = juce::Rectangle<float>(bounds.getRight() - 58.0f,
                                                     bounds.getBottom() - 30.0f,
                                                     23.0f,
                                                     23.0f);
@@ -3539,8 +3678,9 @@ public:
         matchBpiButton.setBounds(top.removeFromRight(21).reduced(1));
 
         auto bottom = area.removeFromBottom(22);
+        duckRouteButton.setBounds(bottom.removeFromRight(21).reduced(1));
+        bottom.removeFromRight(4);
         auto nameArea = bottom.reduced(2, 0);
-        nameArea.removeFromRight(28);
         nameLabel.setBounds(nameArea);
     }
 
@@ -3595,8 +3735,27 @@ public:
             // start hold detection; short/long press handled on mouseUp / refreshFromProcessor
             mouseDownActive = true;
             mouseHoldActionTriggered = false;
+            fxRouteDragActive = false;
             mouseDownAtMs = juce::Time::getMillisecondCounterHiRes();
         }
+    }
+
+    void mouseDrag(const juce::MouseEvent& e) override
+    {
+        if (!mouseDownActive || !e.mods.isLeftButtonDown())
+            return;
+
+        if (!fxRouteDragActive)
+        {
+            if (e.getDistanceFromDragStart() < 14)
+                return;
+
+            fxRouteDragActive = true;
+            mouseHoldActionTriggered = true;
+        }
+
+        if (onFxRouteDrag)
+            onFxRouteDrag(padIndex, getParentPointForEvent(e), false);
     }
 
     void mouseUp(const juce::MouseEvent& e) override
@@ -3606,6 +3765,16 @@ public:
 
         if (!mouseDownActive)
             return;
+
+        if (fxRouteDragActive)
+        {
+            if (onFxRouteDrag)
+                onFxRouteDrag(padIndex, getParentPointForEvent(e), true);
+            mouseDownActive = false;
+            mouseHoldActionTriggered = false;
+            fxRouteDragActive = false;
+            return;
+        }
 
         if (mouseHoldActionTriggered)
         {
@@ -3683,6 +3852,7 @@ public:
         matchBpiButton.setToggleState(processor.isSamplePadMatchBpiEnabled(padIndex), juce::dontSendNotification);
         loopButton.setToggleState(processor.isSamplePadLoopEnabled(padIndex), juce::dontSendNotification);
         reverseButton.setToggleState(processor.isSamplePadReverseEnabled(padIndex), juce::dontSendNotification);
+        duckRouteButton.setToggleState(processor.isSamplePadDuckRouteEnabled(padIndex), juce::dontSendNotification);
 
         const int triggerFlashCounter = processor.getSamplePadTriggerFlashCounter(padIndex);
         if (triggerFlashCounter != lastTriggerFlashCounter)
@@ -3695,6 +3865,14 @@ public:
     }
 
 private:
+    juce::Point<int> getParentPointForEvent(const juce::MouseEvent& e) const
+    {
+        if (auto* parent = getParentComponent())
+            return parent->getLocalPoint(this, e.getPosition());
+
+        return e.getPosition();
+    }
+
     void showPadMenu(juce::Point<int> screenPosition)
     {
         juce::PopupMenu menu;
@@ -3708,6 +3886,20 @@ private:
         menu.addItem(6, "Undo BPM Resync", processor.canUndoSamplePadBpmResync(padIndex));
         menu.addItem(7, "Sync to Beat", hasSample && processor.isSamplePadLoopEnabled(padIndex));
         menu.addItem(8, "Undo Clear", processor.canUndoSamplePadClear(padIndex));
+        menu.addSeparator();
+        juce::PopupMenu clearWireMenu;
+        bool hasFxWire = false;
+        for (int slot = 0; slot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++slot)
+        {
+            if (processor.isSamplePadFxSlotRouteEnabled(padIndex, slot))
+            {
+                clearWireMenu.addItem(100 + slot, "Knob " + juce::String(slot + 1));
+                hasFxWire = true;
+            }
+        }
+        if (!hasFxWire)
+            clearWireMenu.addItem(99, "No knob wires", false);
+        menu.addSubMenu("Clear Wire", clearWireMenu);
         menu.addSeparator();
         menu.addItem(10, "MIDI Learn");
         menu.addItem(11, "MIDI Forget", editor.hasSamplePadMidiLearn(padIndex));
@@ -3761,6 +3953,16 @@ private:
                                {
                                    safeThis->processor.undoSamplePadClear(safeThis->padIndex);
                                    safeThis->refreshFromProcessor();
+                               }
+                               else if (result >= 100
+                                        && result < 100 + NinjamVst3AudioProcessor::numSamplePadFxSlots)
+                               {
+                                   safeThis->processor.setSamplePadFxSlotRouteEnabled(safeThis->padIndex,
+                                                                                      result - 100,
+                                                                                      false);
+                                   safeThis->refreshFromProcessor();
+                                   if (auto* parent = safeThis->getParentComponent())
+                                       parent->repaint();
                                }
                                else if (result == 10)
                                    safeThis->editor.armSamplePadMidiLearn(safeThis->padIndex);
@@ -3823,11 +4025,13 @@ private:
     NinjamVst3AudioProcessor& processor;
     NinjamVst3AudioProcessorEditor& editor;
     int padIndex = 0;
+    FxRouteDragCallback onFxRouteDrag;
     juce::Label nameLabel;
     LeftClickOnlyTextButton recordButton{ "" };
     LeftClickOnlyTextButton matchBpiButton{ "" };
     LeftClickOnlyTextButton loopButton{ "" };
     LeftClickOnlyTextButton reverseButton{ "" };
+    LeftClickOnlyTextButton duckRouteButton{ "D" };
     SamplePadToggleLookAndFeel toggleLookAndFeel;
     std::unique_ptr<juce::FileChooser> chooser;
     static constexpr double hitGlowDurationMs = 240.0;
@@ -3837,6 +4041,7 @@ private:
     double mouseDownAtMs = 0.0;
     bool mouseDownActive = false;
     bool mouseHoldActionTriggered = false;
+    bool fxRouteDragActive = false;
 };
 
 class SamplePadsComponent : public juce::Component,
@@ -3857,9 +4062,18 @@ public:
           onSamplerSizePresetChanged(std::move(onSamplerSizePresetChangedCallback)),
           bpiCounter(p)
     {
+        padCurrentAlpha.fill(1.0f);
+        padTargetAlpha.fill(1.0f);
+
         for (int pad = 0; pad < NinjamVst3AudioProcessor::numSamplePads; ++pad)
         {
-            auto component = std::make_unique<SamplePadComponent>(processor, editor, pad);
+            auto component = std::make_unique<SamplePadComponent>(processor,
+                                                                  editor,
+                                                                  pad,
+                                                                  [this](int draggedPad, juce::Point<int> point, bool finished)
+                                                                  {
+                                                                      handleFxRouteDrag(draggedPad, point, finished);
+                                                                  });
             addAndMakeVisible(component.get());
             pads[(size_t)pad] = std::move(component);
         }
@@ -3911,18 +4125,18 @@ public:
         bankSelector.setPopupMinimumWidth(240);
         addAndMakeVisible(bankSelector);
 
-        for (int i = 0; i < 3; ++i)
+        for (int i = 0; i < 2; ++i)
         {
             auto& button = samplerSizeButtons[(size_t)i];
-            button.setButtonText(i == 0 ? "S" : i == 1 ? "M" : "L");
-            button.setTooltip("Sampler window size");
+            button.setButtonText(i == 0 ? "-" : "+");
+            button.setTooltip(i == 0 ? "Smaller sampler window" : "Larger sampler window");
             button.setVisible(abletonHosted);
             button.onClick = [this, i]
             {
-                currentSamplerSizePreset = i;
+                currentSamplerSizePreset = juce::jlimit(0, 2, currentSamplerSizePreset + (i == 0 ? -1 : 1));
                 updateSamplerSizeButtons();
                 if (onSamplerSizePresetChanged)
-                    onSamplerSizePresetChanged(i);
+                    onSamplerSizePresetChanged(currentSamplerSizePreset);
             };
             addAndMakeVisible(button);
         }
@@ -3937,6 +4151,84 @@ public:
         saveBankButton.setTooltip("Save current pads as a bank");
         saveBankButton.onClick = [this] { showSaveBankDialog(); };
         addAndMakeVisible(saveBankButton);
+
+        resetSettingsButton.setButtonText("Reset");
+        resetSettingsButton.setTooltip("Reset sampler settings without clearing pads");
+        resetSettingsButton.onClick = [this]
+        {
+            processor.resetSamplePadSettings();
+            refreshSampleFxControls();
+            for (auto& pad : pads)
+                if (pad != nullptr)
+                    pad->refreshFromProcessor();
+            repaint();
+        };
+        addAndMakeVisible(resetSettingsButton);
+
+        clearPadsButton.setButtonText("Clear");
+        clearPadsButton.setTooltip("Clear all sample pads");
+        clearPadsButton.onClick = [this]
+        {
+            processor.clearAllSamplePads();
+            refreshSampleFxControls();
+            for (auto& pad : pads)
+                if (pad != nullptr)
+                    pad->refreshFromProcessor();
+            repaint();
+        };
+        addAndMakeVisible(clearPadsButton);
+
+        for (int slot = 0; slot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++slot)
+        {
+            auto& knob = sampleFxKnobs[(size_t)slot];
+            knob.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+            knob.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+            knob.setRange(0.0, 1.0, 0.001);
+            knob.setDoubleClickReturnValue(true, 0.0);
+            knob.setLookAndFeel(&editor.getSamplerKnobLookAndFeel());
+            knob.getProperties().set("forceImageKnob", true);
+            knob.setTooltip("Sampler FX amount " + juce::String(slot + 1));
+            knob.setValue(processor.getSamplePadFxSlotAmount(slot), juce::dontSendNotification);
+            knob.onControlInteraction = [this]
+            {
+                noteSampleFxKnobEdited();
+            };
+            knob.onValueChange = [this, slot]
+            {
+                noteSampleFxKnobEdited();
+                processor.setSamplePadFxSlotAmount(slot, (float)sampleFxKnobs[(size_t)slot].getValue());
+            };
+            knob.onPopupMenuRequest = [this, slot](const juce::MouseEvent& e)
+            {
+                editor.showMidiLearnMenuForComponent(sampleFxKnobs[(size_t)slot], e.getScreenPosition());
+            };
+            knob.onRouteMouseDown = [this, slot](const juce::MouseEvent& e)
+            {
+                handleFxChainRouteDrag(slot, getLocalPoint(&sampleFxKnobs[(size_t)slot], e.getPosition()), false);
+            };
+            knob.onRouteMouseDrag = [this, slot](const juce::MouseEvent& e)
+            {
+                handleFxChainRouteDrag(slot, getLocalPoint(&sampleFxKnobs[(size_t)slot], e.getPosition()), false);
+            };
+            knob.onRouteMouseUp = [this, slot](const juce::MouseEvent& e)
+            {
+                handleFxChainRouteDrag(slot, getLocalPoint(&sampleFxKnobs[(size_t)slot], e.getPosition()), true);
+            };
+            addAndMakeVisible(knob);
+            editor.registerSamplerFxKnobLearnTarget(knob, slot);
+
+            auto& selector = sampleFxSelectors[(size_t)slot];
+            selector.setPopupMinimumWidth(190);
+            selector.setTooltip("Sampler FX type " + juce::String(slot + 1));
+            populateSampleFxSelector(selector, processor.getSamplePadFxSlotType(slot));
+            selector.onChange = [this, slot]
+            {
+                processor.setSamplePadFxSlotType(slot,
+                                                 samplePadFxTypeForMenuId(sampleFxSelectors[(size_t)slot].getSelectedId()));
+            };
+            addAndMakeVisible(selector);
+        }
+
         refreshQuickSelectors(true);
         refreshBankList({});
 
@@ -3973,6 +4265,34 @@ public:
         addAndMakeVisible(limiterButton);
         updateLimiterButtonColour();
 
+        duckButton.setClickingTogglesState(true);
+        duckButton.setButtonText("Duck");
+        duckButton.setToggleState(processor.isSamplePadDuckEnabled(), juce::dontSendNotification);
+        duckButton.setTooltip("Tempo-synced sampler duck before the sampler limiter");
+        duckButton.onClick = [this]
+        {
+            processor.setSamplePadDuckEnabled(duckButton.getToggleState());
+            updateDuckButtonColour();
+        };
+        duckButton.onPopupMenuRequest = [this](const juce::MouseEvent& e)
+        {
+            showDuckMenu(e.getScreenPosition());
+        };
+        addAndMakeVisible(duckButton);
+        updateDuckButtonColour();
+
+        defaultFxButton.setClickingTogglesState(true);
+        defaultFxButton.setButtonText("NJ FX");
+        defaultFxButton.setToggleState(processor.getSamplePadsUseDefaultFx(), juce::dontSendNotification);
+        defaultFxButton.setTooltip("Route sample pads into the main NINJAM reverb/delay sends");
+        defaultFxButton.onClick = [this]
+        {
+            processor.setSamplePadsUseDefaultFx(defaultFxButton.getToggleState());
+            updateDefaultFxButtonColour();
+        };
+        addAndMakeVisible(defaultFxButton);
+        updateDefaultFxButtonColour();
+
         bpiLabel.setJustificationType(juce::Justification::centredLeft);
         bpiLabel.setFont(juce::Font(12.0f, juce::Font::bold));
         bpiLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
@@ -3988,6 +4308,12 @@ public:
     {
         stopTimer();
         volumeSlider.setLookAndFeel(nullptr);
+        for (int slot = 0; slot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++slot)
+        {
+            auto& knob = sampleFxKnobs[(size_t)slot];
+            editor.unregisterSamplerFxKnobLearnTarget(knob, slot);
+            knob.setLookAndFeel(nullptr);
+        }
     }
 
     void paint(juce::Graphics& g) override
@@ -3998,6 +4324,8 @@ public:
         g.setGradientFill(bg);
         g.fillAll();
 
+        drawFxRouteLines(g);
+
         auto frame = getLocalBounds().toFloat().reduced(6.0f);
         g.setColour(juce::Colours::white.withAlpha(0.08f));
         g.drawRoundedRectangle(frame, 7.0f, 1.0f);
@@ -4006,10 +4334,16 @@ public:
     void resized() override
     {
         auto area = getLocalBounds().reduced(14);
-        auto controls = area.removeFromRight(96);
+        auto controls = area.removeFromRight(104);
         area.removeFromRight(12);
 
         volumeLabel.setBounds(controls.removeFromTop(22));
+        auto duckArea = controls.removeFromBottom(30);
+        duckButton.setBounds(duckArea.reduced(0, 2));
+        controls.removeFromBottom(4);
+        auto defaultFxArea = controls.removeFromBottom(30);
+        defaultFxButton.setBounds(defaultFxArea.reduced(0, 2));
+        controls.removeFromBottom(4);
         auto limiterArea = controls.removeFromBottom(30);
         limiterButton.setBounds(limiterArea.reduced(0, 2));
         controls.removeFromBottom(8);
@@ -4020,13 +4354,15 @@ public:
 
         auto bankRow = area.removeFromTop(30);
         area.removeFromTop(8);
+        clearPadsButton.setBounds(bankRow.removeFromRight(48).reduced(2, 1));
+        resetSettingsButton.setBounds(bankRow.removeFromRight(54).reduced(2, 1));
         saveBankButton.setBounds(bankRow.removeFromRight(50).reduced(2, 1));
         loadBankButton.setBounds(bankRow.removeFromRight(50).reduced(2, 1));
         if (abletonHosted)
         {
             bankRow.removeFromRight(4);
-            for (int i = 2; i >= 0; --i)
-                samplerSizeButtons[(size_t)i].setBounds(bankRow.removeFromRight(24).reduced(2, 1));
+            for (int i = 1; i >= 0; --i)
+                samplerSizeButtons[(size_t)i].setBounds(bankRow.removeFromRight(28).reduced(2, 1));
         }
         bankRow.removeFromRight(4);
 
@@ -4047,6 +4383,10 @@ public:
         area.removeFromBottom(8);
         bpiLabel.setBounds(bpiArea.removeFromLeft(72));
         bpiCounter.setBounds(bpiArea.reduced(2, 5));
+
+        auto fxArea = area.removeFromLeft(250);
+        area.removeFromLeft(12);
+        layoutSampleFxRack(fxArea);
 
         const int cols = 4;
         const int rows = (NinjamVst3AudioProcessor::numSamplePads + cols - 1) / cols;
@@ -4077,9 +4417,428 @@ private:
             bpiLabel.setText(bpiText, juce::dontSendNotification);
         bpiCounter.repaint();
         refreshQuickSelectors(false);
+        updateHoveredFxKnobSlot();
+        updatePadAlphaFade();
         for (auto& pad : pads)
             if (pad != nullptr)
                 pad->refreshFromProcessor();
+    }
+
+    static int samplePadFxMenuIdForType(NinjamVst3AudioProcessor::SamplePadFxType type)
+    {
+        using FxType = NinjamVst3AudioProcessor::SamplePadFxType;
+        switch (type)
+        {
+            case FxType::reverb: return 1;
+            case FxType::delay: return 2;
+            case FxType::djFilter: return 3;
+            case FxType::djFilterHp: return 4;
+            case FxType::djFilterLp: return 5;
+            case FxType::djFilterBp: return 6;
+            case FxType::phaser: return 7;
+        }
+
+        return 1;
+    }
+
+    static NinjamVst3AudioProcessor::SamplePadFxType samplePadFxTypeForMenuId(int menuId)
+    {
+        using FxType = NinjamVst3AudioProcessor::SamplePadFxType;
+        switch (menuId)
+        {
+            case 2: return FxType::delay;
+            case 3: return FxType::djFilter;
+            case 4: return FxType::djFilterHp;
+            case 5: return FxType::djFilterLp;
+            case 6: return FxType::djFilterBp;
+            case 7: return FxType::phaser;
+            case 1:
+            default:
+                return FxType::reverb;
+        }
+    }
+
+    static void populateSampleFxSelector(WidePopupComboBox& selector,
+                                         NinjamVst3AudioProcessor::SamplePadFxType selectedType)
+    {
+        selector.clear(juce::dontSendNotification);
+        selector.addItem("Reverb", 1);
+        selector.addItem("Delay", 2);
+        selector.addItem("DJ Filter LP+HP", 3);
+        selector.addItem("DJ Filter HP", 4);
+        selector.addItem("DJ Filter LP", 5);
+        selector.addItem("DJ Filter BP", 6);
+        selector.addItem("Phaser", 7);
+        selector.setSelectedId(samplePadFxMenuIdForType(selectedType), juce::dontSendNotification);
+    }
+
+    static juce::Colour sampleFxSlotColour(int slot)
+    {
+        static constexpr juce::uint32 colours[] =
+        {
+            0xff5ec8ff, 0xffffc14f, 0xff7cf27c, 0xffff6ea8,
+            0xffb486ff, 0xffff895c, 0xff56e0c2, 0xffe4ef6a
+        };
+
+        return juce::Colour(colours[(size_t)juce::jlimit(0, 7, slot)]);
+    }
+
+    int findFxSlotAtPoint(juce::Point<int> point) const
+    {
+        for (int slot = 0; slot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++slot)
+        {
+            if (sampleFxSlotBounds[(size_t)slot].contains(point)
+                || sampleFxKnobs[(size_t)slot].getBounds().contains(point)
+                || sampleFxSelectors[(size_t)slot].getBounds().contains(point))
+                return slot;
+        }
+
+        return -1;
+    }
+
+    int findHoveredFxKnobSlot() const
+    {
+        if (!isMouseOver(true))
+            return -1;
+        if (fxChainRouteDragActive)
+            return -1;
+        if (juce::Time::getMillisecondCounterHiRes() < suppressRouteFocusUntilMs)
+            return -1;
+
+        const auto point = getMouseXYRelative();
+        for (int slot = 0; slot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++slot)
+            if (sampleFxKnobs[(size_t)slot].getBounds().contains(point))
+                return slot;
+
+        return -1;
+    }
+
+    void updateHoveredFxKnobSlot()
+    {
+        const int nextSlot = findHoveredFxKnobSlot();
+        if (hoveredFxSlot == nextSlot)
+            return;
+
+        hoveredFxSlot = nextSlot;
+        const bool focusingRoutes = hoveredFxSlot >= 0;
+        for (int pad = 0; pad < NinjamVst3AudioProcessor::numSamplePads; ++pad)
+        {
+            auto* padComponent = pads[(size_t)pad].get();
+            if (padComponent == nullptr)
+                continue;
+
+            if (!focusingRoutes)
+            {
+                padTargetAlpha[(size_t)pad] = 1.0f;
+                continue;
+            }
+
+            const bool routedToHoveredSlot = processor.isSamplePadFxSlotRouteEnabled(pad, hoveredFxSlot);
+            padTargetAlpha[(size_t)pad] = routedToHoveredSlot ? 0.62f : 0.36f;
+        }
+
+        repaint();
+    }
+
+    void noteSampleFxKnobEdited()
+    {
+        suppressRouteFocusUntilMs = juce::Time::getMillisecondCounterHiRes() + routeFocusSuppressAfterEditMs;
+        if (hoveredFxSlot >= 0)
+        {
+            hoveredFxSlot = -1;
+            for (int pad = 0; pad < NinjamVst3AudioProcessor::numSamplePads; ++pad)
+                padTargetAlpha[(size_t)pad] = 1.0f;
+            repaint();
+        }
+    }
+
+    void updatePadAlphaFade()
+    {
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        const double previous = lastPadAlphaUpdateMs > 0.0 ? lastPadAlphaUpdateMs : now;
+        lastPadAlphaUpdateMs = now;
+        const float step = (float)juce::jlimit(0.0, 1.0, (now - previous) / padAlphaFadeMs);
+
+        bool changed = false;
+        for (int pad = 0; pad < NinjamVst3AudioProcessor::numSamplePads; ++pad)
+        {
+            auto* padComponent = pads[(size_t)pad].get();
+            if (padComponent == nullptr)
+                continue;
+
+            auto& current = padCurrentAlpha[(size_t)pad];
+            const float target = padTargetAlpha[(size_t)pad];
+            if (std::abs(current - target) <= 0.001f)
+            {
+                current = target;
+            }
+            else if (current < target)
+            {
+                current = juce::jmin(target, current + step);
+            }
+            else
+            {
+                current = juce::jmax(target, current - step);
+            }
+
+            if (std::abs(padComponent->getAlpha() - current) > 0.001f)
+            {
+                padComponent->setAlpha(current);
+                changed = true;
+            }
+        }
+
+        if (changed)
+            repaint();
+    }
+
+    void handleFxRouteDrag(int padIndex, juce::Point<int> point, bool finished)
+    {
+        if (padIndex < 0 || padIndex >= NinjamVst3AudioProcessor::numSamplePads)
+            return;
+
+        if (finished)
+        {
+            const int targetSlot = findFxSlotAtPoint(point);
+            if (targetSlot >= 0)
+                processor.setSamplePadFxSlotRouteEnabled(padIndex, targetSlot, true);
+
+            fxRouteDragActive = false;
+            fxRouteDragPad = -1;
+            fxRouteDragPoint = {};
+            highlightedFxSlot = -1;
+            repaint();
+            return;
+        }
+
+        fxRouteDragActive = true;
+        fxRouteDragPad = padIndex;
+        fxRouteDragPoint = point;
+        highlightedFxSlot = findFxSlotAtPoint(point);
+        repaint();
+    }
+
+    bool isValidFxChainRouteTarget(int sourceSlot, int targetSlot) const
+    {
+        return targetSlot >= 0
+            && targetSlot < NinjamVst3AudioProcessor::numSamplePadFxSlots
+            && processor.canRouteSamplePadFxSlotToSlot(sourceSlot, targetSlot);
+    }
+
+    void handleFxChainRouteDrag(int sourceSlot, juce::Point<int> point, bool finished)
+    {
+        if (sourceSlot < 0 || sourceSlot >= NinjamVst3AudioProcessor::numSamplePadFxSlots)
+            return;
+
+        if (finished)
+        {
+            const int targetSlot = findFxSlotAtPoint(point);
+            if (isValidFxChainRouteTarget(sourceSlot, targetSlot))
+                processor.setSamplePadFxSlotToSlotRouteEnabled(sourceSlot, targetSlot, true);
+
+            fxChainRouteDragActive = false;
+            fxChainRouteSourceSlot = -1;
+            fxChainRouteDragPoint = {};
+            highlightedFxChainTargetSlot = -1;
+            repaint();
+            return;
+        }
+
+        fxChainRouteDragActive = true;
+        fxChainRouteSourceSlot = sourceSlot;
+        fxChainRouteDragPoint = point;
+        const int targetSlot = findFxSlotAtPoint(point);
+        highlightedFxChainTargetSlot = isValidFxChainRouteTarget(sourceSlot, targetSlot) ? targetSlot : -1;
+        repaint();
+    }
+
+    void drawCable(juce::Graphics& g,
+                   juce::Point<float> start,
+                   juce::Point<float> end,
+                   juce::Colour colour,
+                   float alpha,
+                   float thickness,
+                   bool drawArrow = false) const
+    {
+        juce::Path path;
+        path.startNewSubPath(start);
+        const float controlOffset = juce::jlimit(40.0f, 180.0f, std::abs(end.x - start.x) * 0.45f);
+        path.cubicTo(start.x - controlOffset, start.y,
+                     end.x + controlOffset, end.y,
+                     end.x, end.y);
+
+        g.setColour(colour.withAlpha(alpha * 0.22f));
+        g.strokePath(path, juce::PathStrokeType(thickness + 4.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        g.setColour(juce::Colours::black.withAlpha(alpha * 0.35f));
+        g.strokePath(path, juce::PathStrokeType(thickness + 1.8f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        g.setColour(colour.withAlpha(alpha));
+        g.strokePath(path, juce::PathStrokeType(thickness, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+        if (drawArrow)
+            drawCableArrow(g, start, end, colour, alpha);
+    }
+
+    void drawCableArrow(juce::Graphics& g,
+                        juce::Point<float> start,
+                        juce::Point<float> end,
+                        juce::Colour colour,
+                        float alpha) const
+    {
+        auto direction = end - start;
+        const float length = std::sqrt(direction.x * direction.x + direction.y * direction.y);
+        if (length < 1.0f)
+            return;
+
+        direction.x /= length;
+        direction.y /= length;
+        const auto perpendicular = juce::Point<float>(-direction.y, direction.x);
+        const auto tip = end - direction * 8.0f;
+        const auto base = tip - direction * 11.0f;
+
+        juce::Path arrow;
+        arrow.addTriangle(tip,
+                          base + perpendicular * 5.0f,
+                          base - perpendicular * 5.0f);
+        g.setColour(juce::Colours::black.withAlpha(alpha * 0.42f));
+        g.fillPath(arrow, juce::AffineTransform::translation(1.0f, 1.0f));
+        g.setColour(colour.withAlpha(alpha));
+        g.fillPath(arrow);
+    }
+
+    void drawFxRouteLines(juce::Graphics& g) const
+    {
+        for (int sourceSlot = 0; sourceSlot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++sourceSlot)
+        {
+            const auto sourceBounds = sampleFxKnobs[(size_t)sourceSlot].getBounds().toFloat();
+            if (sourceBounds.isEmpty())
+                continue;
+
+            const auto start = sourceBounds.getCentre();
+            for (int targetSlot = 0; targetSlot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++targetSlot)
+            {
+                if (!processor.isSamplePadFxSlotToSlotRouteEnabled(sourceSlot, targetSlot))
+                    continue;
+
+                const auto targetBounds = sampleFxKnobs[(size_t)targetSlot].getBounds().toFloat();
+                if (targetBounds.isEmpty())
+                    continue;
+
+                drawCable(g,
+                          start,
+                          targetBounds.getCentre(),
+                          sampleFxSlotColour(sourceSlot).interpolatedWith(sampleFxSlotColour(targetSlot), 0.35f),
+                          0.62f,
+                          2.2f,
+                          true);
+            }
+        }
+
+        for (int pad = 0; pad < NinjamVst3AudioProcessor::numSamplePads; ++pad)
+        {
+            if (pads[(size_t)pad] == nullptr)
+                continue;
+
+            const auto padBounds = pads[(size_t)pad]->getBounds().toFloat();
+            const auto start = juce::Point<float>(padBounds.getX() + 8.0f, padBounds.getCentreY());
+            for (int slot = 0; slot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++slot)
+            {
+                if (!processor.isSamplePadFxSlotRouteEnabled(pad, slot))
+                    continue;
+
+                const auto knobBounds = sampleFxKnobs[(size_t)slot].getBounds().toFloat();
+                if (knobBounds.isEmpty())
+                    continue;
+
+                const auto end = juce::Point<float>(knobBounds.getRight() - 3.0f, knobBounds.getCentreY());
+                drawCable(g, start, end, sampleFxSlotColour(slot), 0.48f, 2.0f);
+            }
+        }
+
+        if (fxRouteDragActive
+            && fxRouteDragPad >= 0
+            && fxRouteDragPad < NinjamVst3AudioProcessor::numSamplePads
+            && pads[(size_t)fxRouteDragPad] != nullptr)
+        {
+            const auto padBounds = pads[(size_t)fxRouteDragPad]->getBounds().toFloat();
+            const auto start = juce::Point<float>(padBounds.getX() + 8.0f, padBounds.getCentreY());
+            const auto end = fxRouteDragPoint.toFloat();
+            const auto colour = highlightedFxSlot >= 0 ? sampleFxSlotColour(highlightedFxSlot)
+                                                       : juce::Colour(0xff8fe7ff);
+            drawCable(g, start, end, colour, highlightedFxSlot >= 0 ? 0.9f : 0.58f, highlightedFxSlot >= 0 ? 3.0f : 2.2f);
+        }
+
+        if (fxChainRouteDragActive
+            && fxChainRouteSourceSlot >= 0
+            && fxChainRouteSourceSlot < NinjamVst3AudioProcessor::numSamplePadFxSlots)
+        {
+            const auto sourceBounds = sampleFxKnobs[(size_t)fxChainRouteSourceSlot].getBounds().toFloat();
+            if (!sourceBounds.isEmpty())
+            {
+                const auto colour = highlightedFxChainTargetSlot >= 0
+                    ? sampleFxSlotColour(fxChainRouteSourceSlot).interpolatedWith(sampleFxSlotColour(highlightedFxChainTargetSlot), 0.35f)
+                    : sampleFxSlotColour(fxChainRouteSourceSlot);
+                drawCable(g,
+                          sourceBounds.getCentre(),
+                          fxChainRouteDragPoint.toFloat(),
+                          colour,
+                          highlightedFxChainTargetSlot >= 0 ? 0.92f : 0.48f,
+                          highlightedFxChainTargetSlot >= 0 ? 3.0f : 2.1f,
+                          true);
+            }
+        }
+    }
+
+    void refreshSampleFxControls()
+    {
+        if (!volumeSlider.isMouseButtonDown())
+            volumeSlider.setValue(processor.getSamplePadVolume(), juce::dontSendNotification);
+
+        limiterButton.setToggleState(processor.isSamplePadLimiterEnabled(), juce::dontSendNotification);
+        updateLimiterButtonColour();
+
+        for (int slot = 0; slot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++slot)
+        {
+            auto& knob = sampleFxKnobs[(size_t)slot];
+            if (!knob.isMouseButtonDown())
+                knob.setValue(processor.getSamplePadFxSlotAmount(slot), juce::dontSendNotification);
+
+            auto& selector = sampleFxSelectors[(size_t)slot];
+            const int targetId = samplePadFxMenuIdForType(processor.getSamplePadFxSlotType(slot));
+            if (selector.getSelectedId() != targetId)
+                selector.setSelectedId(targetId, juce::dontSendNotification);
+        }
+
+        duckButton.setToggleState(processor.isSamplePadDuckEnabled(), juce::dontSendNotification);
+        updateDuckButtonColour();
+        defaultFxButton.setToggleState(processor.getSamplePadsUseDefaultFx(), juce::dontSendNotification);
+        updateDefaultFxButtonColour();
+    }
+
+    void layoutSampleFxRack(juce::Rectangle<int> fxArea)
+    {
+        fxArea = fxArea.reduced(2);
+        const int cols = 2;
+        const int rows = 4;
+        const int gap = 6;
+        const int cellW = (fxArea.getWidth() - gap) / cols;
+        const int cellH = (fxArea.getHeight() - gap * (rows - 1)) / rows;
+
+        for (int slot = 0; slot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++slot)
+        {
+            const int row = slot / cols;
+            const int col = slot % cols;
+            juce::Rectangle<int> cell(fxArea.getX() + col * (cellW + gap),
+                                      fxArea.getY() + row * (cellH + gap),
+                                      cellW,
+                                      cellH);
+            sampleFxSlotBounds[(size_t)slot] = cell;
+
+            auto selectorArea = cell.removeFromBottom(22);
+            auto knobArea = cell.reduced(4, 1);
+            const int knobSize = juce::jmin(knobArea.getWidth(), knobArea.getHeight());
+            sampleFxKnobs[(size_t)slot].setBounds(knobArea.withSizeKeepingCentre(knobSize, knobSize));
+            sampleFxSelectors[(size_t)slot].setBounds(selectorArea.reduced(0, 1));
+        }
     }
 
     static void populatePadsMidiSelector(juce::ComboBox& selector,
@@ -4211,6 +4970,131 @@ private:
         return parts.joinIntoString("|");
     }
 
+    static juce::String samplePadDuckShapeName(NinjamVst3AudioProcessor::SamplePadDuckShape shape)
+    {
+        using DuckShape = NinjamVst3AudioProcessor::SamplePadDuckShape;
+        switch (shape)
+        {
+            case DuckShape::tightPump:    return "Tight Pump";
+            case DuckShape::slowPump:     return "Slow Pump";
+            case DuckShape::hardGate:     return "Hard Gate";
+            case DuckShape::reverseSwell: return "Reverse Swell";
+            case DuckShape::notchPulse:   return "Notch Pulse";
+            case DuckShape::smoothPump:
+            default:                      return "Smooth Pump";
+        }
+    }
+
+    static int samplePadDuckShapeMenuId(NinjamVst3AudioProcessor::SamplePadDuckShape shape)
+    {
+        return 100 + (int)shape;
+    }
+
+    static NinjamVst3AudioProcessor::SamplePadDuckShape samplePadDuckShapeForMenuId(int menuId)
+    {
+        using DuckShape = NinjamVst3AudioProcessor::SamplePadDuckShape;
+        const int shape = menuId - 100;
+        switch ((DuckShape)shape)
+        {
+            case DuckShape::smoothPump:
+            case DuckShape::tightPump:
+            case DuckShape::slowPump:
+            case DuckShape::hardGate:
+            case DuckShape::reverseSwell:
+            case DuckShape::notchPulse:
+                return (DuckShape)shape;
+        }
+        return DuckShape::smoothPump;
+    }
+
+    static juce::String samplePadDuckLengthName(NinjamVst3AudioProcessor::SamplePadDuckLength length)
+    {
+        using DuckLength = NinjamVst3AudioProcessor::SamplePadDuckLength;
+        switch (length)
+        {
+            case DuckLength::eighth:  return "1/8";
+            case DuckLength::half:    return "1/2";
+            case DuckLength::quarter:
+            default:                  return "1/4";
+        }
+    }
+
+    static int samplePadDuckLengthMenuId(NinjamVst3AudioProcessor::SamplePadDuckLength length)
+    {
+        return 200 + (int)length;
+    }
+
+    static NinjamVst3AudioProcessor::SamplePadDuckLength samplePadDuckLengthForMenuId(int menuId)
+    {
+        using DuckLength = NinjamVst3AudioProcessor::SamplePadDuckLength;
+        const int length = menuId - 200;
+        switch ((DuckLength)length)
+        {
+            case DuckLength::eighth:
+            case DuckLength::quarter:
+            case DuckLength::half:
+                return (DuckLength)length;
+        }
+        return DuckLength::quarter;
+    }
+
+    void showDuckMenu(juce::Point<int> screenPosition)
+    {
+        using DuckShape = NinjamVst3AudioProcessor::SamplePadDuckShape;
+        using DuckLength = NinjamVst3AudioProcessor::SamplePadDuckLength;
+
+        juce::PopupMenu menu;
+        menu.addItem(1, "Duck Enabled", true, processor.isSamplePadDuckEnabled());
+        menu.addSeparator();
+
+        juce::PopupMenu shapeMenu;
+        const auto currentShape = processor.getSamplePadDuckShape();
+        const DuckShape shapes[] =
+        {
+            DuckShape::smoothPump,
+            DuckShape::tightPump,
+            DuckShape::slowPump,
+            DuckShape::hardGate,
+            DuckShape::reverseSwell,
+            DuckShape::notchPulse
+        };
+        for (const auto shape : shapes)
+            shapeMenu.addItem(samplePadDuckShapeMenuId(shape), samplePadDuckShapeName(shape), true, currentShape == shape);
+        menu.addSubMenu("Shape", shapeMenu);
+
+        juce::PopupMenu lengthMenu;
+        const auto currentLength = processor.getSamplePadDuckLength();
+        const DuckLength lengths[] = { DuckLength::eighth, DuckLength::quarter, DuckLength::half };
+        for (const auto length : lengths)
+            lengthMenu.addItem(samplePadDuckLengthMenuId(length), samplePadDuckLengthName(length), true, currentLength == length);
+        menu.addSubMenu("Length", lengthMenu);
+
+        juce::Component::SafePointer<SamplePadsComponent> safeThis(this);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetScreenArea({ screenPosition.x, screenPosition.y, 1, 1 }),
+                           [safeThis](int result)
+                           {
+                               if (safeThis == nullptr || result == 0)
+                                   return;
+
+                               if (result == 1)
+                               {
+                                   const bool enabled = !safeThis->processor.isSamplePadDuckEnabled();
+                                   safeThis->processor.setSamplePadDuckEnabled(enabled);
+                                   safeThis->duckButton.setToggleState(enabled, juce::dontSendNotification);
+                               }
+                               else if (result >= 100 && result < 200)
+                               {
+                                   safeThis->processor.setSamplePadDuckShape(samplePadDuckShapeForMenuId(result));
+                               }
+                               else if (result >= 200 && result < 300)
+                               {
+                                   safeThis->processor.setSamplePadDuckLength(samplePadDuckLengthForMenuId(result));
+                               }
+
+                               safeThis->updateDuckButtonColour();
+                           });
+    }
+
     void updateLimiterButtonColour()
     {
         const bool on = limiterButton.getToggleState();
@@ -4221,17 +5105,42 @@ private:
         limiterButton.setColour(juce::TextButton::textColourOffId, juce::Colours::lightgrey);
     }
 
+    void updateDuckButtonColour()
+    {
+        const bool on = duckButton.getToggleState();
+        const auto colour = on ? juce::Colour(0xff49d5ff) : juce::Colour(0xff17313a);
+        duckButton.setColour(juce::TextButton::buttonColourId, colour);
+        duckButton.setColour(juce::TextButton::buttonOnColourId, colour);
+        duckButton.setColour(juce::TextButton::textColourOnId, juce::Colours::black);
+        duckButton.setColour(juce::TextButton::textColourOffId, juce::Colours::lightgrey);
+        duckButton.setTooltip("Tempo-synced sampler duck: "
+                              + samplePadDuckShapeName(processor.getSamplePadDuckShape())
+                              + ", "
+                              + samplePadDuckLengthName(processor.getSamplePadDuckLength()));
+    }
+
+    void updateDefaultFxButtonColour()
+    {
+        const bool on = defaultFxButton.getToggleState();
+        const auto colour = on ? juce::Colour(0xffa7e36e) : juce::Colour(0xff29351d);
+        defaultFxButton.setColour(juce::TextButton::buttonColourId, colour);
+        defaultFxButton.setColour(juce::TextButton::buttonOnColourId, colour);
+        defaultFxButton.setColour(juce::TextButton::textColourOnId, juce::Colours::black);
+        defaultFxButton.setColour(juce::TextButton::textColourOffId, juce::Colours::lightgrey);
+    }
+
     void updateSamplerSizeButtons()
     {
-        for (int i = 0; i < 3; ++i)
+        for (int i = 0; i < 2; ++i)
         {
             auto& button = samplerSizeButtons[(size_t)i];
-            const bool selected = i == currentSamplerSizePreset;
-            const auto colour = selected ? juce::Colour(0xff49d5ff) : juce::Colour(0xff2f3337);
+            const bool canStep = i == 0 ? currentSamplerSizePreset > 0 : currentSamplerSizePreset < 2;
+            const auto colour = canStep ? juce::Colour(0xff49d5ff) : juce::Colour(0xff2f3337);
+            button.setEnabled(canStep);
             button.setColour(juce::TextButton::buttonColourId, colour);
             button.setColour(juce::TextButton::buttonOnColourId, colour);
-            button.setColour(juce::TextButton::textColourOnId, selected ? juce::Colours::black : juce::Colours::white);
-            button.setColour(juce::TextButton::textColourOffId, selected ? juce::Colours::black : juce::Colours::lightgrey);
+            button.setColour(juce::TextButton::textColourOnId, canStep ? juce::Colours::black : juce::Colours::grey);
+            button.setColour(juce::TextButton::textColourOffId, canStep ? juce::Colours::black : juce::Colours::grey);
         }
     }
 
@@ -4297,6 +5206,7 @@ private:
         }
 
         refreshBankList(folder.getFileName());
+        refreshSampleFxControls();
         for (auto& pad : pads)
             if (pad != nullptr)
                 pad->refreshFromProcessor();
@@ -4350,11 +5260,12 @@ private:
     juce::ComboBox looperInputSelector;
     juce::Label bankLabel;
     WidePopupComboBox bankSelector;
-    std::array<LeftClickOnlyTextButton, 3> samplerSizeButtons { LeftClickOnlyTextButton{ "S" },
-                                                                LeftClickOnlyTextButton{ "M" },
-                                                                LeftClickOnlyTextButton{ "L" } };
+    std::array<LeftClickOnlyTextButton, 2> samplerSizeButtons { LeftClickOnlyTextButton{ "-" },
+                                                                LeftClickOnlyTextButton{ "+" } };
     LeftClickOnlyTextButton loadBankButton{ "Load" };
     LeftClickOnlyTextButton saveBankButton{ "Save" };
+    LeftClickOnlyTextButton resetSettingsButton{ "Reset" };
+    LeftClickOnlyTextButton clearPadsButton{ "Clear" };
     std::map<int, juce::String> padsMidiDeviceByMenuId;
     std::map<int, int> looperInputByMenuId;
     juce::String displayedPadsMidiDeviceId;
@@ -4363,10 +5274,30 @@ private:
     juce::String displayedLooperUsersFingerprint;
     juce::Array<juce::File> bankFolders;
     std::unique_ptr<juce::FileChooser> bankChooser;
+    std::array<SampleFxKnobSlider, NinjamVst3AudioProcessor::numSamplePadFxSlots> sampleFxKnobs;
+    std::array<WidePopupComboBox, NinjamVst3AudioProcessor::numSamplePadFxSlots> sampleFxSelectors;
+    std::array<juce::Rectangle<int>, NinjamVst3AudioProcessor::numSamplePadFxSlots> sampleFxSlotBounds;
+    bool fxRouteDragActive = false;
+    int fxRouteDragPad = -1;
+    int highlightedFxSlot = -1;
+    int hoveredFxSlot = -1;
+    juce::Point<int> fxRouteDragPoint;
+    bool fxChainRouteDragActive = false;
+    int fxChainRouteSourceSlot = -1;
+    int highlightedFxChainTargetSlot = -1;
+    juce::Point<int> fxChainRouteDragPoint;
+    std::array<float, NinjamVst3AudioProcessor::numSamplePads> padCurrentAlpha {};
+    std::array<float, NinjamVst3AudioProcessor::numSamplePads> padTargetAlpha {};
+    double lastPadAlphaUpdateMs = 0.0;
+    double suppressRouteFocusUntilMs = 0.0;
+    static constexpr double routeFocusSuppressAfterEditMs = 800.0;
+    static constexpr double padAlphaFadeMs = 100.0;
     NonlinearFaderSlider volumeSlider;
     juce::Label volumeLabel;
     MasterPeakMeter peakMeter;
     LeftClickOnlyTextButton limiterButton{ "Limiter" };
+    PopupTextButton duckButton{ "Duck" };
+    LeftClickOnlyTextButton defaultFxButton{ "NJ FX" };
     juce::Label bpiLabel;
     IntervalDisplayComponent bpiCounter;
 };
@@ -4388,7 +5319,7 @@ public:
           onBoundsChanged(std::move(onBoundsChangedCallback)),
           abletonHosted(abletonHostedWindow)
     {
-        setUsingNativeTitleBar(!abletonHosted);
+        setUsingNativeTitleBar(true);
         setContentOwned(new SamplePadsComponent(p,
                                                 editor,
                                                 abletonHosted,
@@ -4405,16 +5336,16 @@ public:
         else
         {
             setResizable(true, true);
-            setResizeLimits(560, 360, 1100, 760);
-            if (savedWindowBounds.getWidth() >= 560 && savedWindowBounds.getHeight() >= 360)
+            setResizeLimits(840, 500, 1320, 840);
+            if (savedWindowBounds.getWidth() >= 840 && savedWindowBounds.getHeight() >= 500)
             {
-                savedWindowBounds.setSize(juce::jlimit(560, 1100, savedWindowBounds.getWidth()),
-                                          juce::jlimit(360, 760, savedWindowBounds.getHeight()));
+                savedWindowBounds.setSize(juce::jlimit(840, 1320, savedWindowBounds.getWidth()),
+                                          juce::jlimit(500, 840, savedWindowBounds.getHeight()));
                 setBounds(savedWindowBounds);
             }
             else
             {
-                centreWithSize(680, 450);
+                centreWithSize(980, 600);
             }
         }
         setVisible(true);
@@ -5368,7 +6299,9 @@ void CustomKnobLookAndFeel::drawRotarySlider(juce::Graphics& g, int x, int y, in
     auto centreX = (float)x + (float)width * 0.5f;
     auto centreY = (float)y + (float)height * 0.5f;
 
-    auto* editor = dynamic_cast<NinjamVst3AudioProcessorEditor*>(slider.getParentComponent());
+    auto* editor = explicitEditor != nullptr
+        ? explicitEditor
+        : dynamic_cast<NinjamVst3AudioProcessorEditor*>(slider.getParentComponent());
     if (editor == nullptr)
     {
         auto* p = slider.getParentComponent();
@@ -5520,6 +6453,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
 {
     setResizable(true, true);
     setResizeLimits(900, 500, 2200, 1500);
+    customKnobLookAndFeel.setExplicitEditor(this);
     const bool settingsFileReady = renewSettingsFileIfCorrupt(makeSettingsOptions(), this);
 
     juce::LookAndFeel::setDefaultLookAndFeel(&outlinedLabelLAF);
@@ -6021,7 +6955,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     addAndMakeVisible(delayTimeSlider);
     delayTimeSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
     delayTimeSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-    delayTimeSlider.setRange(20.0, 2000.0);
+    delayTimeSlider.setRange(20.0, 10000.0);
     delayTimeSlider.setValue(audioProcessor.getFxDelayTimeMs(), juce::dontSendNotification);
     delayTimeSlider.setLookAndFeel(&customKnobLookAndFeel);
     delayTimeSlider.onValueChange = [this]
@@ -6246,6 +7180,14 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         target.isToggle = true;
         midiTargetsById[target.id] = target;
     }
+    for (int slot = 0; slot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++slot)
+    {
+        NinjamVst3AudioProcessorEditor::MidiLearnTarget target;
+        target.id = getSampleFxKnobLearnTargetId(slot);
+        target.component = nullptr;
+        target.isToggle = false;
+        midiTargetsById[target.id] = target;
+    }
     syncUserStripMidiTargets();
     updateFxControlsVisibility();
     loadLearnMappingsFromProcessor();
@@ -6421,6 +7363,35 @@ bool NinjamVst3AudioProcessorEditor::hasSamplePadOscLearn(int padIndex) const
     if (padIndex < 0 || padIndex >= NinjamVst3AudioProcessor::numSamplePads)
         return false;
     return oscSourceByTargetId.find(getSamplePadLearnTargetId(padIndex)) != oscSourceByTargetId.end();
+}
+
+void NinjamVst3AudioProcessorEditor::registerSamplerFxKnobLearnTarget(juce::Component& component, int slotIndex)
+{
+    if (slotIndex < 0 || slotIndex >= NinjamVst3AudioProcessor::numSamplePadFxSlots)
+        return;
+
+    const auto targetId = getSampleFxKnobLearnTargetId(slotIndex);
+    MidiLearnTarget target;
+    target.id = targetId;
+    target.component = &component;
+    target.isToggle = false;
+    midiTargetsByComponent[&component] = target;
+    midiTargetsById[targetId] = target;
+    component.removeMouseListener(this);
+}
+
+void NinjamVst3AudioProcessorEditor::unregisterSamplerFxKnobLearnTarget(juce::Component& component, int slotIndex)
+{
+    if (slotIndex < 0 || slotIndex >= NinjamVst3AudioProcessor::numSamplePadFxSlots)
+        return;
+
+    component.removeMouseListener(this);
+    midiTargetsByComponent.erase(&component);
+
+    const auto targetId = getSampleFxKnobLearnTargetId(slotIndex);
+    auto it = midiTargetsById.find(targetId);
+    if (it != midiTargetsById.end() && it->second.component == &component)
+        it->second.component = nullptr;
 }
 
 void NinjamVst3AudioProcessorEditor::paint (juce::Graphics& g)
@@ -7286,6 +8257,33 @@ void NinjamVst3AudioProcessorEditor::showMidiLearnMenuForComponent(juce::Compone
 
     const juce::String targetId = it->second.id;
     juce::PopupMenu menu;
+    const int sampleFxSlot = getSampleFxKnobSlotFromLearnTargetId(targetId);
+    if (sampleFxSlot >= 0 && sampleFxSlot < NinjamVst3AudioProcessor::numSamplePadFxSlots)
+    {
+        juce::PopupMenu clearWireMenu;
+        bool hasWire = false;
+        for (int targetSlot = 0; targetSlot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++targetSlot)
+        {
+            if (audioProcessor.isSamplePadFxSlotToSlotRouteEnabled(sampleFxSlot, targetSlot))
+            {
+                clearWireMenu.addItem(1000 + targetSlot, "To knob " + juce::String(targetSlot + 1));
+                hasWire = true;
+            }
+        }
+        for (int sourceSlot = 0; sourceSlot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++sourceSlot)
+        {
+            if (audioProcessor.isSamplePadFxSlotToSlotRouteEnabled(sourceSlot, sampleFxSlot))
+            {
+                clearWireMenu.addItem(1100 + sourceSlot, "From knob " + juce::String(sourceSlot + 1));
+                hasWire = true;
+            }
+        }
+
+        if (!hasWire)
+            clearWireMenu.addItem(1099, "No knob wires", false);
+        menu.addSubMenu("Clear Wire", clearWireMenu);
+        menu.addSeparator();
+    }
     menu.addItem(3, "OSC Learn");
     menu.addItem(4, "OSC Forget", oscSourceByTargetId.find(targetId) != oscSourceByTargetId.end());
     menu.addSeparator();
@@ -7297,9 +8295,21 @@ void NinjamVst3AudioProcessorEditor::showMidiLearnMenuForComponent(juce::Compone
     menu.addItem(12, "Forget All Learn Mappings");
     juce::Rectangle<int> popupAnchor(screenPos.x, screenPos.y, 1, 1);
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&component).withTargetScreenArea(popupAnchor),
-                       [this, targetId](int result)
+                       [this, targetId, sampleFxSlot](int result)
                        {
-                           if (result == 3)
+                           if (sampleFxSlot >= 0 && result >= 1000 && result < 1100)
+                           {
+                               audioProcessor.setSamplePadFxSlotToSlotRouteEnabled(sampleFxSlot, result - 1000, false);
+                               if (samplePadsWindow != nullptr)
+                                   samplePadsWindow->repaint();
+                           }
+                           else if (sampleFxSlot >= 0 && result >= 1100 && result < 1200)
+                           {
+                               audioProcessor.setSamplePadFxSlotToSlotRouteEnabled(result - 1100, sampleFxSlot, false);
+                               if (samplePadsWindow != nullptr)
+                                   samplePadsWindow->repaint();
+                           }
+                           else if (result == 3)
                            {
                                oscLearnArmedTargetId = targetId;
                            }
@@ -7392,9 +8402,7 @@ void NinjamVst3AudioProcessorEditor::applyMidiMappings()
             }
             else
             {
-                if (component == nullptr)
-                    continue;
-
+                const int sampleFxSlot = getSampleFxKnobSlotFromLearnTargetId(pair.first);
                 if (auto* slider = dynamic_cast<juce::Slider*>(component))
                 {
                     if (slider->isMouseButtonDown())
@@ -7403,6 +8411,10 @@ void NinjamVst3AudioProcessorEditor::applyMidiMappings()
                     const double norm = juce::jlimit(0.0, 1.0, (double)event.normalized);
                     const double value = juce::jlimit(range.getStart(), range.getEnd(), range.getStart() + norm * range.getLength());
                     slider->setValue(value, juce::sendNotificationSync);
+                }
+                else if (sampleFxSlot >= 0 && sampleFxSlot < NinjamVst3AudioProcessor::numSamplePadFxSlots)
+                {
+                    audioProcessor.setSamplePadFxSlotAmount(sampleFxSlot, event.normalized);
                 }
             }
         }
@@ -7485,6 +8497,12 @@ void NinjamVst3AudioProcessorEditor::applyOscMappings()
                 const double norm = juce::jlimit(0.0, 1.0, (double)event.normalized);
                 const double value = juce::jlimit(range.getStart(), range.getEnd(), range.getStart() + norm * range.getLength());
                 slider->setValue(value, juce::sendNotificationSync);
+            }
+            else
+            {
+                const int sampleFxSlot = getSampleFxKnobSlotFromLearnTargetId(pair.first);
+                if (sampleFxSlot >= 0 && sampleFxSlot < NinjamVst3AudioProcessor::numSamplePadFxSlots)
+                    audioProcessor.setSamplePadFxSlotAmount(sampleFxSlot, event.normalized);
             }
         }
     }
@@ -7770,8 +8788,8 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
     {
         samplePadsWindowBounds = juce::Rectangle<int>(props.getIntValue("samplePadsWindowX", 0),
                                                       props.getIntValue("samplePadsWindowY", 0),
-                                                      juce::jlimit(560, 1100, props.getIntValue("samplePadsWindowW", 680)),
-                                                      juce::jlimit(360, 760, props.getIntValue("samplePadsWindowH", 450)));
+                                                      juce::jlimit(840, 1320, props.getIntValue("samplePadsWindowW", 980)),
+                                                      juce::jlimit(500, 840, props.getIntValue("samplePadsWindowH", 600)));
     }
 
     transmitButton.setToggleState(audioProcessor.isTransmittingLocal(), juce::dontSendNotification);
@@ -8830,8 +9848,8 @@ void NinjamVst3AudioProcessorEditor::rememberSamplePadsWindowBounds(juce::Rectan
     if (bounds.getWidth() < 100 || bounds.getHeight() < 100)
         return;
 
-    bounds.setSize(juce::jlimit(560, 1100, bounds.getWidth()),
-                   juce::jlimit(360, 760, bounds.getHeight()));
+    bounds.setSize(juce::jlimit(840, 1320, bounds.getWidth()),
+                   juce::jlimit(500, 840, bounds.getHeight()));
 
     if (samplePadsWindowBoundsValid && samplePadsWindowBounds == bounds && !saveNow)
         return;

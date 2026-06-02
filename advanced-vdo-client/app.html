@@ -691,15 +691,6 @@
             return true;
         }
 
-        function scheduleBufferChangeRefresh(userKey, desiredBufferMs) {
-            const key = normalizeUserId(userKey);
-            if (!key) {
-                return false;
-            }
-            const eventId = 'auto:' + Math.round(desiredBufferMs) + ':' + Date.now();
-            return scheduleBufferRefresh(key, eventId);
-        }
-
         function requestVdoRoster() {
             if (!vdoState.iframeLoaded) {
                 return;
@@ -730,7 +721,9 @@
                 const lastAppliedBuffer = vdoState.lastAppliedBufferByUser[userKey];
                 const hasAppliedBuffer = typeof lastAppliedBuffer === 'number' && isFinite(lastAppliedBuffer);
                 if (hasAppliedBuffer && lastAppliedBuffer !== desiredBufferMs) {
-                    scheduleBufferChangeRefresh(userKey, desiredBufferMs);
+                    if (sendTargetedBuffer(userKey, desiredBufferMs)) {
+                        vdoState.lastAppliedBufferByUser[userKey] = desiredBufferMs;
+                    }
                     continue;
                 }
                 if (sendTargetedBuffer(userKey, desiredBufferMs)) {

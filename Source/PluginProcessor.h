@@ -193,6 +193,13 @@ public:
     bool isFxReverbEnabled() const;
     void setFxDelayEnabled(bool enabled);
     bool isFxDelayEnabled() const;
+    enum class FxDelayMode
+    {
+        standard = 0,
+        frippertronics = 1
+    };
+    void setFxDelayMode(FxDelayMode mode);
+    FxDelayMode getFxDelayMode() const;
     void setFxReverbRoomSize(float roomSize);
     float getFxReverbRoomSize() const;
     void setFxReverbDamping(float damping);
@@ -222,6 +229,17 @@ public:
 
     // Sample pads
     static constexpr int numSamplePads = 16;
+    static constexpr int numSamplePadFxSlots = 8;
+    enum class SamplePadFxType
+    {
+        reverb = 0,
+        delay = 1,
+        djFilter = 2,
+        djFilterBp = 3,
+        phaser = 4,
+        djFilterHp = 5,
+        djFilterLp = 6
+    };
     static constexpr int looperInputLocalChannel = -10000;
     static constexpr int looperInputSamplePads = -10001;
     static constexpr int looperInputRemoteUserBase = -20000;
@@ -235,6 +253,8 @@ public:
     }
     bool loadSamplePad(int padIndex, const juce::File& file);
     void clearSamplePad(int padIndex);
+    void clearAllSamplePads();
+    void resetSamplePadSettings();
     void undoSamplePadClear(int padIndex);
     bool canUndoSamplePadClear(int padIndex) const;
     void triggerSamplePad(int padIndex);
@@ -271,7 +291,41 @@ public:
     float getSamplePadVolume() const;
     void setSamplePadLimiterEnabled(bool shouldEnable);
     bool isSamplePadLimiterEnabled() const;
+    void setSamplePadDuckEnabled(bool shouldEnable);
+    bool isSamplePadDuckEnabled() const;
+    enum class SamplePadDuckShape
+    {
+        smoothPump = 0,
+        tightPump = 1,
+        slowPump = 2,
+        hardGate = 3,
+        reverseSwell = 4,
+        notchPulse = 5
+    };
+    enum class SamplePadDuckLength
+    {
+        eighth = 0,
+        quarter = 1,
+        half = 2
+    };
+    void setSamplePadDuckShape(SamplePadDuckShape shape);
+    SamplePadDuckShape getSamplePadDuckShape() const;
+    void setSamplePadDuckLength(SamplePadDuckLength length);
+    SamplePadDuckLength getSamplePadDuckLength() const;
+    void setSamplePadsUseDefaultFx(bool shouldUse);
+    bool getSamplePadsUseDefaultFx() const;
+    void setSamplePadDuckRouteEnabled(int padIndex, bool shouldEnable);
+    bool isSamplePadDuckRouteEnabled(int padIndex) const;
+    void setSamplePadFxSlotRouteEnabled(int padIndex, int slotIndex, bool shouldEnable);
+    bool isSamplePadFxSlotRouteEnabled(int padIndex, int slotIndex) const;
+    void setSamplePadFxSlotToSlotRouteEnabled(int sourceSlotIndex, int targetSlotIndex, bool shouldEnable);
+    bool isSamplePadFxSlotToSlotRouteEnabled(int sourceSlotIndex, int targetSlotIndex) const;
+    bool canRouteSamplePadFxSlotToSlot(int sourceSlotIndex, int targetSlotIndex) const;
     float getSamplePadPeak() const;
+    void setSamplePadFxSlotType(int slotIndex, SamplePadFxType type);
+    SamplePadFxType getSamplePadFxSlotType(int slotIndex) const;
+    void setSamplePadFxSlotAmount(int slotIndex, float amount);
+    float getSamplePadFxSlotAmount(int slotIndex) const;
     juce::File getSamplePadBanksDirectory() const;
     juce::File getSamplePadBankDirectory(const juce::String& bankName) const;
     juce::StringArray getSamplePadBankNames() const;
@@ -458,6 +512,7 @@ private:
     std::atomic<bool> localMonitorEnabled { true };
     std::atomic<bool> fxReverbEnabled { true };
     std::atomic<bool> fxDelayEnabled { true };
+    std::atomic<int> fxDelayMode { (int)FxDelayMode::standard };
     std::atomic<float> fxReverbRoomSize { 0.45f };
     std::atomic<float> fxReverbDamping { 0.45f };
     std::atomic<float> fxReverbWetDryMix { 1.0f };
@@ -476,6 +531,7 @@ private:
     juce::AudioBuffer<float> fxTransmitBuffer;
     juce::AudioBuffer<float> fxReturnBuffer;
     int fxDelayWritePosition = 0;
+    std::array<float, 2> fxDelayLowpassState {};
     double processingSampleRate = 44100.0;
 
     static constexpr int samplePadOneShotVoiceCount = 4;
@@ -512,11 +568,15 @@ private:
         bool undoClearReverse = false;
         bool undoClearMatchBpi = false;
         bool undoClearBpmSyncEnabled = true;
+        bool undoClearDuckRoute = false;
+        std::array<bool, numSamplePadFxSlots> undoClearFxSlotRoutes {};
         bool canUndoClear = false;
         std::atomic<bool> loop { false };
         std::atomic<bool> reverse { false };
         std::atomic<bool> matchBpi { false };
         std::atomic<bool> bpmSyncEnabled { true };
+        std::atomic<bool> duckRoute { false };
+        std::array<std::atomic<bool>, numSamplePadFxSlots> fxSlotRoutes {};
         std::atomic<bool> playing { false };
         std::atomic<bool> playbackScheduled { false };
         std::atomic<bool> recordArmed { false };
@@ -559,8 +619,25 @@ private:
     juce::AudioBuffer<float> samplePadsRenderBuffer;
     juce::AudioBuffer<float> samplePadsOneShotRenderBuffer;
     juce::AudioBuffer<float> samplePadRemoteLooperInputBuffer;
+    std::array<std::atomic<int>, numSamplePadFxSlots> samplePadFxSlotTypes;
+    std::array<std::atomic<float>, numSamplePadFxSlots> samplePadFxSlotAmounts;
+    std::array<std::array<std::atomic<bool>, numSamplePadFxSlots>, numSamplePadFxSlots> samplePadFxSlotChainRoutes;
+    std::array<std::array<juce::dsp::StateVariableTPTFilter<float>, numSamplePadFxSlots>, numSamplePads> samplePadPerPadDjFilters;
+    std::array<std::array<juce::dsp::StateVariableTPTFilter<float>, numSamplePadFxSlots>, numSamplePads> samplePadPerPadDjBpFilters;
+    std::array<std::array<juce::dsp::Phaser<float>, numSamplePadFxSlots>, numSamplePads> samplePadPerPadPhasers;
+    std::array<std::array<juce::Reverb, numSamplePadFxSlots>, numSamplePads> samplePadPerPadReverbs;
+    std::array<std::array<juce::AudioBuffer<float>, numSamplePadFxSlots>, numSamplePads> samplePadPerPadDelayBuffers;
+    std::array<std::array<juce::AudioBuffer<float>, numSamplePadFxSlots>, numSamplePads> samplePadPerPadFxSlotInputBuffers;
+    juce::AudioBuffer<float> samplePadFxScratchBuffer;
+    juce::dsp::Oscillator<float> samplePadDuckOscillator;
+    std::vector<float> samplePadDuckGainBuffer;
+    std::array<std::array<int, numSamplePadFxSlots>, numSamplePads> samplePadPerPadDelayWritePositions {};
     std::atomic<float> samplePadsVolume { 1.0f };
     std::atomic<bool> samplePadsLimiterEnabled { false };
+    std::atomic<bool> samplePadsDuckEnabled { false };
+    std::atomic<int> samplePadsDuckShape { (int)SamplePadDuckShape::smoothPump };
+    std::atomic<int> samplePadsDuckLength { (int)SamplePadDuckLength::quarter };
+    std::atomic<bool> samplePadsUseDefaultFx { true };
     std::atomic<float> samplePadsPeak { 0.0f };
     std::atomic<int> samplePadLooperInput { looperInputLocalChannel };
     static constexpr int remoteAudioTapBufferSamples = 32768;
@@ -865,6 +942,8 @@ private:
                                          int localLeftIndex = -1,
                                          int localRightIndex = -1);
     bool renderSamplePads(int numSamples, double blockStartBeat, double samplesPerBeat, int bpi);
+    void applySamplePadInsertFx(int numSamples, double blockStartBeat, double samplesPerBeat, int bpi);
+    float getSamplePadFxSendAmount(SamplePadFxType type) const;
     void resyncLoopedSamplePadsToBpm(double targetBpm);
     void resyncSamplePadToBpm(int padIndex, double targetBpm, bool force);
     static void RemoteChannelAudioTap_Callback(void* userData,

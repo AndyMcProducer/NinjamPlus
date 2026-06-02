@@ -1739,6 +1739,152 @@ namespace
         return padIndex >= 0 && padIndex < NinjamVst3AudioProcessor::numSamplePads;
     }
 
+    inline bool isValidSamplePadFxSlot(int slotIndex)
+    {
+        return slotIndex >= 0 && slotIndex < NinjamVst3AudioProcessor::numSamplePadFxSlots;
+    }
+
+    static NinjamVst3AudioProcessor::SamplePadFxType sanitizeSamplePadFxType(int type)
+    {
+        using FxType = NinjamVst3AudioProcessor::SamplePadFxType;
+        switch ((FxType)type)
+        {
+            case FxType::reverb:
+            case FxType::delay:
+            case FxType::djFilter:
+            case FxType::djFilterHp:
+            case FxType::djFilterLp:
+            case FxType::djFilterBp:
+            case FxType::phaser:
+                return (FxType)type;
+        }
+        return FxType::reverb;
+    }
+
+    static NinjamVst3AudioProcessor::SamplePadDuckShape sanitizeSamplePadDuckShape(int shape)
+    {
+        using DuckShape = NinjamVst3AudioProcessor::SamplePadDuckShape;
+        switch ((DuckShape)shape)
+        {
+            case DuckShape::smoothPump:
+            case DuckShape::tightPump:
+            case DuckShape::slowPump:
+            case DuckShape::hardGate:
+            case DuckShape::reverseSwell:
+            case DuckShape::notchPulse:
+                return (DuckShape)shape;
+        }
+        return DuckShape::smoothPump;
+    }
+
+    static NinjamVst3AudioProcessor::SamplePadDuckLength sanitizeSamplePadDuckLength(int length)
+    {
+        using DuckLength = NinjamVst3AudioProcessor::SamplePadDuckLength;
+        switch ((DuckLength)length)
+        {
+            case DuckLength::eighth:
+            case DuckLength::quarter:
+            case DuckLength::half:
+                return (DuckLength)length;
+        }
+        return DuckLength::quarter;
+    }
+
+    static NinjamVst3AudioProcessor::SamplePadFxType getDefaultSamplePadFxType(int slotIndex)
+    {
+        using FxType = NinjamVst3AudioProcessor::SamplePadFxType;
+        static constexpr FxType defaultFxTypes[NinjamVst3AudioProcessor::numSamplePadFxSlots] =
+        {
+            FxType::reverb,
+            FxType::delay,
+            FxType::djFilter,
+            FxType::djFilterHp,
+            FxType::djFilterLp,
+            FxType::djFilterBp,
+            FxType::phaser,
+            FxType::delay
+        };
+
+        return defaultFxTypes[(size_t)juce::jlimit(0,
+                                                   NinjamVst3AudioProcessor::numSamplePadFxSlots - 1,
+                                                   slotIndex)];
+    }
+
+    static double mapNormalisedToLogFrequency(double normalised, double minHz, double maxHz)
+    {
+        normalised = juce::jlimit(0.0, 1.0, normalised);
+        minHz = juce::jmax(1.0, minHz);
+        maxHz = juce::jmax(minHz + 1.0, maxHz);
+        return minHz * std::pow(maxHz / minHz, normalised);
+    }
+
+    static double smoothDuckStep(double x)
+    {
+        x = juce::jlimit(0.0, 1.0, x);
+        return x * x * (3.0 - 2.0 * x);
+    }
+
+    static double getSamplePadDuckLengthBeats(NinjamVst3AudioProcessor::SamplePadDuckLength length)
+    {
+        using DuckLength = NinjamVst3AudioProcessor::SamplePadDuckLength;
+        switch (length)
+        {
+            case DuckLength::eighth:  return 0.5;
+            case DuckLength::half:    return 2.0;
+            case DuckLength::quarter:
+            default:                  return 1.0;
+        }
+    }
+
+    static float getSamplePadDuckGainForBeat(double beat,
+                                             NinjamVst3AudioProcessor::SamplePadDuckShape shape,
+                                             NinjamVst3AudioProcessor::SamplePadDuckLength length)
+    {
+        const double cycleBeats = getSamplePadDuckLengthBeats(length);
+        double phase = beat / cycleBeats;
+        phase = std::fmod(phase, 1.0);
+        if (phase < 0.0)
+            phase += 1.0;
+
+        constexpr float duckAmount = 0.82f;
+        double shaped = 1.0;
+
+        using DuckShape = NinjamVst3AudioProcessor::SamplePadDuckShape;
+        switch (shape)
+        {
+            case DuckShape::tightPump:
+                shaped = phase < 0.30 ? smoothDuckStep(phase / 0.30) : 1.0;
+                break;
+
+            case DuckShape::slowPump:
+                shaped = phase < 0.86 ? smoothDuckStep(phase / 0.86) : 1.0;
+                break;
+
+            case DuckShape::hardGate:
+                shaped = phase < 0.38 ? 0.03 : phase < 0.47 ? smoothDuckStep((phase - 0.38) / 0.09) : 1.0;
+                break;
+
+            case DuckShape::reverseSwell:
+                shaped = phase < 0.16 ? 1.0 : 1.0 - smoothDuckStep((phase - 0.16) / 0.84);
+                break;
+
+            case DuckShape::notchPulse:
+            {
+                constexpr double centre = 0.55;
+                constexpr double width = 0.22;
+                shaped = smoothDuckStep(juce::jlimit(0.0, 1.0, std::abs(phase - centre) / width));
+                break;
+            }
+
+            case DuckShape::smoothPump:
+            default:
+                shaped = phase < 0.62 ? smoothDuckStep(phase / 0.62) : 1.0;
+                break;
+        }
+
+        return 1.0f - duckAmount * (1.0f - (float)shaped);
+    }
+
     inline juce::String getDefaultSamplePadName(int padIndex)
     {
         return "Pad " + juce::String(padIndex + 1);
@@ -2049,6 +2195,18 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
         remoteChordDetectionEnabled[(size_t)i].store(true, std::memory_order_relaxed);
         remoteChordUserKeys[(size_t)i].clear();
     }
+
+    for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+    {
+        samplePadFxSlotTypes[(size_t)slot].store((int)getDefaultSamplePadFxType(slot), std::memory_order_relaxed);
+        samplePadFxSlotAmounts[(size_t)slot].store(0.0f, std::memory_order_relaxed);
+        for (int targetSlot = 0; targetSlot < numSamplePadFxSlots; ++targetSlot)
+            samplePadFxSlotChainRoutes[(size_t)slot][(size_t)targetSlot].store(false, std::memory_order_relaxed);
+    }
+    samplePadDuckOscillator.initialise([](float x)
+    {
+        return std::sin(x);
+    });
 
     localChordAnalyzer = std::make_unique<LocalChordAnalyzer>();
     linkTimingState = std::make_unique<LinkTimingState>();
@@ -2892,6 +3050,11 @@ void NinjamVst3AudioProcessor::stopAdvancedVideoClient()
 {
     videoHelperRunning.store(false);
     lastIntervalHelperPayloadWriteMs = 0.0;
+    {
+        const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+        remoteVideoBufferRefreshIdByUser.clear();
+        videoBufferRefreshCounter = 0;
+    }
     if (advancedVideoServer)
         advancedVideoServer->stop();
     advancedVideoServer.reset();
@@ -4414,6 +4577,22 @@ bool NinjamVst3AudioProcessor::isFxDelayEnabled() const
     return fxDelayEnabled.load();
 }
 
+void NinjamVst3AudioProcessor::setFxDelayMode(FxDelayMode mode)
+{
+    const int modeValue = mode == FxDelayMode::frippertronics ? (int)FxDelayMode::frippertronics
+                                                              : (int)FxDelayMode::standard;
+    const int previous = fxDelayMode.exchange(modeValue);
+    if (previous != modeValue)
+        fxDelayLowpassState.fill(0.0f);
+}
+
+NinjamVst3AudioProcessor::FxDelayMode NinjamVst3AudioProcessor::getFxDelayMode() const
+{
+    return fxDelayMode.load() == (int)FxDelayMode::frippertronics
+        ? FxDelayMode::frippertronics
+        : FxDelayMode::standard;
+}
+
 void NinjamVst3AudioProcessor::setFxReverbRoomSize(float roomSize)
 {
     fxReverbRoomSize.store(juce::jlimit(0.0f, 1.0f, roomSize));
@@ -4466,7 +4645,7 @@ float NinjamVst3AudioProcessor::getFxReverbTail() const
 
 void NinjamVst3AudioProcessor::setFxDelayTimeMs(float timeMs)
 {
-    fxDelayTimeMs.store(juce::jlimit(20.0f, 2000.0f, timeMs));
+    fxDelayTimeMs.store(juce::jlimit(20.0f, 10000.0f, timeMs));
 }
 
 float NinjamVst3AudioProcessor::getFxDelayTimeMs() const
@@ -5179,10 +5358,15 @@ void NinjamVst3AudioProcessor::prepareToPlay (double sampleRate, int samplesPerB
     params.freezeMode = 0.0f;
     fxReverb.setParameters(params);
 
-    const int maxDelaySamples = juce::jmax(1, (int)std::ceil(processingSampleRate * 2.5));
-    fxDelayBuffer.setSize(2, maxDelaySamples, false, true, true);
+    const int maxGlobalDelaySamples = juce::jmax(1, (int)std::ceil(processingSampleRate * 10.0));
+    const int maxSamplePadDelaySamples = juce::jmax(1, (int)std::ceil(processingSampleRate * 2.5));
+    fxDelayBuffer.setSize(2, maxGlobalDelaySamples, false, true, true);
     fxDelayBuffer.clear();
     fxDelayWritePosition = 0;
+    fxDelayLowpassState.fill(0.0f);
+    samplePadFxScratchBuffer.setSize(2, juce::jmax(1, samplesPerBlock), false, true, true);
+    samplePadFxScratchBuffer.clear();
+    samplePadDuckGainBuffer.assign((size_t)juce::jmax(1, samplesPerBlock), 1.0f);
 
     fxReverbInputBuffer.setSize(1, juce::jmax(1, samplesPerBlock), false, true, true);
     fxDelayInputBuffer.setSize(1, juce::jmax(1, samplesPerBlock), false, true, true);
@@ -5192,6 +5376,51 @@ void NinjamVst3AudioProcessor::prepareToPlay (double sampleRate, int samplesPerB
     samplePadsRenderBuffer.clear();
     samplePadsOneShotRenderBuffer.clear();
     samplePadsPeak.store(0.0f, std::memory_order_relaxed);
+
+    juce::dsp::ProcessSpec sampleFxSpec;
+    sampleFxSpec.sampleRate = sampleRate;
+    sampleFxSpec.maximumBlockSize = (juce::uint32) juce::jmax(1, samplesPerBlock);
+    sampleFxSpec.numChannels = 2;
+    for (int pad = 0; pad < numSamplePads; ++pad)
+    {
+        for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+        {
+            auto& dj = samplePadPerPadDjFilters[(size_t)pad][(size_t)slot];
+            dj.prepare(sampleFxSpec);
+            dj.setResonance(0.707f);
+            dj.reset();
+
+            auto& bp = samplePadPerPadDjBpFilters[(size_t)pad][(size_t)slot];
+            bp.prepare(sampleFxSpec);
+            bp.setType(juce::dsp::StateVariableTPTFilterType::bandpass);
+            bp.setResonance(1.2f);
+            bp.reset();
+
+            auto& phaser = samplePadPerPadPhasers[(size_t)pad][(size_t)slot];
+            phaser.prepare(sampleFxSpec);
+            phaser.setDepth(0.72f);
+            phaser.setCentreFrequency(950.0f);
+            phaser.setFeedback(0.18f);
+            phaser.setMix(0.0f);
+            phaser.reset();
+
+            auto& slotDelay = samplePadPerPadDelayBuffers[(size_t)pad][(size_t)slot];
+            slotDelay.setSize(2, maxSamplePadDelaySamples, false, true, true);
+            slotDelay.clear();
+            samplePadPerPadDelayWritePositions[(size_t)pad][(size_t)slot] = 0;
+
+            auto& reverb = samplePadPerPadReverbs[(size_t)pad][(size_t)slot];
+            reverb.reset();
+            reverb.setParameters(params);
+
+            auto& slotInput = samplePadPerPadFxSlotInputBuffers[(size_t)pad][(size_t)slot];
+            slotInput.setSize(2, juce::jmax(1, samplesPerBlock), false, true, true);
+            slotInput.clear();
+        }
+    }
+    samplePadDuckOscillator.prepare(sampleFxSpec);
+    samplePadDuckOscillator.setFrequency(1.0f, true);
+    samplePadDuckOscillator.reset();
 
     linkAudioMaxNumSamples = (size_t) juce::jmax(8192, samplesPerBlock * 2);
     {
@@ -5304,6 +5533,9 @@ void NinjamVst3AudioProcessor::clearSamplePad(int padIndex)
         pad.undoClearReverse = pad.reverse.load(std::memory_order_relaxed);
         pad.undoClearMatchBpi = pad.matchBpi.load(std::memory_order_relaxed);
         pad.undoClearBpmSyncEnabled = pad.bpmSyncEnabled.load(std::memory_order_relaxed);
+        pad.undoClearDuckRoute = pad.duckRoute.load(std::memory_order_relaxed);
+        for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+            pad.undoClearFxSlotRoutes[(size_t)slot] = pad.fxSlotRoutes[(size_t)slot].load(std::memory_order_relaxed);
         pad.undoClearLoopAnchorBeat = pad.loopAnchorBeat;
         pad.undoClearRecordedStartBeatInInterval = pad.recordedStartBeatInInterval;
         pad.undoClearLoopLengthBeats = pad.loopLengthBeats;
@@ -5325,6 +5557,9 @@ void NinjamVst3AudioProcessor::clearSamplePad(int padIndex)
     pad.reverse.store(false, std::memory_order_relaxed);
     pad.matchBpi.store(false, std::memory_order_relaxed);
     pad.bpmSyncEnabled.store(true, std::memory_order_relaxed);
+    pad.duckRoute.store(false, std::memory_order_relaxed);
+    for (auto& route : pad.fxSlotRoutes)
+        route.store(false, std::memory_order_relaxed);
     pad.playing.store(false, std::memory_order_relaxed);
     pad.playbackScheduled.store(false, std::memory_order_relaxed);
     for (auto& voice : pad.oneShotVoices)
@@ -5359,6 +5594,39 @@ void NinjamVst3AudioProcessor::clearSamplePad(int padIndex)
     pad.midiHoldStartMs = 0.0;
 }
 
+void NinjamVst3AudioProcessor::clearAllSamplePads()
+{
+    for (int pad = 0; pad < numSamplePads; ++pad)
+        clearSamplePad(pad);
+}
+
+void NinjamVst3AudioProcessor::resetSamplePadSettings()
+{
+    samplePadsVolume.store(1.0f, std::memory_order_relaxed);
+    samplePadsLimiterEnabled.store(false, std::memory_order_relaxed);
+    samplePadsDuckEnabled.store(false, std::memory_order_relaxed);
+    samplePadsDuckShape.store((int)SamplePadDuckShape::smoothPump, std::memory_order_relaxed);
+    samplePadsDuckLength.store((int)SamplePadDuckLength::quarter, std::memory_order_relaxed);
+    samplePadsUseDefaultFx.store(true, std::memory_order_relaxed);
+    samplePadsPeak.store(0.0f, std::memory_order_relaxed);
+
+    for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+    {
+        samplePadFxSlotTypes[(size_t)slot].store((int)getDefaultSamplePadFxType(slot), std::memory_order_relaxed);
+        samplePadFxSlotAmounts[(size_t)slot].store(0.0f, std::memory_order_relaxed);
+        for (int targetSlot = 0; targetSlot < numSamplePadFxSlots; ++targetSlot)
+            samplePadFxSlotChainRoutes[(size_t)slot][(size_t)targetSlot].store(false, std::memory_order_relaxed);
+    }
+
+    const juce::ScopedLock lock(samplePadsLock);
+    for (auto& pad : samplePads)
+    {
+        pad.duckRoute.store(false, std::memory_order_relaxed);
+        for (auto& route : pad.fxSlotRoutes)
+            route.store(false, std::memory_order_relaxed);
+    }
+}
+
 void NinjamVst3AudioProcessor::undoSamplePadClear(int padIndex)
 {
     if (!isValidSamplePadIndex(padIndex))
@@ -5383,6 +5651,9 @@ void NinjamVst3AudioProcessor::undoSamplePadClear(int padIndex)
     pad.reverse.store(pad.undoClearReverse, std::memory_order_relaxed);
     pad.matchBpi.store(pad.undoClearMatchBpi, std::memory_order_relaxed);
     pad.bpmSyncEnabled.store(pad.undoClearBpmSyncEnabled, std::memory_order_relaxed);
+    pad.duckRoute.store(pad.undoClearDuckRoute, std::memory_order_relaxed);
+    for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+        pad.fxSlotRoutes[(size_t)slot].store(pad.undoClearFxSlotRoutes[(size_t)slot], std::memory_order_relaxed);
     pad.loopAnchorBeat = pad.undoClearLoopAnchorBeat;
     pad.recordedStartBeatInInterval = pad.undoClearRecordedStartBeatInInterval;
     pad.loopLengthBeats = pad.undoClearLoopLengthBeats;
@@ -6054,9 +6325,178 @@ bool NinjamVst3AudioProcessor::isSamplePadLimiterEnabled() const
     return samplePadsLimiterEnabled.load(std::memory_order_relaxed);
 }
 
+void NinjamVst3AudioProcessor::setSamplePadDuckEnabled(bool shouldEnable)
+{
+    samplePadsDuckEnabled.store(shouldEnable, std::memory_order_relaxed);
+}
+
+bool NinjamVst3AudioProcessor::isSamplePadDuckEnabled() const
+{
+    return samplePadsDuckEnabled.load(std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::setSamplePadDuckShape(SamplePadDuckShape shape)
+{
+    samplePadsDuckShape.store((int)sanitizeSamplePadDuckShape((int)shape), std::memory_order_relaxed);
+}
+
+NinjamVst3AudioProcessor::SamplePadDuckShape NinjamVst3AudioProcessor::getSamplePadDuckShape() const
+{
+    return sanitizeSamplePadDuckShape(samplePadsDuckShape.load(std::memory_order_relaxed));
+}
+
+void NinjamVst3AudioProcessor::setSamplePadDuckLength(SamplePadDuckLength length)
+{
+    samplePadsDuckLength.store((int)sanitizeSamplePadDuckLength((int)length), std::memory_order_relaxed);
+}
+
+NinjamVst3AudioProcessor::SamplePadDuckLength NinjamVst3AudioProcessor::getSamplePadDuckLength() const
+{
+    return sanitizeSamplePadDuckLength(samplePadsDuckLength.load(std::memory_order_relaxed));
+}
+
+void NinjamVst3AudioProcessor::setSamplePadsUseDefaultFx(bool shouldUse)
+{
+    samplePadsUseDefaultFx.store(shouldUse, std::memory_order_relaxed);
+}
+
+bool NinjamVst3AudioProcessor::getSamplePadsUseDefaultFx() const
+{
+    return samplePadsUseDefaultFx.load(std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::setSamplePadDuckRouteEnabled(int padIndex, bool shouldEnable)
+{
+    if (!isValidSamplePadIndex(padIndex))
+        return;
+
+    samplePads[(size_t)padIndex].duckRoute.store(shouldEnable, std::memory_order_relaxed);
+}
+
+bool NinjamVst3AudioProcessor::isSamplePadDuckRouteEnabled(int padIndex) const
+{
+    if (!isValidSamplePadIndex(padIndex))
+        return false;
+
+    return samplePads[(size_t)padIndex].duckRoute.load(std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::setSamplePadFxSlotRouteEnabled(int padIndex, int slotIndex, bool shouldEnable)
+{
+    if (!isValidSamplePadIndex(padIndex) || !isValidSamplePadFxSlot(slotIndex))
+        return;
+
+    samplePads[(size_t)padIndex].fxSlotRoutes[(size_t)slotIndex].store(shouldEnable,
+                                                                       std::memory_order_relaxed);
+}
+
+bool NinjamVst3AudioProcessor::isSamplePadFxSlotRouteEnabled(int padIndex, int slotIndex) const
+{
+    if (!isValidSamplePadIndex(padIndex) || !isValidSamplePadFxSlot(slotIndex))
+        return false;
+
+    return samplePads[(size_t)padIndex].fxSlotRoutes[(size_t)slotIndex].load(std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::setSamplePadFxSlotToSlotRouteEnabled(int sourceSlotIndex,
+                                                                     int targetSlotIndex,
+                                                                     bool shouldEnable)
+{
+    if (!isValidSamplePadFxSlot(sourceSlotIndex) || !isValidSamplePadFxSlot(targetSlotIndex))
+        return;
+
+    if (shouldEnable && !canRouteSamplePadFxSlotToSlot(sourceSlotIndex, targetSlotIndex))
+        return;
+
+    samplePadFxSlotChainRoutes[(size_t)sourceSlotIndex][(size_t)targetSlotIndex].store(shouldEnable,
+                                                                                       std::memory_order_relaxed);
+}
+
+bool NinjamVst3AudioProcessor::isSamplePadFxSlotToSlotRouteEnabled(int sourceSlotIndex, int targetSlotIndex) const
+{
+    if (!isValidSamplePadFxSlot(sourceSlotIndex) || !isValidSamplePadFxSlot(targetSlotIndex))
+        return false;
+
+    return samplePadFxSlotChainRoutes[(size_t)sourceSlotIndex][(size_t)targetSlotIndex].load(std::memory_order_relaxed);
+}
+
+bool NinjamVst3AudioProcessor::canRouteSamplePadFxSlotToSlot(int sourceSlotIndex, int targetSlotIndex) const
+{
+    if (!isValidSamplePadFxSlot(sourceSlotIndex)
+        || !isValidSamplePadFxSlot(targetSlotIndex)
+        || sourceSlotIndex == targetSlotIndex)
+        return false;
+
+    if (isSamplePadFxSlotToSlotRouteEnabled(sourceSlotIndex, targetSlotIndex))
+        return true;
+
+    std::array<bool, numSamplePadFxSlots> visited {};
+    std::array<int, numSamplePadFxSlots> stack {};
+    int stackSize = 0;
+    visited[(size_t)sourceSlotIndex] = true;
+    stack[(size_t)stackSize++] = sourceSlotIndex;
+
+    while (stackSize > 0)
+    {
+        const int slot = stack[(size_t)--stackSize];
+        if (slot == targetSlotIndex)
+            return false;
+
+        for (int other = 0; other < numSamplePadFxSlots; ++other)
+        {
+            if (visited[(size_t)other])
+                continue;
+
+            const bool connected = samplePadFxSlotChainRoutes[(size_t)slot][(size_t)other].load(std::memory_order_relaxed)
+                || samplePadFxSlotChainRoutes[(size_t)other][(size_t)slot].load(std::memory_order_relaxed);
+            if (!connected)
+                continue;
+
+            visited[(size_t)other] = true;
+            stack[(size_t)stackSize++] = other;
+        }
+    }
+
+    return true;
+}
+
 float NinjamVst3AudioProcessor::getSamplePadPeak() const
 {
     return samplePadsPeak.load(std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::setSamplePadFxSlotType(int slotIndex, SamplePadFxType type)
+{
+    if (!isValidSamplePadFxSlot(slotIndex))
+        return;
+
+    samplePadFxSlotTypes[(size_t)slotIndex].store((int)sanitizeSamplePadFxType((int)type),
+                                                  std::memory_order_relaxed);
+}
+
+NinjamVst3AudioProcessor::SamplePadFxType NinjamVst3AudioProcessor::getSamplePadFxSlotType(int slotIndex) const
+{
+    if (!isValidSamplePadFxSlot(slotIndex))
+        return SamplePadFxType::reverb;
+
+    return sanitizeSamplePadFxType(samplePadFxSlotTypes[(size_t)slotIndex].load(std::memory_order_relaxed));
+}
+
+void NinjamVst3AudioProcessor::setSamplePadFxSlotAmount(int slotIndex, float amount)
+{
+    if (!isValidSamplePadFxSlot(slotIndex))
+        return;
+
+    samplePadFxSlotAmounts[(size_t)slotIndex].store(juce::jlimit(0.0f, 1.0f, amount),
+                                                    std::memory_order_relaxed);
+}
+
+float NinjamVst3AudioProcessor::getSamplePadFxSlotAmount(int slotIndex) const
+{
+    if (!isValidSamplePadFxSlot(slotIndex))
+        return 0.0f;
+
+    return samplePadFxSlotAmounts[(size_t)slotIndex].load(std::memory_order_relaxed);
 }
 
 juce::File NinjamVst3AudioProcessor::getSamplePadBanksDirectory() const
@@ -6115,6 +6555,8 @@ bool NinjamVst3AudioProcessor::saveSamplePadBank(const juce::String& bankName, j
         bool reverse = false;
         bool matchBpi = false;
         bool bpmSyncEnabled = true;
+        bool duckRoute = false;
+        std::array<bool, numSamplePadFxSlots> fxSlotRoutes {};
         bool recordedLoop = false;
         bool bpmSyncApplied = false;
         int loopLengthBeats = 0;
@@ -6139,6 +6581,9 @@ bool NinjamVst3AudioProcessor::saveSamplePadBank(const juce::String& bankName, j
             snapshot.reverse = source.reverse.load(std::memory_order_relaxed);
             snapshot.matchBpi = source.matchBpi.load(std::memory_order_relaxed);
             snapshot.bpmSyncEnabled = source.bpmSyncEnabled.load(std::memory_order_relaxed);
+            snapshot.duckRoute = source.duckRoute.load(std::memory_order_relaxed);
+            for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+                snapshot.fxSlotRoutes[(size_t)slot] = source.fxSlotRoutes[(size_t)slot].load(std::memory_order_relaxed);
             snapshot.recordedLoop = source.recordedLoop;
             snapshot.bpmSyncApplied = source.bpmSyncApplied;
             snapshot.loopLengthBeats = source.loopLengthBeats;
@@ -6152,6 +6597,37 @@ bool NinjamVst3AudioProcessor::saveSamplePadBank(const juce::String& bankName, j
     root->setProperty("version", 1);
     root->setProperty("name", safeName);
     root->setProperty("savedAt", juce::Time::getCurrentTime().toISO8601(true));
+    root->setProperty("duck", isSamplePadDuckEnabled());
+    root->setProperty("duckShape", (int)getSamplePadDuckShape());
+    root->setProperty("duckLength", (int)getSamplePadDuckLength());
+    root->setProperty("useDefaultFx", getSamplePadsUseDefaultFx());
+
+    juce::Array<juce::var> fxSlotArray;
+    for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+    {
+        juce::DynamicObject::Ptr slotObj = new juce::DynamicObject();
+        slotObj->setProperty("index", slot);
+        slotObj->setProperty("type", (int)getSamplePadFxSlotType(slot));
+        slotObj->setProperty("amount", (double)getSamplePadFxSlotAmount(slot));
+        fxSlotArray.add(juce::var(slotObj.get()));
+    }
+    root->setProperty("fxSlots", juce::var(fxSlotArray));
+
+    juce::Array<juce::var> fxChainRouteArray;
+    for (int sourceSlot = 0; sourceSlot < numSamplePadFxSlots; ++sourceSlot)
+    {
+        for (int targetSlot = 0; targetSlot < numSamplePadFxSlots; ++targetSlot)
+        {
+            if (!isSamplePadFxSlotToSlotRouteEnabled(sourceSlot, targetSlot))
+                continue;
+
+            juce::DynamicObject::Ptr routeObj = new juce::DynamicObject();
+            routeObj->setProperty("source", sourceSlot);
+            routeObj->setProperty("target", targetSlot);
+            fxChainRouteArray.add(juce::var(routeObj.get()));
+        }
+    }
+    root->setProperty("fxChainRoutes", juce::var(fxChainRouteArray));
 
     juce::Array<juce::var> padArray;
     for (int pad = 0; pad < numSamplePads; ++pad)
@@ -6166,6 +6642,9 @@ bool NinjamVst3AudioProcessor::saveSamplePadBank(const juce::String& bankName, j
         padObj->setProperty("reverse", snapshot.reverse);
         padObj->setProperty("matchBpi", snapshot.matchBpi);
         padObj->setProperty("bpmSyncEnabled", snapshot.bpmSyncEnabled);
+        padObj->setProperty("duckRoute", snapshot.duckRoute);
+        for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+            padObj->setProperty("fxSlotRoute" + juce::String(slot), snapshot.fxSlotRoutes[(size_t)slot]);
         padObj->setProperty("recordedLoop", snapshot.recordedLoop);
         padObj->setProperty("bpmSyncApplied", snapshot.bpmSyncApplied);
         padObj->setProperty("loopLengthBeats", snapshot.loopLengthBeats);
@@ -6251,6 +6730,55 @@ bool NinjamVst3AudioProcessor::loadSamplePadBank(const juce::File& bankDirectory
         return false;
     }
 
+    setSamplePadDuckEnabled(rootObj->hasProperty("duck") ? (bool)rootObj->getProperty("duck") : false);
+    setSamplePadDuckShape(rootObj->hasProperty("duckShape")
+        ? sanitizeSamplePadDuckShape((int)rootObj->getProperty("duckShape"))
+        : SamplePadDuckShape::smoothPump);
+    setSamplePadDuckLength(rootObj->hasProperty("duckLength")
+        ? sanitizeSamplePadDuckLength((int)rootObj->getProperty("duckLength"))
+        : SamplePadDuckLength::quarter);
+    setSamplePadsUseDefaultFx(rootObj->hasProperty("useDefaultFx") ? (bool)rootObj->getProperty("useDefaultFx") : true);
+    for (int sourceSlot = 0; sourceSlot < numSamplePadFxSlots; ++sourceSlot)
+        for (int targetSlot = 0; targetSlot < numSamplePadFxSlots; ++targetSlot)
+            setSamplePadFxSlotToSlotRouteEnabled(sourceSlot, targetSlot, false);
+
+    if (auto* fxSlots = rootObj->getProperty("fxSlots").getArray())
+    {
+        for (const auto& slotVar : *fxSlots)
+        {
+            auto* slotObj = slotVar.getDynamicObject();
+            if (slotObj == nullptr)
+                continue;
+
+            const int slotIndex = (int)slotObj->getProperty("index");
+            if (!isValidSamplePadFxSlot(slotIndex))
+                continue;
+
+            setSamplePadFxSlotType(slotIndex,
+                                   sanitizeSamplePadFxType(slotObj->hasProperty("type")
+                                       ? (int)slotObj->getProperty("type")
+                                       : 0));
+            setSamplePadFxSlotAmount(slotIndex,
+                                     juce::jlimit(0.0f, 1.0f, slotObj->hasProperty("amount")
+                                         ? (float)(double)slotObj->getProperty("amount")
+                                         : 0.0f));
+        }
+    }
+
+    if (auto* fxChainRoutes = rootObj->getProperty("fxChainRoutes").getArray())
+    {
+        for (const auto& routeVar : *fxChainRoutes)
+        {
+            auto* routeObj = routeVar.getDynamicObject();
+            if (routeObj == nullptr)
+                continue;
+
+            const int sourceSlot = routeObj->hasProperty("source") ? (int)routeObj->getProperty("source") : -1;
+            const int targetSlot = routeObj->hasProperty("target") ? (int)routeObj->getProperty("target") : -1;
+            setSamplePadFxSlotToSlotRouteEnabled(sourceSlot, targetSlot, true);
+        }
+    }
+
     for (int pad = 0; pad < numSamplePads; ++pad)
         clearSamplePad(pad);
 
@@ -6284,6 +6812,15 @@ bool NinjamVst3AudioProcessor::loadSamplePadBank(const juce::File& bankDirectory
         pad.reverse.store((bool)padObj->getProperty("reverse"), std::memory_order_relaxed);
         pad.matchBpi.store((bool)padObj->getProperty("matchBpi"), std::memory_order_relaxed);
         pad.bpmSyncEnabled.store((bool)padObj->getProperty("bpmSyncEnabled"), std::memory_order_relaxed);
+        pad.duckRoute.store(padObj->hasProperty("duckRoute") ? (bool)padObj->getProperty("duckRoute") : false,
+                            std::memory_order_relaxed);
+        for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+        {
+            pad.fxSlotRoutes[(size_t)slot].store(padObj->hasProperty("fxSlotRoute" + juce::String(slot))
+                                                     ? (bool)padObj->getProperty("fxSlotRoute" + juce::String(slot))
+                                                     : false,
+                                                 std::memory_order_relaxed);
+        }
         pad.recordedLoop = (bool)padObj->getProperty("recordedLoop");
         pad.bpmSyncApplied = false;
         pad.loopLengthBeats = (int)padObj->getProperty("loopLengthBeats");
@@ -6835,6 +7372,16 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
         samplePadsOneShotRenderBuffer.setSize(2, numSamples, false, true, true);
     samplePadsRenderBuffer.clear();
     samplePadsOneShotRenderBuffer.clear();
+    for (int pad = 0; pad < numSamplePads; ++pad)
+    {
+        for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+        {
+            auto& slotBuffer = samplePadPerPadFxSlotInputBuffers[(size_t)pad][(size_t)slot];
+            if (slotBuffer.getNumChannels() < 2 || slotBuffer.getNumSamples() < numSamples)
+                slotBuffer.setSize(2, numSamples, false, true, true);
+            slotBuffer.clear();
+        }
+    }
 
     const double targetRate = processingSampleRate > 1.0 ? processingSampleRate : juce::jmax(1.0, getSampleRate());
     const double safeSamplesPerBeat = juce::jmax(1.0, samplesPerBeat);
@@ -6843,11 +7390,33 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
     float* outR = samplePadsRenderBuffer.getWritePointer(1);
     float* oneShotOutL = samplePadsOneShotRenderBuffer.getWritePointer(0);
     float* oneShotOutR = samplePadsOneShotRenderBuffer.getWritePointer(1);
+    const bool duckActive = samplePadsDuckEnabled.load(std::memory_order_relaxed);
+    const float* duckGains = nullptr;
+    if (duckActive)
+    {
+        if (samplePadDuckGainBuffer.size() < (size_t)numSamples)
+            samplePadDuckGainBuffer.resize((size_t)numSamples, 1.0f);
+
+        const double bpm = juce::jmax(1.0, (double)getBPM());
+        const auto duckShape = getSamplePadDuckShape();
+        const auto duckLength = getSamplePadDuckLength();
+        samplePadDuckOscillator.setFrequency((float)(bpm / 60.0), false);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            (void)samplePadDuckOscillator.processSample(0.0f);
+            samplePadDuckGainBuffer[(size_t)i] =
+                getSamplePadDuckGainForBeat(blockStartBeat + (double)i / safeSamplesPerBeat,
+                                            duckShape,
+                                            duckLength);
+        }
+        duckGains = samplePadDuckGainBuffer.data();
+    }
 
     {
         const juce::ScopedLock lock(samplePadsLock);
-        for (auto& pad : samplePads)
+        for (int padIndex = 0; padIndex < numSamplePads; ++padIndex)
         {
+            auto& pad = samplePads[(size_t)padIndex];
             const int length = pad.sample.getNumSamples();
             if (length <= 0)
             {
@@ -6868,6 +7437,15 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
             const bool loop = pad.loop.load(std::memory_order_relaxed);
             const double lengthD = (double)length;
             const double step = juce::jmax(0.000001, pad.sourceSampleRate / targetRate);
+            const bool duckThisPad = duckActive && pad.duckRoute.load(std::memory_order_relaxed);
+            std::array<bool, numSamplePadFxSlots> routedFxSlots {};
+            bool hasRoutedFxSlot = false;
+            for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+            {
+                const bool routed = pad.fxSlotRoutes[(size_t)slot].load(std::memory_order_relaxed);
+                routedFxSlots[(size_t)slot] = routed;
+                hasRoutedFxSlot = hasRoutedFxSlot || routed;
+            }
 
             int startSample = 0;
             bool mainVoiceActive = pad.playing.load(std::memory_order_relaxed);
@@ -6893,8 +7471,22 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
                     const int index0 = juce::jlimit(0, length - 1, (int)std::floor(pos));
                     const int index1 = juce::jmin(index0 + 1, length - 1);
                     const float frac = (float)(pos - (double)index0);
-                    outL[i] += srcL[index0] + (srcL[index1] - srcL[index0]) * frac;
-                    outR[i] += srcR[index0] + (srcR[index1] - srcR[index0]) * frac;
+                    const float gain = duckThisPad ? duckGains[i] : 1.0f;
+                    const float sampleL = (srcL[index0] + (srcL[index1] - srcL[index0]) * frac) * gain;
+                    const float sampleR = (srcR[index0] + (srcR[index1] - srcR[index0]) * frac) * gain;
+                    outL[i] += sampleL;
+                    outR[i] += sampleR;
+                    if (hasRoutedFxSlot)
+                    {
+                        for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+                        {
+                            if (!routedFxSlots[(size_t)slot])
+                                continue;
+                            auto& fxBuffer = samplePadPerPadFxSlotInputBuffers[(size_t)padIndex][(size_t)slot];
+                            fxBuffer.addSample(0, i, sampleL);
+                            fxBuffer.addSample(1, i, sampleR);
+                        }
+                    }
 
                     pos += reverse ? -step : step;
                     if (reverse)
@@ -6948,12 +7540,24 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
                     const int index0 = juce::jlimit(0, length - 1, (int)std::floor(pos));
                     const int index1 = juce::jmin(index0 + 1, length - 1);
                     const float frac = (float)(pos - (double)index0);
-                    const float sampleL = srcL[index0] + (srcL[index1] - srcL[index0]) * frac;
-                    const float sampleR = srcR[index0] + (srcR[index1] - srcR[index0]) * frac;
+                    const float gain = duckThisPad ? duckGains[i] : 1.0f;
+                    const float sampleL = (srcL[index0] + (srcL[index1] - srcL[index0]) * frac) * gain;
+                    const float sampleR = (srcR[index0] + (srcR[index1] - srcR[index0]) * frac) * gain;
                     outL[i] += sampleL;
                     outR[i] += sampleR;
                     oneShotOutL[i] += sampleL;
                     oneShotOutR[i] += sampleR;
+                    if (hasRoutedFxSlot)
+                    {
+                        for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+                        {
+                            if (!routedFxSlots[(size_t)slot])
+                                continue;
+                            auto& fxBuffer = samplePadPerPadFxSlotInputBuffers[(size_t)padIndex][(size_t)slot];
+                            fxBuffer.addSample(0, i, sampleL);
+                            fxBuffer.addSample(1, i, sampleR);
+                        }
+                    }
 
                     pos += reverse ? -step : step;
                     if (reverse)
@@ -6984,6 +7588,30 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
     }
 
     const float volume = samplePadsVolume.load(std::memory_order_relaxed);
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        float* data = samplePadsRenderBuffer.getWritePointer(ch);
+        float* oneShotData = samplePadsOneShotRenderBuffer.getWritePointer(ch);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            data[i] *= volume;
+            oneShotData[i] *= volume;
+        }
+    }
+    if (volume != 1.0f)
+    {
+        for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+        {
+            for (int pad = 0; pad < numSamplePads; ++pad)
+            {
+                samplePadPerPadFxSlotInputBuffers[(size_t)pad][(size_t)slot].applyGain(0, 0, numSamples, volume);
+                samplePadPerPadFxSlotInputBuffers[(size_t)pad][(size_t)slot].applyGain(1, 0, numSamples, volume);
+            }
+        }
+    }
+
+    applySamplePadInsertFx(numSamples, blockStartBeat, samplesPerBeat, bpi);
+
     const bool limiter = samplePadsLimiterEnabled.load(std::memory_order_relaxed);
     constexpr float limiterThreshold = 0.79432823f; // -2 dBFS
     float peak = 0.0f;
@@ -6993,13 +7621,13 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
         float* oneShotData = samplePadsOneShotRenderBuffer.getWritePointer(ch);
         for (int i = 0; i < numSamples; ++i)
         {
-            float v = data[i] * volume;
+            float v = data[i];
             if (limiter)
                 v = juce::jlimit(-limiterThreshold, limiterThreshold, v);
 
             data[i] = v;
 
-            float oneShotV = oneShotData[i] * volume;
+            float oneShotV = oneShotData[i];
             if (limiter)
                 oneShotV = juce::jlimit(-limiterThreshold, limiterThreshold, oneShotV);
             oneShotData[i] = oneShotV;
@@ -7010,6 +7638,332 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
 
     samplePadsPeak.store(peak, std::memory_order_relaxed);
     return peak > 0.000001f;
+}
+
+void NinjamVst3AudioProcessor::applySamplePadInsertFx(int numSamples,
+                                                      double,
+                                                      double,
+                                                      int)
+{
+    if (numSamples <= 0
+        || samplePadsRenderBuffer.getNumChannels() < 2
+        || samplePadsRenderBuffer.getNumSamples() < numSamples)
+        return;
+
+    const double sampleRate = processingSampleRate > 1.0 ? processingSampleRate : juce::jmax(1.0, getSampleRate());
+    const double bpm = juce::jmax(1.0, (double)getBPM());
+    if (samplePadFxScratchBuffer.getNumChannels() < 2 || samplePadFxScratchBuffer.getNumSamples() < numSamples)
+        samplePadFxScratchBuffer.setSize(2, numSamples, false, true, true);
+
+    std::array<std::array<bool, numSamplePadFxSlots>, numSamplePadFxSlots> chainRoutes {};
+    std::array<bool, numSamplePadFxSlots> slotHasInput {};
+    std::array<bool, numSamplePadFxSlots> slotHasDownstream {};
+    for (int sourceSlot = 0; sourceSlot < numSamplePadFxSlots; ++sourceSlot)
+    {
+        for (int targetSlot = 0; targetSlot < numSamplePadFxSlots; ++targetSlot)
+        {
+            const bool routed = samplePadFxSlotChainRoutes[(size_t)sourceSlot][(size_t)targetSlot].load(std::memory_order_relaxed);
+            chainRoutes[(size_t)sourceSlot][(size_t)targetSlot] = routed;
+            slotHasDownstream[(size_t)sourceSlot] = slotHasDownstream[(size_t)sourceSlot] || routed;
+        }
+    }
+
+    std::array<int, numSamplePadFxSlots> fxProcessOrder {};
+    std::array<int, numSamplePadFxSlots> indegree {};
+    std::array<bool, numSamplePadFxSlots> ordered {};
+    for (int sourceSlot = 0; sourceSlot < numSamplePadFxSlots; ++sourceSlot)
+        for (int targetSlot = 0; targetSlot < numSamplePadFxSlots; ++targetSlot)
+            if (chainRoutes[(size_t)sourceSlot][(size_t)targetSlot])
+                ++indegree[(size_t)targetSlot];
+
+    int orderCount = 0;
+    for (int pass = 0; pass < numSamplePadFxSlots; ++pass)
+    {
+        int nextSlot = -1;
+        for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+        {
+            if (!ordered[(size_t)slot] && indegree[(size_t)slot] == 0)
+            {
+                nextSlot = slot;
+                break;
+            }
+        }
+
+        if (nextSlot < 0)
+            break;
+
+        ordered[(size_t)nextSlot] = true;
+        fxProcessOrder[(size_t)orderCount++] = nextSlot;
+        for (int targetSlot = 0; targetSlot < numSamplePadFxSlots; ++targetSlot)
+            if (chainRoutes[(size_t)nextSlot][(size_t)targetSlot])
+                --indegree[(size_t)targetSlot];
+    }
+
+    for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+        if (!ordered[(size_t)slot])
+            fxProcessOrder[(size_t)orderCount++] = slot;
+
+    auto copySlotDry = [this, numSamples](const juce::AudioBuffer<float>& slotBuffer)
+    {
+        samplePadFxScratchBuffer.copyFrom(0, 0, slotBuffer, 0, 0, numSamples);
+        samplePadFxScratchBuffer.copyFrom(1, 0, slotBuffer, 1, 0, numSamples);
+    };
+
+    auto addSlotDeltaToOutput = [this, numSamples](const juce::AudioBuffer<float>& slotBuffer)
+    {
+        float* outL = samplePadsRenderBuffer.getWritePointer(0);
+        float* outR = samplePadsRenderBuffer.getWritePointer(1);
+        const float* dryL = samplePadFxScratchBuffer.getReadPointer(0);
+        const float* dryR = samplePadFxScratchBuffer.getReadPointer(1);
+        const float* wetL = slotBuffer.getReadPointer(0);
+        const float* wetR = slotBuffer.getReadPointer(1);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            outL[i] += wetL[i] - dryL[i];
+            outR[i] += wetR[i] - dryR[i];
+        }
+    };
+
+    for (int padIndex = 0; padIndex < numSamplePads; ++padIndex)
+    {
+        for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+            slotHasInput[(size_t)slot] = samplePads[(size_t)padIndex].fxSlotRoutes[(size_t)slot].load(std::memory_order_relaxed);
+
+        for (int orderIndex = 0; orderIndex < numSamplePadFxSlots; ++orderIndex)
+        {
+            const int slot = fxProcessOrder[(size_t)orderIndex];
+            const auto type = getSamplePadFxSlotType(slot);
+            const float amount = juce::jlimit(0.0f, 1.0f, getSamplePadFxSlotAmount(slot));
+            if (!slotHasInput[(size_t)slot])
+                continue;
+            if (amount <= 0.0001f && !slotHasDownstream[(size_t)slot])
+                continue;
+
+            auto& slotBuffer = samplePadPerPadFxSlotInputBuffers[(size_t)padIndex][(size_t)slot];
+            if (slotBuffer.getNumChannels() < 2 || slotBuffer.getNumSamples() < numSamples)
+                continue;
+
+            if (amount > 0.0001f)
+            {
+                switch (type)
+                {
+                case SamplePadFxType::djFilter:
+                {
+                    if (amount > 0.49f && amount < 0.51f)
+                        break;
+
+                    copySlotDry(slotBuffer);
+                    auto& filter = samplePadPerPadDjFilters[(size_t)padIndex][(size_t)slot];
+                    if (amount < 0.5f)
+                    {
+                        filter.setType(juce::dsp::StateVariableTPTFilterType::lowpass);
+                        filter.setCutoffFrequency((float)mapNormalisedToLogFrequency((double)amount / 0.5, 80.0, 18000.0));
+                    }
+                    else
+                    {
+                        filter.setType(juce::dsp::StateVariableTPTFilterType::highpass);
+                        filter.setCutoffFrequency((float)mapNormalisedToLogFrequency(((double)amount - 0.5) / 0.5, 35.0, 9000.0));
+                    }
+
+                    for (int i = 0; i < numSamples; ++i)
+                    {
+                        slotBuffer.setSample(0, i, filter.processSample(0, slotBuffer.getSample(0, i)));
+                        slotBuffer.setSample(1, i, filter.processSample(1, slotBuffer.getSample(1, i)));
+                    }
+                    addSlotDeltaToOutput(slotBuffer);
+                    break;
+                }
+
+                case SamplePadFxType::djFilterHp:
+                {
+                    copySlotDry(slotBuffer);
+                    auto& filter = samplePadPerPadDjFilters[(size_t)padIndex][(size_t)slot];
+                    filter.setType(juce::dsp::StateVariableTPTFilterType::highpass);
+                    filter.setCutoffFrequency((float)mapNormalisedToLogFrequency(amount, 35.0, 9000.0));
+                    for (int i = 0; i < numSamples; ++i)
+                    {
+                        slotBuffer.setSample(0, i, filter.processSample(0, slotBuffer.getSample(0, i)));
+                        slotBuffer.setSample(1, i, filter.processSample(1, slotBuffer.getSample(1, i)));
+                    }
+                    addSlotDeltaToOutput(slotBuffer);
+                    break;
+                }
+
+                case SamplePadFxType::djFilterLp:
+                {
+                    copySlotDry(slotBuffer);
+                    auto& filter = samplePadPerPadDjFilters[(size_t)padIndex][(size_t)slot];
+                    filter.setType(juce::dsp::StateVariableTPTFilterType::lowpass);
+                    filter.setCutoffFrequency((float)mapNormalisedToLogFrequency(1.0 - (double)amount, 80.0, 18000.0));
+                    for (int i = 0; i < numSamples; ++i)
+                    {
+                        slotBuffer.setSample(0, i, filter.processSample(0, slotBuffer.getSample(0, i)));
+                        slotBuffer.setSample(1, i, filter.processSample(1, slotBuffer.getSample(1, i)));
+                    }
+                    addSlotDeltaToOutput(slotBuffer);
+                    break;
+                }
+
+                case SamplePadFxType::djFilterBp:
+                {
+                    copySlotDry(slotBuffer);
+                    auto& filter = samplePadPerPadDjBpFilters[(size_t)padIndex][(size_t)slot];
+                    filter.setCutoffFrequency((float)mapNormalisedToLogFrequency(amount, 120.0, 9000.0));
+                    filter.setResonance(1.35f);
+                    for (int i = 0; i < numSamples; ++i)
+                    {
+                        const float dryL = slotBuffer.getSample(0, i);
+                        const float dryR = slotBuffer.getSample(1, i);
+                        const float wetL = filter.processSample(0, dryL);
+                        const float wetR = filter.processSample(1, dryR);
+                        slotBuffer.setSample(0, i, dryL + (wetL - dryL) * amount);
+                        slotBuffer.setSample(1, i, dryR + (wetR - dryR) * amount);
+                    }
+                    addSlotDeltaToOutput(slotBuffer);
+                    break;
+                }
+
+                case SamplePadFxType::phaser:
+                {
+                    copySlotDry(slotBuffer);
+                    auto& phaser = samplePadPerPadPhasers[(size_t)padIndex][(size_t)slot];
+                    phaser.setRate((float)juce::jlimit(0.02, 12.0, bpm / 120.0));
+                    phaser.setMix(amount * 0.5f);
+                    auto block = juce::dsp::AudioBlock<float>(slotBuffer).getSubBlock(0, (size_t)numSamples);
+                    juce::dsp::ProcessContextReplacing<float> context(block);
+                    phaser.process(context);
+                    addSlotDeltaToOutput(slotBuffer);
+                    break;
+                }
+
+                case SamplePadFxType::reverb:
+                {
+                    float* mono = samplePadFxScratchBuffer.getWritePointer(0);
+                    const float* left = slotBuffer.getReadPointer(0);
+                    const float* right = slotBuffer.getReadPointer(1);
+                    for (int i = 0; i < numSamples; ++i)
+                        mono[i] = 0.5f * (left[i] + right[i]);
+
+                    juce::Reverb::Parameters params;
+                    params.roomSize = 0.48f;
+                    params.damping = 0.45f;
+                    params.width = 1.0f;
+                    params.wetLevel = 1.0f;
+                    params.dryLevel = 0.0f;
+                    params.freezeMode = 0.0f;
+                    auto& reverb = samplePadPerPadReverbs[(size_t)padIndex][(size_t)slot];
+                    reverb.setParameters(params);
+                    reverb.processMono(mono, numSamples);
+
+                    const float gain = amount * 0.55f;
+                    float* outL = samplePadsRenderBuffer.getWritePointer(0);
+                    float* outR = samplePadsRenderBuffer.getWritePointer(1);
+                    for (int i = 0; i < numSamples; ++i)
+                    {
+                        const float dryL = left[i];
+                        const float dryR = right[i];
+                        const float wet = mono[i] * gain;
+                        outL[i] += wet;
+                        outR[i] += wet;
+                        slotBuffer.setSample(0, i, dryL + wet);
+                        slotBuffer.setSample(1, i, dryR + wet);
+                    }
+                    break;
+                }
+
+                case SamplePadFxType::delay:
+                {
+                    auto& delayBuffer = samplePadPerPadDelayBuffers[(size_t)padIndex][(size_t)slot];
+                    if (delayBuffer.getNumSamples() <= 1)
+                        break;
+
+                    const int delayBufferSamples = delayBuffer.getNumSamples();
+                    const int division = fxDelayDivision.load(std::memory_order_relaxed);
+                    double targetDelaySeconds = fxDelayTimeMs.load(std::memory_order_relaxed) / 1000.0;
+                    if (fxDelaySyncToHost.load(std::memory_order_relaxed) && bpm > 1.0)
+                        targetDelaySeconds = (60.0 / bpm) * (4.0 / (double)division);
+
+                    const int delaySamples = juce::jlimit(1, delayBufferSamples - 1, (int)std::round(targetDelaySeconds * sampleRate));
+                    const float feedback = juce::jlimit(0.0f, 0.92f, fxDelayFeedback.load(std::memory_order_relaxed));
+                    const bool pingPong = fxDelayPingPong.load(std::memory_order_relaxed);
+                    const float wetGain = amount * 0.75f;
+                    float* delayMemoryL = delayBuffer.getWritePointer(0);
+                    float* delayMemoryR = delayBuffer.getWritePointer(1);
+                    const float* slotL = slotBuffer.getReadPointer(0);
+                    const float* slotR = slotBuffer.getReadPointer(1);
+                    float* outL = samplePadsRenderBuffer.getWritePointer(0);
+                    float* outR = samplePadsRenderBuffer.getWritePointer(1);
+                    int writePos = samplePadPerPadDelayWritePositions[(size_t)padIndex][(size_t)slot];
+
+                    for (int i = 0; i < numSamples; ++i)
+                    {
+                        int readPos = writePos - delaySamples;
+                        if (readPos < 0)
+                            readPos += delayBufferSamples;
+
+                        const float readL = delayMemoryL[readPos];
+                        const float readR = delayMemoryR[readPos];
+                        const float dryL = slotL[i];
+                        const float dryR = slotR[i];
+                        const float input = 0.5f * (dryL + dryR);
+                        const float wetL = readL * wetGain;
+                        const float wetR = readR * wetGain;
+
+                        outL[i] += wetL;
+                        outR[i] += wetR;
+                        slotBuffer.setSample(0, i, dryL + wetL);
+                        slotBuffer.setSample(1, i, dryR + wetR);
+
+                        if (pingPong)
+                        {
+                            delayMemoryL[writePos] = input + readR * feedback;
+                            delayMemoryR[writePos] = input + readL * feedback;
+                        }
+                        else
+                        {
+                            const float monoDelay = 0.5f * (readL + readR);
+                            delayMemoryL[writePos] = input + monoDelay * feedback;
+                            delayMemoryR[writePos] = input + monoDelay * feedback;
+                        }
+
+                        if (++writePos >= delayBufferSamples)
+                            writePos = 0;
+                    }
+
+                    samplePadPerPadDelayWritePositions[(size_t)padIndex][(size_t)slot] = writePos;
+                    break;
+                }
+            }
+        }
+
+        for (int targetSlot = 0; targetSlot < numSamplePadFxSlots; ++targetSlot)
+        {
+            if (!chainRoutes[(size_t)slot][(size_t)targetSlot])
+                continue;
+
+            auto& targetBuffer = samplePadPerPadFxSlotInputBuffers[(size_t)padIndex][(size_t)targetSlot];
+            if (targetBuffer.getNumChannels() < 2 || targetBuffer.getNumSamples() < numSamples)
+                continue;
+
+            targetBuffer.addFrom(0, 0, slotBuffer, 0, 0, numSamples);
+            targetBuffer.addFrom(1, 0, slotBuffer, 1, 0, numSamples);
+            slotHasInput[(size_t)targetSlot] = true;
+        }
+    }
+    }
+}
+
+float NinjamVst3AudioProcessor::getSamplePadFxSendAmount(SamplePadFxType type) const
+{
+    float amount = 0.0f;
+    for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+    {
+        const auto slotType = sanitizeSamplePadFxType(samplePadFxSlotTypes[(size_t)slot].load(std::memory_order_relaxed));
+        if (slotType == type)
+            amount = juce::jlimit(0.0f, 1.0f,
+                                  amount + samplePadFxSlotAmounts[(size_t)slot].load(std::memory_order_relaxed));
+    }
+    return amount;
 }
 
 bool NinjamVst3AudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -8095,6 +9049,9 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         fxDelayInputBuffer.clear();
 
         const int activeLocal = juce::jmin(actualLocal, numLocalChannels.load());
+        const bool removePadsFromDefaultFxSends = samplePadsActiveThisBlock && !samplePadsUseDefaultFx.load(std::memory_order_relaxed);
+        const float* padSendL = removePadsFromDefaultFxSends ? samplePadsRenderBuffer.getReadPointer(0) : nullptr;
+        const float* padSendR = removePadsFromDefaultFxSends ? samplePadsRenderBuffer.getReadPointer(1) : nullptr;
         for (int ch = 0; ch < activeLocal; ++ch)
         {
             const float reverbSend = localChannelReverbSends[(size_t)ch].load();
@@ -8107,7 +9064,10 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
             float* delayDst = fxDelayInputBuffer.getWritePointer(0);
             for (int i = 0; i < numSamples; ++i)
             {
-                const float v = src[i];
+                float v = src[i];
+                if (ch == 0 && removePadsFromDefaultFxSends)
+                    v -= 0.5f * (padSendL[i] + padSendR[i]);
+
                 if (reverbSend > 0.0001f)
                     reverbDst[i] += v * reverbSend;
                 if (delaySend > 0.0001f)
@@ -8161,16 +9121,22 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
                     targetDelaySeconds = (60.0 / bpm) * (4.0 / (double)division);
                 const int delaySamples = juce::jlimit(1, delayBufferSamples - 1, (int)std::round(targetDelaySeconds * processingSampleRate));
 
+                const bool frippertronics = getFxDelayMode() == FxDelayMode::frippertronics;
                 const bool pingPong = fxDelayPingPong.load();
                 const float feedback = juce::jlimit(0.0f, 0.95f, fxDelayFeedback.load());
                 const float wetDryMix = juce::jlimit(0.0f, 1.0f, fxDelayWetDryMix.load());
                 const float delayWet = wetDryMix * 0.8f;
+                const float tapeCutoff = 3600.0f;
+                const float tapeLowpassAlpha = 1.0f - std::exp(-2.0f * juce::MathConstants<float>::pi * tapeCutoff
+                                                              / (float)juce::jmax(1.0, processingSampleRate));
 
                 float* delayMemoryL = fxDelayBuffer.getWritePointer(0);
                 float* delayMemoryR = fxDelayBuffer.getWritePointer(1);
                 const float* delayIn = fxDelayInputBuffer.getReadPointer(0);
 
                 int writePos = fxDelayWritePosition;
+                float lowpassL = fxDelayLowpassState[0];
+                float lowpassR = fxDelayLowpassState[1];
                 for (int i = 0; i < numSamples; ++i)
                 {
                     int readPos = writePos - delaySamples;
@@ -8187,7 +9153,23 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
                     fxRight[i] += wetR;
                     fxSendMono[i] += (wetL + wetR) * 0.25f;
 
-                    if (pingPong)
+                    if (frippertronics)
+                    {
+                        lowpassL += tapeLowpassAlpha * (readL - lowpassL);
+                        lowpassR += tapeLowpassAlpha * (readR - lowpassR);
+
+                        if (pingPong)
+                        {
+                            delayMemoryL[writePos] = input + lowpassR * feedback;
+                            delayMemoryR[writePos] = input + lowpassL * feedback;
+                        }
+                        else
+                        {
+                            delayMemoryL[writePos] = input + lowpassL * feedback;
+                            delayMemoryR[writePos] = input + lowpassR * feedback;
+                        }
+                    }
+                    else if (pingPong)
                     {
                         delayMemoryL[writePos] = input + readR * feedback;
                         delayMemoryR[writePos] = input + readL * feedback;
@@ -8204,6 +9186,8 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
                         writePos = 0;
                 }
                 fxDelayWritePosition = writePos;
+                fxDelayLowpassState[0] = lowpassL;
+                fxDelayLowpassState[1] = lowpassR;
             }
         }
     }
@@ -9693,8 +10677,16 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     state.setProperty("autoTranslate", isAutoTranslateEnabled(), nullptr);
     state.setProperty("translateSourceLang", getTranslateSourceLang(), nullptr);
     state.setProperty("translateTargetLang", getTranslateTargetLang(), nullptr);
+    state.setProperty("fxReverbEnabled", isFxReverbEnabled(), nullptr);
     state.setProperty("fxReverbWetDryMix", (double)getFxReverbWetDryMix(), nullptr);
+    state.setProperty("fxDelayEnabled", isFxDelayEnabled(), nullptr);
+    state.setProperty("fxDelayMode", (int)getFxDelayMode(), nullptr);
+    state.setProperty("fxDelayTimeMs", (double)getFxDelayTimeMs(), nullptr);
+    state.setProperty("fxDelaySyncToHost", isFxDelaySyncToHost(), nullptr);
+    state.setProperty("fxDelayDivision", getFxDelayDivision(), nullptr);
+    state.setProperty("fxDelayPingPong", isFxDelayPingPong(), nullptr);
     state.setProperty("fxDelayWetDryMix", (double)getFxDelayWetDryMix(), nullptr);
+    state.setProperty("fxDelayFeedback", (double)getFxDelayFeedback(), nullptr);
     state.setProperty("syncMode", (int)getSyncMode(), nullptr);
     state.setProperty("syncStartCompensationMs", (double)getSyncStartCompensationMs(), nullptr);
     state.setProperty("linkAudioEnabled", isLinkAudioEnabled(), nullptr);
@@ -9707,6 +10699,21 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     state.setProperty("chordDetectionEnabled", isChordDetectionEnabled(), nullptr);
     state.setProperty("samplePadsVolume", (double)getSamplePadVolume(), nullptr);
     state.setProperty("samplePadsLimiter", isSamplePadLimiterEnabled(), nullptr);
+    state.setProperty("samplePadsDuck", isSamplePadDuckEnabled(), nullptr);
+    state.setProperty("samplePadsDuckShape", (int)getSamplePadDuckShape(), nullptr);
+    state.setProperty("samplePadsDuckLength", (int)getSamplePadDuckLength(), nullptr);
+    state.setProperty("samplePadsUseDefaultFx", getSamplePadsUseDefaultFx(), nullptr);
+    for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+    {
+        state.setProperty("samplePadFxType" + juce::String(slot), (int)getSamplePadFxSlotType(slot), nullptr);
+        state.setProperty("samplePadFxAmount" + juce::String(slot), (double)getSamplePadFxSlotAmount(slot), nullptr);
+        for (int targetSlot = 0; targetSlot < numSamplePadFxSlots; ++targetSlot)
+        {
+            state.setProperty("samplePadFxSlotChainRoute" + juce::String(slot) + "_" + juce::String(targetSlot),
+                              isSamplePadFxSlotToSlotRouteEnabled(slot, targetSlot),
+                              nullptr);
+        }
+    }
     {
         const juce::ScopedLock lock(samplePadsLock);
         for (int pad = 0; pad < numSamplePads; ++pad)
@@ -9717,6 +10724,13 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
             state.setProperty("samplePadReverse" + juce::String(pad), samplePad.reverse.load(std::memory_order_relaxed), nullptr);
             state.setProperty("samplePadMatchBpi" + juce::String(pad), samplePad.matchBpi.load(std::memory_order_relaxed), nullptr);
             state.setProperty("samplePadBpmSync" + juce::String(pad), samplePad.bpmSyncEnabled.load(std::memory_order_relaxed), nullptr);
+            state.setProperty("samplePadDuckRoute" + juce::String(pad), samplePad.duckRoute.load(std::memory_order_relaxed), nullptr);
+            for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+            {
+                state.setProperty("samplePadFxSlotRoute" + juce::String(pad) + "_" + juce::String(slot),
+                                  samplePad.fxSlotRoutes[(size_t)slot].load(std::memory_order_relaxed),
+                                  nullptr);
+            }
             state.setProperty("samplePadName" + juce::String(pad), samplePad.name, nullptr);
             state.setProperty("samplePadNameCustom" + juce::String(pad), samplePad.nameIsCustom, nullptr);
         }
@@ -9748,8 +10762,18 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setAutoTranslateEnabled((bool) state.getProperty("autoTranslate", false));
     setTranslateSourceLang(state.getProperty("translateSourceLang", "en").toString());
     setTranslateTargetLang(state.getProperty("translateTargetLang", "system").toString());
+    setFxReverbEnabled((bool)state.getProperty("fxReverbEnabled", true));
     setFxReverbWetDryMix((float)(double)state.getProperty("fxReverbWetDryMix", 1.0));
+    setFxDelayEnabled((bool)state.getProperty("fxDelayEnabled", true));
+    setFxDelayMode((int)state.getProperty("fxDelayMode", (int)FxDelayMode::standard) == (int)FxDelayMode::frippertronics
+        ? FxDelayMode::frippertronics
+        : FxDelayMode::standard);
+    setFxDelayTimeMs((float)(double)state.getProperty("fxDelayTimeMs", 320.0));
+    setFxDelaySyncToHost((bool)state.getProperty("fxDelaySyncToHost", true));
+    setFxDelayDivision((int)state.getProperty("fxDelayDivision", 8));
+    setFxDelayPingPong((bool)state.getProperty("fxDelayPingPong", false));
     setFxDelayWetDryMix((float)(double)state.getProperty("fxDelayWetDryMix", 1.0));
+    setFxDelayFeedback((float)(double)state.getProperty("fxDelayFeedback", 0.38));
     setSyncMode((SyncMode) (int) state.getProperty("syncMode", (int) SyncMode::off));
     setSyncStartCompensationMs((float)(double)state.getProperty("syncStartCompensationMs", 0.0));
     setLinkAudioEnabled((bool)state.getProperty("linkAudioEnabled", false));
@@ -9762,6 +10786,31 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setChordDetectionEnabled((bool)state.getProperty("chordDetectionEnabled", true));
     setSamplePadVolume(juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("samplePadsVolume", 1.0)));
     setSamplePadLimiterEnabled((bool)state.getProperty("samplePadsLimiter", false));
+    setSamplePadDuckEnabled((bool)state.getProperty("samplePadsDuck", false));
+    setSamplePadDuckShape(sanitizeSamplePadDuckShape((int)state.getProperty("samplePadsDuckShape",
+                                                                            (int)SamplePadDuckShape::smoothPump)));
+    setSamplePadDuckLength(sanitizeSamplePadDuckLength((int)state.getProperty("samplePadsDuckLength",
+                                                                              (int)SamplePadDuckLength::quarter)));
+    setSamplePadsUseDefaultFx((bool)state.getProperty("samplePadsUseDefaultFx", true));
+    for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+    {
+        setSamplePadFxSlotType(slot,
+                               sanitizeSamplePadFxType((int)state.getProperty("samplePadFxType" + juce::String(slot),
+                                                                               (int)getSamplePadFxSlotType(slot))));
+        setSamplePadFxSlotAmount(slot,
+                                 juce::jlimit(0.0f, 1.0f,
+                                              (float)(double)state.getProperty("samplePadFxAmount" + juce::String(slot),
+                                                                               getSamplePadFxSlotAmount(slot))));
+    }
+    for (int sourceSlot = 0; sourceSlot < numSamplePadFxSlots; ++sourceSlot)
+    {
+        for (int targetSlot = 0; targetSlot < numSamplePadFxSlots; ++targetSlot)
+        {
+            setSamplePadFxSlotToSlotRouteEnabled(sourceSlot, targetSlot, false);
+            if ((bool)state.getProperty("samplePadFxSlotChainRoute" + juce::String(sourceSlot) + "_" + juce::String(targetSlot), false))
+                setSamplePadFxSlotToSlotRouteEnabled(sourceSlot, targetSlot, true);
+        }
+    }
     for (int pad = 0; pad < numSamplePads; ++pad)
     {
         const juce::String filePath = state.getProperty("samplePadFile" + juce::String(pad), "").toString();
@@ -9773,6 +10822,12 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
         setSamplePadLoopEnabled(pad, (bool)state.getProperty("samplePadLoop" + juce::String(pad), false));
         setSamplePadReverseEnabled(pad, (bool)state.getProperty("samplePadReverse" + juce::String(pad), false));
         setSamplePadMatchBpiEnabled(pad, (bool)state.getProperty("samplePadMatchBpi" + juce::String(pad), false));
+        setSamplePadDuckRouteEnabled(pad, (bool)state.getProperty("samplePadDuckRoute" + juce::String(pad), false));
+        for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+            setSamplePadFxSlotRouteEnabled(pad,
+                                           slot,
+                                           (bool)state.getProperty("samplePadFxSlotRoute" + juce::String(pad) + "_" + juce::String(slot),
+                                                                   false));
         if ((bool)state.getProperty("samplePadNameCustom" + juce::String(pad), false))
             setSamplePadName(pad, state.getProperty("samplePadName" + juce::String(pad), "").toString());
     }
@@ -10123,9 +11178,11 @@ void NinjamVst3AudioProcessor::timerCallback()
         bool forceIntervalHelperPayloadWrite = false;
         const int localBpi = juce::jmax(1, getBPI());
         const double localBpm = juce::jmax(1.0, (double)getBPM());
+        const bool hadPreviousTiming = lastLatencyTimingBpi > 0 && lastLatencyTimingBpm > 0.0;
+        const bool bpmChanged = hadPreviousTiming && std::abs(lastLatencyTimingBpm - localBpm) > 0.05;
         const bool timingChanged = lastLatencyTimingBpi != localBpi
             || lastLatencyTimingLength != length
-            || std::abs(lastLatencyTimingBpm - localBpm) > 0.001;
+            || bpmChanged;
 
         if (std::abs(lastSamplePadBpmSyncBpm - localBpm) > 0.05)
         {
@@ -10136,7 +11193,6 @@ void NinjamVst3AudioProcessor::timerCallback()
         if (timingChanged)
         {
             int timingDelayDeltaMs = 0;
-            const bool hadPreviousTiming = lastLatencyTimingBpi > 0 && lastLatencyTimingBpm > 0.0;
             if (hadPreviousTiming)
             {
                 const double previousIntervalDurationMs = (60.0 / lastLatencyTimingBpm) * (double)lastLatencyTimingBpi * 1000.0;
@@ -10145,17 +11201,19 @@ void NinjamVst3AudioProcessor::timerCallback()
                     && previousIntervalDurationMs > 0.0 && newIntervalDurationMs > 0.0)
                     timingDelayDeltaMs = (int)std::llround(newIntervalDurationMs - previousIntervalDurationMs);
             }
-            if (hadPreviousTiming)
+            if (bpmChanged && status == NJClient::NJC_STATUS_OK)
             {
                 const juce::ScopedLock lock(intervalSyncAnnouncementLock);
                 if (!remoteLatencyFirmDelayMsByUser.empty())
                 {
-                    const auto refreshId = ++videoBufferRefreshCounter;
+                    const bool shouldRefreshVideoBuffers = videoHelperRunning.load();
+                    const auto refreshId = shouldRefreshVideoBuffers ? ++videoBufferRefreshCounter : 0;
                     for (auto& userDelay : remoteLatencyFirmDelayMsByUser)
                     {
                         if (timingDelayDeltaMs != 0)
                             userDelay.second = juce::jmax(0, userDelay.second + timingDelayDeltaMs);
-                        remoteVideoBufferRefreshIdByUser[userDelay.first] = refreshId;
+                        if (shouldRefreshVideoBuffers)
+                            remoteVideoBufferRefreshIdByUser[userDelay.first] = refreshId;
                     }
                 }
             }

@@ -848,8 +848,13 @@ private:
 class CustomKnobLookAndFeel : public juce::LookAndFeel_V4
 {
 public:
+    void setExplicitEditor(NinjamVst3AudioProcessorEditor* editor) { explicitEditor = editor; }
+
     void drawRotarySlider(juce::Graphics& g, int x, int y, int width, int height, float sliderPos,
                           const float rotaryStartAngle, const float rotaryEndAngle, juce::Slider& slider) override;
+
+private:
+    NinjamVst3AudioProcessorEditor* explicitEditor = nullptr;
 };
 
 class SyncIconLookAndFeel : public juce::LookAndFeel_V4
@@ -1125,6 +1130,10 @@ public:
     void forgetSamplePadOscLearn(int padIndex);
     bool hasSamplePadMidiLearn(int padIndex) const;
     bool hasSamplePadOscLearn(int padIndex) const;
+    void registerSamplerFxKnobLearnTarget(juce::Component& component, int slotIndex);
+    void unregisterSamplerFxKnobLearnTarget(juce::Component& component, int slotIndex);
+    void showMidiLearnMenuForComponent(juce::Component& component, juce::Point<int> screenPos);
+    juce::LookAndFeel& getSamplerKnobLookAndFeel() { return customKnobLookAndFeel; }
     
     juce::Image backgroundImage;
     juce::Image radioKnobImage;
@@ -1341,7 +1350,6 @@ private:
     void applyThemeColours();
     void registerMidiLearnTarget(juce::Component& component, const juce::String& targetId, bool isToggle);
     void syncUserStripMidiTargets();
-    void showMidiLearnMenuForComponent(juce::Component& component, juce::Point<int> screenPos);
     void applyMidiMappings();
 
     struct MidiLearnTarget
@@ -1387,7 +1395,7 @@ private:
     int abletonWindowSizePreset = 1;
     int abletonChatWindowSizePreset = 1;
     int abletonSamplerWindowSizePreset = 1;
-    juce::Rectangle<int> samplePadsWindowBounds { 0, 0, 680, 450 };
+    juce::Rectangle<int> samplePadsWindowBounds { 0, 0, 980, 600 };
     bool samplePadsWindowBoundsValid = false;
     std::unique_ptr<juce::DialogWindow> aboutWindow;
     double lastResizeEventMs = 0.0;

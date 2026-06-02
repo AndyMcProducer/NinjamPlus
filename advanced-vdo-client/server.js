@@ -283,6 +283,11 @@ const htmlPage = `
             }
         };
         const remoteUserStaleMs = 12000;
+        const vdoRefreshState = {
+            lastRefreshIdByUser: {},
+            refreshTimersByUser: {},
+            refreshPendingUntilByUser: {}
+        };
 
         if (!appState.intervalSource) {
             appState.intervalSource = window.location.origin + '/intervals';
@@ -346,6 +351,9 @@ const htmlPage = `
                     receiverBufferMs,
                     buildUserSampleKey(data, receiverBufferMs)
                 );
+                if (data.refreshBuffer && data.bufferRefreshEventId) {
+                    scheduleBufferRefresh(data.userId, data.bufferRefreshEventId);
+                }
                 updateRendererView();
                 updateGuestOverlays();
                 return false;
@@ -362,6 +370,9 @@ const htmlPage = `
                     receiverBufferMs,
                     buildUserSampleKey(data, receiverBufferMs)
                 );
+                if (data.refreshBuffer && data.bufferRefreshEventId) {
+                    scheduleBufferRefresh(data.userId || data.userKey || '', data.bufferRefreshEventId);
+                }
                 updateRendererView();
                 updateGuestOverlays();
                 return false;
@@ -380,6 +391,12 @@ const htmlPage = `
                     delete ninjamSync.userLastSampleKey[userId];
                     delete ninjamSync.remoteTimecodes[userId];
                     delete ninjamSync.remoteBuffers[userId];
+                    delete vdoRefreshState.lastRefreshIdByUser[userId];
+                    if (vdoRefreshState.refreshTimersByUser[userId]) {
+                        clearTimeout(vdoRefreshState.refreshTimersByUser[userId]);
+                    }
+                    delete vdoRefreshState.refreshTimersByUser[userId];
+                    delete vdoRefreshState.refreshPendingUntilByUser[userId];
                 }
             }
         }
@@ -391,6 +408,8 @@ const htmlPage = `
                 String(data.videoClockMs ?? ''),
                 String(data.timecode ?? ''),
                 String(data.eventId ?? ''),
+                String(data.refreshBuffer ? 1 : 0),
+                String(data.bufferRefreshEventId ?? ''),
                 (typeof bufferMs === 'number' && isFinite(bufferMs)) ? String(Math.round(bufferMs)) : ''
             ].join('|');
         }
@@ -861,6 +880,73 @@ const htmlPage = `
             } catch (e) {
             }
         }
+
+        function postFrameRefresh(frameEl) {
+            if (!frameEl || !frameEl.contentWindow) {
+                return false;
+            }
+            let sent = false;
+            try {
+                frameEl.contentWindow.postMessage({ refresh: true }, '*');
+                sent = true;
+            } catch (e) {
+            }
+            try {
+                frameEl.contentWindow.postMessage({ action: 'refresh' }, '*');
+                sent = true;
+            } catch (e) {
+            }
+            return sent;
+        }
+
+        function isBufferRefreshPending(userKey) {
+            const key = normalizeUserId(userKey);
+            return !!key && (vdoRefreshState.refreshPendingUntilByUser[key] || 0) > Date.now();
+        }
+
+        function hasAnyBufferRefreshPending() {
+            const now = Date.now();
+            const keys = Object.keys(vdoRefreshState.refreshPendingUntilByUser || {});
+            for (let i = 0; i < keys.length; i++) {
+                if ((vdoRefreshState.refreshPendingUntilByUser[keys[i]] || 0) > now) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        function scheduleBufferRefresh(userKey, refreshEventId) {
+            const key = normalizeUserId(userKey);
+            const eventId = String(refreshEventId || '');
+            if (!key || !eventId || vdoRefreshState.lastRefreshIdByUser[key] === eventId) {
+                return false;
+            }
+
+            vdoRefreshState.lastRefreshIdByUser[key] = eventId;
+            if (vdoRefreshState.refreshTimersByUser[key]) {
+                clearTimeout(vdoRefreshState.refreshTimersByUser[key]);
+            }
+            vdoRefreshState.refreshPendingUntilByUser[key] = Date.now() + 150;
+
+            if (appState.view === 'renderer') {
+                postFrameRefresh(document.getElementById('peer-frame-' + sanitizePeerId(key)));
+            } else {
+                postFrameRefresh(document.getElementById('vdoFrame'));
+            }
+
+            vdoRefreshState.refreshTimersByUser[key] = setTimeout(function () {
+                delete vdoRefreshState.refreshTimersByUser[key];
+                delete vdoRefreshState.refreshPendingUntilByUser[key];
+                if (appState.view === 'renderer') {
+                    applyPeerFrameBufferDelay(key, getPeerDelayedBufferMs(key));
+                } else {
+                    applyMainFrameBufferDelay(getRecommendedBufferMs());
+                }
+                updateSyncStatus();
+            }, 150);
+            return true;
+        }
+
         function applyRecommendedBuffer(force) {
             if (appState.view === 'renderer') {
                 const gridEl = document.getElementById('rendererGrid');
@@ -900,12 +986,11 @@ const htmlPage = `
                         frameEl.src = buildPeerIframeUrl(userId, nextBuffer);
                         state.frameLoaded = false;
                     } else if (frameEl) {
+                        if (isBufferRefreshPending(userId)) {
+                            continue;
+                        }
                         const bufferChanged = state.appliedBufferMs !== nextBuffer;
-                        if (bufferChanged) {
-                            // Force iframe URL to carry the new buffer value for deterministic per-user updates.
-                            frameEl.src = buildPeerIframeUrl(userId, nextBuffer);
-                            state.frameLoaded = false;
-                        } else if (state.frameLoaded) {
+                        if (bufferChanged || state.frameLoaded) {
                             applyPeerFrameBufferDelay(userId, nextBuffer);
                         }
                     }
@@ -937,6 +1022,10 @@ const htmlPage = `
                 iframe.src = buildIframeUrl(nextBuffer);
                 mainFrameLoaded = false;
             } else if (mainFrameLoaded) {
+                if (hasAnyBufferRefreshPending()) {
+                    updateSyncStatus();
+                    return;
+                }
                 applyMainFrameBufferDelay(nextBuffer);
             }
             updateSyncStatus();
