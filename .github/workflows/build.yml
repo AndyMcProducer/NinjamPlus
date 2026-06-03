@@ -24,9 +24,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $cmakeFile = Get-ChildItem -Path . -Recurse -File -Filter CMakeLists.txt | Where-Object {
-            Select-String -Path $_.FullName -Pattern 'project\s*\(\s*NINJAM_VST3\b' -Quiet
-          } | Select-Object -First 1
+          $rootCmake = Join-Path $PWD "CMakeLists.txt"
+          if ((Test-Path $rootCmake) -and (Select-String -Path $rootCmake -Pattern 'project\s*\(\s*NINJAM_VST3\b' -Quiet)) {
+            $cmakeFile = Get-Item $rootCmake
+          } else {
+            $cmakeFile = Get-ChildItem -Path . -Recurse -File -Filter CMakeLists.txt | Where-Object {
+              Select-String -Path $_.FullName -Pattern 'project\s*\(\s*NINJAM_VST3\b' -Quiet
+            } | Select-Object -First 1
+          }
           if ($null -eq $cmakeFile) {
             throw "Could not find CMakeLists.txt for NINJAM_VST3"
           }
@@ -153,14 +158,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CMAKE_FILE="$(
-            find . -name CMakeLists.txt -type f -print0 | while IFS= read -r -d '' f; do
-              if grep -Eq 'project[[:space:]]*\([[:space:]]*NINJAM_VST3\b' "$f"; then
-                echo "$f"
-                break
-              fi
-            done
-          )"
+          if [ -f ./CMakeLists.txt ] && grep -Eq 'project[[:space:]]*\([[:space:]]*NINJAM_VST3\b' ./CMakeLists.txt; then
+            CMAKE_FILE="./CMakeLists.txt"
+          else
+            CMAKE_FILE="$(
+              find . -name CMakeLists.txt -type f -print0 | while IFS= read -r -d '' f; do
+                if grep -Eq 'project[[:space:]]*\([[:space:]]*NINJAM_VST3\b' "$f"; then
+                  echo "$f"
+                  break
+                fi
+              done
+            )"
+          fi
           if [ -z "${CMAKE_FILE}" ]; then
             echo "Could not find CMakeLists.txt for NINJAM_VST3"
             exit 1
@@ -265,14 +274,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CMAKE_FILE="$(
-            find . -name CMakeLists.txt -type f -print0 | while IFS= read -r -d '' f; do
-              if grep -Eq 'project[[:space:]]*\([[:space:]]*NINJAM_VST3\b' "$f"; then
-                echo "$f"
-                break
-              fi
-            done
-          )"
+          if [ -f ./CMakeLists.txt ] && grep -Eq 'project[[:space:]]*\([[:space:]]*NINJAM_VST3\b' ./CMakeLists.txt; then
+            CMAKE_FILE="./CMakeLists.txt"
+          else
+            CMAKE_FILE="$(
+              find . -name CMakeLists.txt -type f -print0 | while IFS= read -r -d '' f; do
+                if grep -Eq 'project[[:space:]]*\([[:space:]]*NINJAM_VST3\b' "$f"; then
+                  echo "$f"
+                  break
+                fi
+              done
+            )"
+          fi
           if [ -z "${CMAKE_FILE}" ]; then
             echo "Could not find CMakeLists.txt for NINJAM_VST3"
             exit 1

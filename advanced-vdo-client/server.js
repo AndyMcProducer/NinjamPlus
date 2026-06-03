@@ -1069,7 +1069,7 @@ const server = http.createServer((req, res) => {
     if (pathname === '/' || pathname === '/buffer-room' || pathname === '/sync-buffer-room' || pathname === '/index.html') {
         fs.readFile(helperPagePath, 'utf8', (err, body) => {
             const responseBody = err ? htmlPage : body;
-            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate' });
             if (req.method === 'HEAD') {
                 res.end();
                 return;
@@ -1082,7 +1082,7 @@ const server = http.createServer((req, res) => {
     if (pathname === '/app') {
         fs.readFile(appHtmlPath, 'utf8', (err, body) => {
             const responseBody = (!err && body && body.trim().length) ? body : htmlPage;
-            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate' });
             if (req.method === 'HEAD') {
                 res.end();
                 return;

@@ -402,6 +402,7 @@ public:
     void setChatText(const juce::StringArray& lines,
                      const juce::StringArray& senders,
                      const NinjamVst3AudioProcessor& processor);
+    void setCommandLinkCallback(std::function<void(const juce::String&)> callback);
 
     void paint(juce::Graphics& g) override;
     void resized() override;
@@ -429,6 +430,7 @@ private:
     {
         juce::Rectangle<int> bounds;
         juce::String url;
+        juce::String command;
     };
 
     void scrollBarMoved(juce::ScrollBar* scrollBarThatHasMoved, double newRangeStart) override;
@@ -455,6 +457,7 @@ private:
     juce::Font chatFont { 14.0f };
     juce::Colour backgroundColour { 0xff101417 };
     std::shared_ptr<std::atomic<bool>> aliveFlag;
+    std::function<void(const juce::String&)> commandLinkCallback;
     int scrollY = 0;
     int contentHeight = 0;
     int hoveredLinkIndex = -1;
@@ -1347,6 +1350,7 @@ private:
     void updateHostResizeModeForConnectionStatus(int status);
     void showAboutWindow();
     void loadControlImages(const juce::File& themeDir);
+    void updateEditorTimerInterval();
     void applyThemeColours();
     void registerMidiLearnTarget(juce::Component& component, const juce::String& targetId, bool isToggle);
     void syncUserStripMidiTargets();
@@ -1402,6 +1406,7 @@ private:
     double suppressHeavyUiUntilMs = 0.0;
     int lastLaidOutEditorWidth = -1;
     int lastLaidOutEditorHeight = -1;
+    int currentEditorTimerIntervalMs = 0;
     int heavyUiTickCounter = 0;
     float voiceChatGlowPhase = 0.0f;
     float storedMetronomeVolume = 0.5f;

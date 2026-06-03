@@ -239,6 +239,11 @@ struct WinVideoReader : public juce::Thread
         return f;
     }
 
+    int getFramePeriodMs() const
+    {
+        return framePeriodMs;
+    }
+
     //==============================================================================
     void run() override
     {
@@ -1957,6 +1962,108 @@ juce::String emojiText(const ChatEmojiChoice& choice)
     return juce::String::fromUTF8(choice.utf8);
 }
 
+juce::String emojiCommandForLabel(juce::String label)
+{
+    label = label.trim().toLowerCase();
+    juce::String command;
+    bool lastWasDash = false;
+    for (int i = 0; i < label.length(); ++i)
+    {
+        const auto c = label[i];
+        const bool isAlphaNum = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+        if (isAlphaNum)
+        {
+            command << juce::String::charToString(c);
+            lastWasDash = false;
+        }
+        else if (!lastWasDash && command.isNotEmpty())
+        {
+            command << "-";
+            lastWasDash = true;
+        }
+    }
+
+    while (command.endsWithChar('-'))
+        command = command.dropLastCharacters(1);
+
+    return command.isNotEmpty() ? ":" + command + ":" : juce::String();
+}
+
+juce::String emojiShortcutForLabel(juce::String label)
+{
+    label = label.trim().toLowerCase();
+    if (label == "smile" || label == "grinning face" || label == "happy")
+        return ":)";
+    if (label == "laugh" || label == "tears of joy")
+        return ":D";
+    if (label == "cool" || label == "sunglasses face")
+        return "B)";
+    if (label == "heart")
+        return "<3";
+    if (label == "thumbs up")
+        return ":+1:";
+    if (label == "fire")
+        return ":fire:";
+    if (label == "guitar")
+        return ":guitar:";
+    if (label == "drums" || label == "drum")
+        return ":drums:";
+    if (label == "mic" || label == "microphone")
+        return ":mic:";
+    return emojiCommandForLabel(label);
+}
+
+juce::String emojiMenuText(const ChatEmojiChoice& choice)
+{
+    const auto shortcut = emojiShortcutForLabel(choice.label);
+    return shortcut.isNotEmpty() ? emojiText(choice) + "  " + shortcut
+                                 : emojiText(choice);
+}
+
+juce::String expandChatEmojiShortcuts(juce::String text)
+{
+    struct Replacement
+    {
+        const char* shortcut;
+        const char* emojiUtf8;
+    };
+
+    static constexpr Replacement replacements[] =
+    {
+        { ":)", "\xF0\x9F\x98\x80" },
+        { ":-)", "\xF0\x9F\x98\x80" },
+        { ":D", "\xF0\x9F\x98\x82" },
+        { ":-D", "\xF0\x9F\x98\x82" },
+        { "B)", "\xF0\x9F\x98\x8E" },
+        { "B-)", "\xF0\x9F\x98\x8E" },
+        { "<3", "\xE2\x9D\xA4\xEF\xB8\x8F" },
+        { ":fire:", "\xF0\x9F\x94\xA5" },
+        { ":guitar:", "\xF0\x9F\x8E\xB8" },
+        { ":drums:", "\xF0\x9F\xA5\x81" },
+        { ":mic:", "\xF0\x9F\x8E\xA4" },
+        { ":+1:", "\xF0\x9F\x91\x8D" }
+    };
+
+    for (const auto& replacement : replacements)
+        text = text.replace(replacement.shortcut, juce::String::fromUTF8(replacement.emojiUtf8), true);
+
+    auto expandChoices = [&text](const ChatEmojiChoice* choices, int count)
+    {
+        for (int i = 0; i < count; ++i)
+        {
+            const auto command = emojiCommandForLabel(choices[i].label);
+            if (command.isNotEmpty())
+                text = text.replace(command, emojiText(choices[i]), true);
+        }
+    };
+
+    expandChoices(commonEmojiChoices, (int)(sizeof(commonEmojiChoices) / sizeof(commonEmojiChoices[0])));
+    for (const auto& category : chatEmojiCategories)
+        expandChoices(category.choices, category.count);
+
+    return text;
+}
+
 using EmojiMenuMap = std::map<int, const ChatEmojiChoice*>;
 
 void addEmojiChoicesToMenu(juce::PopupMenu& menu,
@@ -1969,15 +2076,19 @@ void addEmojiChoicesToMenu(juce::PopupMenu& menu,
     {
         const int id = baseId + i;
         idToEmoji[id] = &choices[i];
-        menu.addItem(id, emojiText(choices[i]) + "  " + choices[i].label);
+        menu.addItem(id, emojiMenuText(choices[i]));
     }
 }
 
 void populateEmojiMenu(juce::PopupMenu& menu, int baseId, EmojiMenuMap& idToEmoji)
 {
-    menu.addSectionHeader("Common");
-    addEmojiChoicesToMenu(menu, baseId, commonEmojiChoices, (int)(sizeof(commonEmojiChoices) / sizeof(commonEmojiChoices[0])), idToEmoji);
-    menu.addSeparator();
+    juce::PopupMenu commonMenu;
+    addEmojiChoicesToMenu(commonMenu,
+                          baseId,
+                          commonEmojiChoices,
+                          (int)(sizeof(commonEmojiChoices) / sizeof(commonEmojiChoices[0])),
+                          idToEmoji);
+    menu.addSubMenu("Common", commonMenu);
 
     constexpr int categoryIdStride = 200;
     const int categoryBaseId = baseId + 1000;
@@ -2012,6 +2123,76 @@ void showEmojiMenuForTextEditor(juce::TextEditor& targetEditor, juce::Component&
                            safeEditor->grabKeyboardFocus();
                            safeEditor->insertTextAtCaret(emojiText(*it->second));
                        });
+}
+
+class EmojiGridComponent : public juce::PopupMenu::CustomComponent
+{
+public:
+    explicit EmojiGridComponent(juce::TextEditor& targetEditor)
+        : juce::PopupMenu::CustomComponent(false),
+          safeEditor(&targetEditor)
+    {
+        for (const auto& choice : commonEmojiChoices)
+        {
+            auto button = std::make_unique<juce::TextButton>(emojiText(choice));
+            const auto shortcut = emojiShortcutForLabel(choice.label);
+            button->setTooltip(shortcut.isNotEmpty()
+                ? juce::String(choice.label) + "  " + shortcut
+                : juce::String(choice.label));
+            button->onClick = [this, emoji = emojiText(choice)]
+            {
+                if (safeEditor != nullptr)
+                {
+                    safeEditor->grabKeyboardFocus();
+                    safeEditor->insertTextAtCaret(emoji);
+                }
+
+                if (auto* callout = findParentComponentOfClass<juce::CallOutBox>())
+                    callout->dismiss();
+                else
+                    juce::PopupMenu::dismissAllActiveMenus();
+            };
+            addAndMakeVisible(*button);
+            buttons.push_back(std::move(button));
+        }
+
+        setSize(214, 104);
+    }
+
+    void getIdealSize(int& idealWidth, int& idealHeight) override
+    {
+        idealWidth = 214;
+        idealHeight = 104;
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced(8);
+        constexpr int columns = 6;
+        constexpr int gap = 4;
+        const int buttonW = (area.getWidth() - gap * (columns - 1)) / columns;
+        const int buttonH = (area.getHeight() - gap * 2) / 3;
+        for (int i = 0; i < (int)buttons.size(); ++i)
+        {
+            const int row = i / columns;
+            const int col = i % columns;
+            buttons[(size_t)i]->setBounds(area.getX() + col * (buttonW + gap),
+                                          area.getY() + row * (buttonH + gap),
+                                          buttonW,
+                                          buttonH);
+        }
+    }
+
+private:
+    juce::Component::SafePointer<juce::TextEditor> safeEditor;
+    std::vector<std::unique_ptr<juce::TextButton>> buttons;
+};
+
+void showEmojiGridForTextEditor(juce::TextEditor& targetEditor, juce::Component& anchorComponent)
+{
+    auto content = std::make_unique<EmojiGridComponent>(targetEditor);
+    auto& callout = juce::CallOutBox::launchAsynchronously(std::move(content), anchorComponent.getScreenBounds(), nullptr);
+    callout.setDismissalMouseClicksAreAlwaysConsumed(true);
 }
 
 bool isChatUrlTerminator(juce_wchar c)
@@ -2146,6 +2327,73 @@ juce::Colour chatWindowColourForKey(const juce::String& keyIn)
     return juce::Colour(0xff101417);
 }
 
+class VoteValueComponent : public juce::Component
+{
+public:
+    VoteValueComponent(const juce::String& labelText, int minValue, int maxValue, int initialValue)
+    {
+        label.setText(labelText, juce::dontSendNotification);
+        label.setJustificationType(juce::Justification::centredLeft);
+        addAndMakeVisible(label);
+
+        slider.setRange(minValue, maxValue, 1.0);
+        slider.setValue(juce::jlimit(minValue, maxValue, initialValue), juce::dontSendNotification);
+        slider.setSliderStyle(juce::Slider::LinearHorizontal);
+        slider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 62, 22);
+        addAndMakeVisible(slider);
+
+        setSize(300, 58);
+    }
+
+    int getValue() const
+    {
+        return (int)std::round(slider.getValue());
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced(2);
+        label.setBounds(area.removeFromTop(20));
+        slider.setBounds(area);
+    }
+
+private:
+    juce::Label label;
+    juce::Slider slider;
+};
+
+void showChatVoteDialog(NinjamVst3AudioProcessor& processor, const juce::String& voteKind)
+{
+    const bool isBpi = voteKind.equalsIgnoreCase("bpi");
+    const int minValue = isBpi ? 4 : 40;
+    const int maxValue = isBpi ? 128 : 240;
+    const int initialValue = isBpi ? processor.getBPI() : (int)std::round(processor.getBPM());
+
+    auto* alert = new juce::AlertWindow(isBpi ? "Vote BPI" : "Vote BPM",
+                                        "Choose the value to vote for.",
+                                        juce::AlertWindow::QuestionIcon);
+    auto* valueComponent = new VoteValueComponent(isBpi ? "BPI" : "BPM", minValue, maxValue, initialValue);
+    alert->addCustomComponent(valueComponent);
+    alert->addButton("Vote", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    alert->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+
+    auto* processorPtr = &processor;
+    alert->enterModalState(true,
+                           juce::ModalCallbackFunction::create(
+                               [alert, valueComponent, processorPtr, voteKind](int result)
+                               {
+                                   std::unique_ptr<VoteValueComponent> valueOwner(valueComponent);
+                                   std::unique_ptr<juce::AlertWindow> alertOwner(alert);
+
+                                   if (result != 1)
+                                       return;
+
+                                   const auto normalisedKind = voteKind.toLowerCase();
+                                   processorPtr->sendChatMessage("!vote " + normalisedKind + " " + juce::String(valueOwner->getValue()));
+                               }),
+                           false);
+}
+
 void showChatAttachmentMenu(NinjamVst3AudioProcessor& processor,
                             juce::TextEditor& targetEditor,
                             juce::Component& anchorComponent,
@@ -2192,12 +2440,18 @@ void showChatAttachmentMenu(NinjamVst3AudioProcessor& processor,
     if (!draftIsUrl)
         menu.addItem(4, "Paste an http:// or https:// URL in the message box first", false, false);
     menu.addSeparator();
+    menu.addSectionHeader("Voting");
+    menu.addItem(5, "Vote BPM...");
+    menu.addItem(6, "Vote BPI...");
+    menu.addSeparator();
     menu.addSubMenu("My Chat Colour", colourMenu);
     menu.addSubMenu("Chat Window Colour", windowColourMenu);
     menu.addSeparator();
-    menu.addSectionHeader("Emoji");
     auto idToEmoji = std::make_shared<EmojiMenuMap>();
-    populateEmojiMenu(menu, emojiBaseId, *idToEmoji);
+    menu.addCustomItem(7, std::make_unique<EmojiGridComponent>(targetEditor), nullptr, "Emoji");
+    juce::PopupMenu emojiMenu;
+    populateEmojiMenu(emojiMenu, emojiBaseId, *idToEmoji);
+    menu.addSubMenu("More Emoji", emojiMenu);
 
     juce::Component::SafePointer<juce::TextEditor> safeEditor(&targetEditor);
     auto* processorPtr = &processor;
@@ -2239,6 +2493,12 @@ void showChatAttachmentMenu(NinjamVst3AudioProcessor& processor,
                            {
                                if (showGifPicker)
                                    showGifPicker();
+                               return;
+                           }
+
+                           if (result == 5 || result == 6)
+                           {
+                               showChatVoteDialog(*processorPtr, result == 5 ? "bpm" : "bpi");
                                return;
                            }
 
@@ -2885,6 +3145,10 @@ public:
         chatDisplay.setMultiLine(true);
         chatDisplay.setReadOnly(true);
         chatDisplay.setFont(juce::Font(14.0f));
+        chatDisplay.setCommandLinkCallback([this](const juce::String& command)
+        {
+            processor.sendChatMessage(command);
+        });
         setChatWindowColourKey(initialChatWindowColourKey);
 
         addAndMakeVisible(chatInput);
@@ -2952,12 +3216,14 @@ public:
     {
         auto area = getLocalBounds().reduced(8);
         auto inputArea = area.removeFromBottom(30);
-        auto sendArea = inputArea.removeFromRight(32);
-        inputArea.removeFromRight(5);
-        auto atArea = inputArea.removeFromRight(34);
-        inputArea.removeFromRight(5);
+        auto sendArea = inputArea.removeFromRight(26);
+        inputArea.removeFromRight(1);
+        auto atArea = inputArea.removeFromRight(26);
+        inputArea.removeFromRight(1);
+        auto attachArea = inputArea.removeFromRight(26);
+        inputArea.removeFromRight(2);
         chatInput.setBounds(inputArea);
-        chatEmojiButton.setBounds(inputArea.removeFromRight(28).reduced(2));
+        chatEmojiButton.setBounds(attachArea);
         sendButton.setBounds(sendArea);
         atButton.setBounds(atArea);
         chatDisplay.setBounds(area);
@@ -3023,7 +3289,7 @@ private:
 
     void sendClicked()
     {
-        auto msg = chatInput.getText();
+        auto msg = expandChatEmojiShortcuts(chatInput.getText());
         if (msg.isNotEmpty())
         {
             processor.sendChatMessage(msg);
@@ -3197,6 +3463,7 @@ class WidePopupComboBox : public juce::ComboBox
 {
 public:
     void setPopupMinimumWidth(int width) { popupMinimumWidth = width; }
+    std::function<void(bool)> onPopupActiveChanged;
 
     void showPopup() override
     {
@@ -3213,12 +3480,23 @@ public:
             menu.addItem(1, "No banks", false, false);
 
         juce::Component::SafePointer<WidePopupComboBox> safeThis(this);
+        if (onPopupActiveChanged)
+            onPopupActiveChanged(true);
+
         menu.showMenuAsync(juce::PopupMenu::Options()
                                .withTargetComponent(this)
                                .withMinimumWidth(juce::jmax(getWidth(), popupMinimumWidth)),
                            [safeThis](int result)
                            {
-                               if (safeThis != nullptr && result != 0)
+                               if (safeThis == nullptr)
+                                   return;
+
+                               safeThis->hidePopup();
+
+                               if (safeThis->onPopupActiveChanged)
+                                   safeThis->onPopupActiveChanged(false);
+
+                               if (result != 0)
                                    safeThis->setSelectedId(result);
                            });
     }
@@ -3283,6 +3561,13 @@ public:
         }
 
         LeftClickOnlySlider::mouseUp(e);
+    }
+
+    void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override
+    {
+        if (onControlInteraction)
+            onControlInteraction();
+        juce::Slider::mouseWheelMove(e, wheel);
     }
 
 private:
@@ -4085,6 +4370,11 @@ public:
         addAndMakeVisible(padsMidiLabel);
 
         padsMidiSelector.setTooltip("Pads MIDI input");
+        padsMidiSelector.setPopupMinimumWidth(210);
+        padsMidiSelector.onPopupActiveChanged = [this](bool active)
+        {
+            samplerPopupActive = active;
+        };
         addAndMakeVisible(padsMidiSelector);
         padsMidiSelector.onChange = [this]
         {
@@ -4103,6 +4393,11 @@ public:
         addAndMakeVisible(looperInputLabel);
 
         looperInputSelector.setTooltip("Looper recording input");
+        looperInputSelector.setPopupMinimumWidth(210);
+        looperInputSelector.onPopupActiveChanged = [this](bool active)
+        {
+            samplerPopupActive = active;
+        };
         addAndMakeVisible(looperInputSelector);
         looperInputSelector.onChange = [this]
         {
@@ -4123,6 +4418,10 @@ public:
         bankSelector.setTextWhenNothingSelected("Select bank");
         bankSelector.setTooltip("Saved sample pad banks");
         bankSelector.setPopupMinimumWidth(240);
+        bankSelector.onPopupActiveChanged = [this](bool active)
+        {
+            samplerPopupActive = active;
+        };
         addAndMakeVisible(bankSelector);
 
         for (int i = 0; i < 2; ++i)
@@ -4186,7 +4485,8 @@ public:
             knob.setRange(0.0, 1.0, 0.001);
             knob.setDoubleClickReturnValue(true, 0.0);
             knob.setLookAndFeel(&editor.getSamplerKnobLookAndFeel());
-            knob.getProperties().set("forceImageKnob", true);
+            knob.getProperties().set("disableImageKnob", true);
+            knob.getProperties().set("forceGreyKnob", true);
             knob.setTooltip("Sampler FX amount " + juce::String(slot + 1));
             knob.setValue(processor.getSamplePadFxSlotAmount(slot), juce::dontSendNotification);
             knob.onControlInteraction = [this]
@@ -4218,8 +4518,12 @@ public:
             editor.registerSamplerFxKnobLearnTarget(knob, slot);
 
             auto& selector = sampleFxSelectors[(size_t)slot];
-            selector.setPopupMinimumWidth(190);
+            selector.setPopupMinimumWidth(220);
             selector.setTooltip("Sampler FX type " + juce::String(slot + 1));
+            selector.onPopupActiveChanged = [this](bool active)
+            {
+                samplerPopupActive = active;
+            };
             populateSampleFxSelector(selector, processor.getSamplePadFxSlotType(slot));
             selector.onChange = [this, slot]
             {
@@ -4333,6 +4637,8 @@ public:
 
     void resized() override
     {
+        samplerResizeSuppressUntilMs = juce::Time::getMillisecondCounterHiRes() + samplerResizeRefreshSuppressMs;
+
         auto area = getLocalBounds().reduced(14);
         auto controls = area.removeFromRight(104);
         area.removeFromRight(12);
@@ -4409,6 +4715,9 @@ public:
 private:
     void timerCallback() override
     {
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        const bool canDoHeavyRefresh = !samplerPopupActive && now >= samplerResizeSuppressUntilMs;
+
         peakMeter.setPeak(processor.getSamplePadPeak());
         const int bpi = juce::jmax(1, processor.getBPI());
         const int beat = juce::jlimit(1, bpi, 1 + (int)std::floor(juce::jlimit(0.0f, 0.9999f, processor.getIntervalProgress()) * (float)bpi));
@@ -4416,12 +4725,27 @@ private:
         if (bpiLabel.getText() != bpiText)
             bpiLabel.setText(bpiText, juce::dontSendNotification);
         bpiCounter.repaint();
-        refreshQuickSelectors(false);
-        updateHoveredFxKnobSlot();
-        updatePadAlphaFade();
-        for (auto& pad : pads)
-            if (pad != nullptr)
-                pad->refreshFromProcessor();
+        if (canDoHeavyRefresh)
+            refreshQuickSelectors(false);
+
+        const bool samplerControlIsBusy = samplerPopupActive
+            || juce::ModifierKeys::currentModifiers.isAnyMouseButtonDown();
+        if (samplerControlIsBusy && !fxRouteDragActive && !fxChainRouteDragActive)
+        {
+            resetRouteFocusAlpha(true);
+        }
+        else
+        {
+            updateHoveredFxKnobSlot();
+            updatePadAlphaFade();
+        }
+
+        if (canDoHeavyRefresh)
+        {
+            for (auto& pad : pads)
+                if (pad != nullptr)
+                    pad->refreshFromProcessor();
+        }
     }
 
     static int samplePadFxMenuIdForType(NinjamVst3AudioProcessor::SamplePadFxType type)
@@ -4431,11 +4755,14 @@ private:
         {
             case FxType::reverb: return 1;
             case FxType::delay: return 2;
-            case FxType::djFilter: return 3;
-            case FxType::djFilterHp: return 4;
-            case FxType::djFilterLp: return 5;
-            case FxType::djFilterBp: return 6;
-            case FxType::phaser: return 7;
+            case FxType::delayQuarter: return 3;
+            case FxType::delayQuarterPingPong: return 4;
+            case FxType::djFilter: return 5;
+            case FxType::djFilterHp: return 6;
+            case FxType::djFilterLp: return 7;
+            case FxType::djFilterBp: return 8;
+            case FxType::phaser: return 9;
+            case FxType::phaserHalf: return 10;
         }
 
         return 1;
@@ -4447,11 +4774,14 @@ private:
         switch (menuId)
         {
             case 2: return FxType::delay;
-            case 3: return FxType::djFilter;
-            case 4: return FxType::djFilterHp;
-            case 5: return FxType::djFilterLp;
-            case 6: return FxType::djFilterBp;
-            case 7: return FxType::phaser;
+            case 3: return FxType::delayQuarter;
+            case 4: return FxType::delayQuarterPingPong;
+            case 5: return FxType::djFilter;
+            case 6: return FxType::djFilterHp;
+            case 7: return FxType::djFilterLp;
+            case 8: return FxType::djFilterBp;
+            case 9: return FxType::phaser;
+            case 10: return FxType::phaserHalf;
             case 1:
             default:
                 return FxType::reverb;
@@ -4463,12 +4793,15 @@ private:
     {
         selector.clear(juce::dontSendNotification);
         selector.addItem("Reverb", 1);
-        selector.addItem("Delay", 2);
-        selector.addItem("DJ Filter LP+HP", 3);
-        selector.addItem("DJ Filter HP", 4);
-        selector.addItem("DJ Filter LP", 5);
-        selector.addItem("DJ Filter BP", 6);
-        selector.addItem("Phaser", 7);
+        selector.addItem("Delay 1/8", 2);
+        selector.addItem("Delay 1/4", 3);
+        selector.addItem("Delay 1/4 Ping Pong", 4);
+        selector.addItem("DJ Filter LP+HP", 5);
+        selector.addItem("DJ Filter HP", 6);
+        selector.addItem("DJ Filter LP", 7);
+        selector.addItem("DJ Filter BP", 8);
+        selector.addItem("Phaser 1/4", 9);
+        selector.addItem("Phaser 1/2", 10);
         selector.setSelectedId(samplePadFxMenuIdForType(selectedType), juce::dontSendNotification);
     }
 
@@ -4502,6 +4835,10 @@ private:
             return -1;
         if (fxChainRouteDragActive)
             return -1;
+        if (samplerPopupActive)
+            return -1;
+        if (juce::ModifierKeys::currentModifiers.isAnyMouseButtonDown())
+            return -1;
         if (juce::Time::getMillisecondCounterHiRes() < suppressRouteFocusUntilMs)
             return -1;
 
@@ -4513,14 +4850,14 @@ private:
         return -1;
     }
 
-    void updateHoveredFxKnobSlot()
+    void setHoveredFxKnobSlot(int nextSlot)
     {
-        const int nextSlot = findHoveredFxKnobSlot();
         if (hoveredFxSlot == nextSlot)
             return;
 
         hoveredFxSlot = nextSlot;
         const bool focusingRoutes = hoveredFxSlot >= 0;
+        bool targetChanged = false;
         for (int pad = 0; pad < NinjamVst3AudioProcessor::numSamplePads; ++pad)
         {
             auto* padComponent = pads[(size_t)pad].get();
@@ -4529,27 +4866,109 @@ private:
 
             if (!focusingRoutes)
             {
-                padTargetAlpha[(size_t)pad] = 1.0f;
+                targetChanged = setPadTargetAlpha(pad, 1.0f) || targetChanged;
                 continue;
             }
 
             const bool routedToHoveredSlot = processor.isSamplePadFxSlotRouteEnabled(pad, hoveredFxSlot);
-            padTargetAlpha[(size_t)pad] = routedToHoveredSlot ? 0.62f : 0.36f;
+            targetChanged = setPadTargetAlpha(pad, routedToHoveredSlot ? 0.62f : 0.36f) || targetChanged;
         }
 
-        repaint();
+        if (targetChanged)
+            repaintPadAlphaAreas();
+    }
+
+    void updateHoveredFxKnobSlot()
+    {
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        const int nextCandidate = findHoveredFxKnobSlot();
+
+        if (nextCandidate != hoverCandidateFxSlot)
+        {
+            hoverCandidateFxSlot = nextCandidate;
+            hoverCandidateSinceMs = now;
+            if (hoveredFxSlot >= 0 && hoveredFxSlot != nextCandidate)
+                setHoveredFxKnobSlot(-1);
+            return;
+        }
+
+        if (nextCandidate < 0)
+        {
+            setHoveredFxKnobSlot(-1);
+            return;
+        }
+
+        if (hoveredFxSlot != nextCandidate
+            && now - hoverCandidateSinceMs >= routeFocusHoverDelayMs)
+        {
+            setHoveredFxKnobSlot(nextCandidate);
+        }
     }
 
     void noteSampleFxKnobEdited()
     {
         suppressRouteFocusUntilMs = juce::Time::getMillisecondCounterHiRes() + routeFocusSuppressAfterEditMs;
-        if (hoveredFxSlot >= 0)
+        resetRouteFocusAlpha(true);
+    }
+
+    bool setPadTargetAlpha(int pad, float target)
+    {
+        target = juce::jlimit(0.0f, 1.0f, target);
+        auto& currentTarget = padTargetAlpha[(size_t)pad];
+        if (std::abs(currentTarget - target) <= 0.001f)
+            return false;
+
+        currentTarget = target;
+        return true;
+    }
+
+    void repaintPadAlphaAreas()
+    {
+        for (const auto& pad : pads)
+            if (pad != nullptr)
+                repaint(pad->getBounds().expanded(3));
+    }
+
+    void resetRouteFocusAlpha(bool snapVisible)
+    {
+        hoverCandidateFxSlot = -1;
+        hoverCandidateSinceMs = 0.0;
+        hoveredFxSlot = -1;
+
+        bool changed = false;
+        for (int pad = 0; pad < NinjamVst3AudioProcessor::numSamplePads; ++pad)
+            changed = setPadTargetAlpha(pad, 1.0f) || changed;
+
+        if (snapVisible)
+            changed = snapPadAlphaToTargets() || changed;
+
+        if (changed)
+            repaintPadAlphaAreas();
+    }
+
+    bool snapPadAlphaToTargets()
+    {
+        bool changed = false;
+        lastPadAlphaUpdateMs = juce::Time::getMillisecondCounterHiRes();
+
+        for (int pad = 0; pad < NinjamVst3AudioProcessor::numSamplePads; ++pad)
         {
-            hoveredFxSlot = -1;
-            for (int pad = 0; pad < NinjamVst3AudioProcessor::numSamplePads; ++pad)
-                padTargetAlpha[(size_t)pad] = 1.0f;
-            repaint();
+            auto* padComponent = pads[(size_t)pad].get();
+            if (padComponent == nullptr)
+                continue;
+
+            auto& current = padCurrentAlpha[(size_t)pad];
+            const float target = padTargetAlpha[(size_t)pad];
+            if (std::abs(current - target) <= 0.001f
+                && std::abs(padComponent->getAlpha() - target) <= 0.001f)
+                continue;
+
+            current = target;
+            padComponent->setAlpha(target);
+            changed = true;
         }
+
+        return changed;
     }
 
     void updatePadAlphaFade()
@@ -4557,9 +4976,8 @@ private:
         const double now = juce::Time::getMillisecondCounterHiRes();
         const double previous = lastPadAlphaUpdateMs > 0.0 ? lastPadAlphaUpdateMs : now;
         lastPadAlphaUpdateMs = now;
-        const float step = (float)juce::jlimit(0.0, 1.0, (now - previous) / padAlphaFadeMs);
+        const float blend = (float)(1.0 - std::exp(-(now - previous) / padAlphaFadeMs));
 
-        bool changed = false;
         for (int pad = 0; pad < NinjamVst3AudioProcessor::numSamplePads; ++pad)
         {
             auto* padComponent = pads[(size_t)pad].get();
@@ -4572,24 +4990,17 @@ private:
             {
                 current = target;
             }
-            else if (current < target)
-            {
-                current = juce::jmin(target, current + step);
-            }
             else
             {
-                current = juce::jmax(target, current - step);
+                current += (target - current) * juce::jlimit(0.0f, 1.0f, blend);
             }
 
             if (std::abs(padComponent->getAlpha() - current) > 0.001f)
             {
                 padComponent->setAlpha(current);
-                changed = true;
+                repaint(padComponent->getBounds().expanded(3));
             }
         }
-
-        if (changed)
-            repaint();
     }
 
     void handleFxRouteDrag(int padIndex, juce::Point<int> point, bool finished)
@@ -4804,7 +5215,7 @@ private:
 
             auto& selector = sampleFxSelectors[(size_t)slot];
             const int targetId = samplePadFxMenuIdForType(processor.getSamplePadFxSlotType(slot));
-            if (selector.getSelectedId() != targetId)
+            if (!samplerPopupActive && selector.getSelectedId() != targetId)
                 selector.setSelectedId(targetId, juce::dontSendNotification);
         }
 
@@ -4940,6 +5351,9 @@ private:
 
     void refreshQuickSelectors(bool force)
     {
+        if (samplerPopupActive && !force)
+            return;
+
         const auto padsMidiDeviceId = processor.getSamplePadsMidiInputDeviceId();
         if (force || padsMidiDeviceId != displayedPadsMidiDeviceId)
         {
@@ -5255,9 +5669,9 @@ private:
     std::array<std::unique_ptr<SamplePadComponent>, NinjamVst3AudioProcessor::numSamplePads> pads;
     FaderLookAndFeel faderLookAndFeel;
     juce::Label padsMidiLabel;
-    juce::ComboBox padsMidiSelector;
+    WidePopupComboBox padsMidiSelector;
     juce::Label looperInputLabel;
-    juce::ComboBox looperInputSelector;
+    WidePopupComboBox looperInputSelector;
     juce::Label bankLabel;
     WidePopupComboBox bankSelector;
     std::array<LeftClickOnlyTextButton, 2> samplerSizeButtons { LeftClickOnlyTextButton{ "-" },
@@ -5281,6 +5695,8 @@ private:
     int fxRouteDragPad = -1;
     int highlightedFxSlot = -1;
     int hoveredFxSlot = -1;
+    int hoverCandidateFxSlot = -1;
+    double hoverCandidateSinceMs = 0.0;
     juce::Point<int> fxRouteDragPoint;
     bool fxChainRouteDragActive = false;
     int fxChainRouteSourceSlot = -1;
@@ -5290,8 +5706,12 @@ private:
     std::array<float, NinjamVst3AudioProcessor::numSamplePads> padTargetAlpha {};
     double lastPadAlphaUpdateMs = 0.0;
     double suppressRouteFocusUntilMs = 0.0;
+    double samplerResizeSuppressUntilMs = 0.0;
+    bool samplerPopupActive = false;
     static constexpr double routeFocusSuppressAfterEditMs = 800.0;
-    static constexpr double padAlphaFadeMs = 100.0;
+    static constexpr double padAlphaFadeMs = 320.0;
+    static constexpr double routeFocusHoverDelayMs = 300.0;
+    static constexpr double samplerResizeRefreshSuppressMs = 220.0;
     NonlinearFaderSlider volumeSlider;
     juce::Label volumeLabel;
     MasterPeakMeter peakMeter;
@@ -5302,7 +5722,8 @@ private:
     IntervalDisplayComponent bpiCounter;
 };
 
-class SamplePadsWindow : public juce::DocumentWindow
+class SamplePadsWindow : public juce::DocumentWindow,
+                         private juce::Timer
 {
 public:
     SamplePadsWindow(NinjamVst3AudioProcessor& p,
@@ -5366,6 +5787,7 @@ public:
 
     void closeButtonPressed() override
     {
+        stopTimer();
         notifyBoundsChanged(true);
         setVisible(false);
         auto callback = onClosed;
@@ -5379,16 +5801,38 @@ public:
     void moved() override
     {
         DocumentWindow::moved();
-        notifyBoundsChanged(false);
+        scheduleBoundsChanged(false);
     }
 
     void resized() override
     {
         DocumentWindow::resized();
-        notifyBoundsChanged(false);
+        scheduleBoundsChanged(false);
     }
 
 private:
+    void scheduleBoundsChanged(bool saveNow)
+    {
+        if (abletonHosted || onBoundsChanged == nullptr || getWidth() <= 0 || getHeight() <= 0)
+            return;
+
+        pendingBoundsSaveNow = pendingBoundsSaveNow || saveNow;
+        pendingBoundsChanged = true;
+        startTimer(boundsChangedDebounceMs);
+    }
+
+    void timerCallback() override
+    {
+        stopTimer();
+        if (!pendingBoundsChanged)
+            return;
+
+        const bool saveNow = pendingBoundsSaveNow;
+        pendingBoundsChanged = false;
+        pendingBoundsSaveNow = false;
+        notifyBoundsChanged(saveNow);
+    }
+
     void notifyBoundsChanged(bool saveNow)
     {
         if (!abletonHosted && onBoundsChanged && getWidth() > 0 && getHeight() > 0)
@@ -5398,6 +5842,9 @@ private:
     std::function<void()> onClosed;
     std::function<void(juce::Rectangle<int>, bool)> onBoundsChanged;
     bool abletonHosted = false;
+    bool pendingBoundsChanged = false;
+    bool pendingBoundsSaveNow = false;
+    static constexpr int boundsChangedDebounceMs = 250;
 };
 
 struct ChatStylePalette
@@ -5689,6 +6136,57 @@ void RichChatDisplayComponent::setBackgroundColour(juce::Colour newColour)
     repaint();
 }
 
+void RichChatDisplayComponent::setCommandLinkCallback(std::function<void(const juce::String&)> callback)
+{
+    commandLinkCallback = std::move(callback);
+}
+
+static juce::String extractFirstIntegerText(juce::String text)
+{
+    text = text.trim();
+    juce::String digits;
+    bool started = false;
+    for (int i = 0; i < text.length(); ++i)
+    {
+        const auto c = text[i];
+        if (c >= '0' && c <= '9')
+        {
+            digits << juce::String::charToString(c);
+            started = true;
+        }
+        else if (started)
+        {
+            break;
+        }
+    }
+    return digits;
+}
+
+static bool extractVoteCommandFromVotingLine(const juce::String& line, juce::String& command)
+{
+    const auto lower = line.toLowerCase();
+    if (!lower.contains("[voting system]"))
+        return false;
+
+    auto tryMarker = [&](const char* marker, const char* kind)
+    {
+        const juce::String markerText(marker);
+        const int markerIndex = lower.indexOf(markerText);
+        if (markerIndex < 0)
+            return false;
+
+        const auto valueText = extractFirstIntegerText(line.substring(markerIndex + markerText.length()));
+        if (valueText.isEmpty())
+            return false;
+
+        command = "!vote " + juce::String(kind) + " " + valueText;
+        return true;
+    };
+
+    return tryMarker("setting bpm to", "bpm")
+        || tryMarker("setting bpi to", "bpi");
+}
+
 static bool extractChatMedia(const juce::String& line, juce::String& kind, juce::String& url)
 {
     const juce::String gifMarker = " shared a GIF: ";
@@ -5855,7 +6353,7 @@ int RichChatDisplayComponent::layoutEntryText(const RichChatDisplayComponent::En
             }
         }
 
-        links->push_back({ bounds, url });
+        links->push_back({ bounds, url, {} });
     };
 
     auto drawPiece = [&](const juce::String& text,
@@ -5923,7 +6421,12 @@ int RichChatDisplayComponent::layoutEntryText(const RichChatDisplayComponent::En
         }
     }
 
-    return juce::jmax(lineHeight, lineY - y + lineHeight);
+    const int textHeight = juce::jmax(lineHeight, lineY - y + lineHeight);
+    juce::String voteCommand;
+    if (links != nullptr && extractVoteCommandFromVotingLine(entry.line, voteCommand))
+        links->push_back({ { leftEdge, y, rightEdge - leftEdge, textHeight }, {}, voteCommand });
+
+    return textHeight;
 }
 
 void RichChatDisplayComponent::paint(juce::Graphics& g)
@@ -6037,7 +6540,15 @@ void RichChatDisplayComponent::mouseDown(const juce::MouseEvent& e)
     const int linkIndex = getLinkIndexAt(e.getPosition());
     if (linkIndex >= 0 && linkIndex < (int)paintedLinks.size())
     {
-        juce::URL(paintedLinks[(size_t)linkIndex].url).launchInDefaultBrowser();
+        const auto& link = paintedLinks[(size_t)linkIndex];
+        if (link.command.isNotEmpty())
+        {
+            if (commandLinkCallback)
+                commandLinkCallback(link.command);
+            return;
+        }
+
+        juce::URL(link.url).launchInDefaultBrowser();
         return;
     }
 }
@@ -6089,9 +6600,14 @@ int RichChatDisplayComponent::getTextWidthForLayout() const
     return juce::jmax(40, getWidth() - scrollBar.getWidth() - 10);
 }
 
+static int getRichChatMediaTileWidth(int textWidth)
+{
+    return juce::jmax(40, juce::jmin(420, textWidth - 8));
+}
+
 int RichChatDisplayComponent::getMediaTileHeight(const RichChatDisplayComponent::Entry& entry, int textWidth) const
 {
-    const int tileWidth = juce::jmin(180, juce::jmax(40, textWidth - 8));
+    const int tileWidth = getRichChatMediaTileWidth(textWidth);
     int imageWidth = 0;
     int imageHeight = 0;
 
@@ -6107,14 +6623,14 @@ int RichChatDisplayComponent::getMediaTileHeight(const RichChatDisplayComponent:
     }
 
     if (imageWidth > 0 && imageHeight > 0)
-        return juce::jlimit(72, 260, (int)std::ceil((double)tileWidth * (double)imageHeight / (double)imageWidth));
+        return juce::jlimit(96, 420, (int)std::ceil((double)tileWidth * (double)imageHeight / (double)imageWidth));
 
-    return 92;
+    return 120;
 }
 
 juce::Rectangle<int> RichChatDisplayComponent::getMediaTileBounds(const RichChatDisplayComponent::Entry& entry, int y, int textWidth) const
 {
-    const int tileWidth = juce::jmin(180, juce::jmax(40, textWidth - 8));
+    const int tileWidth = getRichChatMediaTileWidth(textWidth);
     return { 8, y, tileWidth, getMediaTileHeight(entry, textWidth) };
 }
 
@@ -6315,9 +6831,12 @@ void CustomKnobLookAndFeel::drawRotarySlider(juce::Graphics& g, int x, int y, in
     const int knobMinDim = juce::jmin(width, height);
     const bool forceImageKnob = slider.getProperties().contains("forceImageKnob")
         && (bool)slider.getProperties()["forceImageKnob"];
+    const bool disableImageKnob = slider.getProperties().contains("disableImageKnob")
+        && (bool)slider.getProperties()["disableImageKnob"];
     const bool matchReleaseStyle = slider.getProperties().contains("matchReleaseStyle")
         && (bool)slider.getProperties()["matchReleaseStyle"];
-    const bool useImageKnob = (editor != nullptr
+    const bool useImageKnob = (!disableImageKnob
+                               && editor != nullptr
                                && editor->radioKnobImage.isValid()
                                && (knobMinDim >= 40 || forceImageKnob || matchReleaseStyle));
     if (useImageKnob)
@@ -6356,9 +6875,12 @@ void CustomKnobLookAndFeel::drawRotarySlider(juce::Graphics& g, int x, int y, in
     const float angle = rotaryStartAngle + sliderPos * (rotaryEndAngle - rotaryStartAngle);
     const float outerRadius = (float)juce::jmin(width / 2, height / 2) - (knobMinDim < 30 ? 2.5f : 4.0f);
 
+    const bool forceGreyKnob = slider.getProperties().contains("forceGreyKnob")
+        && (bool)slider.getProperties()["forceGreyKnob"];
     const auto knobPreset = editor != nullptr ? normaliseColourPresetName(editor->knobColourPreset) : juce::String();
-    const bool multiColourKnob = knobPreset.startsWith("multi");
-    const juce::Colour knobBase = editor != nullptr ? editor->knobThemeColour : juce::Colours::grey;
+    const bool multiColourKnob = !forceGreyKnob && knobPreset.startsWith("multi");
+    const juce::Colour knobBase = forceGreyKnob ? juce::Colour(0xff9ca3ad)
+                                                : (editor != nullptr ? editor->knobThemeColour : juce::Colours::grey);
     const juce::Colour ringFill = knobBase.darker(1.1f);
     const juce::Colour ringStroke = knobBase.darker(1.4f);
     const juce::Colour tickColour = multiColourKnob
@@ -6548,7 +7070,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
                 break;
 
     addAndMakeVisible(videoButton);
-    videoButton.setTooltip("VDO Synced Video");
+    videoButton.setTooltip("Video Room");
     videoButton.onClick = [this] { videoClicked(); };
 
     addAndMakeVisible(samplePadsButton);
@@ -6990,6 +7512,10 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     chatDisplay.setMultiLine(true);
     chatDisplay.setReadOnly(true);
     chatDisplay.setFont(juce::Font(14.0f));
+    chatDisplay.setCommandLinkCallback([this](const juce::String& command)
+    {
+        audioProcessor.sendChatMessage(command);
+    });
 
     addAndMakeVisible(chatInput);
     chatInput.onReturnKey = [this] { sendClicked(); };
@@ -7230,7 +7756,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     lastSavedUiSettingsFingerprint = buildPersistentSettingsFingerprint(false);
     persistentSettingsDirty = false;
 
-    startTimer((!audioProcessor.isStandaloneWrapper() && isAbletonLiveHost()) ? 50 : 30);
+    updateEditorTimerInterval();
 
     if (!audioProcessor.isStandaloneWrapper() && isAbletonLiveHost())
     {
@@ -7740,12 +8266,13 @@ void NinjamVst3AudioProcessorEditor::resized()
         chatArea.removeFromBottom(5);
         chatDisplay.setBounds(chatArea);
 
-        sendButton.setBounds(chatInputArea.removeFromRight(32));
-        chatInputArea.removeFromRight(5);
-        atButton.setBounds(chatInputArea.removeFromRight(34));
-        chatInputArea.removeFromRight(5);
+        sendButton.setBounds(chatInputArea.removeFromRight(26));
+        chatInputArea.removeFromRight(1);
+        atButton.setBounds(chatInputArea.removeFromRight(26));
+        chatInputArea.removeFromRight(1);
+        chatEmojiButton.setBounds(chatInputArea.removeFromRight(26));
+        chatInputArea.removeFromRight(2);
         chatInput.setBounds(chatInputArea);
-        chatEmojiButton.setBounds(chatInputArea.removeFromRight(28).reduced(2));
 
         if (gifPickerPanel != nullptr && gifPickerPanel->isVisible())
         {
@@ -7883,7 +8410,12 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         return;
 
     const bool heavyUiAllowed = nowMs >= suppressHeavyUiUntilMs;
-    const int heavyUiTickDivisor = abletonHostEditor ? 8 : 6;
+#if JUCE_WINDOWS
+    const bool animatedBackgroundActive = videoFrameReader != nullptr;
+#else
+    const bool animatedBackgroundActive = false;
+#endif
+    const int heavyUiTickDivisor = abletonHostEditor ? 8 : (animatedBackgroundActive ? 11 : 6);
     const bool runHeavyUiTick = ((++heavyUiTickCounter % heavyUiTickDivisor) == 0);
     if (heavyUiAllowed && runHeavyUiTick)
     {
@@ -8097,9 +8629,12 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
     if (videoFrameReader != nullptr)
     {
         auto frame = videoFrameReader->getLatestFrame();
-        const bool abletonLinkSensitive = audioProcessor.isAbletonLinkTransportEnabled()
-            || audioProcessor.isLinkAudioEnabled();
-        const double minimumBackgroundRepaintMs = (abletonHostEditor || abletonLinkSensitive) ? 250.0 : 0.0;
+        const bool samplerVisible = samplePadsWindow != nullptr && samplePadsWindow->isVisible();
+        const bool samplerMouseBusy = samplerVisible && juce::ModifierKeys::currentModifiers.isAnyMouseButtonDown();
+        const double minimumBackgroundRepaintMs = abletonHostEditor ? 250.0
+            : samplerMouseBusy ? 100.0
+            : samplerVisible ? 40.0
+            : 0.0;
         if (frame.isValid()
             && (minimumBackgroundRepaintMs <= 0.0
                 || nowMs - lastVideoBackgroundRepaintMs >= minimumBackgroundRepaintMs))
@@ -8278,9 +8813,20 @@ void NinjamVst3AudioProcessorEditor::showMidiLearnMenuForComponent(juce::Compone
                 hasWire = true;
             }
         }
+        for (int pad = 0; pad < NinjamVst3AudioProcessor::numSamplePads; ++pad)
+        {
+            if (audioProcessor.isSamplePadFxSlotRouteEnabled(pad, sampleFxSlot))
+            {
+                auto padName = audioProcessor.getSamplePadName(pad).trim();
+                if (padName.isEmpty())
+                    padName = "Pad " + juce::String(pad + 1);
+                clearWireMenu.addItem(1200 + pad, "From " + padName);
+                hasWire = true;
+            }
+        }
 
         if (!hasWire)
-            clearWireMenu.addItem(1099, "No knob wires", false);
+            clearWireMenu.addItem(1099, "No wires", false);
         menu.addSubMenu("Clear Wire", clearWireMenu);
         menu.addSeparator();
     }
@@ -8306,6 +8852,12 @@ void NinjamVst3AudioProcessorEditor::showMidiLearnMenuForComponent(juce::Compone
                            else if (sampleFxSlot >= 0 && result >= 1100 && result < 1200)
                            {
                                audioProcessor.setSamplePadFxSlotToSlotRouteEnabled(result - 1100, sampleFxSlot, false);
+                               if (samplePadsWindow != nullptr)
+                                   samplePadsWindow->repaint();
+                           }
+                           else if (sampleFxSlot >= 0 && result >= 1200 && result < 1300)
+                           {
+                               audioProcessor.setSamplePadFxSlotRouteEnabled(result - 1200, sampleFxSlot, false);
                                if (samplePadsWindow != nullptr)
                                    samplePadsWindow->repaint();
                            }
@@ -8880,7 +9432,7 @@ void NinjamVst3AudioProcessorEditor::connectClicked()
 
 void NinjamVst3AudioProcessorEditor::sendClicked()
 {
-    juce::String msg = chatInput.getText();
+    juce::String msg = expandChatEmojiShortcuts(chatInput.getText());
     if (msg.isNotEmpty())
     {
         audioProcessor.sendChatMessage(msg);
@@ -9064,6 +9616,7 @@ void NinjamVst3AudioProcessorEditor::showSamplePadsWindow()
             samplerWindow->applyAbletonSizePreset(abletonSamplerWindowSizePreset);
         samplePadsWindow->setVisible(true);
         samplePadsWindow->toFront(false);
+        updateEditorTimerInterval();
         return;
     }
 
@@ -9101,8 +9654,12 @@ void NinjamVst3AudioProcessorEditor::showSamplePadsWindow()
                                                               [callbackSafeThis]
                                                               {
                                                                   if (callbackSafeThis != nullptr)
+                                                                  {
                                                                       callbackSafeThis->samplePadsWindow.reset();
+                                                                      callbackSafeThis->updateEditorTimerInterval();
+                                                                  }
                                                               }));
+        editorPtr->updateEditorTimerInterval();
     };
 
     if (abletonHostedWindow)
@@ -9309,7 +9866,28 @@ void NinjamVst3AudioProcessorEditor::syncToggled()
 
 void NinjamVst3AudioProcessorEditor::videoClicked()
 {
-    audioProcessor.launchVideoSessionAsync();
+    if (!audioProcessor.isNinjamZapVideoAvailable())
+    {
+        audioProcessor.launchVideoSessionAsync();
+        return;
+    }
+
+    juce::PopupMenu menu;
+    menu.addItem(1, "VDO synced video");
+    menu.addItem(2, "NINJAMZap server video");
+
+    juce::Component::SafePointer<NinjamVst3AudioProcessorEditor> safeThis(this);
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&videoButton),
+                       [safeThis](int result)
+                       {
+                           if (safeThis == nullptr)
+                               return;
+
+                           if (result == 1)
+                               safeThis->audioProcessor.launchVideoSessionAsync();
+                           else if (result == 2)
+                               safeThis->audioProcessor.launchNinjamZapVideoSession();
+                       });
 }
 
 void NinjamVst3AudioProcessorEditor::serverListClicked()
@@ -9672,6 +10250,7 @@ void NinjamVst3AudioProcessorEditor::loadControlImages(const juce::File& themeDi
     }
 
     applyThemeColours();
+    updateEditorTimerInterval();
     repaint();
 }
 
@@ -9778,6 +10357,40 @@ bool NinjamVst3AudioProcessorEditor::shouldDeferHeavyUiWork() const
     if (pendingDeferredResizeLayout || applyingDeferredResizeLayout)
         return true;
     return juce::Time::getMillisecondCounterHiRes() < suppressHeavyUiUntilMs;
+}
+
+void NinjamVst3AudioProcessorEditor::updateEditorTimerInterval()
+{
+    const bool abletonHostEditor = !audioProcessor.isStandaloneWrapper() && isAbletonLiveHost();
+
+#if JUCE_WINDOWS
+    const bool animatedBackgroundActive = videoFrameReader != nullptr;
+#else
+    const bool animatedBackgroundActive = false;
+#endif
+
+    int nextIntervalMs = 30;
+    if (abletonHostEditor)
+    {
+        nextIntervalMs = 50;
+    }
+    else if (animatedBackgroundActive)
+    {
+        const bool samplerVisible = samplePadsWindow != nullptr && samplePadsWindow->isVisible();
+#if JUCE_WINDOWS
+        const int videoFrameMs = videoFrameReader != nullptr ? videoFrameReader->getFramePeriodMs() : 33;
+#else
+        const int videoFrameMs = 33;
+#endif
+        nextIntervalMs = samplerVisible ? juce::jmax(40, videoFrameMs)
+                                        : juce::jlimit(16, 50, videoFrameMs);
+    }
+
+    if (currentEditorTimerIntervalMs != nextIntervalMs)
+    {
+        currentEditorTimerIntervalMs = nextIntervalMs;
+        startTimer(nextIntervalMs);
+    }
 }
 
 bool NinjamVst3AudioProcessorEditor::isAbletonLiveHost() const

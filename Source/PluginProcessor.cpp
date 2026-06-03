@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "ZapVideoCodec.h"
 #include "Chromagram.h"
 #include "ChordDetector.h"
 #include "signalsmith-stretch/signalsmith-stretch.h"
@@ -192,6 +193,7 @@ private:
         {
             HttpResponse response;
             response.contentType = "text/html; charset=utf-8";
+            response.noStore = true;
             response.body = makeUtf8Body(helperIndexHtml);
             if (isHead)
                 response.body.reset();
@@ -202,6 +204,7 @@ private:
         {
             HttpResponse response;
             response.contentType = "text/html; charset=utf-8";
+            response.noStore = true;
             response.body = makeUtf8Body(helperAppHtml);
             if (isHead)
                 response.body.reset();
@@ -226,6 +229,7 @@ private:
         {
             HttpResponse response;
             response.contentType = "image/png";
+            response.noStore = true;
             response.body = helperIconPng;
             if (isHead)
                 response.body.reset();
@@ -1428,6 +1432,10 @@ namespace
     constexpr unsigned int kOpusSyncFourcc    = makeNjFourcc('N','J','S','3');
     // Custom FOURCC for interval sync signals (intervalSyncTag, transportProbe, latencyReport)
     constexpr unsigned int kSyncSignalFourcc  = makeNjFourcc('N','J','S','4');
+    constexpr unsigned int kNinjamZapVideoH264Fourcc = makeNjFourcc('H','2','6','4');
+    constexpr unsigned int kNinjamZapVideoVp8Fourcc  = makeNjFourcc('V','P','8',' ');
+    constexpr unsigned int kNinjamZapVideoMjpgFourcc = makeNjFourcc('M','J','P','G');
+    constexpr int kNinjamZapVideoOnlyChannelFlag = NJClient::NJCLIENT_CHANNEL_FLAG_VIDEO_ONLY;
     constexpr const char* sideSignalChatPrefix = "__NINJAM_VST3_SIDESIGNAL__ ";
     constexpr int remoteLatencyUpdateCadenceIntervals = 1;
     constexpr int kSyncSignalChannelIndex = 0;
@@ -1435,6 +1443,36 @@ namespace
     constexpr long long intervalSyncMarkerKeyBeatStride = 1024;
     constexpr int kLocalInputLinkAudioSentinel = -2000000000;
     constexpr double linkAudioQuantumBeats = 4.0;
+
+    bool isNinjamZapVideoFourcc(unsigned int fourcc)
+    {
+        return fourcc == kNinjamZapVideoH264Fourcc
+            || fourcc == kNinjamZapVideoVp8Fourcc
+            || fourcc == kNinjamZapVideoMjpgFourcc;
+    }
+
+    ninjamplus::zap::VideoCodec getNinjamZapVideoCodec(unsigned int fourcc)
+    {
+        if (fourcc == kNinjamZapVideoMjpgFourcc) return ninjamplus::zap::VideoCodec::mjpeg;
+        if (fourcc == kNinjamZapVideoH264Fourcc) return ninjamplus::zap::VideoCodec::h264;
+        if (fourcc == kNinjamZapVideoVp8Fourcc)  return ninjamplus::zap::VideoCodec::vp8;
+        return ninjamplus::zap::VideoCodec::unknown;
+    }
+
+    juce::String guidToHexString(const unsigned char* guid)
+    {
+        if (guid == nullptr)
+            return {};
+
+        static constexpr char hex[] = "0123456789abcdef";
+        char text[33] {};
+        for (int i = 0; i < 16; ++i)
+        {
+            text[i * 2] = hex[(guid[i] >> 4) & 0x0f];
+            text[i * 2 + 1] = hex[guid[i] & 0x0f];
+        }
+        return juce::String::fromUTF8(text);
+    }
 
     juce::String makeShortUserName(juce::String fullName)
     {
@@ -1756,6 +1794,9 @@ namespace
             case FxType::djFilterLp:
             case FxType::djFilterBp:
             case FxType::phaser:
+            case FxType::delayQuarter:
+            case FxType::delayQuarterPingPong:
+            case FxType::phaserHalf:
                 return (FxType)type;
         }
         return FxType::reverb;
@@ -2280,6 +2321,7 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
         remoteVideoBufferRefreshIdByUser.clear();
         videoBufferRefreshCounter = 0;
     }
+    resetIntervalSyncTimingCache();
     opusSyncAvailable.store(false);
     opusSyncHasLegacyClients.store(false);
     lastOpusSupportBroadcastMs = 0.0;
@@ -2332,6 +2374,7 @@ void NinjamVst3AudioProcessor::disconnectFromServer()
         remoteVideoBufferRefreshIdByUser.clear();
         videoBufferRefreshCounter = 0;
     }
+    resetIntervalSyncTimingCache();
     {
         const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
         remoteLinkAudioOutputPairs.clear();
@@ -2603,7 +2646,7 @@ void NinjamVst3AudioProcessor::broadcastOpusSyncSupport(const juce::String& targ
     obj->setProperty("handshakeVersion", opusSyncHandshakeVersion);
     obj->setProperty("runtimeFormat", getWrapperTypeName(wrapperType));
     obj->setProperty("pluginName", juce::String(JucePlugin_Name));
-    obj->setProperty("pluginVersion", juce::String(NINJAM_DISPLAY_VERSION));
+    obj->setProperty("pluginVersion", getVersionString());
     obj->setProperty("supportsOpus", true);
     obj->setProperty("enabled", numLocalChannels.load() > 1);
     obj->setProperty("numChannels", numLocalChannels.load());
@@ -2786,6 +2829,29 @@ juce::String NinjamVst3AudioProcessor::buildIntervalSyncTag(int interval, int le
     return userPart + ":" + juce::String(interval) + ":" + juce::String(length);
 }
 
+void NinjamVst3AudioProcessor::resetIntervalSyncTimingCache()
+{
+    lastBroadcastIntervalTag.store(-1);
+    lastProcessedIntervalMarkerKey.store(-1);
+    lastLatencyTimingBpi = -1;
+    lastLatencyTimingLength = -1;
+    lastLatencyTimingBpm = -1.0;
+    lastIntervalHelperPayloadWriteMs = 0.0;
+
+    const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+    lastAnnouncedRemoteIntervalByUser.clear();
+    localIntervalStartMsByInterval.clear();
+    pendingRemoteIntervalStartsByUser.clear();
+    pendingTransportProbeSentMsById.clear();
+    remoteLatencyLastAppliedIntervalByUser.clear();
+    remoteLatencyAverageByUser.clear();
+    remoteLatencyFirmDelayMsByUser.clear();
+    remoteVideoBufferRefreshIdByUser.clear();
+    videoBufferRefreshCounter = 0;
+    lastRemoteServerLatencyMsByUser.clear();
+    recentVideoTimingChangeEventIds.clear();
+}
+
 void NinjamVst3AudioProcessor::invalidateIntervalSyncLatencyState(bool keepRemoteServerLatency)
 {
     lastBroadcastIntervalTag.store(-1);
@@ -2804,6 +2870,45 @@ void NinjamVst3AudioProcessor::invalidateIntervalSyncLatencyState(bool keepRemot
         videoBufferRefreshCounter = 0;
         lastRemoteServerLatencyMsByUser.clear();
     }
+}
+
+bool NinjamVst3AudioProcessor::consumeVideoTimingChangeEvent(const juce::String& eventId)
+{
+    if (eventId.isEmpty())
+        return true;
+
+    const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+    for (const auto& existing : recentVideoTimingChangeEventIds)
+    {
+        if (existing == eventId)
+            return false;
+    }
+
+    recentVideoTimingChangeEventIds.push_back(eventId);
+    while (recentVideoTimingChangeEventIds.size() > 128)
+        recentVideoTimingChangeEventIds.pop_front();
+    return true;
+}
+
+void NinjamVst3AudioProcessor::broadcastVideoTimingChange(double previousBpm, double newBpm, int bpi, int length, int timingDelayDeltaMs)
+{
+    if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
+        return;
+
+    const juce::String userId = normaliseOpusPeerId(currentUser);
+    const juce::String senderKey = userId.isNotEmpty() ? userId : currentUser.trim();
+    juce::DynamicObject::Ptr obj = new juce::DynamicObject();
+    obj->setProperty("appFamily", opusSyncAppFamily);
+    obj->setProperty("userId", senderKey);
+    obj->setProperty("previousBpm", previousBpm);
+    obj->setProperty("bpm", newBpm);
+    obj->setProperty("bpi", bpi);
+    obj->setProperty("length", length);
+    obj->setProperty("timingDelayDeltaMs", timingDelayDeltaMs);
+    obj->setProperty("intervalIndex", getDisplayIntervalIndex());
+    obj->setProperty("intervalAbsolute", intervalIndex.load());
+    obj->setProperty("eventId", "videoTimingChange:" + senderKey + ":" + juce::String(++sideSignalEventCounter));
+    sendIntervalSignal("videoTimingChange", juce::JSON::toString(juce::var(obj.get())));
 }
 
 void NinjamVst3AudioProcessor::pruneDisconnectedRemoteSyncState()
@@ -3044,6 +3149,110 @@ void NinjamVst3AudioProcessor::launchVideoSessionAsync()
             }
         }
     });
+}
+
+bool NinjamVst3AudioProcessor::isNinjamZapVideoAvailable()
+{
+    return ninjamClient.GetStatus() == NJClient::NJC_STATUS_OK
+        && ninjamClient.GetServerVideoSupported();
+}
+
+bool NinjamVst3AudioProcessor::isNinjamZapVideoEnabled() const
+{
+    return ninjamZapVideoEnabled.load(std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::addSystemChatLine(const juce::String& message)
+{
+    juce::ScopedLock lock(chatLock);
+    chatHistory.add(message);
+    chatSenders.add("");
+    chatRevision.fetch_add(1);
+    if (chatHistory.size() > 100)
+    {
+        chatHistory.removeRange(0, chatHistory.size() - 100);
+        chatSenders.removeRange(0, juce::jmax(0, chatSenders.size() - 100));
+    }
+}
+
+bool NinjamVst3AudioProcessor::isNinjamRemoteChannelVideoOnly(int userIndex, int channelIndex)
+{
+    int flags = 0;
+    const char* chName = ninjamClient.GetUserChannelState(userIndex, channelIndex,
+                                                          nullptr, nullptr, nullptr,
+                                                          nullptr, nullptr, nullptr,
+                                                          &flags);
+    return chName != nullptr && ((flags & kNinjamZapVideoOnlyChannelFlag) != 0);
+}
+
+int NinjamVst3AudioProcessor::syncNinjamZapVideoSubscriptions(bool subscribe)
+{
+    if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
+        return 0;
+
+    int videoChannelCount = 0;
+    const int numUsers = ninjamClient.GetNumUsers();
+    for (int userIndex = 0; userIndex < numUsers; ++userIndex)
+    {
+        for (int channelIndex = 0; channelIndex < 32; ++channelIndex)
+        {
+            bool isSubscribed = false;
+            int flags = 0;
+            const char* chName = ninjamClient.GetUserChannelState(userIndex, channelIndex,
+                                                                  &isSubscribed,
+                                                                  nullptr, nullptr,
+                                                                  nullptr, nullptr,
+                                                                  nullptr,
+                                                                  &flags);
+            if (chName == nullptr || ((flags & kNinjamZapVideoOnlyChannelFlag) == 0))
+                continue;
+
+            ++videoChannelCount;
+            if (isSubscribed != subscribe)
+            {
+                ninjamClient.SetUserChannelState(userIndex, channelIndex,
+                                                 true, subscribe,
+                                                 false, 0.0f,
+                                                 false, 0.0f,
+                                                 false, false,
+                                                 false, false);
+            }
+        }
+    }
+
+    return videoChannelCount;
+}
+
+void NinjamVst3AudioProcessor::launchNinjamZapVideoSession()
+{
+    if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
+    {
+        addSystemChatLine("Connect to a server first, then click Video Room.");
+        return;
+    }
+
+    if (!ninjamClient.GetServerVideoSupported())
+    {
+        ninjamZapVideoEnabled.store(false, std::memory_order_relaxed);
+        addSystemChatLine("This server does not advertise NINJAMZap video support.");
+        return;
+    }
+
+    ninjamZapVideoEnabled.store(true, std::memory_order_relaxed);
+    ninjamZapVideoReceivedNotice.store(false, std::memory_order_relaxed);
+    {
+        const juce::ScopedLock lock(ninjamZapVideoChunkLock);
+        ninjamZapVideoChunkReassemblers.clear();
+    }
+    const int videoChannels = syncNinjamZapVideoSubscriptions(true);
+
+    juce::String message = "NINJAMZap video transport enabled";
+    if (videoChannels > 0)
+        message << " (" << videoChannels << " video channel" << (videoChannels == 1 ? "" : "s") << " subscribed)";
+    else
+        message << " (waiting for video channels)";
+    message << ". Zap codec support: " << ninjamplus::zap::getCodecCapabilitySummary() << ".";
+    addSystemChatLine(message);
 }
 
 void NinjamVst3AudioProcessor::stopAdvancedVideoClient()
@@ -3582,6 +3791,23 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
         const char* name = ninjamClient.GetUserState(i, nullptr, nullptr, nullptr);
         if (name)
         {
+            bool hasAudioChannel = false;
+            for (int ch = 0; ch < 32; ++ch)
+            {
+                int channelFlags = 0;
+                const char* channelName = ninjamClient.GetUserChannelState(i, ch,
+                                                                           nullptr, nullptr, nullptr,
+                                                                           nullptr, nullptr, nullptr,
+                                                                           &channelFlags);
+                if (channelName != nullptr && ((channelFlags & kNinjamZapVideoOnlyChannelFlag) == 0))
+                {
+                    hasAudioChannel = true;
+                    break;
+                }
+            }
+            if (!hasAudioChannel)
+                continue;
+
             activeUserIndexes.insert(i);
             UserInfo u;
             u.index = i;
@@ -3605,7 +3831,7 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
             bool chMute = false, chSolo = false;
             int outCh = 0, flags = 0;
             const char* chName = ninjamClient.GetUserChannelState(i, 0, &sub, &chVol, &chPan, &chMute, &chSolo, &outCh, &flags);
-            if (chName)
+            if (chName && ((flags & kNinjamZapVideoOnlyChannelFlag) == 0))
             {
                 float baseVol = chVol;
                 bool hasStored = false;
@@ -3684,7 +3910,10 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
                 if (u.outputChannel != desiredChannel)
                 {
                     for (int ch = 0; ch < 32; ++ch)
-                        ninjamClient.SetUserChannelState(i, ch, false, false, false, 0, false, 0, false, false, false, false, true, desiredChannel);
+                    {
+                        if (!isNinjamRemoteChannelVideoOnly(i, ch))
+                            ninjamClient.SetUserChannelState(i, ch, false, false, false, 0, false, 0, false, false, false, false, true, desiredChannel);
+                    }
                 }
                 u.outputChannel = desiredChannel;
                 u.outputUsesLinkAudio = true;
@@ -3767,8 +3996,12 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
                 u.channelNames.clear();
                 for (int ch = 0; ch < u.numChannels; ++ch)
                 {
-                    const char* chName = ninjamClient.GetUserChannelState(i, ch + 1); // ch0=mix, ch1..N=individual
-                    if (chName != nullptr && *chName != '\0')
+                    int channelFlags = 0;
+                    const char* chName = ninjamClient.GetUserChannelState(i, ch + 1,
+                                                                          nullptr, nullptr, nullptr,
+                                                                          nullptr, nullptr, nullptr,
+                                                                          &channelFlags); // ch0=mix, ch1..N=individual
+                    if (chName != nullptr && *chName != '\0' && ((channelFlags & kNinjamZapVideoOnlyChannelFlag) == 0))
                         u.channelNames.add(juce::String::fromUTF8(chName));
                     else
                         u.channelNames.add("Ch " + juce::String(ch + 1));
@@ -3780,8 +4013,12 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
                 u.channelNames.clear();
                 for (int ch = 0; ch < 32; ++ch)
                 {
-                    const char* chName = ninjamClient.GetUserChannelState(i, ch);
-                    if (chName != nullptr)
+                    int channelFlags = 0;
+                    const char* chName = ninjamClient.GetUserChannelState(i, ch,
+                                                                          nullptr, nullptr, nullptr,
+                                                                          nullptr, nullptr, nullptr,
+                                                                          &channelFlags);
+                    if (chName != nullptr && ((channelFlags & kNinjamZapVideoOnlyChannelFlag) == 0))
                     {
                         ++u.numChannels;
                         u.channelNames.add(juce::String::fromUTF8(chName));
@@ -3895,7 +4132,8 @@ void NinjamVst3AudioProcessor::setUserOutput(int userIndex, int outputChannelInd
     for (int i = 0; i < 32; ++i)
     {
         // SetUserChannelState arguments: useridx, channelidx, setsub, sub, setvol, vol, setpan, pan, setmute, mute, setsolo, solo, setoutch, outchannel
-        ninjamClient.SetUserChannelState(userIndex, i, false, false, false, 0, false, 0, false, false, false, false, true, outputChannelIndex);
+        if (!isNinjamRemoteChannelVideoOnly(userIndex, i))
+            ninjamClient.SetUserChannelState(userIndex, i, false, false, false, 0, false, 0, false, false, false, false, true, outputChannelIndex);
     }
 
     const char* name = ninjamClient.GetUserState(userIndex, nullptr, nullptr, nullptr);
@@ -3986,7 +4224,10 @@ bool NinjamVst3AudioProcessor::setUserOutputToLinkAudio(int userIndex)
         return false;
 
     for (int channel = 0; channel < 32; ++channel)
-        ninjamClient.SetUserChannelState(userIndex, channel, false, false, false, 0, false, 0, false, false, false, false, true, stagingPair * 2);
+    {
+        if (!isNinjamRemoteChannelVideoOnly(userIndex, channel))
+            ninjamClient.SetUserChannelState(userIndex, channel, false, false, false, 0, false, 0, false, false, false, false, true, stagingPair * 2);
+    }
 
     {
         const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
@@ -4023,7 +4264,8 @@ void NinjamVst3AudioProcessor::setUserLevel(int userIndex, float volume, float p
     userPanOverrides[userIndex] = pan;
     for (int i = 0; i < 32; ++i)
     {
-        ninjamClient.SetUserChannelState(userIndex, i, false, false, true, volume, true, pan, true, isMuted, true, isSolo);
+        if (!isNinjamRemoteChannelVideoOnly(userIndex, i))
+            ninjamClient.SetUserChannelState(userIndex, i, false, false, true, volume, true, pan, true, isMuted, true, isSolo);
     }
 }
 
@@ -4035,7 +4277,8 @@ void NinjamVst3AudioProcessor::setUserVolume(int userIndex, float volume)
 
     for (int i = 0; i < 32; ++i)
     {
-        ninjamClient.SetUserChannelState(userIndex, i, false, false, true, volume, false, 0, false, false, false, false, false, 0);
+        if (!isNinjamRemoteChannelVideoOnly(userIndex, i))
+            ninjamClient.SetUserChannelState(userIndex, i, false, false, true, volume, false, 0, false, false, false, false, false, 0);
     }
 }
 
@@ -4051,6 +4294,8 @@ float NinjamVst3AudioProcessor::getUserPeak(int userIndex, int channelIndex)
     float maxPeak = 0.0f;
     for (int i = 0; i < 32; ++i)
     {
+        if (isNinjamRemoteChannelVideoOnly(userIndex, i))
+            continue;
         float p = ninjamClient.GetUserChannelPeak(userIndex, i, channelIndex);
         if (p > maxPeak) maxPeak = p;
     }
@@ -4063,6 +4308,9 @@ float NinjamVst3AudioProcessor::getUserChannelPeak(int userIndex, int njChanIdx,
     if (userIndex < 0 || userIndex >= numUsers || njChanIdx < 0)
         return 0.0f;
 
+    if (isNinjamRemoteChannelVideoOnly(userIndex, njChanIdx))
+        return 0.0f;
+
     return ninjamClient.GetUserChannelPeak(userIndex, njChanIdx, lrSide);
 }
 
@@ -4070,6 +4318,9 @@ void NinjamVst3AudioProcessor::setUserNjChannelVolume(int userIndex, int njChanI
 {
     const int numUsers = ninjamClient.GetNumUsers();
     if (userIndex < 0 || userIndex >= numUsers || njChanIdx < 0)
+        return;
+
+    if (isNinjamRemoteChannelVideoOnly(userIndex, njChanIdx))
         return;
 
     ninjamClient.SetUserChannelState(userIndex, njChanIdx, false, false, true, volume, false, 0, false, false, false, false);
@@ -4102,52 +4353,7 @@ float NinjamVst3AudioProcessor::getMasterPeakRight() const
 
 juce::String NinjamVst3AudioProcessor::getVersionString() const
 {
-    static juce::String cachedVersion;
-    static bool cached = false;
-
-    if (cached)
-        return cachedVersion;
-
-    juce::String version = NINJAM_DISPLAY_VERSION;
-
-    auto runGit = [](const juce::String& command) -> juce::String
-    {
-        juce::ChildProcess cp;
-        if (!cp.start(command + " 2>nul"))
-            return {};
-        return cp.readAllProcessOutput().trim();
-    };
-
-    const juce::String repoCheck = runGit("git rev-parse --is-inside-work-tree");
-    if (repoCheck == "true")
-    {
-        const juce::String latestTag = runGit("git describe --tags --abbrev=0");
-        if (latestTag.isNotEmpty())
-            version = latestTag;
-
-        bool appendPlus = runGit("git status --porcelain").isNotEmpty();
-
-        if (!appendPlus)
-        {
-            if (latestTag.isNotEmpty())
-            {
-                const juce::String commitsSinceTag = runGit("git rev-list --count HEAD ^" + latestTag);
-                appendPlus = commitsSinceTag.getIntValue() > 0;
-            }
-            else
-            {
-                // In a git repo without tags, mark build as post-release state.
-                appendPlus = true;
-            }
-        }
-
-        if (appendPlus)
-            version += "+";
-    }
-
-    cachedVersion = version;
-    cached = true;
-    return cachedVersion;
+    return NINJAM_DISPLAY_VERSION;
 }
 
 void NinjamVst3AudioProcessor::setSoftLimiterEnabled(bool shouldEnable)
@@ -4223,8 +4429,8 @@ void NinjamVst3AudioProcessor::setNumLocalChannels(int num)
     }
 
     numLocalChannels.store(clamped);
-    syncLocalIntervalChannelConfig();
     applyCodecPreference();
+    syncLocalIntervalChannelConfig();
 
     // Post a local status message when transitioning into or out of multichannel
     if (previous != clamped)
@@ -7652,6 +7858,7 @@ void NinjamVst3AudioProcessor::applySamplePadInsertFx(int numSamples,
 
     const double sampleRate = processingSampleRate > 1.0 ? processingSampleRate : juce::jmax(1.0, getSampleRate());
     const double bpm = juce::jmax(1.0, (double)getBPM());
+    static constexpr double samplePadDjFilterHpMaxHz = 5200.0;
     if (samplePadFxScratchBuffer.getNumChannels() < 2 || samplePadFxScratchBuffer.getNumSamples() < numSamples)
         samplePadFxScratchBuffer.setSize(2, numSamples, false, true, true);
 
@@ -7762,7 +7969,9 @@ void NinjamVst3AudioProcessor::applySamplePadInsertFx(int numSamples,
                     else
                     {
                         filter.setType(juce::dsp::StateVariableTPTFilterType::highpass);
-                        filter.setCutoffFrequency((float)mapNormalisedToLogFrequency(((double)amount - 0.5) / 0.5, 35.0, 9000.0));
+                        filter.setCutoffFrequency((float)mapNormalisedToLogFrequency(((double)amount - 0.5) / 0.5,
+                                                                                     35.0,
+                                                                                     samplePadDjFilterHpMaxHz));
                     }
 
                     for (int i = 0; i < numSamples; ++i)
@@ -7779,7 +7988,7 @@ void NinjamVst3AudioProcessor::applySamplePadInsertFx(int numSamples,
                     copySlotDry(slotBuffer);
                     auto& filter = samplePadPerPadDjFilters[(size_t)padIndex][(size_t)slot];
                     filter.setType(juce::dsp::StateVariableTPTFilterType::highpass);
-                    filter.setCutoffFrequency((float)mapNormalisedToLogFrequency(amount, 35.0, 9000.0));
+                    filter.setCutoffFrequency((float)mapNormalisedToLogFrequency(amount, 35.0, samplePadDjFilterHpMaxHz));
                     for (int i = 0; i < numSamples; ++i)
                     {
                         slotBuffer.setSample(0, i, filter.processSample(0, slotBuffer.getSample(0, i)));
@@ -7824,10 +8033,12 @@ void NinjamVst3AudioProcessor::applySamplePadInsertFx(int numSamples,
                 }
 
                 case SamplePadFxType::phaser:
+                case SamplePadFxType::phaserHalf:
                 {
                     copySlotDry(slotBuffer);
                     auto& phaser = samplePadPerPadPhasers[(size_t)padIndex][(size_t)slot];
-                    phaser.setRate((float)juce::jlimit(0.02, 12.0, bpm / 120.0));
+                    const double beatsPerCycle = type == SamplePadFxType::phaserHalf ? 2.0 : 1.0;
+                    phaser.setRate((float)juce::jlimit(0.02, 12.0, bpm / (60.0 * beatsPerCycle)));
                     phaser.setMix(amount * 0.5f);
                     auto block = juce::dsp::AudioBlock<float>(slotBuffer).getSubBlock(0, (size_t)numSamples);
                     juce::dsp::ProcessContextReplacing<float> context(block);
@@ -7845,8 +8056,8 @@ void NinjamVst3AudioProcessor::applySamplePadInsertFx(int numSamples,
                         mono[i] = 0.5f * (left[i] + right[i]);
 
                     juce::Reverb::Parameters params;
-                    params.roomSize = 0.48f;
-                    params.damping = 0.45f;
+                    params.roomSize = juce::jlimit(0.35f, 0.98f, 0.35f + amount * 0.63f);
+                    params.damping = juce::jlimit(0.25f, 0.62f, 0.58f - amount * 0.24f);
                     params.width = 1.0f;
                     params.wetLevel = 1.0f;
                     params.dryLevel = 0.0f;
@@ -7855,7 +8066,7 @@ void NinjamVst3AudioProcessor::applySamplePadInsertFx(int numSamples,
                     reverb.setParameters(params);
                     reverb.processMono(mono, numSamples);
 
-                    const float gain = amount * 0.55f;
+                    const float gain = amount * 0.72f;
                     float* outL = samplePadsRenderBuffer.getWritePointer(0);
                     float* outR = samplePadsRenderBuffer.getWritePointer(1);
                     for (int i = 0; i < numSamples; ++i)
@@ -7872,20 +8083,22 @@ void NinjamVst3AudioProcessor::applySamplePadInsertFx(int numSamples,
                 }
 
                 case SamplePadFxType::delay:
+                case SamplePadFxType::delayQuarter:
+                case SamplePadFxType::delayQuarterPingPong:
                 {
                     auto& delayBuffer = samplePadPerPadDelayBuffers[(size_t)padIndex][(size_t)slot];
                     if (delayBuffer.getNumSamples() <= 1)
                         break;
 
                     const int delayBufferSamples = delayBuffer.getNumSamples();
-                    const int division = fxDelayDivision.load(std::memory_order_relaxed);
-                    double targetDelaySeconds = fxDelayTimeMs.load(std::memory_order_relaxed) / 1000.0;
-                    if (fxDelaySyncToHost.load(std::memory_order_relaxed) && bpm > 1.0)
-                        targetDelaySeconds = (60.0 / bpm) * (4.0 / (double)division);
+                    const int division = type == SamplePadFxType::delay ? 8 : 4;
+                    const double targetDelaySeconds = bpm > 1.0
+                        ? (60.0 / bpm) * (4.0 / (double)division)
+                        : 0.35;
 
                     const int delaySamples = juce::jlimit(1, delayBufferSamples - 1, (int)std::round(targetDelaySeconds * sampleRate));
                     const float feedback = juce::jlimit(0.0f, 0.92f, fxDelayFeedback.load(std::memory_order_relaxed));
-                    const bool pingPong = fxDelayPingPong.load(std::memory_order_relaxed);
+                    const bool pingPong = type == SamplePadFxType::delayQuarterPingPong;
                     const float wetGain = amount * 0.75f;
                     float* delayMemoryL = delayBuffer.getWritePointer(0);
                     float* delayMemoryR = delayBuffer.getWritePointer(1);
@@ -8200,6 +8413,53 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
             if (channel >= 0 && channel < maxLocalChannels)
                 setLocalChannelInput(channel, inputIndex);
         }
+        return;
+    }
+    if (type == "videoTimingChange")
+    {
+        juce::String payloadUserId;
+        juce::String appFamily;
+        juce::String eventId;
+        double previousBpm = 0.0;
+        double newBpm = 0.0;
+        int bpi = 0;
+        int timingDelayDeltaMs = 0;
+        const juce::var parsed = juce::JSON::parse(payload);
+        if (auto* obj = parsed.getDynamicObject())
+        {
+            payloadUserId = obj->getProperty("userId").toString();
+            appFamily = obj->getProperty("appFamily").toString();
+            eventId = obj->getProperty("eventId").toString();
+            previousBpm = obj->getProperty("previousBpm").toString().getDoubleValue();
+            newBpm = obj->getProperty("bpm").toString().getDoubleValue();
+            bpi = (int)obj->getProperty("bpi");
+            timingDelayDeltaMs = (int)obj->getProperty("timingDelayDeltaMs");
+        }
+
+        if (appFamily.isNotEmpty() && appFamily != opusSyncAppFamily)
+            return;
+
+        const juce::String senderKey = normaliseOpusPeerId(payloadUserId.isNotEmpty() ? payloadUserId : sender);
+        const juce::String localUserKey = normaliseOpusPeerId(currentUser);
+        if (senderKey.isEmpty() || senderKey == localUserKey || !consumeVideoTimingChangeEvent(eventId))
+            return;
+
+        if (videoHelperRunning.load())
+        {
+            const juce::String canonicalSenderKey = canonicalDelayUserKey(senderKey);
+            const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+            const auto refreshId = ++videoBufferRefreshCounter;
+            remoteVideoBufferRefreshIdByUser[senderKey] = refreshId;
+            if (canonicalSenderKey.isNotEmpty())
+                remoteVideoBufferRefreshIdByUser[canonicalSenderKey] = refreshId;
+            lastIntervalHelperPayloadWriteMs = 0.0;
+        }
+
+        vlogStr("[MCRefresh] Remote videoTimingChange from=" + senderKey
+            + " prevBpm=" + juce::String(previousBpm, 2)
+            + " bpm=" + juce::String(newBpm, 2)
+            + " bpi=" + juce::String(bpi)
+            + " deltaMs=" + juce::String(timingDelayDeltaMs));
         return;
     }
     if (type == "intervalSyncTag")
@@ -9725,10 +9985,61 @@ void NinjamVst3AudioProcessor::NewIntervalCallback_cb(void* /*userData*/, NJClie
 {
 }
 
-void NinjamVst3AudioProcessor::IntervalChunkCallback_cb(void* /*userData*/, NJClient* /*inst*/,
-    const char* /*username*/, int /*chidx*/, unsigned int /*fourcc*/,
-    const unsigned char* /*guid*/, const void* /*data*/, int /*dataLen*/, int /*flags*/)
+void NinjamVst3AudioProcessor::IntervalChunkCallback_cb(void* userData, NJClient* /*inst*/,
+    const char* username, int chidx, unsigned int fourcc,
+    const unsigned char* guid, const void* data, int dataLen, int flags)
 {
+    if (!isNinjamZapVideoFourcc(fourcc))
+        return;
+
+    auto* self = static_cast<NinjamVst3AudioProcessor*>(userData);
+    if (self == nullptr || !self->ninjamZapVideoEnabled.load(std::memory_order_relaxed))
+        return;
+
+    const auto codec = getNinjamZapVideoCodec(fourcc);
+    const auto codecCap = ninjamplus::zap::getCodecCapability(codec);
+    const juce::String sender = username != nullptr ? juce::String::fromUTF8(username) : juce::String();
+    const juce::String streamKey = sender + ":" + juce::String(chidx) + ":" + guidToHexString(guid);
+    std::vector<juce::MemoryBlock> chunks;
+
+    if (streamKey.isNotEmpty())
+    {
+        const juce::ScopedLock lock(self->ninjamZapVideoChunkLock);
+        auto& reassembler = self->ninjamZapVideoChunkReassemblers[streamKey];
+        if (dataLen > 0 && data != nullptr)
+            chunks = reassembler.pushBytes(data, static_cast<size_t>(dataLen));
+
+        if ((flags & 1) != 0)
+            self->ninjamZapVideoChunkReassemblers.erase(streamKey);
+    }
+
+    if (!self->ninjamZapVideoReceivedNotice.exchange(true, std::memory_order_relaxed))
+    {
+        juce::String message = "Receiving NINJAMZap video transport";
+        if (sender.isNotEmpty())
+            message << " from " << sender;
+        message << " on channel " << (chidx + 1)
+                << " as " << ninjamplus::zap::getCodecName(codec)
+                << " (" << dataLen << " bytes first fragment";
+        if (!chunks.empty())
+            message << ", " << (int)chunks.size() << " complete Zap chunk" << (chunks.size() == 1 ? "" : "s");
+        message << ").";
+        if (!codecCap.canDecode)
+            message << " Decode backend is not compiled for this codec yet.";
+        self->addSystemChatLine(message);
+    }
+
+    if (!chunks.empty())
+    {
+        ninjamplus::zap::SyncMarker marker;
+        if (ninjamplus::zap::parseSyncMarkerPayload(chunks.front().getData(), chunks.front().getSize(), marker))
+        {
+            vlogStr("Zap video sync marker from=" + sender
+                    + " ch=" + juce::String(chidx + 1)
+                    + " interval=" + juce::String((int)marker.intervalCounter)
+                    + " codec=" + ninjamplus::zap::getCodecName(codec));
+        }
+    }
 }
 
 void NinjamVst3AudioProcessor::IntervalMediaItem_Callback(void* userData, NJClient* /*inst*/,
@@ -9736,6 +10047,7 @@ void NinjamVst3AudioProcessor::IntervalMediaItem_Callback(void* userData, NJClie
     const unsigned char* /*guid*/, const void* data, int dataLen)
 {
     if (!username || !data || dataLen <= 0) return;
+    if (isNinjamZapVideoFourcc(fourcc)) return;
     if (fourcc == kSyncSignalFourcc)
     {
         auto* self = static_cast<NinjamVst3AudioProcessor*>(userData);
@@ -11053,8 +11365,16 @@ void NinjamVst3AudioProcessor::timerCallback()
             opusSyncAvailable.store(false);
             opusSyncHasLegacyClients.store(false);
             lastOpusSupportBroadcastMs = 0.0;
+            ninjamZapVideoEnabled.store(false, std::memory_order_relaxed);
+            ninjamZapVideoReceivedNotice.store(false, std::memory_order_relaxed);
+            {
+                const juce::ScopedLock lock(ninjamZapVideoChunkLock);
+                ninjamZapVideoChunkReassemblers.clear();
+            }
+            lastNinjamZapVideoSubscriptionSyncMs = 0.0;
             localServerLatencyMs.store(-1);
             lastServerLatencyProbeInterval.store(-1);
+            resetIntervalSyncTimingCache();
             if (!isTransportSyncEnabled())
             {
                 syncWaitForInterval.store(false);
@@ -11078,10 +11398,18 @@ void NinjamVst3AudioProcessor::timerCallback()
             }
             opusSyncAvailable.store(false);
             opusSyncHasLegacyClients.store(false);
+            ninjamZapVideoEnabled.store(false, std::memory_order_relaxed);
+            ninjamZapVideoReceivedNotice.store(false, std::memory_order_relaxed);
+            {
+                const juce::ScopedLock lock(ninjamZapVideoChunkLock);
+                ninjamZapVideoChunkReassemblers.clear();
+            }
+            lastNinjamZapVideoSubscriptionSyncMs = 0.0;
             localServerLatencyMs.store(-1);
             lastServerLatencyProbeInterval.store(-1);
             setIntervalSyncStatusText({});
             lastBroadcastIntervalTag.store(-1);
+            resetIntervalSyncTimingCache();
             applyCodecPreference();
         }
         lastStatus = status;
@@ -11148,7 +11476,16 @@ void NinjamVst3AudioProcessor::timerCallback()
     {
         // Rebuild peer capability state only after Run() finishes dispatching inbound callbacks.
         refreshOpusSyncAvailabilityFromUsers();
-        const double nowMs = juce::Time::getMillisecondCounterHiRes();
+        if (ninjamZapVideoEnabled.load(std::memory_order_relaxed))
+        {
+            if (!ninjamClient.GetServerVideoSupported())
+                ninjamZapVideoEnabled.store(false, std::memory_order_relaxed);
+            else if ((nowMs - lastNinjamZapVideoSubscriptionSyncMs) >= 750.0)
+            {
+                syncNinjamZapVideoSubscriptions(true);
+                lastNinjamZapVideoSubscriptionSyncMs = nowMs;
+            }
+        }
         {
             const juce::ScopedLock lock(intervalSyncAnnouncementLock);
             const int displayInterval = getDisplayIntervalIndex();
@@ -11201,7 +11538,7 @@ void NinjamVst3AudioProcessor::timerCallback()
                     && previousIntervalDurationMs > 0.0 && newIntervalDurationMs > 0.0)
                     timingDelayDeltaMs = (int)std::llround(newIntervalDurationMs - previousIntervalDurationMs);
             }
-            if (bpmChanged && status == NJClient::NJC_STATUS_OK)
+            if (hadPreviousTiming && status == NJClient::NJC_STATUS_OK)
             {
                 const juce::ScopedLock lock(intervalSyncAnnouncementLock);
                 if (!remoteLatencyFirmDelayMsByUser.empty())
@@ -11217,6 +11554,8 @@ void NinjamVst3AudioProcessor::timerCallback()
                     }
                 }
             }
+            if (hadPreviousTiming && status == NJClient::NJC_STATUS_OK)
+                broadcastVideoTimingChange(lastLatencyTimingBpm, localBpm, localBpi, length, timingDelayDeltaMs);
             invalidateIntervalSyncLatencyState(true);
             lastLatencyTimingBpi = localBpi;
             lastLatencyTimingLength = length;

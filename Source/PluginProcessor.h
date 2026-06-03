@@ -16,6 +16,7 @@
 #include <array>
 
 #include "ninjam/njclient.h"
+#include "ZapVideoCodec.h"
 
 class NinjamVst3AudioProcessorEditor;
 class LocalVideoHttpServer;
@@ -238,7 +239,10 @@ public:
         djFilterBp = 3,
         phaser = 4,
         djFilterHp = 5,
-        djFilterLp = 6
+        djFilterLp = 6,
+        delayQuarter = 7,
+        delayQuarterPingPong = 8,
+        phaserHalf = 9
     };
     static constexpr int looperInputLocalChannel = -10000;
     static constexpr int looperInputSamplePads = -10001;
@@ -358,6 +362,9 @@ public:
     void processSyncSignal(const juce::String& sender, const juce::String& type, const juce::String& payload);
     void launchVideoSession();
     void launchVideoSessionAsync();
+    bool isNinjamZapVideoAvailable();
+    bool isNinjamZapVideoEnabled() const;
+    void launchNinjamZapVideoSession();
 
     void rememberUserVolume(int userIndex, float volume, const juce::String& name);
     void resetRemoteUserIndexState(int userIndex, const juce::String& userName);
@@ -800,6 +807,11 @@ private:
     double lastIntervalHelperPayloadWriteMs = 0.0;
     std::atomic<bool> videoHelperRunning { false };
     std::atomic<bool> videoLaunchInProgress { false };
+    std::atomic<bool> ninjamZapVideoEnabled { false };
+    std::atomic<bool> ninjamZapVideoReceivedNotice { false };
+    juce::CriticalSection ninjamZapVideoChunkLock;
+    std::map<juce::String, ninjamplus::zap::ChunkReassembler> ninjamZapVideoChunkReassemblers;
+    double lastNinjamZapVideoSubscriptionSyncMs = 0.0;
     juce::CriticalSection videoLaunchWorkerLock;
     std::future<void> videoLaunchFuture;
     std::unique_ptr<LocalVideoHttpServer> advancedVideoServer;
@@ -833,6 +845,7 @@ private:
     std::map<juce::String, int> lastRemoteServerLatencyMsByUser;
     std::map<juce::String, double> pendingTransportProbeSentMsById;
     std::map<juce::String, long long> remoteLatencyLastAppliedIntervalByUser;
+    std::deque<juce::String> recentVideoTimingChangeEventIds;
     int lastLatencyTimingBpi = -1;
     int lastLatencyTimingLength = -1;
     double lastLatencyTimingBpm = -1.0;
@@ -920,12 +933,18 @@ private:
     void invalidateIntervalSyncLatencyState(bool keepRemoteServerLatency);
     void pruneDisconnectedRemoteSyncState();
     void processPendingIntervalSyncMarkers(int localMarkerBeat, long long localMarkerSampleCount, double intervalDurationMs);
+    void resetIntervalSyncTimingCache();
+    bool consumeVideoTimingChangeEvent(const juce::String& eventId);
+    void broadcastVideoTimingChange(double previousBpm, double newBpm, int bpi, int length, int timingDelayDeltaMs);
     juce::File resolveVideoHelperRootDir() const;
     bool isAdvancedVideoClientAvailable() const;
     bool ensureAdvancedVideoClientStarted();
     void stopAdvancedVideoClient();
     void writeIntervalHelperJson(int pos, int length);
     void syncLocalIntervalChannelConfig();
+    bool isNinjamRemoteChannelVideoOnly(int userIndex, int channelIndex);
+    int syncNinjamZapVideoSubscriptions(bool subscribe);
+    void addSystemChatLine(const juce::String& message);
     void flushOutboundMidiRelayEvents();
     void flushOutboundOscRelayEvents();
     void injectInboundMidiRelayEvents(juce::MidiBuffer& midiMessages);
