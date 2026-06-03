@@ -3,12 +3,45 @@ cmake_minimum_required(VERSION 3.22)
 # Fix for old CMake policies in dependencies (ogg/vorbis)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
-project(NINJAM_VST3 VERSION 0.9.8.4)
+set(NINJAM_VERSION_FALLBACK "0.0.0")
+set(NINJAM_VERSION_TAG "")
+foreach(_ninjam_version_env NINJAM_VERSION_TAG RELEASE_TAG GITHUB_REF_NAME)
+    if (NOT NINJAM_VERSION_TAG AND DEFINED ENV{${_ninjam_version_env}} AND NOT "$ENV{${_ninjam_version_env}}" STREQUAL "")
+        set(_ninjam_version_candidate "$ENV{${_ninjam_version_env}}")
+        string(REGEX REPLACE "^refs/tags/" "" _ninjam_version_candidate "${_ninjam_version_candidate}")
+        string(REGEX REPLACE "^[vV]" "" _ninjam_version_candidate_number "${_ninjam_version_candidate}")
+        if (_ninjam_version_candidate_number MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+(\\.[0-9]+)?$")
+            set(NINJAM_VERSION_TAG "${_ninjam_version_candidate}")
+        endif()
+    endif()
+endforeach()
+if (NOT NINJAM_VERSION_TAG)
+    execute_process(
+        COMMAND git describe --tags --abbrev=0
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE NINJAM_VERSION_TAG
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+endif()
+if (NOT NINJAM_VERSION_TAG)
+    execute_process(
+        COMMAND git describe --tags --abbrev=0
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../../.."
+        OUTPUT_VARIABLE NINJAM_VERSION_TAG
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+endif()
+string(REGEX REPLACE "^refs/tags/" "" NINJAM_VERSION_TAG "${NINJAM_VERSION_TAG}")
+string(REGEX REPLACE "^[vV]" "" NINJAM_PLUGIN_VERSION "${NINJAM_VERSION_TAG}")
+if (NOT NINJAM_PLUGIN_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+(\\.[0-9]+)?$")
+    set(NINJAM_PLUGIN_VERSION "${NINJAM_VERSION_FALLBACK}")
+endif()
+set(NINJAM_DISPLAY_VERSION "v${NINJAM_PLUGIN_VERSION}")
+
+project(NINJAM_VST3 VERSION ${NINJAM_PLUGIN_VERSION})
 
 set(NINJAM_BRAND_NAME "NINJAMplus")
 set(NINJAM_VENDOR_NAME "AMP")
-set(NINJAM_PLUGIN_VERSION "0.9.8.4")
-set(NINJAM_DISPLAY_VERSION "V0.9.8.4.1")
 set(NINJAM_OUTPUT_ROOT "${CMAKE_CURRENT_BINARY_DIR}/${NINJAM_BRAND_NAME}")
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")

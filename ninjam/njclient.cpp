@@ -39,6 +39,21 @@
 #define NJ_ENCODER_FMT_TYPE MAKE_NJ_FOURCC('O','G','G','v')
 #define NJ_ENCODER_FMT_TYPE_OPUS MAKE_NJ_FOURCC('O','P','U','S')
 
+static inline unsigned int make_ninjamzap_fourcc(char a, char b, char c, char d)
+{
+  return ((unsigned int)(unsigned char)a) |
+         ((unsigned int)(unsigned char)b << 8) |
+         ((unsigned int)(unsigned char)c << 16) |
+         ((unsigned int)(unsigned char)d << 24);
+}
+
+static inline bool is_ninjamzap_video_fourcc(unsigned int fourcc)
+{
+  return fourcc == make_ninjamzap_fourcc('H','2','6','4') ||
+         fourcc == make_ninjamzap_fourcc('V','P','8',' ') ||
+         fourcc == make_ninjamzap_fourcc('M','J','P','G');
+}
+
 static inline float softclip_to_minus2db(float x)
 {
   const float k = 2.0f;
@@ -464,6 +479,7 @@ class DecodeState
     double resample_state;
     WDL_Resampler resampler;
     WDL_TypedBuf<WDL_ResampleSample> resample_outbuf;
+    WDL_TypedBuf<float> tap_outbuf;
     int resampler_src_srate;
     int resampler_dest_srate;
     int resampler_nch;
@@ -728,12 +744,14 @@ public:
     memset(guid,0,sizeof(guid));
     chidx = 0;
     fourcc = 0;
+    accumulate = true;
     last_time = 0;
   }
 
   unsigned char guid[16];
   int chidx;
   unsigned int fourcc;
+  bool accumulate;
   WDL_String username;
   WDL_HeapBuf data;
   time_t last_time;
@@ -815,6 +833,7 @@ public:
   I_NJEncoder  *m_enc;
   int m_enc_bitrate_used;
   int m_enc_nch_used;
+  unsigned int m_enc_fourcc_used;
   Net_Message *m_enc_header_needsend;
 #endif
 
@@ -1013,6 +1032,7 @@ void NJClient::_reinit()
   output_peaklevel[0]=output_peaklevel[1]=0.0;
 
   m_connection_keepalive=0;
+  m_server_video_supported=false;
   m_status=1002;
 
   m_in_auth=0;
@@ -1441,6 +1461,7 @@ int NJClient::Run() // nonzero if sleep ok
               repl.client_version=PROTO_VER_CUR; // client version number
 
               m_connection_keepalive=(cha.server_caps>>8)&0xff;
+              m_server_video_supported=(cha.server_caps&2)!=0;
 
 //              printf("Got keepalive of %d\n",m_connection_keepalive);
 
@@ -1565,7 +1586,7 @@ int NJClient::Run() // nonzero if sleep ok
                       m_remoteusers.Add(theuser);
                     }
 
-                    if ((theuser->channels[cid].flags^f)&(2|4)) // if flags changed instamode, flush out the samples
+                    if ((theuser->channels[cid].flags^f)&(2|4|NJCLIENT_CHANNEL_FLAG_VIDEO_ONLY)) // if flags changed instamode/video-only, flush out the samples
                     {
                       delete theuser->channels[cid].ds;
                       delete theuser->channels[cid].next_ds[0];
@@ -1586,7 +1607,7 @@ int NJClient::Run() // nonzero if sleep ok
                     theuser->chanpresentmask |= 1<<cid;
 
 
-                    if (config_autosubscribe)
+                    if (config_autosubscribe && !(f & NJCLIENT_CHANNEL_FLAG_VIDEO_ONLY))
                     {
                       theuser->submask |= 1<<cid;
                       mpb_client_set_usermask su;
@@ -1707,6 +1728,7 @@ int NJClient::Run() // nonzero if sleep ok
                     memcpy(cs->guid,dib.guid,sizeof(cs->guid));
                     cs->chidx = dib.chidx;
                     cs->fourcc = dib.fourcc;
+                    cs->accumulate = !is_ninjamzap_video_fourcc(dib.fourcc);
                     cs->username.Set(dib.username);
                     time(&cs->last_time);
                     m_customIntervalDownloads.Add(cs);
@@ -1761,7 +1783,7 @@ int NJClient::Run() // nonzero if sleep ok
                   // stream/decode frames as they arrive throughout the interval.
                   if (IntervalChunkCallback)
                     IntervalChunkCallback(IntervalChunkCallbackUser, this, cs->username.Get(), cs->chidx, cs->fourcc, cs->guid, diw.audio_data, diw.audio_data_len, (int)diw.flags);
-                  if (diw.audio_data_len > 0 && diw.audio_data)
+                  if (cs->accumulate && diw.audio_data_len > 0 && diw.audio_data)
                   {
                     const int cur = (int)cs->data.GetSize();
                     cs->data.Resize(cur + diw.audio_data_len);
@@ -1924,6 +1946,7 @@ int NJClient::Run() // nonzero if sleep ok
   for (u = 0; u < m_locchannels.GetSize(); u ++)
   {
     Local_Channel *lc=m_locchannels.Get(u);
+    if (lc->flags & NJCLIENT_CHANNEL_FLAG_VIDEO_ONLY) continue;
     WDL_HeapBuf *p=0;
     int block_nch=1;
 
@@ -1986,6 +2009,7 @@ int NJClient::Run() // nonzero if sleep ok
         if (!lc->m_enc)
         {
           lc->m_enc = createEncoderForChannel(lc->channel_idx, m_srate, lc->m_enc_nch_used=block_nch, lc->m_enc_bitrate_used = lc->bitrate+(block_nch>1?lc->bitrate/3:0), WDL_RNG_int32());
+          lc->m_enc_fourcc_used = ShouldEncodeOpus(lc->channel_idx) ? NJ_ENCODER_FMT_TYPE_OPUS : NJ_ENCODER_FMT_TYPE;
         }
 
         if (lc->m_need_header)
@@ -2157,10 +2181,18 @@ int NJClient::Run() // nonzero if sleep ok
 
           //delete m_enc;
         //  m_enc=0;
-          if (lc->m_enc_nch_used != ((lc->src_channel&1024)?2:1))
+          const unsigned int desiredEncoderFourcc = ShouldEncodeOpus(lc->channel_idx) ? NJ_ENCODER_FMT_TYPE_OPUS : NJ_ENCODER_FMT_TYPE;
+          if (lc->m_enc_fourcc_used != desiredEncoderFourcc)
           {
             delete lc->m_enc;
             lc->m_enc=0;
+            lc->m_enc_fourcc_used=0;
+          }
+          else if (lc->m_enc_nch_used != ((lc->src_channel&1024)?2:1))
+          {
+            delete lc->m_enc;
+            lc->m_enc=0;
+            lc->m_enc_fourcc_used=0;
           }
           else
             lc->m_enc->reinit();
@@ -2171,6 +2203,7 @@ int NJClient::Run() // nonzero if sleep ok
         {
           delete lc->m_enc;
           lc->m_enc=0;
+          lc->m_enc_fourcc_used=0;
         }
         lc->m_need_header=true;
         lc->m_curwritefile_writelen=0.0;
@@ -2387,14 +2420,18 @@ int NJClient::EndRawIntervalStream(const unsigned char guid[16])
 
 void NJClient::SetCodecCapabilities(int encodeCaps, int decodeCaps)
 {
-  m_codec_caps_encode = encodeCaps;
-  m_codec_caps_decode = decodeCaps;
+  // Keep legacy Vorbis available even when Opus is enabled for extended
+  // multichannel clients.
+  m_codec_caps_encode = encodeCaps | NJCLIENT_CAP_ENCODE_VORBIS;
+  m_codec_caps_decode = decodeCaps | NJCLIENT_CAP_DECODE_VORBIS;
 }
 
 void NJClient::SetCodecConfig(unsigned int vorbisMask, unsigned int opusMask)
 {
-  m_codec_vorbis_mask = vorbisMask;
-  m_codec_opus_mask = opusMask;
+  // Channel 0 remains the legacy Vorbis/mixdown lane for ReaNINJAM and
+  // stock clients. Extra Opus channels start at 1.
+  m_codec_vorbis_mask = vorbisMask | 1u;
+  m_codec_opus_mask = opusMask & ~1u;
 }
 
 bool NJClient::ShouldEncodeVorbis(int chidx) const
@@ -2402,10 +2439,9 @@ bool NJClient::ShouldEncodeVorbis(int chidx) const
   if (!(m_codec_caps_encode & NJCLIENT_CAP_ENCODE_VORBIS)) return false;
   if (chidx < 0) return false;
   if (chidx >= 32) return false;
+  if (chidx == 0) return true;
   unsigned int bit = (1u << chidx);
-  if (m_codec_vorbis_mask & bit) return true;
-  if (m_codec_opus_mask & bit) return true;
-  return false;
+  return (m_codec_vorbis_mask & bit) != 0;
 }
 
 bool NJClient::ShouldEncodeOpus(int chidx) const
@@ -2413,6 +2449,7 @@ bool NJClient::ShouldEncodeOpus(int chidx) const
   if (!(m_codec_caps_encode & NJCLIENT_CAP_ENCODE_OPUS)) return false;
   if (chidx < 0) return false;
   if (chidx >= 32) return false;
+  if (chidx == 0) return false;
   return (m_codec_opus_mask & (1u << chidx)) != 0;
 }
 
@@ -2426,6 +2463,7 @@ void NJClient::process_samples(float **inbuf, int innch, float **outbuf, int out
   for (u = 0; u < m_locchannels.GetSize(); u ++)
   {
     Local_Channel *lc=m_locchannels.Get(u);
+    if (lc->flags & NJCLIENT_CHANNEL_FLAG_VIDEO_ONLY) continue;
     if (!justmonitor && lc->channel_idx >= m_max_localch) continue; // server does not allow this channel index
 
     int sc=lc->src_channel&1023;
@@ -2736,7 +2774,8 @@ static int resampleLengthNeeded(DecodeState *decode_state, int src_srate, int de
 static int mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // lengths are sample pairs. input is interleaved samples, output not
                             float **dest, int dest_srate, int dest_nch,
                             int dest_len, float vol, float pan, double *state, int src_len,
-                            DecodeState *decode_state, int *src_consumed)
+                            DecodeState *decode_state, int *src_consumed,
+                            float *tap_interleaved, int tap_nch)
 {
   int x;
   if (pan < -1.0f) pan=-1.0f;
@@ -2752,6 +2791,8 @@ static int mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // lengths
     if (src_consumed) *src_consumed=0;
     return 0;
   }
+  if (tap_nch < 1)
+    tap_interleaved=0;
 
   double vol1=vol,vol2=vol;
   float *dest1=dest[0];
@@ -2804,6 +2845,7 @@ static int mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // lengths
 
       *dest1++ +=(float) ls;
 
+      double tap_rs=rs;
       if (dest_nch > 1)
       {
         rs *= vol2;
@@ -2811,6 +2853,18 @@ static int mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // lengths
         else if (rs<-1.0) rs=-1.0;
 
         *dest2++ += (float) rs;
+        tap_rs=rs;
+      }
+      else
+      {
+        tap_rs=ls;
+      }
+
+      if (tap_interleaved)
+      {
+        tap_interleaved[x*tap_nch]=(float)ls;
+        if (tap_nch > 1)
+          tap_interleaved[x*tap_nch + 1]=(float)tap_rs;
       }
     }
 
@@ -2870,6 +2924,7 @@ static int mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // lengths
 
     *dest1++ +=(float) ls;
 
+    double tap_rs=rs;
     if (dest_nch > 1)
     {
       rs *= vol2;
@@ -2877,6 +2932,18 @@ static int mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // lengths
       else if (rs<-1.0) rs=-1.0;
 
       *dest2++ += (float) rs;
+      tap_rs=rs;
+    }
+    else
+    {
+      tap_rs=ls;
+    }
+
+    if (tap_interleaved)
+    {
+      tap_interleaved[x*tap_nch]=(float)ls;
+      if (tap_nch > 1)
+        tap_interleaved[x*tap_nch + 1]=(float)tap_rs;
     }
   }
   const int input_frames_used = src_srate != dest_srate ? (int)rspos : dest_len;
@@ -3071,6 +3138,8 @@ void NJClient::mixInChannel(int useridx, RemoteUser *user, int chanidx,
   {
     float *sptr=chan->decode_codec->Get();
     int source_frames_consumed=needed;
+    float *tap_interleaved=0;
+    int tap_frames=0;
 
     // process VU meter, yay for powerful CPUs
     if (!muted && vol > 0.0000001)
@@ -3126,6 +3195,9 @@ void NJClient::mixInChannel(int useridx, RemoteUser *user, int chanidx,
         use_nch=2;
       }
 
+      if (RemoteChannelAudioTap)
+        tap_interleaved=chan->tap_outbuf.ResizeOK(len_out*2,false);
+
       const int mixed_len = mixFloatsNIOutput(sptr,
               chan->decode_codec->GetSampleRate(),
               srcnch,
@@ -3133,25 +3205,28 @@ void NJClient::mixInChannel(int useridx, RemoteUser *user, int chanidx,
               srate,use_nch,len_out,
               lvol,pan,&chan->resample_state,
               chan->decode_codec->Available() / srcnch,
-              chan,&source_frames_consumed);
+              chan,&source_frames_consumed,
+              tap_interleaved,2);
       if (mixed_len < len_out)
         len_out=mixed_len;
+      if (tap_interleaved && len_out > 0)
+        tap_frames=len_out;
       if (source_frames_consumed < 0) source_frames_consumed=0;
       if (source_frames_consumed > chan->decode_codec->Available() / srcnch)
         source_frames_consumed=chan->decode_codec->Available() / srcnch;
       needed=source_frames_consumed;
     }
 
-    if (RemoteChannelAudioTap && source_frames_consumed > 0)
+    if (RemoteChannelAudioTap && tap_interleaved && tap_frames > 0)
     {
       RemoteChannelAudioTap(RemoteChannelAudioTap_User,
                             useridx,
                             user ? user->name.Get() : NULL,
                             chanidx,
-                            sptr,
-                            srcnch,
-                            source_frames_consumed,
-                            chan->decode_codec->GetSampleRate());
+                            tap_interleaved,
+                            2,
+                            tap_frames,
+                            srate);
     }
 
     // advance the queue
@@ -3222,6 +3297,7 @@ void NJClient::on_new_interval()
   for (u = 0; u < m_locchannels.GetSize(); u ++)
   {
     Local_Channel *lc=m_locchannels.Get(u);
+    if (lc->flags & NJCLIENT_CHANNEL_FLAG_VIDEO_ONLY) continue;
     if (lc->channel_idx >= m_max_localch) continue;
 
     if (!(lc->flags&(4|2)))  // session mode and voice chat modes use their own (fixed) intervals
@@ -3991,6 +4067,7 @@ Local_Channel::Local_Channel() : channel_idx(0), src_channel(0), volume(1.0f), p
                 m_enc(NULL),
                 m_enc_bitrate_used(0),
                 m_enc_nch_used(0),
+                m_enc_fourcc_used(0),
                 m_enc_header_needsend(NULL),
 #endif
                 bcast_active(false), cbf(NULL), cbf_inst(NULL),
@@ -4137,4 +4214,3 @@ void NJClient::SetOggOutFile(FILE *fp, int srate, int nch, int bitrate)
   }
 #endif
 }
-

@@ -98,6 +98,8 @@ class NJClient
 public:
   enum
   {
+    NJCLIENT_CHANNEL_FLAG_VIDEO_ONLY = 1 << 4,
+
     NJCLIENT_CAP_DECODE_VORBIS = 1 << 8,
     NJCLIENT_CAP_DECODE_OPUS   = 1 << 9,
     NJCLIENT_CAP_ENCODE_VORBIS = 1 << 10,
@@ -151,6 +153,7 @@ public:
   void GetPosition(int *pos, int *length);  // positions in samples
   int GetLoopCount() { return m_loopcnt; }
   unsigned int GetSessionPosition(); // returns milliseconds
+  bool GetServerVideoSupported() const { return m_server_video_supported; }
 
   int HasUserInfoChanged() { if (m_userinfochange) { m_userinfochange=0; return 1; } return 0; }
   int GetNumUsers() { return m_remoteusers.GetSize(); }
@@ -248,8 +251,9 @@ public:
   int (*ChannelMixer)(void *userData, float **inbuf, int in_offset, int innch, int chidx, float *outbuf, int len);
   void *ChannelMixer_User;
 
-  // Passive decoded-remote-audio tap. Called from the audio thread before
-  // remote volume/pan/output routing is applied; implementations must not block.
+  // Passive mixed-remote-audio tap. Called from the audio thread after remote
+  // audio has been resampled to the output rate and mixed to stereo; implementations
+  // must not block.
   void (*RemoteChannelAudioTap)(void *userData, int useridx, const char *username, int channelidx,
                                 const float *interleaved, int numChannels, int numFrames, int sampleRate);
   void *RemoteChannelAudioTap_User;
@@ -282,6 +286,7 @@ protected:
   int m_status;
   int m_max_localch;
   int m_connection_keepalive;
+  bool m_server_video_supported;
   int m_codec_caps_encode;
   int m_codec_caps_decode;
   unsigned int m_codec_vorbis_mask;
