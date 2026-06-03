@@ -40,6 +40,10 @@ set(NINJAM_OUTPUT_ROOT "${CMAKE_CURRENT_BINARY_DIR}/${NINJAM_BRAND_NAME}")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Linux LV2 is a shared module and links the fetched Ogg/Vorbis/Opus static
+# libraries, so those dependencies must be built with -fPIC.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # Fetch JUCE
 include(FetchContent)
 FetchContent_Declare(
