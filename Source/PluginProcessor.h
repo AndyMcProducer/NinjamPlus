@@ -510,6 +510,7 @@ private:
     juce::String buildLinkAudioChannelKey(const juce::String& peerName, const juce::String& channelName) const;
     juce::String getLinkPeerName() const;
     NJClient ninjamClient;
+    juce::CriticalSection ninjamClientLock;
     juce::CriticalSection processLock;
     mutable juce::CriticalSection serverListLock;
     std::vector<PublicServerInfo> publicServers;
@@ -910,6 +911,7 @@ private:
         int remoteBeat = 0;
         int remoteBpi = 0;
         int remoteServerLatencyMs = -1;
+        int serverRouteLatencyMs = -1;
         juce::String senderKey;
         juce::String displaySender;
         long long receivedSampleCount = -1;
@@ -917,6 +919,7 @@ private:
     };
     std::map<juce::String, PendingRemoteIntervalStart> pendingRemoteIntervalStartsByUser;
     std::map<juce::String, int> lastRemoteServerLatencyMsByUser;
+    std::map<juce::String, int> remoteServerRouteLatencyMsByUser;
     std::map<juce::String, double> pendingTransportProbeSentMsById;
     std::map<juce::String, long long> remoteLatencyLastAppliedIntervalByUser;
     std::deque<juce::String> recentVideoTimingChangeEventIds;
