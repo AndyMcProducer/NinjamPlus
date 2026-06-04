@@ -12,6 +12,7 @@ static juce::Colour colourFromPresetName(const juce::String& preset, const juce:
 
 #if JUCE_WINDOWS
 #include <windows.h>
+#include <shellapi.h>
 #else
 #include <dlfcn.h>
 #endif
@@ -1960,6 +1961,16 @@ constexpr ChatEmojiCategory chatEmojiCategories[] = {
 juce::String emojiText(const ChatEmojiChoice& choice)
 {
     return juce::String::fromUTF8(choice.utf8);
+}
+
+static bool openSystemCameraSettings()
+{
+#if JUCE_WINDOWS
+    const auto result = ShellExecuteW(nullptr, L"open", L"ms-settings:camera", nullptr, nullptr, SW_SHOWNORMAL);
+    return reinterpret_cast<INT_PTR>(result) > 32;
+#else
+    return false;
+#endif
 }
 
 juce::String emojiCommandForLabel(juce::String label)
@@ -4167,6 +4178,12 @@ private:
         menu.addItem(3, "Rename Pad");
         menu.addSeparator();
         menu.addItem(4, "Auto BPM Sync", hasSample, processor.isSamplePadBpmSyncEnabled(padIndex));
+        juce::PopupMenu speedMenu;
+        const auto currentSpeed = processor.getSamplePadPlaybackSpeed(padIndex);
+        speedMenu.addItem(20, "Half Speed", hasSample, currentSpeed == NinjamVst3AudioProcessor::SamplePadPlaybackSpeed::half);
+        speedMenu.addItem(21, "Normal Speed", hasSample, currentSpeed == NinjamVst3AudioProcessor::SamplePadPlaybackSpeed::normal);
+        speedMenu.addItem(22, "Double Speed", hasSample, currentSpeed == NinjamVst3AudioProcessor::SamplePadPlaybackSpeed::doubleSpeed);
+        menu.addSubMenu("Playback Speed", speedMenu, hasSample);
         menu.addItem(5, "Resync to NINJAM BPM", hasSample && processor.isSamplePadLoopEnabled(padIndex));
         menu.addItem(6, "Undo BPM Resync", processor.canUndoSamplePadBpmResync(padIndex));
         menu.addItem(7, "Sync to Beat", hasSample && processor.isSamplePadLoopEnabled(padIndex));
@@ -4237,6 +4254,16 @@ private:
                                else if (result == 8)
                                {
                                    safeThis->processor.undoSamplePadClear(safeThis->padIndex);
+                                   safeThis->refreshFromProcessor();
+                               }
+                               else if (result == 20 || result == 21 || result == 22)
+                               {
+                                   auto speed = NinjamVst3AudioProcessor::SamplePadPlaybackSpeed::normal;
+                                   if (result == 20)
+                                       speed = NinjamVst3AudioProcessor::SamplePadPlaybackSpeed::half;
+                                   else if (result == 22)
+                                       speed = NinjamVst3AudioProcessor::SamplePadPlaybackSpeed::doubleSpeed;
+                                   safeThis->processor.setSamplePadPlaybackSpeed(safeThis->padIndex, speed);
                                    safeThis->refreshFromProcessor();
                                }
                                else if (result >= 100
@@ -9866,8 +9893,20 @@ void NinjamVst3AudioProcessorEditor::syncToggled()
 
 void NinjamVst3AudioProcessorEditor::videoClicked()
 {
+    auto disableBackgroundVideo = [this]
+    {
+        if (videoBgToggle.getToggleState())
+        {
+            videoBgToggle.setToggleState(false, juce::dontSendNotification);
+            videoFrameReader.reset();
+            markPersistentSettingsDirty();
+            repaint();
+        }
+    };
+
     if (!audioProcessor.isNinjamZapVideoAvailable())
     {
+        disableBackgroundVideo();
         audioProcessor.launchVideoSessionAsync();
         return;
     }
@@ -9875,6 +9914,38 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
     juce::PopupMenu menu;
     menu.addItem(1, "VDO synced video");
     menu.addItem(2, "NINJAMZap server video");
+    menu.addItem(4, "Open Windows Camera Settings");
+    if (audioProcessor.isNinjamZapCameraSending())
+    {
+        menu.addItem(3, "Stop NINJAMZap Camera (" + ninjamplus::zap::getCodecName(audioProcessor.getNinjamZapCameraActiveCodec()) + ")");
+    }
+    else
+    {
+        juce::PopupMenu cameraMenu;
+        const auto cameras = audioProcessor.getNinjamZapCameraDevices();
+        if (cameras.isEmpty())
+        {
+            cameraMenu.addItem(300, "No cameras found", false);
+        }
+        else
+        {
+            juce::PopupMenu autoMenu;
+            juce::PopupMenu h264Menu;
+            juce::PopupMenu mjpegMenu;
+            const bool h264Available = ninjamplus::zap::getCodecCapability(ninjamplus::zap::VideoCodec::h264).canEncode;
+            for (int i = 0; i < cameras.size(); ++i)
+            {
+                const juce::String cameraName = cameras[i].isNotEmpty() ? cameras[i] : "Camera " + juce::String(i + 1);
+                autoMenu.addItem(3001 + i, cameraName);
+                h264Menu.addItem(4001 + i, cameraName, h264Available);
+                mjpegMenu.addItem(5001 + i, cameraName);
+            }
+            cameraMenu.addSubMenu("Auto (H.264 preferred)", autoMenu);
+            cameraMenu.addSubMenu("H.264", h264Menu, h264Available);
+            cameraMenu.addSubMenu("MJPEG", mjpegMenu);
+        }
+        menu.addSubMenu("Start NINJAMZap Camera", cameraMenu);
+    }
 
     juce::Component::SafePointer<NinjamVst3AudioProcessorEditor> safeThis(this);
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&videoButton),
@@ -9884,9 +9955,62 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
                                return;
 
                            if (result == 1)
+                           {
+                               safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
+                               safeThis->videoFrameReader.reset();
+                               safeThis->markPersistentSettingsDirty();
+                               safeThis->repaint();
                                safeThis->audioProcessor.launchVideoSessionAsync();
+                           }
                            else if (result == 2)
+                           {
+                               safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
+                               safeThis->videoFrameReader.reset();
+                               safeThis->markPersistentSettingsDirty();
+                               safeThis->repaint();
                                safeThis->audioProcessor.launchNinjamZapVideoSession();
+                           }
+                           else if (result == 3)
+                           {
+                               if (safeThis->audioProcessor.isNinjamZapCameraSending())
+                               {
+                                   safeThis->audioProcessor.stopNinjamZapCameraSend();
+                               }
+                           }
+                           else if (result == 4)
+                           {
+                               if (!openSystemCameraSettings())
+                                   juce::NativeMessageBox::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                                               "Camera Settings",
+                                                                               "Windows camera settings could not be opened.");
+                           }
+                           else if (result >= 3001 && result < 4000)
+                           {
+                               safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
+                               safeThis->videoFrameReader.reset();
+                               safeThis->markPersistentSettingsDirty();
+                               safeThis->repaint();
+                               safeThis->audioProcessor.startNinjamZapCameraSend(result - 3001,
+                                                                                 ninjamplus::zap::CameraCodecPreference::autoCodec);
+                           }
+                           else if (result >= 4001 && result < 5000)
+                           {
+                               safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
+                               safeThis->videoFrameReader.reset();
+                               safeThis->markPersistentSettingsDirty();
+                               safeThis->repaint();
+                               safeThis->audioProcessor.startNinjamZapCameraSend(result - 4001,
+                                                                                 ninjamplus::zap::CameraCodecPreference::h264);
+                           }
+                           else if (result >= 5001)
+                           {
+                               safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
+                               safeThis->videoFrameReader.reset();
+                               safeThis->markPersistentSettingsDirty();
+                               safeThis->repaint();
+                               safeThis->audioProcessor.startNinjamZapCameraSend(result - 5001,
+                                                                                 ninjamplus::zap::CameraCodecPreference::mjpeg);
+                           }
                        });
 }
 

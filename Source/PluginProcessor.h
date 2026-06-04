@@ -18,8 +18,20 @@
 #include "ninjam/njclient.h"
 #include "ZapVideoCodec.h"
 
+#ifndef NINJAMPLUS_HAS_H264_DECODE
+#define NINJAMPLUS_HAS_H264_DECODE 0
+#endif
+
+#if defined(NINJAMPLUS_HAS_PROVIDEO) && NINJAMPLUS_HAS_PROVIDEO
+#include "ProVideoDecoder.h"
+#else
+class ProVideoDecoder;
+#endif
+
 class NinjamVst3AudioProcessorEditor;
 class LocalVideoHttpServer;
+class ZapVideoDecodeWorker;
+class ZapCameraSender;
 class AsyncChatTranslationWorker;
 class LocalChordAnalyzer;
 
@@ -35,6 +47,8 @@ class NinjamVst3AudioProcessor : public juce::AudioProcessor,
 {
     friend class NinjamVst3AudioProcessorEditor;
     friend class AsyncChatTranslationWorker;
+    friend class ZapVideoDecodeWorker;
+    friend class ZapCameraSender;
 public:
     NinjamVst3AudioProcessor();
     ~NinjamVst3AudioProcessor() override;
@@ -274,6 +288,14 @@ public:
     bool isSamplePadMatchBpiEnabled(int padIndex) const;
     void setSamplePadBpmSyncEnabled(int padIndex, bool shouldEnable);
     bool isSamplePadBpmSyncEnabled(int padIndex) const;
+    enum class SamplePadPlaybackSpeed
+    {
+        half = -1,
+        normal = 0,
+        doubleSpeed = 1
+    };
+    void setSamplePadPlaybackSpeed(int padIndex, SamplePadPlaybackSpeed speed);
+    SamplePadPlaybackSpeed getSamplePadPlaybackSpeed(int padIndex) const;
     void resyncSamplePadToNinjamBpm(int padIndex);
     void syncSamplePadLoopToBeat(int padIndex);
     void undoSamplePadBpmResync(int padIndex);
@@ -365,6 +387,15 @@ public:
     bool isNinjamZapVideoAvailable();
     bool isNinjamZapVideoEnabled() const;
     void launchNinjamZapVideoSession();
+    juce::StringArray getNinjamZapCameraDevices() const;
+    ninjamplus::zap::CameraCodecPreference getNinjamZapCameraCodecPreference() const;
+    void setNinjamZapCameraCodecPreference(ninjamplus::zap::CameraCodecPreference preference);
+    ninjamplus::zap::VideoCodec getNinjamZapCameraActiveCodec() const;
+    void startNinjamZapCameraSend();
+    void startNinjamZapCameraSend(int deviceIndex);
+    void startNinjamZapCameraSend(int deviceIndex, ninjamplus::zap::CameraCodecPreference preference);
+    void stopNinjamZapCameraSend();
+    bool isNinjamZapCameraSending() const;
 
     void rememberUserVolume(int userIndex, float volume, const juce::String& name);
     void resetRemoteUserIndexState(int userIndex, const juce::String& userName);
@@ -451,6 +482,24 @@ public:
     juce::String getIntervalSyncStatusText() const;
 
 private:
+    struct ZapVideoFrameInfo
+    {
+        juce::String streamKey;
+        juce::String sender;
+        int channelIndex = 0;
+        juce::uint64 refreshId = 0;
+        double lastUpdateMs = 0.0;
+    };
+
+    struct ZapVideoDecodeJob
+    {
+        juce::String streamKey;
+        juce::String sender;
+        int channelIndex = 0;
+        ninjamplus::zap::VideoCodec codec = ninjamplus::zap::VideoCodec::unknown;
+        juce::MemoryBlock payload;
+    };
+
     struct LinkTimingState;
     int getSyncStartCompensationSamples() const;
     void primeSyncTransportStart(const juce::AudioPlayHead::CurrentPositionInfo* hostInfo = nullptr);
@@ -575,6 +624,7 @@ private:
         bool undoClearReverse = false;
         bool undoClearMatchBpi = false;
         bool undoClearBpmSyncEnabled = true;
+        SamplePadPlaybackSpeed undoClearPlaybackSpeed = SamplePadPlaybackSpeed::normal;
         bool undoClearDuckRoute = false;
         std::array<bool, numSamplePadFxSlots> undoClearFxSlotRoutes {};
         bool canUndoClear = false;
@@ -582,6 +632,7 @@ private:
         std::atomic<bool> reverse { false };
         std::atomic<bool> matchBpi { false };
         std::atomic<bool> bpmSyncEnabled { true };
+        std::atomic<int> playbackSpeed { (int)SamplePadPlaybackSpeed::normal };
         std::atomic<bool> duckRoute { false };
         std::array<std::atomic<bool>, numSamplePadFxSlots> fxSlotRoutes {};
         std::atomic<bool> playing { false };
@@ -811,12 +862,35 @@ private:
     std::atomic<bool> ninjamZapVideoReceivedNotice { false };
     juce::CriticalSection ninjamZapVideoChunkLock;
     std::map<juce::String, ninjamplus::zap::ChunkReassembler> ninjamZapVideoChunkReassemblers;
+    // Per-user reassembly + decode state (used by helper HTTP server)
+    std::map<juce::String, ninjamplus::zap::ChunkReassembler> remoteVideoChunkReassemblersByUser;
+#if defined(NINJAMPLUS_HAS_PROVIDEO) && NINJAMPLUS_HAS_PROVIDEO
+    std::map<juce::String, std::unique_ptr<ProVideoDecoder>> remoteVideoDecodersByUser;
+#endif
     double lastNinjamZapVideoSubscriptionSyncMs = 0.0;
     juce::CriticalSection videoLaunchWorkerLock;
     std::future<void> videoLaunchFuture;
     std::unique_ptr<LocalVideoHttpServer> advancedVideoServer;
+    std::unique_ptr<ZapVideoDecodeWorker> zapVideoDecodeWorker;
+    std::unique_ptr<ZapCameraSender> zapCameraSender;
+    std::atomic<bool> ninjamZapCameraSendEnabled { false };
+    std::atomic<int> ninjamZapCameraCodecPreference { (int)ninjamplus::zap::CameraCodecPreference::autoCodec };
+    std::atomic<int> ninjamZapCameraActiveCodec { (int)ninjamplus::zap::VideoCodec::mjpeg };
+    std::atomic<bool> ninjamZapVideoStreamOpen { false };
+    std::array<unsigned char, 16> ninjamZapVideoStreamGuid {};
+    juce::SpinLock pendingNinjamZapIntervalLock;
+    std::atomic<bool> pendingNinjamZapIntervalRotate { false };
+    std::array<unsigned char, 16> pendingNinjamZapAudioGuid {};
+    int pendingNinjamZapIntervalCounter = 0;
+    juce::SpinLock ninjamZapCameraChunkQueueLock;
+    std::vector<juce::MemoryBlock> pendingNinjamZapCameraChunks;
+    juce::MemoryBlock ninjamZapCameraH264ConfigChunk;
+    mutable juce::CriticalSection zapVideoFrameLock;
     std::map<juce::String, int> remoteLatencyFirmDelayMsByUser;
     std::map<juce::String, juce::uint64> remoteVideoBufferRefreshIdByUser;
+    std::map<juce::String, ZapVideoFrameInfo> remoteVideoFrameInfoByUser;
+    std::map<juce::String, juce::MemoryBlock> remoteVideoLatestJpegByUser;
+    std::map<juce::String, juce::Image> remoteVideoLatestFrameByUser;
     juce::uint64 videoBufferRefreshCounter = 0;
 
     std::atomic<bool> opusSyncAvailable { false };
@@ -939,8 +1013,29 @@ private:
     juce::File resolveVideoHelperRootDir() const;
     bool isAdvancedVideoClientAvailable() const;
     bool ensureAdvancedVideoClientStarted();
+    bool ensureZapVideoClientStarted();
     void stopAdvancedVideoClient();
     void writeIntervalHelperJson(int pos, int length);
+    void startZapVideoDecodeWorker();
+    void stopZapVideoDecodeWorker();
+    void enqueueZapVideoDecodeJob(ZapVideoDecodeJob job);
+    int getNinjamZapVideoChannelIndex() const;
+    void configureNinjamZapVideoLocalChannel();
+    void beginNinjamZapVideoIntervalStream(const unsigned char audioGuid[16], int intervalCounter);
+    void requestNinjamZapVideoIntervalRotateFromAudioThread();
+    void processPendingNinjamZapVideoIntervalRotate();
+    void rotateNinjamZapVideoIntervalStream(const unsigned char audioGuid[16], int intervalCounter);
+    void flushPendingNinjamZapCameraVideo();
+    void enqueueNinjamZapCameraFrameChunk(juce::MemoryBlock chunk);
+    void publishLocalNinjamZapCameraFrame(const juce::Image& frame, const juce::MemoryBlock& encodedJpeg);
+    void closeNinjamZapVideoIntervalStream();
+    void publishDecodedZapVideoFrame(const ZapVideoDecodeJob& job,
+                                     const juce::Image& frame,
+                                     const juce::MemoryBlock& encodedJpeg);
+    juce::String buildZapVideoFrameListJson() const;
+    bool getZapVideoFrameJpeg(const juce::String& streamKey, juce::MemoryBlock& jpegData) const;
+    void clearZapVideoFrameState();
+    void stopNinjamZapVideoTransportForDisconnect();
     void syncLocalIntervalChannelConfig();
     bool isNinjamRemoteChannelVideoOnly(int userIndex, int channelIndex);
     int syncNinjamZapVideoSubscriptions(bool subscribe);

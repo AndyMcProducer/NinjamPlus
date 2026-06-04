@@ -172,6 +172,7 @@ target_sources(NINJAM_VST3 PRIVATE
     Source/StandaloneApp.cpp
     Source/ZapVideoCodec.cpp
     Source/ZapVideoCodec.h
+    # ProVideoCodec is optional (FFmpeg-based). Do not add unconditionally.
     
     # NINJAM Core
     ${NINJAM_ROOT}/ninjam/njclient.cpp
@@ -219,6 +220,54 @@ target_include_directories(NINJAM_VST3 PRIVATE
     $<$<BOOL:${WIN32}>:${asiosdk_SOURCE_DIR}/host>
 )
 
+# Optional H.264 decode backends. MJPEG decode is always available through JUCE.
+if (WIN32)
+    target_sources(NINJAM_VST3 PRIVATE
+        Source/ProVideoDecoder.h
+        Source/ProVideoDecoder_MF.cpp
+    )
+    target_compile_definitions(NINJAM_VST3 PRIVATE
+        NINJAMPLUS_HAS_PROVIDEO=1
+        NINJAMPLUS_HAS_H264_DECODE=0)
+    target_link_libraries(NINJAM_VST3 PRIVATE Mfplat Mfreadwrite Mfuuid wmcodecdspuuid)
+elseif (APPLE)
+    target_sources(NINJAM_VST3 PRIVATE
+        Source/ProVideoDecoder.h
+        Source/ProVideoDecoder_VT.mm
+    )
+    target_compile_definitions(NINJAM_VST3 PRIVATE
+        NINJAMPLUS_HAS_PROVIDEO=1
+        NINJAMPLUS_HAS_H264_DECODE=1)
+    target_link_libraries(NINJAM_VST3 PRIVATE
+        "-framework VideoToolbox"
+        "-framework CoreMedia"
+        "-framework CoreVideo"
+        "-framework CoreFoundation")
+else()
+    find_package(PkgConfig QUIET)
+    if (PkgConfig_FOUND)
+        pkg_check_modules(GSTREAMER QUIET IMPORTED_TARGET
+            gstreamer-1.0
+            gstreamer-app-1.0
+            gstreamer-video-1.0)
+    endif()
+
+    if (TARGET PkgConfig::GSTREAMER)
+        target_sources(NINJAM_VST3 PRIVATE
+            Source/ProVideoDecoder.h
+            Source/ProVideoDecoder_GStreamer.cpp
+        )
+        target_link_libraries(NINJAM_VST3 PRIVATE PkgConfig::GSTREAMER)
+        target_compile_definitions(NINJAM_VST3 PRIVATE
+            NINJAMPLUS_HAS_PROVIDEO=1
+            NINJAMPLUS_HAS_H264_DECODE=1)
+    else()
+        target_compile_definitions(NINJAM_VST3 PRIVATE
+            NINJAMPLUS_HAS_PROVIDEO=0
+            NINJAMPLUS_HAS_H264_DECODE=0)
+    endif()
+endif()
+
 set(NINJAMPLUS_LOCAL_AUBIO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/local_deps/aubio-install")
 find_path(AUBIO_INCLUDE_DIR
     NAMES aubio.h aubio/aubio.h
@@ -244,6 +293,7 @@ target_link_libraries(NINJAM_VST3 PRIVATE
     juce::juce_audio_processors
     juce::juce_gui_basics
     juce::juce_gui_extra
+    juce::juce_video
     juce::juce_dsp
     juce::juce_osc
     Ableton::Link
@@ -257,6 +307,7 @@ target_link_libraries(NINJAM_VST3 PRIVATE
 # Compiler definitions
 target_compile_definitions(NINJAM_VST3 PRIVATE
     JUCE_WEB_BROWSER=0
+    JUCE_USE_CAMERA=1
     JUCE_USE_CURL=0
     JUCE_USE_CUSTOM_PLUGIN_STANDALONE_APP=1
     JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0

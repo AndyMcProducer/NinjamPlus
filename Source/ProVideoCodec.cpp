@@ -1,4 +1,13 @@
 #include "ProVideoCodec.h"
+extern "C"
+{
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/avutil.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
+#include <libswscale/swscale.h>
+}
 
 //==============================================================================
 // Internal helpers
@@ -278,7 +287,7 @@ void ProVideoDecoder::close()
         swsCtx = nullptr;
         swsW   = 0;
         swsH   = 0;
-        swsFmt = AV_PIX_FMT_NONE;
+        swsFmt = (int)AV_PIX_FMT_NONE;
     }
     if (avFrame  != nullptr) { av_frame_free(&avFrame);         avFrame  = nullptr; }
     if (codecCtx != nullptr) { avcodec_free_context(&codecCtx); codecCtx = nullptr; }
@@ -314,7 +323,7 @@ bool ProVideoDecoder::decode(const void* data, int dataLen, juce::Image& outImag
             const auto fmt = static_cast<AVPixelFormat>(avFrame->format);
 
             // Reuse the sws context if the frame geometry hasn't changed.
-            if (swsCtx == nullptr || swsW != w || swsH != h || swsFmt != fmt)
+            if (swsCtx == nullptr || swsW != w || swsH != h || swsFmt != (int)fmt)
             {
                 if (swsCtx != nullptr)
                     sws_freeContext(swsCtx);
@@ -323,7 +332,7 @@ bool ProVideoDecoder::decode(const void* data, int dataLen, juce::Image& outImag
                                         SWS_BICUBIC, nullptr, nullptr, nullptr);
                 swsW   = w;
                 swsH   = h;
-                swsFmt = fmt;
+                swsFmt = (int)fmt;
             }
 
             if (swsCtx != nullptr)

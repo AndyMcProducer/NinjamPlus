@@ -23,9 +23,16 @@ namespace ninjamplus::zap
         juce::String backend;
     };
 
+    enum class CameraCodecPreference
+    {
+        autoCodec,
+        h264,
+        mjpeg
+    };
+
     constexpr int kZapVideoWidth = 1280;
     constexpr int kZapVideoHeight = 720;
-    constexpr int kZapVideoFps = 15;
+    constexpr int kZapVideoFps = 30;
     constexpr int kZapJpegDefaultQuality = 72;
     constexpr int kZapJpegMinQuality = 30;
     constexpr int kZapJpegMaxQuality = 90;
@@ -45,6 +52,30 @@ namespace ninjamplus::zap
     bool encodeMjpegFrame(const juce::Image& source, int jpegQuality, juce::MemoryBlock& outData);
     bool decodeMjpegFrame(const void* data, size_t dataSize, juce::Image& outImage);
     int adaptJpegQualityForBandwidth(int currentQuality, size_t encodedBytes, size_t targetBytesPerFrame);
+
+    struct EncodedH264Frame
+    {
+        juce::MemoryBlock configChunk;
+        juce::MemoryBlock frameChunk;
+    };
+
+    class H264Encoder
+    {
+    public:
+        H264Encoder();
+        ~H264Encoder();
+
+        bool open(int width, int height, int fps, int bitrateBitsPerSecond);
+        void close();
+        bool isOpen() const;
+        bool encodeFrame(const juce::Image& source, EncodedH264Frame& outFrame);
+
+        static bool isAvailable();
+
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> impl;
+    };
 
     void appendBigEndian32(juce::MemoryBlock& outData, juce::uint32 value);
     juce::uint32 readBigEndian32(const void* data);

@@ -2,14 +2,13 @@
 #include <juce_core/juce_core.h>
 #include <juce_graphics/juce_graphics.h>
 
-extern "C"
-{
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/avutil.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/opt.h>
-#include <libswscale/swscale.h>
+// Forward-declare a minimal set of FFmpeg types here so other translation
+// units can include this header without pulling in FFmpeg include paths.
+extern "C" {
+    struct AVCodec;
+    struct AVCodecContext;
+    struct AVFrame;
+    struct SwsContext;
 }
 
 //==============================================================================
@@ -82,7 +81,7 @@ private:
     SwsContext*     swsCtx   = nullptr;
     int             swsW     = 0;
     int             swsH     = 0;
-    AVPixelFormat   swsFmt   = AV_PIX_FMT_NONE;
+    int             swsFmt   = -1; // store AVPixelFormat as int to avoid requiring FFmpeg headers here
 
     bool ensureOpen();
 
