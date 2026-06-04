@@ -30,6 +30,7 @@
 #define _NETMSG_H_
 
 #include "../WDL/queue.h"
+#include "../WDL/mutex.h"
 #include "../WDL/jnetlib/jnetlib.h"
 #ifndef _WIN32
 #include <netinet/tcp.h>
@@ -142,6 +143,7 @@ class Net_Connection
 
     JNL_IConnection *m_con;
     WDL_Queue m_sendq;
+    WDL_Mutex m_mutex;
 
 
 };

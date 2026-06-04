@@ -91,6 +91,7 @@ int Net_Message::makeMessageHeader(void *data) // makes message header, data sho
 
 Net_Message *Net_Connection::Run(int *wantsleep)
 {
+  WDL_MutexLock lock(&m_mutex);
   if (!m_con || m_error) return 0;
 
   {
@@ -222,6 +223,7 @@ Net_Message *Net_Connection::Run(int *wantsleep)
 
 int Net_Connection::Send(Net_Message *msg)
 {
+  WDL_MutexLock lock(&m_mutex);
   if (msg)
   {
     msg->addRef();
@@ -292,6 +294,7 @@ int Net_Connection::Send(Net_Message *msg)
 
 int Net_Connection::GetStatus()
 {
+  WDL_MutexLock lock(&m_mutex);
   if (m_error) return m_error;
   return !m_con || m_con->get_state()<JNL_Connection::STATE_RESOLVING || m_con->get_state()>=JNL_Connection::STATE_CLOSING; // 1 if disconnected somehow
 }
@@ -319,5 +322,6 @@ Net_Connection::~Net_Connection()
 
 void Net_Connection::Kill(int quick)
 {
+  WDL_MutexLock lock(&m_mutex);
   m_con->close();
 }

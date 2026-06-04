@@ -181,6 +181,7 @@ public:
   void ResetTransportPhase();
   void SetTransportPosition(int pos);
   void NotifyServerOfChannelChange(); // call after any SetLocalChannel* that occur after initial connect
+  bool GetLocalChannelCurrentGuid(int chidx, unsigned char outGuid[16]);
 
   void SetMetronomeChannel(int chidx) { m_metro_chidx=chidx; } // chidx&255 is stereo pair index, add 1024 for mono only
   int GetMetronomeChannel() const { return m_metro_chidx; }

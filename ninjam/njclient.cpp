@@ -2395,12 +2395,25 @@ int NJClient::WriteRawIntervalChunk(const unsigned char guid[16], const void *da
   if (!m_netcon || GetStatus() != NJC_STATUS_OK || !data || dataLen <= 0)
     return -1;
 
-  mpb_client_upload_interval_write wh;
-  memcpy(wh.guid, guid, 16);
-  wh.flags = 0;
-  wh.audio_data = data;
-  wh.audio_data_len = dataLen;
-  m_netcon->Send(wh.build());
+  const unsigned char *p = (const unsigned char *)data;
+  int offs = 0;
+  const int maxChunkBytes = 8192;
+
+  while (offs < dataLen)
+  {
+    int n = dataLen - offs;
+    if (n > maxChunkBytes) n = maxChunkBytes;
+
+    mpb_client_upload_interval_write wh;
+    memcpy(wh.guid, guid, 16);
+    wh.flags = 0;
+    wh.audio_data = p + offs;
+    wh.audio_data_len = n;
+    m_netcon->Send(wh.build());
+
+    offs += n;
+  }
+
   return 0;
 }
 
@@ -3646,6 +3659,24 @@ const char *NJClient::GetLocalChannelInfo(int ch, int *srcch, int *bitrate, bool
   if (flags) *flags=c->flags;
 
   return c->name.Get();
+}
+
+bool NJClient::GetLocalChannelCurrentGuid(int chidx, unsigned char outGuid[16])
+{
+  if (!outGuid) return false;
+
+  bool found = false;
+  m_locchan_cs.Enter();
+  int x;
+  for (x = 0; x < m_locchannels.GetSize() && m_locchannels.Get(x)->channel_idx!=chidx; x ++);
+  if (x != m_locchannels.GetSize())
+  {
+    Local_Channel *c = m_locchannels.Get(x);
+    memcpy(outGuid, c->m_curwritefile.guid, 16);
+    found = memcmp(outGuid, zero_guid, 16) != 0;
+  }
+  m_locchan_cs.Leave();
+  return found;
 }
 
 int NJClient::EnumLocalChannels(int i)
