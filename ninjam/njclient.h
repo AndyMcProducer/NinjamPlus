@@ -182,6 +182,9 @@ public:
   void SetTransportPosition(int pos);
   void NotifyServerOfChannelChange(); // call after any SetLocalChannel* that occur after initial connect
   bool GetLocalChannelCurrentGuid(int chidx, unsigned char outGuid[16]);
+  bool GetUserChannelPlaybackGuids(int useridx, int channelidx,
+                                   unsigned char currentGuid[16], bool *hasCurrent,
+                                   unsigned char previousGuid[16], bool *hasPrevious);
 
   void SetMetronomeChannel(int chidx) { m_metro_chidx=chidx; } // chidx&255 is stereo pair index, add 1024 for mono only
   int GetMetronomeChannel() const { return m_metro_chidx; }
@@ -236,6 +239,8 @@ public:
   // moment as audio's ds/next_ds promotion, with no poll jitter.
   void (*NewIntervalCallback)(void *userData, NJClient *inst);
   void *NewIntervalCallbackUser;
+  void (*PostNewIntervalCallback)(void *userData, NJClient *inst);
+  void *PostNewIntervalCallbackUser;
 
   void (*IntervalMediaItem_Callback)(void *userData, NJClient *inst, const char *username, int chidx, unsigned int fourcc, const unsigned char *guid, const void *data, int dataLen);
   void *IntervalMediaItem_User;

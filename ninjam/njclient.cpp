@@ -664,6 +664,8 @@ class RemoteUser_Channel
     int dump_samples;
     DecodeState *ds;
     DecodeState *next_ds[2]; // prepared by main thread, for audio thread
+    unsigned char prev_ds_guid[16];
+    bool has_prev_ds_guid;
 
     double decode_peak_vol[2];
 
@@ -995,6 +997,8 @@ NJClient::NJClient()
   IntervalMediaItem_User=0;
   NewIntervalCallback=0;
   NewIntervalCallbackUser=0;
+  PostNewIntervalCallback=0;
+  PostNewIntervalCallbackUser=0;
   IntervalChunkCallback=0;
   IntervalChunkCallbackUser=0;
   ChannelMixer=0;
@@ -1594,6 +1598,8 @@ int NJClient::Run() // nonzero if sleep ok
                       theuser->channels[cid].ds=0;
                       theuser->channels[cid].next_ds[0]=0;
                       theuser->channels[cid].next_ds[1]=0;
+                      memset(theuser->channels[cid].prev_ds_guid,0,sizeof(theuser->channels[cid].prev_ds_guid));
+                      theuser->channels[cid].has_prev_ds_guid=false;
 //                      OutputDebugString("channel flags changed, flushing sources\n");
                     }
                     theuser->channels[cid].flags = f;
@@ -1658,6 +1664,8 @@ int NJClient::Run() // nonzero if sleep ok
                       theuser->channels[cid].ds=0;
                       theuser->channels[cid].next_ds[0]=0;
                       theuser->channels[cid].next_ds[1]=0;
+                      memset(theuser->channels[cid].prev_ds_guid,0,sizeof(theuser->channels[cid].prev_ds_guid));
+                      theuser->channels[cid].has_prev_ds_guid=false;
 //                      OutputDebugString("channel flags changed, flushing sources2\n");
 
                       if (!theuser->chanpresentmask) // user no longer exists, it seems
@@ -3352,6 +3360,16 @@ void NJClient::on_new_interval()
         chan->dump_samples=0;
         overlapFadeState fade_state;
         if (chan->ds) chan->ds->calcOverlap(&fade_state);
+        if (chan->ds)
+        {
+          memcpy(chan->prev_ds_guid,chan->ds->guid,sizeof(chan->prev_ds_guid));
+          chan->has_prev_ds_guid=true;
+        }
+        else
+        {
+          memset(chan->prev_ds_guid,0,sizeof(chan->prev_ds_guid));
+          chan->has_prev_ds_guid=false;
+        }
         delete chan->ds;
         chan->ds=0;
         if ((user->submask & user->chanpresentmask) & (1<<ch)) chan->ds = chan->next_ds[0];
@@ -3368,6 +3386,9 @@ void NJClient::on_new_interval()
     }
   }
   m_users_cs.Leave();
+
+  if (PostNewIntervalCallback)
+    PostNewIntervalCallback(PostNewIntervalCallbackUser, this);
 }  //if (m_enc->isError()) printf("ERROR\n");
   //else printf("YAY\n");
 
@@ -3676,6 +3697,37 @@ bool NJClient::GetLocalChannelCurrentGuid(int chidx, unsigned char outGuid[16])
     found = memcmp(outGuid, zero_guid, 16) != 0;
   }
   m_locchan_cs.Leave();
+  return found;
+}
+
+bool NJClient::GetUserChannelPlaybackGuids(int useridx, int channelidx,
+                                           unsigned char currentGuid[16], bool *hasCurrent,
+                                           unsigned char previousGuid[16], bool *hasPrevious)
+{
+  if (hasCurrent) *hasCurrent=false;
+  if (hasPrevious) *hasPrevious=false;
+  if (currentGuid) memset(currentGuid,0,16);
+  if (previousGuid) memset(previousGuid,0,16);
+
+  bool found=false;
+  m_users_cs.Enter();
+  if (useridx >= 0 && useridx < m_remoteusers.GetSize() && channelidx >= 0 && channelidx < MAX_USER_CHANNELS)
+  {
+    RemoteUser_Channel *c = &m_remoteusers.Get(useridx)->channels[channelidx];
+    if (c->ds && c->ds->guid)
+    {
+      if (currentGuid) memcpy(currentGuid,c->ds->guid,16);
+      if (hasCurrent) *hasCurrent=memcmp(c->ds->guid,zero_guid,16)!=0;
+      found=true;
+    }
+    if (c->has_prev_ds_guid)
+    {
+      if (previousGuid) memcpy(previousGuid,c->prev_ds_guid,16);
+      if (hasPrevious) *hasPrevious=memcmp(c->prev_ds_guid,zero_guid,16)!=0;
+      found=true;
+    }
+  }
+  m_users_cs.Leave();
   return found;
 }
 
