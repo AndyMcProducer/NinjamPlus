@@ -7857,6 +7857,13 @@ void NinjamVst3AudioProcessorEditor::setStandaloneOptionsMenuHandler(std::functi
     standaloneOptionsMenuHandler = handler;
 }
 
+void NinjamVst3AudioProcessorEditor::stopBackgroundVideoReader()
+{
+#if JUCE_WINDOWS
+    videoFrameReader.reset();
+#endif
+}
+
 void NinjamVst3AudioProcessorEditor::armSamplePadMidiLearn(int padIndex)
 {
     if (padIndex < 0 || padIndex >= NinjamVst3AudioProcessor::numSamplePads)
@@ -9895,7 +9902,7 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
         if (videoBgToggle.getToggleState())
         {
             videoBgToggle.setToggleState(false, juce::dontSendNotification);
-            videoFrameReader.reset();
+            stopBackgroundVideoReader();
             markPersistentSettingsDirty();
             repaint();
         }
@@ -9961,7 +9968,7 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
                            if (result == 1)
                            {
                                safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
-                               safeThis->videoFrameReader.reset();
+                               safeThis->stopBackgroundVideoReader();
                                safeThis->markPersistentSettingsDirty();
                                safeThis->repaint();
                                safeThis->audioProcessor.launchVideoSessionAsync();
@@ -9969,7 +9976,7 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
                            else if (result == 2)
                            {
                                safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
-                               safeThis->videoFrameReader.reset();
+                               safeThis->stopBackgroundVideoReader();
                                safeThis->markPersistentSettingsDirty();
                                safeThis->repaint();
                                safeThis->audioProcessor.launchNinjamZapVideoSession();
@@ -9991,7 +9998,7 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
                            else if (result >= 3001 && result < 4000)
                            {
                                safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
-                               safeThis->videoFrameReader.reset();
+                               safeThis->stopBackgroundVideoReader();
                                safeThis->markPersistentSettingsDirty();
                                safeThis->repaint();
                                safeThis->audioProcessor.startNinjamZapCameraSend(result - 3001,
@@ -10000,7 +10007,7 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
                            else if (result >= 4001 && result < 5000)
                            {
                                safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
-                               safeThis->videoFrameReader.reset();
+                               safeThis->stopBackgroundVideoReader();
                                safeThis->markPersistentSettingsDirty();
                                safeThis->repaint();
                                safeThis->audioProcessor.startNinjamZapCameraSend(result - 4001,
@@ -10009,7 +10016,7 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
                            else if (result >= 5001 && result < 6000)
                            {
                                safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
-                               safeThis->videoFrameReader.reset();
+                               safeThis->stopBackgroundVideoReader();
                                safeThis->markPersistentSettingsDirty();
                                safeThis->repaint();
                                safeThis->audioProcessor.startNinjamZapCameraSend(result - 5001,
@@ -10018,7 +10025,7 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
                            else if (result >= 6001 && result < 7000)
                            {
                                safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
-                               safeThis->videoFrameReader.reset();
+                               safeThis->stopBackgroundVideoReader();
                                safeThis->markPersistentSettingsDirty();
                                safeThis->repaint();
                                safeThis->audioProcessor.startNinjamZapCameraSend(result - 6001,
@@ -10027,7 +10034,7 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
                            else if (result >= 7001)
                            {
                                safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
-                               safeThis->videoFrameReader.reset();
+                               safeThis->stopBackgroundVideoReader();
                                safeThis->markPersistentSettingsDirty();
                                safeThis->repaint();
                                safeThis->audioProcessor.startNinjamZapCameraSend(result - 7001,

@@ -1,8 +1,9 @@
 // ProVideoDecoder_VT.mm
 #include "ProVideoDecoder.h"
-#include "JuceHeader.h"
 
 #import <VideoToolbox/VideoToolbox.h>
+
+#include "JuceHeader.h"
 
 #include <vector>
 

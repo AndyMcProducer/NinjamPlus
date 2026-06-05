@@ -1161,6 +1161,7 @@ public:
     void parentHierarchyChanged() override;
     void mouseDown(const juce::MouseEvent& event) override;
     bool shouldDeferHeavyUiWork() const;
+    void stopBackgroundVideoReader();
     void setStandaloneOptionsMenuHandler(std::function<void(juce::Component*)> handler);
     void armSamplePadMidiLearn(int padIndex);
     void forgetSamplePadMidiLearn(int padIndex);
