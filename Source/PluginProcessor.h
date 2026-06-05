@@ -365,6 +365,7 @@ public:
     static void IntervalMediaItem_Callback(void* userData, NJClient* inst, const char* username, int chidx, unsigned int fourcc, const unsigned char* guid, const void* data, int dataLen);
     static void IntervalChunkCallback_cb(void* userData, NJClient* inst, const char* username, int chidx, unsigned int fourcc, const unsigned char* guid, const void* data, int dataLen, int flags);
     static void NewIntervalCallback_cb(void* userData, NJClient* inst);
+    static void PostNewIntervalCallback_cb(void* userData, NJClient* inst);
 
     // Interval / BPI
     int getBPI();
@@ -495,9 +496,37 @@ private:
     {
         juce::String streamKey;
         juce::String sender;
+        juce::String audioGuidHex;
+        int markerInterval = -1;
         int channelIndex = 0;
         ninjamplus::zap::VideoCodec codec = ninjamplus::zap::VideoCodec::unknown;
         juce::MemoryBlock payload;
+    };
+
+    struct ZapVideoIntervalFrameBuffer
+    {
+        juce::String streamKey;
+        juce::String sender;
+        juce::String audioGuidHex;
+        int markerInterval = -1;
+        int channelIndex = 0;
+        double lastUpdateMs = 0.0;
+        std::vector<juce::MemoryBlock> frames;
+    };
+
+    struct ZapVideoPlaybackBuffer
+    {
+        ZapVideoFrameInfo info;
+        std::vector<juce::MemoryBlock> frames;
+        double startedMs = 0.0;
+        double durationMs = 1000.0;
+        int holdCount = 0;
+    };
+
+    struct PendingNinjamZapCameraChunk
+    {
+        std::array<unsigned char, 16> videoGuid {};
+        juce::MemoryBlock chunk;
     };
 
     struct LinkTimingState;
@@ -863,6 +892,8 @@ private:
     std::atomic<bool> ninjamZapVideoReceivedNotice { false };
     juce::CriticalSection ninjamZapVideoChunkLock;
     std::map<juce::String, ninjamplus::zap::ChunkReassembler> ninjamZapVideoChunkReassemblers;
+    std::map<juce::String, juce::String> ninjamZapVideoAudioGuidByReassemblyKey;
+    std::map<juce::String, int> ninjamZapVideoMarkerIntervalByReassemblyKey;
     // Per-user reassembly + decode state (used by helper HTTP server)
     std::map<juce::String, ninjamplus::zap::ChunkReassembler> remoteVideoChunkReassemblersByUser;
 #if defined(NINJAMPLUS_HAS_PROVIDEO) && NINJAMPLUS_HAS_PROVIDEO
@@ -884,14 +915,18 @@ private:
     std::array<unsigned char, 16> pendingNinjamZapAudioGuid {};
     int pendingNinjamZapIntervalCounter = 0;
     juce::SpinLock ninjamZapCameraChunkQueueLock;
-    std::vector<juce::MemoryBlock> pendingNinjamZapCameraChunks;
+    std::vector<PendingNinjamZapCameraChunk> pendingNinjamZapCameraChunks;
     juce::MemoryBlock ninjamZapCameraH264ConfigChunk;
+    std::atomic<bool> pendingNinjamZapVideoPlaybackSwap { false };
     mutable juce::CriticalSection zapVideoFrameLock;
     std::map<juce::String, int> remoteLatencyFirmDelayMsByUser;
     std::map<juce::String, juce::uint64> remoteVideoBufferRefreshIdByUser;
     std::map<juce::String, ZapVideoFrameInfo> remoteVideoFrameInfoByUser;
     std::map<juce::String, juce::MemoryBlock> remoteVideoLatestJpegByUser;
     std::map<juce::String, juce::Image> remoteVideoLatestFrameByUser;
+    std::map<juce::String, std::map<juce::String, ZapVideoIntervalFrameBuffer>> zapVideoDecodedIntervalsByStream;
+    std::map<juce::String, ZapVideoIntervalFrameBuffer> zapVideoDeferredPlaybackByStream;
+    std::map<juce::String, ZapVideoPlaybackBuffer> zapVideoPlaybackByStream;
     juce::uint64 videoBufferRefreshCounter = 0;
 
     std::atomic<bool> opusSyncAvailable { false };
@@ -1035,6 +1070,7 @@ private:
     void publishDecodedZapVideoFrame(const ZapVideoDecodeJob& job,
                                      const juce::Image& frame,
                                      const juce::MemoryBlock& encodedJpeg);
+    void processPendingNinjamZapVideoPlaybackSwap();
     juce::String buildZapVideoFrameListJson() const;
     bool getZapVideoFrameJpeg(const juce::String& streamKey, juce::MemoryBlock& jpegData) const;
     void clearZapVideoFrameState();

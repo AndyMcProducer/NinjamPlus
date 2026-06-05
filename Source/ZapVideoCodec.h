@@ -27,7 +27,16 @@ namespace ninjamplus::zap
     {
         autoCodec,
         h264,
-        mjpeg
+        mjpeg,
+        h264Hardware,
+        h264Software
+    };
+
+    enum class H264EncoderPreference
+    {
+        autoHardware,
+        hardwareOnly,
+        softwareOnly
     };
 
     constexpr int kZapVideoWidth = 1280;
@@ -65,12 +74,15 @@ namespace ninjamplus::zap
         H264Encoder();
         ~H264Encoder();
 
-        bool open(int width, int height, int fps, int bitrateBitsPerSecond);
+        bool open(int width, int height, int fps, int bitrateBitsPerSecond,
+                  H264EncoderPreference preference = H264EncoderPreference::autoHardware);
         void close();
         bool isOpen() const;
+        juce::String getBackendName() const;
         bool encodeFrame(const juce::Image& source, EncodedH264Frame& outFrame);
 
         static bool isAvailable();
+        static bool isHardwareAvailable();
 
     private:
         struct Impl;

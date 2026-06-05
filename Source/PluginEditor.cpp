@@ -7007,6 +7007,8 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
 
     juce::LookAndFeel::setDefaultLookAndFeel(&outlinedLabelLAF);
 
+    addAndMakeVisible(backgroundComponent);
+
     serverLabel.setJustificationType(juce::Justification::centredRight);
     addAndMakeVisible(serverLabel);
     serverField.setText("");
@@ -7704,6 +7706,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         else
         {
             backgroundImage  = juce::Image();
+            backgroundComponent.setBackgroundImage({});
             radioKnobImage   = juce::Image();
             faderKnobImage   = juce::Image();
             metronomeThemeColour = juce::Colour::fromRGB(80, 185, 255);
@@ -7949,16 +7952,7 @@ void NinjamVst3AudioProcessorEditor::unregisterSamplerFxKnobLearnTarget(juce::Co
 
 void NinjamVst3AudioProcessorEditor::paint (juce::Graphics& g)
 {
-    if (backgroundImage.isValid())
-    {
-        g.drawImageWithin(backgroundImage, 0, 0, getWidth(), getHeight(), juce::RectanglePlacement::fillDestination);
-    }
-    else
-    {
-        // Window Colour sets the app background; falls back to dark grey if not set
-        juce::Colour base = (windowThemeColour.getAlpha() > 0) ? windowThemeColour : juce::Colour(0xff222222);
-        g.fillAll(base);
-    }
+    juce::ignoreUnused(g);
 }
 
 void NinjamVst3AudioProcessorEditor::paintOverChildren(juce::Graphics& g)
@@ -8035,6 +8029,9 @@ void NinjamVst3AudioProcessorEditor::resized()
 {
     if (getWidth() <= 0 || getHeight() <= 0)
         return;
+
+    backgroundComponent.setBounds(getLocalBounds());
+    backgroundComponent.toBack();
 
     if (!audioProcessor.isStandaloneWrapper() && isAbletonLiveHost() && !applyingDeferredResizeLayout)
     {
@@ -8657,10 +8654,10 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
     {
         auto frame = videoFrameReader->getLatestFrame();
         const bool samplerVisible = samplePadsWindow != nullptr && samplePadsWindow->isVisible();
-        const bool samplerMouseBusy = samplerVisible && juce::ModifierKeys::currentModifiers.isAnyMouseButtonDown();
+        const bool samplerMouseBusy = samplerVisible
+            && juce::ModifierKeys::currentModifiers.isAnyMouseButtonDown();
         const double minimumBackgroundRepaintMs = abletonHostEditor ? 250.0
-            : samplerMouseBusy ? 100.0
-            : samplerVisible ? 40.0
+            : samplerMouseBusy ? 90.0
             : 0.0;
         if (frame.isValid()
             && (minimumBackgroundRepaintMs <= 0.0
@@ -8668,7 +8665,7 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         {
             backgroundImage = std::move(frame);
             lastVideoBackgroundRepaintMs = nowMs;
-            repaint();
+            backgroundComponent.setBackgroundImage(backgroundImage);
         }
     }
 #endif
@@ -9930,18 +9927,25 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
         else
         {
             juce::PopupMenu autoMenu;
-            juce::PopupMenu h264Menu;
+            juce::PopupMenu h264AutoMenu;
+            juce::PopupMenu h264HardwareMenu;
+            juce::PopupMenu h264SoftwareMenu;
             juce::PopupMenu mjpegMenu;
             const bool h264Available = ninjamplus::zap::getCodecCapability(ninjamplus::zap::VideoCodec::h264).canEncode;
+            const bool h264HardwareAvailable = ninjamplus::zap::H264Encoder::isHardwareAvailable();
             for (int i = 0; i < cameras.size(); ++i)
             {
                 const juce::String cameraName = cameras[i].isNotEmpty() ? cameras[i] : "Camera " + juce::String(i + 1);
                 autoMenu.addItem(3001 + i, cameraName);
-                h264Menu.addItem(4001 + i, cameraName, h264Available);
+                h264AutoMenu.addItem(4001 + i, cameraName, h264Available);
+                h264HardwareMenu.addItem(6001 + i, cameraName, h264Available && h264HardwareAvailable);
+                h264SoftwareMenu.addItem(7001 + i, cameraName, h264Available);
                 mjpegMenu.addItem(5001 + i, cameraName);
             }
             cameraMenu.addSubMenu("Auto (H.264 preferred)", autoMenu);
-            cameraMenu.addSubMenu("H.264", h264Menu, h264Available);
+            cameraMenu.addSubMenu("H.264 Auto", h264AutoMenu, h264Available);
+            cameraMenu.addSubMenu("H.264 Hardware", h264HardwareMenu, h264Available && h264HardwareAvailable);
+            cameraMenu.addSubMenu("H.264 Software", h264SoftwareMenu, h264Available);
             cameraMenu.addSubMenu("MJPEG", mjpegMenu);
         }
         menu.addSubMenu("Start NINJAMZap Camera", cameraMenu);
@@ -10002,7 +10006,7 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
                                safeThis->audioProcessor.startNinjamZapCameraSend(result - 4001,
                                                                                  ninjamplus::zap::CameraCodecPreference::h264);
                            }
-                           else if (result >= 5001)
+                           else if (result >= 5001 && result < 6000)
                            {
                                safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
                                safeThis->videoFrameReader.reset();
@@ -10010,6 +10014,24 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
                                safeThis->repaint();
                                safeThis->audioProcessor.startNinjamZapCameraSend(result - 5001,
                                                                                  ninjamplus::zap::CameraCodecPreference::mjpeg);
+                           }
+                           else if (result >= 6001 && result < 7000)
+                           {
+                               safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
+                               safeThis->videoFrameReader.reset();
+                               safeThis->markPersistentSettingsDirty();
+                               safeThis->repaint();
+                               safeThis->audioProcessor.startNinjamZapCameraSend(result - 6001,
+                                                                                 ninjamplus::zap::CameraCodecPreference::h264Hardware);
+                           }
+                           else if (result >= 7001)
+                           {
+                               safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
+                               safeThis->videoFrameReader.reset();
+                               safeThis->markPersistentSettingsDirty();
+                               safeThis->repaint();
+                               safeThis->audioProcessor.startNinjamZapCameraSend(result - 7001,
+                                                                                 ninjamplus::zap::CameraCodecPreference::h264Software);
                            }
                        });
 }
@@ -10274,6 +10296,7 @@ bool NinjamVst3AudioProcessorEditor::isSidechainInputActive() const
 void NinjamVst3AudioProcessorEditor::loadControlImages(const juce::File& themeDir)
 {
     backgroundImage = juce::Image();
+    backgroundComponent.setBackgroundImage({});
     lastVideoBackgroundRepaintMs = 0.0;
 
     // Try bg.mp4 when the Video BG toggle is on (Windows only)
@@ -10301,7 +10324,10 @@ void NinjamVst3AudioProcessorEditor::loadControlImages(const juce::File& themeDi
         // Fall back to bg.* image files (bg.jpg, bg.png, bg.gif, etc.)
         auto bgFiles = themeDir.findChildFiles(juce::File::findFiles, false, "bg.*");
         if (!bgFiles.isEmpty())
+        {
             backgroundImage = juce::ImageFileFormat::loadFrom(bgFiles[0]);
+            backgroundComponent.setBackgroundImage(backgroundImage);
+        }
     }
 
     // fknob.png — fader knob image
@@ -10375,6 +10401,7 @@ void NinjamVst3AudioProcessorEditor::loadControlImages(const juce::File& themeDi
 
     applyThemeColours();
     updateEditorTimerInterval();
+    backgroundComponent.repaint();
     repaint();
 }
 
@@ -10382,6 +10409,10 @@ void NinjamVst3AudioProcessorEditor::applyThemeColours()
 {
     metronomeBtnLAF.themeColour = metronomeThemeColour;
     metronomeMuteButton.repaint();
+
+    backgroundComponent.setFallbackColour(windowThemeColour.getAlpha() > 0
+        ? windowThemeColour
+        : juce::Colour(0xff222222));
 
     // Apply Window Colour to the global LAF palette so all component backgrounds pick it up.
     // If no Window Colour is set, restore JUCE defaults.
@@ -10500,14 +10531,12 @@ void NinjamVst3AudioProcessorEditor::updateEditorTimerInterval()
     }
     else if (animatedBackgroundActive)
     {
-        const bool samplerVisible = samplePadsWindow != nullptr && samplePadsWindow->isVisible();
 #if JUCE_WINDOWS
         const int videoFrameMs = videoFrameReader != nullptr ? videoFrameReader->getFramePeriodMs() : 33;
 #else
         const int videoFrameMs = 33;
 #endif
-        nextIntervalMs = samplerVisible ? juce::jmax(40, videoFrameMs)
-                                        : juce::jlimit(16, 50, videoFrameMs);
+        nextIntervalMs = juce::jlimit(16, 50, videoFrameMs);
     }
 
     if (currentEditorTimerIntervalMs != nextIntervalMs)

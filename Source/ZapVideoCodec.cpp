@@ -412,6 +412,7 @@ namespace ninjamplus::zap
         LONGLONG frameTime = 0;
         LONGLONG frameDuration = 0;
         juce::MemoryBlock lastConfigInner;
+        juce::String backendName;
 
         ~Impl()
         {
@@ -424,6 +425,7 @@ namespace ninjamplus::zap
                 encoder->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
             encoder.reset();
             lastConfigInner.reset();
+            backendName.clear();
             if (mfStarted)
             {
                 MFShutdown();
@@ -436,7 +438,100 @@ namespace ninjamplus::zap
             }
         }
 
-        bool open(int w, int h, int frameRate, int bitrate)
+        static void unlockAsyncTransformIfNeeded(IMFTransform* transform)
+        {
+            if (transform == nullptr)
+                return;
+
+            ComPtr<IMFAttributes> attributes;
+            if (FAILED(transform->GetAttributes(attributes.put())) || !attributes)
+                return;
+
+            UINT32 isAsync = 0;
+            if (SUCCEEDED(attributes->GetUINT32(MF_TRANSFORM_ASYNC, &isAsync)) && isAsync != 0)
+                attributes->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+        }
+
+        bool createHardwareEncoder()
+        {
+            MFT_REGISTER_TYPE_INFO inputInfo {};
+            inputInfo.guidMajorType = MFMediaType_Video;
+            inputInfo.guidSubtype = MFVideoFormat_NV12;
+
+            MFT_REGISTER_TYPE_INFO outputInfo {};
+            outputInfo.guidMajorType = MFMediaType_Video;
+            outputInfo.guidSubtype = MFVideoFormat_H264;
+
+            IMFActivate** activations = nullptr;
+            UINT32 count = 0;
+            const HRESULT enumHr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                                             MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                                             &inputInfo,
+                                             &outputInfo,
+                                             &activations,
+                                             &count);
+
+            if (FAILED(enumHr) || activations == nullptr || count == 0)
+            {
+                if (activations != nullptr)
+                    CoTaskMemFree(activations);
+                return false;
+            }
+
+            bool opened = false;
+            for (UINT32 i = 0; i < count; ++i)
+            {
+                if (activations[i] == nullptr)
+                    continue;
+
+                ComPtr<IMFTransform> candidate;
+                if (SUCCEEDED(activations[i]->ActivateObject(IID_PPV_ARGS(candidate.put()))) && candidate)
+                {
+                    unlockAsyncTransformIfNeeded(candidate.get());
+                    encoder.reset();
+                    *encoder.put() = candidate.get();
+                    candidate.get()->AddRef();
+                    backendName = "Media Foundation H.264 hardware";
+                    opened = true;
+                    break;
+                }
+            }
+
+            for (UINT32 i = 0; i < count; ++i)
+            {
+                if (activations[i] != nullptr)
+                    activations[i]->Release();
+            }
+            CoTaskMemFree(activations);
+            return opened;
+        }
+
+        bool createSoftwareEncoder()
+        {
+            if (!succeeded(CoCreateInstance(CLSID_CMSH264EncoderMFT,
+                                            nullptr,
+                                            CLSCTX_INPROC_SERVER,
+                                            IID_PPV_ARGS(encoder.put()))))
+            {
+                return false;
+            }
+
+            backendName = "Media Foundation H.264 software";
+            return true;
+        }
+
+        bool createEncoder(H264EncoderPreference preference)
+        {
+            if (preference == H264EncoderPreference::hardwareOnly)
+                return createHardwareEncoder();
+
+            if (preference == H264EncoderPreference::softwareOnly)
+                return createSoftwareEncoder();
+
+            return createHardwareEncoder() || createSoftwareEncoder();
+        }
+
+        bool open(int w, int h, int frameRate, int bitrate, H264EncoderPreference preference)
         {
             close();
 
@@ -455,13 +550,8 @@ namespace ninjamplus::zap
                 return false;
             mfStarted = true;
 
-            if (!succeeded(CoCreateInstance(CLSID_CMSH264EncoderMFT,
-                                            nullptr,
-                                            CLSCTX_INPROC_SERVER,
-                                            IID_PPV_ARGS(encoder.put()))))
-            {
+            if (!createEncoder(preference))
                 return false;
-            }
 
             setCodecApiUInt32(encoder.get(), CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
             setCodecApiUInt32(encoder.get(), CODECAPI_AVEncCommonMeanBitRate, (juce::uint32) bitrate);
@@ -641,7 +731,8 @@ namespace ninjamplus::zap
 #else
     struct H264Encoder::Impl
     {
-        bool open(int, int, int, int) { return false; }
+        juce::String backendName;
+        bool open(int, int, int, int, H264EncoderPreference) { return false; }
         void close() {}
         bool encodeFrame(const juce::Image&, EncodedH264Frame&) { return false; }
     };
@@ -654,9 +745,9 @@ namespace ninjamplus::zap
 
     H264Encoder::~H264Encoder() = default;
 
-    bool H264Encoder::open(int width, int height, int fps, int bitrateBitsPerSecond)
+    bool H264Encoder::open(int width, int height, int fps, int bitrateBitsPerSecond, H264EncoderPreference preference)
     {
-        return impl->open(width, height, fps, bitrateBitsPerSecond);
+        return impl->open(width, height, fps, bitrateBitsPerSecond, preference);
     }
 
     void H264Encoder::close()
@@ -670,6 +761,15 @@ namespace ninjamplus::zap
         return impl->encoder.get() != nullptr;
        #else
         return false;
+       #endif
+    }
+
+    juce::String H264Encoder::getBackendName() const
+    {
+       #if defined(_WIN32)
+        return impl->backendName;
+       #else
+        return {};
        #endif
     }
 
@@ -706,6 +806,56 @@ namespace ninjamplus::zap
     {
        #if defined(_WIN32)
         return true;
+       #else
+        return false;
+       #endif
+    }
+
+    bool H264Encoder::isHardwareAvailable()
+    {
+       #if defined(_WIN32)
+        const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool didInitCom = coHr == S_OK || coHr == S_FALSE;
+        if (FAILED(coHr) && coHr != RPC_E_CHANGED_MODE)
+            return false;
+
+        if (!succeeded(MFStartup(MF_VERSION)))
+        {
+            if (didInitCom)
+                CoUninitialize();
+            return false;
+        }
+
+        MFT_REGISTER_TYPE_INFO inputInfo {};
+        inputInfo.guidMajorType = MFMediaType_Video;
+        inputInfo.guidSubtype = MFVideoFormat_NV12;
+
+        MFT_REGISTER_TYPE_INFO outputInfo {};
+        outputInfo.guidMajorType = MFMediaType_Video;
+        outputInfo.guidSubtype = MFVideoFormat_H264;
+
+        IMFActivate** activations = nullptr;
+        UINT32 count = 0;
+        const HRESULT enumHr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                                         MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                                         &inputInfo,
+                                         &outputInfo,
+                                         &activations,
+                                         &count);
+
+        if (activations != nullptr)
+        {
+            for (UINT32 i = 0; i < count; ++i)
+                if (activations[i] != nullptr)
+                    activations[i]->Release();
+            CoTaskMemFree(activations);
+        }
+
+        MFShutdown();
+        if (didInitCom)
+            CoUninitialize();
+
+        return SUCCEEDED(enumHr) && count > 0;
        #else
         return false;
        #endif

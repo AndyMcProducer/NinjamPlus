@@ -12,6 +12,41 @@ struct WinVideoReader;  // Windows Media Foundation frame reader (defined in Plu
 
 class GifPickerPanel;
 
+class EditorBackgroundComponent : public juce::Component
+{
+public:
+    EditorBackgroundComponent()
+    {
+        setOpaque(true);
+        setInterceptsMouseClicks(false, false);
+    }
+
+    void setBackgroundImage(juce::Image newImage)
+    {
+        image = std::move(newImage);
+        repaint();
+    }
+
+    void setFallbackColour(juce::Colour newColour)
+    {
+        fallbackColour = newColour;
+        if (!image.isValid())
+            repaint();
+    }
+
+    void paint(juce::Graphics& g) override
+    {
+        if (image.isValid())
+            g.drawImageWithin(image, 0, 0, getWidth(), getHeight(), juce::RectanglePlacement::fillDestination);
+        else
+            g.fillAll(fallbackColour);
+    }
+
+private:
+    juce::Image image;
+    juce::Colour fallbackColour { juce::Colour(0xff222222) };
+};
+
 class IntervalDisplayComponent : public juce::Component
 {
 public:
@@ -1170,6 +1205,7 @@ private:
     juce::TooltipWindow tooltipWindow{ this, 600 };
     
     // UI components
+    EditorBackgroundComponent backgroundComponent;
     juce::Label statusLabel;
     
     // Login

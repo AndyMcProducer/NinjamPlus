@@ -228,7 +228,7 @@ if (WIN32)
     )
     target_compile_definitions(NINJAM_VST3 PRIVATE
         NINJAMPLUS_HAS_PROVIDEO=1
-        NINJAMPLUS_HAS_H264_DECODE=0)
+        NINJAMPLUS_HAS_H264_DECODE=1)
     target_link_libraries(NINJAM_VST3 PRIVATE Mfplat Mfreadwrite Mfuuid wmcodecdspuuid)
 elseif (APPLE)
     target_sources(NINJAM_VST3 PRIVATE
