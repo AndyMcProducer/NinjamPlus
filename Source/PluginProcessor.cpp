@@ -685,6 +685,7 @@ private:
     }
 };
 
+#if JUCE_USE_CAMERA && (JUCE_WINDOWS || JUCE_MAC)
 class ZapCameraSender final : private juce::Thread,
                               private juce::CameraDevice::Listener
 {
@@ -858,6 +859,30 @@ private:
         }
     }
 };
+#else
+class ZapCameraSender final
+{
+public:
+    explicit ZapCameraSender(NinjamVst3AudioProcessor& ownerIn)
+        : owner(ownerIn)
+    {
+    }
+
+    bool start(int deviceIndex, ninjamplus::zap::CameraCodecPreference preference)
+    {
+        juce::ignoreUnused(deviceIndex, preference);
+        owner.ninjamZapCameraActiveCodec.store((int)ninjamplus::zap::VideoCodec::mjpeg,
+                                               std::memory_order_relaxed);
+        vlogStr("[ZapCam] camera capture is not available on this platform/build");
+        return false;
+    }
+
+    void stop() {}
+
+private:
+    NinjamVst3AudioProcessor& owner;
+};
+#endif
 
 class LocalChordAnalyzer final
     : private juce::Thread
@@ -3867,7 +3892,11 @@ void NinjamVst3AudioProcessor::launchNinjamZapVideoSession()
 
 juce::StringArray NinjamVst3AudioProcessor::getNinjamZapCameraDevices() const
 {
+#if JUCE_USE_CAMERA && (JUCE_WINDOWS || JUCE_MAC)
     return juce::CameraDevice::getAvailableDevices();
+#else
+    return {};
+#endif
 }
 
 ninjamplus::zap::CameraCodecPreference NinjamVst3AudioProcessor::getNinjamZapCameraCodecPreference() const
