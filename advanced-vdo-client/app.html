@@ -878,6 +878,10 @@
                 data.voiceChatMode
             );
             if (data.refreshBuffer && data.bufferRefreshEventId) {
+                const refreshUserKey = normalizeUserId(userKey);
+                if (refreshUserKey) {
+                    delete vdoState.lastAppliedBufferByUser[refreshUserKey];
+                }
                 scheduleBufferRefresh(userKey, data.bufferRefreshEventId);
             }
             return false;

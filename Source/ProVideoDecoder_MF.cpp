@@ -225,9 +225,9 @@ struct ProVideoDecoder::Impl
 
         static const GUID preferredSubtypes[] =
         {
-            MFVideoFormat_NV12,
             MFVideoFormat_RGB32,
-            MFVideoFormat_ARGB32
+            MFVideoFormat_ARGB32,
+            MFVideoFormat_NV12
         };
 
         for (const auto& preferred : preferredSubtypes)

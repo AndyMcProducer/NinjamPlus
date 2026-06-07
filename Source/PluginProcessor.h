@@ -490,6 +490,13 @@ private:
         int channelIndex = 0;
         juce::uint64 refreshId = 0;
         double lastUpdateMs = 0.0;
+        double lastDecodeQueueMs = 0.0;
+        double lastDecodeMs = 0.0;
+        double lastReceiveToPublishMs = 0.0;
+        double lastPlaybackOffsetMs = 0.0;
+        double lastSenderCaptureQueueMs = 0.0;
+        double lastSenderEncodeMs = 0.0;
+        int frameCount = 0;
     };
 
     struct ZapVideoDecodeJob
@@ -501,6 +508,10 @@ private:
         int channelIndex = 0;
         ninjamplus::zap::VideoCodec codec = ninjamplus::zap::VideoCodec::unknown;
         juce::MemoryBlock payload;
+        double receivedMs = 0.0;
+        double queuedMs = 0.0;
+        double decodeStartedMs = 0.0;
+        double decodeFinishedMs = 0.0;
     };
 
     struct ZapVideoIntervalFrameBuffer
@@ -511,6 +522,10 @@ private:
         int markerInterval = -1;
         int channelIndex = 0;
         double lastUpdateMs = 0.0;
+        double lastDecodeQueueMs = 0.0;
+        double lastDecodeMs = 0.0;
+        double lastReceiveToPublishMs = 0.0;
+        int decodedFrameCount = 0;
         std::vector<juce::MemoryBlock> frames;
     };
 
@@ -520,6 +535,7 @@ private:
         std::vector<juce::MemoryBlock> frames;
         double startedMs = 0.0;
         double durationMs = 1000.0;
+        double playbackOffsetMs = 0.0;
         int holdCount = 0;
     };
 
@@ -761,6 +777,7 @@ private:
     std::atomic<int> syncTargetInterval { -1 };
     std::atomic<int> syncDisplayIntervalOffset { 0 };
     std::atomic<int> syncDisplayPositionOffset { 0 };
+    std::atomic<int> syncHostPhaseOffsetSamples { 0 };
     std::atomic<float> syncStartCompensationMs { 0.0f };
     std::atomic<bool> mtcOutputEnabled { true };
     std::atomic<int> mtcFrameRateFps { 30 };
@@ -918,6 +935,7 @@ private:
     std::vector<PendingNinjamZapCameraChunk> pendingNinjamZapCameraChunks;
     juce::MemoryBlock ninjamZapCameraH264ConfigChunk;
     std::atomic<bool> pendingNinjamZapVideoPlaybackSwap { false };
+    std::atomic<double> pendingNinjamZapVideoPlaybackBoundaryMs { 0.0 };
     mutable juce::CriticalSection zapVideoFrameLock;
     std::map<juce::String, int> remoteLatencyFirmDelayMsByUser;
     std::map<juce::String, juce::uint64> remoteVideoBufferRefreshIdByUser;
@@ -1065,7 +1083,10 @@ private:
     void rotateNinjamZapVideoIntervalStream(const unsigned char audioGuid[16], int intervalCounter);
     void flushPendingNinjamZapCameraVideo();
     void enqueueNinjamZapCameraFrameChunk(juce::MemoryBlock chunk);
-    void publishLocalNinjamZapCameraFrame(const juce::Image& frame, const juce::MemoryBlock& encodedJpeg);
+    void publishLocalNinjamZapCameraFrame(const juce::Image& frame,
+                                          const juce::MemoryBlock& encodedJpeg,
+                                          double captureQueueMs = 0.0,
+                                          double encodeMs = 0.0);
     void closeNinjamZapVideoIntervalStream();
     void publishDecodedZapVideoFrame(const ZapVideoDecodeJob& job,
                                      const juce::Image& frame,
