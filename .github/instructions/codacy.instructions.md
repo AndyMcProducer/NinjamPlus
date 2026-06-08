@@ -34,8 +34,8 @@ Configuration for AI behavior when interacting with Codacy's MCP Server
 
 ## CRITICAL: Dependencies and Security Checks
 - IMMEDIATELY after ANY of these actions:
- - Running npm/yarn/pnpm install
- - Adding dependencies to package.json
+ - Running a package manager install
+ - Adding dependencies to a project dependency manifest
  - Adding requirements to requirements.txt
  - Adding dependencies to pom.xml
  - Adding dependencies to build.gradle
@@ -49,7 +49,7 @@ Configuration for AI behavior when interacting with Codacy's MCP Server
  - Propose and apply fixes for the security issues
  - Only continue with the original task after security issues are resolved
 - EXAMPLE:
- - After: npm install react-markdown
+ - After: adding a new third-party dependency
  - Do: Run codacy_cli_analyze with trivy
  - Before: Continuing with any other tasks
 
@@ -60,7 +60,7 @@ Configuration for AI behavior when interacting with Codacy's MCP Server
 - Do not run `codacy_cli_analyze` looking for changes in duplicated code or code complexity metrics.
 - Complexity metrics are different from complexity issues. When trying to fix complexity in a repository or file, focus on solving the complexity issues and ignore the complexity metric.
 - Do not run `codacy_cli_analyze` looking for changes in code coverage.
-- Do not try to manually install Codacy CLI using either brew, npm, npx, or any other package manager.
+- Do not try to manually install Codacy CLI using brew or any other package manager.
 - If the Codacy CLI is not installed, just run the `codacy_cli_analyze` tool from Codacy's MCP Server.
 - When calling `codacy_cli_analyze`, only send provider, organization and repository if the project is a git repository.
 

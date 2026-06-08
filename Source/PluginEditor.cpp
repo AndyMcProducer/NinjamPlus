@@ -9916,47 +9916,8 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
     }
 
     juce::PopupMenu menu;
-    menu.addItem(1, "VDO synced video");
-    menu.addItem(2, "NINJAMZap server video");
-    menu.addItem(4, "Open Windows Camera Settings");
-    if (audioProcessor.isNinjamZapCameraSending())
-    {
-        menu.addItem(3, "Stop NINJAMZap Camera (" + ninjamplus::zap::getCodecName(audioProcessor.getNinjamZapCameraActiveCodec()) + ")");
-    }
-    else
-    {
-        juce::PopupMenu cameraMenu;
-        const auto cameras = audioProcessor.getNinjamZapCameraDevices();
-        if (cameras.isEmpty())
-        {
-            cameraMenu.addItem(300, "No cameras found", false);
-        }
-        else
-        {
-            juce::PopupMenu autoMenu;
-            juce::PopupMenu h264AutoMenu;
-            juce::PopupMenu h264HardwareMenu;
-            juce::PopupMenu h264SoftwareMenu;
-            juce::PopupMenu mjpegMenu;
-            const bool h264Available = ninjamplus::zap::getCodecCapability(ninjamplus::zap::VideoCodec::h264).canEncode;
-            const bool h264HardwareAvailable = ninjamplus::zap::H264Encoder::isHardwareAvailable();
-            for (int i = 0; i < cameras.size(); ++i)
-            {
-                const juce::String cameraName = cameras[i].isNotEmpty() ? cameras[i] : "Camera " + juce::String(i + 1);
-                autoMenu.addItem(3001 + i, cameraName);
-                h264AutoMenu.addItem(4001 + i, cameraName, h264Available);
-                h264HardwareMenu.addItem(6001 + i, cameraName, h264Available && h264HardwareAvailable);
-                h264SoftwareMenu.addItem(7001 + i, cameraName, h264Available);
-                mjpegMenu.addItem(5001 + i, cameraName);
-            }
-            cameraMenu.addSubMenu("Auto (H.264 preferred)", autoMenu);
-            cameraMenu.addSubMenu("H.264 Auto", h264AutoMenu, h264Available);
-            cameraMenu.addSubMenu("H.264 Hardware", h264HardwareMenu, h264Available && h264HardwareAvailable);
-            cameraMenu.addSubMenu("H.264 Software", h264SoftwareMenu, h264Available);
-            cameraMenu.addSubMenu("MJPEG", mjpegMenu);
-        }
-        menu.addSubMenu("Start NINJAMZap Camera", cameraMenu);
-    }
+    menu.addItem(1, "VDO Video");
+    menu.addItem(2, "NINJAMZap Video");
 
     juce::Component::SafePointer<NinjamVst3AudioProcessorEditor> safeThis(this);
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&videoButton),
@@ -9980,65 +9941,6 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
                                safeThis->markPersistentSettingsDirty();
                                safeThis->repaint();
                                safeThis->audioProcessor.launchNinjamZapVideoSession();
-                           }
-                           else if (result == 3)
-                           {
-                               if (safeThis->audioProcessor.isNinjamZapCameraSending())
-                               {
-                                   safeThis->audioProcessor.stopNinjamZapCameraSend();
-                               }
-                           }
-                           else if (result == 4)
-                           {
-                               if (!openSystemCameraSettings())
-                                   juce::NativeMessageBox::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
-                                                                               "Camera Settings",
-                                                                               "Windows camera settings could not be opened.");
-                           }
-                           else if (result >= 3001 && result < 4000)
-                           {
-                               safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
-                               safeThis->stopBackgroundVideoReader();
-                               safeThis->markPersistentSettingsDirty();
-                               safeThis->repaint();
-                               safeThis->audioProcessor.startNinjamZapCameraSend(result - 3001,
-                                                                                 ninjamplus::zap::CameraCodecPreference::autoCodec);
-                           }
-                           else if (result >= 4001 && result < 5000)
-                           {
-                               safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
-                               safeThis->stopBackgroundVideoReader();
-                               safeThis->markPersistentSettingsDirty();
-                               safeThis->repaint();
-                               safeThis->audioProcessor.startNinjamZapCameraSend(result - 4001,
-                                                                                 ninjamplus::zap::CameraCodecPreference::h264);
-                           }
-                           else if (result >= 5001 && result < 6000)
-                           {
-                               safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
-                               safeThis->stopBackgroundVideoReader();
-                               safeThis->markPersistentSettingsDirty();
-                               safeThis->repaint();
-                               safeThis->audioProcessor.startNinjamZapCameraSend(result - 5001,
-                                                                                 ninjamplus::zap::CameraCodecPreference::mjpeg);
-                           }
-                           else if (result >= 6001 && result < 7000)
-                           {
-                               safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
-                               safeThis->stopBackgroundVideoReader();
-                               safeThis->markPersistentSettingsDirty();
-                               safeThis->repaint();
-                               safeThis->audioProcessor.startNinjamZapCameraSend(result - 6001,
-                                                                                 ninjamplus::zap::CameraCodecPreference::h264Hardware);
-                           }
-                           else if (result >= 7001)
-                           {
-                               safeThis->videoBgToggle.setToggleState(false, juce::dontSendNotification);
-                               safeThis->stopBackgroundVideoReader();
-                               safeThis->markPersistentSettingsDirty();
-                               safeThis->repaint();
-                               safeThis->audioProcessor.startNinjamZapCameraSend(result - 7001,
-                                                                                 ninjamplus::zap::CameraCodecPreference::h264Software);
                            }
                        });
 }

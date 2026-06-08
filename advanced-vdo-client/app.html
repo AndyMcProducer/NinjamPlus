@@ -2,6 +2,9 @@
 <html>
 <head>
     <meta charset="utf-8">
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <link rel="icon" type="image/png" href="/icon.png">
     <title>NINJAM Advanced VDO Client</title>
     <style>
@@ -37,6 +40,44 @@
             gap: 14px;
             flex-wrap: wrap;
         }
+        .peer-statuses {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            font-size: 12px;
+            align-items: center;
+        }
+        .peer-light-wrap {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            color: #aeb7c9;
+            max-width: 150px;
+        }
+        .peer-light-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .peer-light {
+            width: 11px;
+            height: 11px;
+            border-radius: 50%;
+            border: 1px solid rgba(255,255,255,0.45);
+            background: #cf4343;
+            box-shadow: 0 0 7px rgba(207,67,67,0.75);
+            cursor: pointer;
+            padding: 0;
+            flex: 0 0 auto;
+        }
+        .peer-light.ok {
+            background: #3ed06e;
+            box-shadow: 0 0 7px rgba(62,208,110,0.75);
+        }
+        .peer-light:focus-visible {
+            outline: 2px solid #8fb7ff;
+            outline-offset: 2px;
+        }
         .frame-wrap {
             width: 100%;
             height: 100%;
@@ -71,6 +112,7 @@
                 <span id="roomValue"></span>
                 <span id="labelValue"></span>
                 <span id="syncValue"></span>
+                <span id="peerStatusValue" class="peer-statuses"></span>
             </div>
         </div>
         <div class="frame-wrap">
@@ -111,12 +153,14 @@
         const roomValue = document.getElementById('roomValue');
         const labelValue = document.getElementById('labelValue');
         const syncValue = document.getElementById('syncValue');
+        const peerStatusValue = document.getElementById('peerStatusValue');
 
         const ninjamSync = {
             intervalInfo: null,
             remoteTimecodes: {},
             remoteBuffers: {},
             remoteVoiceChatMode: {},
+            remoteDiagnostics: {},
             userLastSeenAt: {},
             userLastSampleKey: {},
             setIntervalInfo(interval, pos, bpm, bpi, length, bufferMode, voiceChatMode) {
@@ -131,12 +175,15 @@
                     updatedAt: Date.now()
                 };
             },
-            setRemoteTimecode(userId, interval, timecode, bufferMs, sampleKey, voiceChatMode) {
+            setRemoteTimecode(userId, interval, timecode, bufferMs, sampleKey, voiceChatMode, diagnostics) {
                 const key = normalizeUserId(userId);
                 if (!key) {
                     return;
                 }
                 this.remoteVoiceChatMode[key] = !!voiceChatMode;
+                if (diagnostics) {
+                    this.remoteDiagnostics[key] = diagnostics;
+                }
                 if (this.userLastSampleKey[key] === sampleKey) {
                     this.userLastSeenAt[key] = Date.now();
                     return;
@@ -167,6 +214,7 @@
             bufferRefreshPendingUntilByUser: {},
             latencyMsByUser: {},
             latencyUpdatedAtByUser: {},
+            lastRosterRevision: '',
             rosterTimerId: 0
         };
 
@@ -225,6 +273,29 @@
             return nextValue;
         }
 
+        function copyTextToClipboard(text) {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                return navigator.clipboard.writeText(text);
+            }
+            return new Promise(function (resolve, reject) {
+                try {
+                    const temp = document.createElement('textarea');
+                    temp.value = text;
+                    temp.style.position = 'fixed';
+                    temp.style.left = '-9999px';
+                    document.body.appendChild(temp);
+                    temp.focus();
+                    temp.select();
+                    const ok = document.execCommand('copy');
+                    document.body.removeChild(temp);
+                    if (ok) resolve();
+                    else reject(new Error('copy failed'));
+                } catch (err) {
+                    reject(err);
+                }
+            });
+        }
+
         function buildUserSampleKey(data, bufferMs) {
             return [
                 String(data.interval ?? ''),
@@ -235,6 +306,12 @@
                 String(data.bufferRefreshEventId ?? ''),
                 String(data.refreshBuffer ? 1 : 0),
                 String(data.voiceChatMode ? 1 : 0),
+                String(data.intervalMeasurementSeen ? 1 : 0),
+                String(data.bufferCalculated ? 1 : 0),
+                String(data.ourServerLatencyReady ? 1 : 0),
+                String(data.ourServerLatencyProbeEnabled === false ? 0 : 1),
+                String(data.theirServerLatencyReady ? 1 : 0),
+                String(data.serverRouteLatencyReady ? 1 : 0),
                 (typeof bufferMs === 'number' && isFinite(bufferMs)) ? String(Math.round(bufferMs)) : ''
             ].join('|');
         }
@@ -359,15 +436,15 @@
             return changed;
         }
 
-        function getStringProperty(node, keyNames) {
-            if (!node || typeof node !== 'object') {
+        function getStringProperty(objectValue, keyNames) {
+            if (!objectValue || typeof objectValue !== 'object') {
                 return '';
             }
             const wanted = {};
             for (let i = 0; i < keyNames.length; i++) {
                 wanted[String(keyNames[i]).toLowerCase()] = true;
             }
-            const entries = Object.entries(node);
+            const entries = Object.entries(objectValue);
             for (let i = 0; i < entries.length; i++) {
                 const entry = entries[i];
                 if (!wanted[String(entry[0]).toLowerCase()]) {
@@ -380,15 +457,15 @@
             return '';
         }
 
-        function getNumericProperty(node, keyNames) {
-            if (!node || typeof node !== 'object') {
+        function getNumericProperty(objectValue, keyNames) {
+            if (!objectValue || typeof objectValue !== 'object') {
                 return NaN;
             }
             const wanted = {};
             for (let i = 0; i < keyNames.length; i++) {
                 wanted[String(keyNames[i]).toLowerCase()] = true;
             }
-            const entries = Object.entries(node);
+            const entries = Object.entries(objectValue);
             for (let i = 0; i < entries.length; i++) {
                 const entry = entries[i];
                 if (!wanted[String(entry[0]).toLowerCase()]) {
@@ -424,6 +501,50 @@
         function getNonNegativeMessageMs(data, keyNames) {
             const value = getMessageNumber(data, keyNames);
             return (isFinite(value) && value >= 0) ? value : NaN;
+        }
+
+        function boolProp(data, key) {
+            return data && Object.prototype.hasOwnProperty.call(data, key) ? data[key] === true : null;
+        }
+
+        function buildSyncDiagnostics(data, bufferMs) {
+            const senderServerLatencyMs = getNonNegativeMessageMs(data, ['senderServerLatencyMs', 'remoteServerLatencyMs']);
+            const receiverServerLatencyMs = getNonNegativeMessageMs(data, ['receiverServerLatencyMs', 'localServerLatencyMs']);
+            const serverRouteLatencyMs = getNonNegativeMessageMs(data, ['serverRouteLatencyMs']);
+            const hasBuffer = (typeof bufferMs === 'number' && isFinite(bufferMs) && bufferMs >= 0)
+                || boolProp(data, 'bufferCalculated') === true;
+            const hasInterval = boolProp(data, 'intervalMeasurementSeen') === true
+                || isFinite(getMessageNumber(data, ['lastIntervalMeasurementMs', 'averageIntervalMeasurementMs', 'firmIntervalMeasurementMs']))
+                || hasBuffer;
+            const explicitTheirServer = boolProp(data, 'theirServerLatencyReady');
+            const explicitOurServer = boolProp(data, 'ourServerLatencyReady');
+            const explicitServerRoute = boolProp(data, 'serverRouteLatencyReady');
+            const ourServerProbeEnabled = boolProp(data, 'ourServerLatencyProbeEnabled') !== false;
+            const hasTheirServer = explicitTheirServer !== null ? explicitTheirServer : isFinite(senderServerLatencyMs);
+            const hasOurServer = explicitOurServer !== null ? explicitOurServer : isFinite(receiverServerLatencyMs);
+            const hasServerRoute = explicitServerRoute !== null ? explicitServerRoute : isFinite(serverRouteLatencyMs);
+            const parts = [];
+            if (!hasInterval) {
+                parts.push('interval missing');
+            } else if (!hasBuffer) {
+                parts.push('buffer pending');
+            } else {
+                parts.push('sync ok');
+            }
+            if (hasServerRoute) {
+                parts.push('route ok');
+            } else {
+                if (!hasTheirServer) {
+                    parts.push('their srv ?');
+                }
+                if (!hasOurServer) {
+                    parts.push(ourServerProbeEnabled ? 'our srv ?' : 'srv probe off');
+                }
+            }
+            return {
+                ok: hasInterval && hasBuffer,
+                text: parts.join(' | ')
+            };
         }
 
         function resolveIncomingBufferMs(data) {
@@ -489,8 +610,8 @@
             return resolveUserKeyFromLabel(label);
         }
 
-        function extractLatencyMsFromNode(node) {
-            const directMs = getNumericProperty(node, [
+        function extractLatencyMsFromObject(objectValue) {
+            const directMs = getNumericProperty(objectValue, [
                 'cameraSendLatencyMs', 'vdoCameraLatencyMs', 'vdoSendLatencyMs',
                 'cameraLatencyMs', 'videoSendLatencyMs', 'senderVideoLatencyMs',
                 'sendLatencyMs', 'senderLatencyMs', 'captureLatencyMs', 'captureDelayMs',
@@ -500,7 +621,7 @@
                 return clampLatencyMs(directMs);
             }
 
-            const directSeconds = getNumericProperty(node, [
+            const directSeconds = getNumericProperty(objectValue, [
                 'cameraSendLatency', 'vdoCameraLatency', 'vdoSendLatency',
                 'cameraLatency', 'videoSendLatency', 'senderVideoLatency',
                 'sendLatency', 'senderLatency', 'captureLatency', 'captureDelay',
@@ -517,25 +638,25 @@
             const byUser = {};
             const seen = (typeof WeakSet === 'function') ? new WeakSet() : null;
 
-            function visit(node, depth, context) {
-                if (!node || typeof node !== 'object' || depth > 7) {
+            function visit(objectValue, depth, context) {
+                if (!objectValue || typeof objectValue !== 'object' || depth > 7) {
                     return;
                 }
                 if (seen) {
-                    if (seen.has(node)) {
+                    if (seen.has(objectValue)) {
                         return;
                     }
-                    seen.add(node);
+                    seen.add(objectValue);
                 }
 
                 const nextContext = {
-                    streamId: getStringProperty(node, ['streamID', 'streamId', 'streamid']) || context.streamId,
-                    targetId: getStringProperty(node, ['UUID', 'uuid', 'target', 'targetId', 'peerID', 'peerId']) || context.targetId,
-                    label: getStringProperty(node, ['label', 'displayName', 'guestLabel', 'name']) || context.label
+                    streamId: getStringProperty(objectValue, ['streamID', 'streamId', 'streamid']) || context.streamId,
+                    targetId: getStringProperty(objectValue, ['UUID', 'uuid', 'target', 'targetId', 'peerID', 'peerId']) || context.targetId,
+                    label: getStringProperty(objectValue, ['label', 'displayName', 'guestLabel', 'name']) || context.label
                 };
 
                 const userKey = resolveUserKeyFromPeerIds(nextContext.streamId, nextContext.targetId, nextContext.label);
-                const latencyMs = extractLatencyMsFromNode(node);
+                const latencyMs = extractLatencyMsFromObject(objectValue);
                 if (userKey && isFinite(latencyMs) && latencyMs >= 0) {
                     const prior = byUser[userKey];
                     byUser[userKey] = (typeof prior === 'number' && isFinite(prior))
@@ -543,7 +664,7 @@
                         : latencyMs;
                 }
 
-                const children = Array.isArray(node) ? node : Object.values(node);
+                const children = Array.isArray(objectValue) ? objectValue : Object.values(objectValue);
                 for (let i = 0; i < children.length; i++) {
                     const child = children[i];
                     if (child && typeof child === 'object') {
@@ -664,6 +785,34 @@
             return sent;
         }
 
+        function sendTargetedRemove(userKey) {
+            const key = normalizeUserId(userKey);
+            const targetId = vdoState.targetIdByUser[key];
+            const streamId = vdoState.streamIdByUser[key];
+            let sent = false;
+            function sendRemove(targetKey, targetValue) {
+                if (!targetValue) {
+                    return;
+                }
+                const hangupMsg = { action: 'hangup' };
+                hangupMsg[targetKey] = targetValue;
+                sent = postToVdo(hangupMsg) || sent;
+                const removeMsg = { action: 'remove' };
+                removeMsg[targetKey] = targetValue;
+                sent = postToVdo(removeMsg) || sent;
+                const hideMsg = { action: 'hide' };
+                hideMsg[targetKey] = targetValue;
+                sent = postToVdo(hideMsg) || sent;
+            }
+            sendRemove('UUID', targetId);
+            sendRemove('target', targetId);
+            sendRemove('streamID', streamId);
+            if (!targetId) {
+                sendRemove('target', streamId);
+            }
+            return sent;
+        }
+
         function scheduleBufferRefresh(userKey, refreshEventId) {
             const key = normalizeUserId(userKey);
             const eventId = String(refreshEventId || '');
@@ -759,6 +908,37 @@
             syncValue.textContent = 'Launch ' + appState.requestedBufferMs + 'ms | linked '
                 + totalLinkedUsers + '/' + totalUsers + ' | realtime ' + realtimeUsers
                 + ' | updates ' + appState.intervalMessages;
+            renderPeerStatuses();
+        }
+
+        function renderPeerStatuses() {
+            if (!peerStatusValue) {
+                return;
+            }
+            peerStatusValue.innerHTML = '';
+            const users = getTrackedUserKeys();
+            for (let i = 0; i < users.length; i++) {
+                const userKey = users[i];
+                const diagnostics = ninjamSync.remoteDiagnostics[userKey] || { ok: false, text: 'interval pending' };
+                const wrap = document.createElement('span');
+                wrap.className = 'peer-light-wrap';
+                const light = document.createElement('button');
+                light.type = 'button';
+                light.className = diagnostics.ok ? 'peer-light ok' : 'peer-light';
+                const detailText = userKey + ': ' + diagnostics.text;
+                light.title = detailText + '\nClick to copy';
+                light.setAttribute('aria-label', detailText);
+                light.addEventListener('click', function () {
+                    copyTextToClipboard(detailText).catch(function () {});
+                });
+                const name = document.createElement('span');
+                name.className = 'peer-light-name';
+                name.textContent = userKey;
+                name.title = detailText;
+                wrap.appendChild(light);
+                wrap.appendChild(name);
+                peerStatusValue.appendChild(wrap);
+            }
         }
 
         function pruneInactiveUsers() {
@@ -771,11 +951,13 @@
                 if ((now - lastSeen) <= remoteUserStaleMs) {
                     continue;
                 }
+                sendTargetedRemove(userKey);
                 delete ninjamSync.userLastSeenAt[userKey];
                 delete ninjamSync.userLastSampleKey[userKey];
                 delete ninjamSync.remoteTimecodes[userKey];
                 delete ninjamSync.remoteBuffers[userKey];
                 delete ninjamSync.remoteVoiceChatMode[userKey];
+                delete ninjamSync.remoteDiagnostics[userKey];
                 delete vdoState.streamIdByUser[userKey];
                 delete vdoState.targetIdByUser[userKey];
                 delete vdoState.lastAppliedBufferByUser[userKey];
@@ -811,11 +993,13 @@
                     continue;
                 }
 
+                sendTargetedRemove(userKey);
                 delete ninjamSync.userLastSeenAt[userKey];
                 delete ninjamSync.userLastSampleKey[userKey];
                 delete ninjamSync.remoteTimecodes[userKey];
                 delete ninjamSync.remoteBuffers[userKey];
                 delete ninjamSync.remoteVoiceChatMode[userKey];
+                delete ninjamSync.remoteDiagnostics[userKey];
 
                 const streamId = vdoState.streamIdByUser[userKey];
                 if (streamId) {
@@ -842,6 +1026,22 @@
             }
         }
 
+        function applyActiveRosterMessage(data) {
+            if (!data || typeof data !== 'object') {
+                return false;
+            }
+            const revision = String(data.revision ?? data.videoClockMs ?? '');
+            if (revision && vdoState.lastRosterRevision === revision) {
+                return false;
+            }
+            if (revision) {
+                vdoState.lastRosterRevision = revision;
+            }
+            const users = Array.isArray(data.users) ? data.users : [];
+            pruneUsersMissingFromPayload(users);
+            return true;
+        }
+
         function handleIntervalMessage(data) {
             if (!data || typeof data !== 'object') {
                 return false;
@@ -860,11 +1060,16 @@
                 updateSyncStatus();
                 return false;
             }
+            if (data.type === 'activeRoster') {
+                applyActiveRosterMessage(data);
+                return false;
+            }
             if (data.type !== 'remoteTimecode' && data.type !== 'videoTimecode') {
                 return false;
             }
             const receiverBufferMs = resolveIncomingBufferMs(data);
             const userKey = data.userId || data.userKey || '';
+            const diagnostics = buildSyncDiagnostics(data, receiverBufferMs);
             const incomingVdoLatencyMs = getIncomingVdoLatencyMs(data);
             if (isFinite(incomingVdoLatencyMs)) {
                 setEstimatedVdoLatencyMs(userKey, incomingVdoLatencyMs);
@@ -875,7 +1080,8 @@
                 data.timecode,
                 receiverBufferMs,
                 buildUserSampleKey(data, receiverBufferMs),
-                data.voiceChatMode
+                data.voiceChatMode,
+                diagnostics
             );
             if (data.refreshBuffer && data.bufferRefreshEventId) {
                 const refreshUserKey = normalizeUserId(userKey);

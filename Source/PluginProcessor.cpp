@@ -27,6 +27,7 @@
 #include <ableton/link/HostTimeFilter.hpp>
 #include <ableton/util/FloatIntConversion.hpp>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -60,18 +61,27 @@ static juce::String njStatusName(int status)
 }
 // ----------------------------------
 
+static constexpr int advancedVideoHelperBasePort = 8000;
+static constexpr int advancedVideoHelperMaxPort = 8199;
+
 class LocalVideoHttpServer final : private juce::Thread
 {
 public:
     LocalVideoHttpServer(const juce::File& helperRootDir,
                          std::function<juce::String()> intervalPayloadProviderIn,
                          std::function<juce::String()> zapFrameListProviderIn,
-                         std::function<bool(const juce::String&, juce::MemoryBlock&)> zapFrameProviderIn)
+                         std::function<bool(const juce::String&, juce::MemoryBlock&)> zapFrameProviderIn,
+                         std::function<juce::String()> zapBrowserCameraEnableIn,
+                         std::function<juce::String()> zapBrowserCameraDisableIn,
+                         std::function<bool(const juce::MemoryBlock&, double, double, int, int)> zapBrowserFrameConsumerIn)
         : juce::Thread("NINJAMVideoHelperServer"),
           helperRoot(helperRootDir),
           intervalPayloadProvider(std::move(intervalPayloadProviderIn)),
           zapFrameListProvider(std::move(zapFrameListProviderIn)),
-          zapFrameProvider(std::move(zapFrameProviderIn))
+          zapFrameProvider(std::move(zapFrameProviderIn)),
+          zapBrowserCameraEnable(std::move(zapBrowserCameraEnableIn)),
+          zapBrowserCameraDisable(std::move(zapBrowserCameraDisableIn)),
+          zapBrowserFrameConsumer(std::move(zapBrowserFrameConsumerIn))
     {
         reloadStaticContent();
     }
@@ -81,24 +91,32 @@ public:
         stop();
     }
 
-    bool start()
+    bool start(int preferredPort, int maxPort)
     {
         if (isThreadRunning())
-            return true;
+            return listenPort.load() > 0;
 
         reloadStaticContent();
         if (!helperRoot.isDirectory() || helperIndexHtml.isEmpty() || helperAppHtml.isEmpty())
             return false;
 
-        listener = std::make_unique<juce::StreamingSocket>();
-        if (!listener->createListener(8100, "127.0.0.1"))
+        const int firstPort = juce::jlimit(1, 65535, preferredPort);
+        const int lastPort = juce::jlimit(firstPort, 65535, maxPort);
+        for (int port = firstPort; port <= lastPort; ++port)
         {
-            listener.reset();
-            return false;
+            auto candidate = std::make_unique<juce::StreamingSocket>();
+            if (!candidate->createListener(port, "127.0.0.1"))
+                continue;
+
+            listener = std::move(candidate);
+            listenPort.store(port);
+            startThread();
+            return true;
         }
 
-        startThread();
-        return true;
+        listener.reset();
+        listenPort.store(0);
+        return false;
     }
 
     void stop()
@@ -108,6 +126,12 @@ public:
             listener->close();
         stopThread(500);
         listener.reset();
+        listenPort.store(0);
+    }
+
+    int getPort() const
+    {
+        return listenPort.load();
     }
 
 private:
@@ -120,11 +144,22 @@ private:
         bool noStore = false;
     };
 
+    struct HttpRequest
+    {
+        juce::String method;
+        juce::String target;
+        juce::MemoryBlock body;
+    };
+
     juce::File helperRoot;
     std::function<juce::String()> intervalPayloadProvider;
     std::function<juce::String()> zapFrameListProvider;
     std::function<bool(const juce::String&, juce::MemoryBlock&)> zapFrameProvider;
+    std::function<juce::String()> zapBrowserCameraEnable;
+    std::function<juce::String()> zapBrowserCameraDisable;
+    std::function<bool(const juce::MemoryBlock&, double, double, int, int)> zapBrowserFrameConsumer;
     std::unique_ptr<juce::StreamingSocket> listener;
+    std::atomic<int> listenPort { 0 };
     juce::String helperIndexHtml;
     juce::String helperAppHtml;
     juce::MemoryBlock helperIconPng;
@@ -203,6 +238,14 @@ body{display:flex;flex-direction:column}
 header{display:flex;align-items:center;gap:12px;padding:10px 14px;background:#172326;border-bottom:1px solid #34464a}
 h1{font-size:15px;margin:0;font-weight:700}
 #status{font-size:12px;color:#a8b8bb}
+.camera-panel{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 12px;background:#111b1e;border-bottom:1px solid #2f4145}
+.camera-panel select,.camera-panel button{height:28px;border:1px solid #3b5358;border-radius:4px;background:#19272b;color:#edf5f5}
+.camera-panel button{padding:0 10px;cursor:pointer}
+.camera-panel button:hover{background:#22343a}
+.camera-panel button:disabled{opacity:.45;cursor:default}
+.camera-panel label{font-size:12px;color:#aebfc2;display:flex;align-items:center;gap:5px}
+#camStatus{font-size:12px;color:#a8b8bb}
+#browserPreview{width:128px;height:72px;object-fit:contain;background:#050808;border:1px solid #2c3b3e;border-radius:4px}
 #grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;padding:10px;flex:1}
 .tile{background:#0c1113;border:1px solid #2c3b3e;border-radius:8px;overflow:hidden;min-height:210px;display:flex;flex-direction:column}
 .label{font-size:12px;color:#cbd8d9;padding:7px 9px;background:#162124;border-bottom:1px solid #2c3b3e}
@@ -213,15 +256,157 @@ img{display:block;width:100%;height:100%;object-fit:contain}
 </head>
 <body>
 <header><h1>NINJAMZap Video</h1><div id="status">Waiting for video frames</div></header>
+<section class="camera-panel">
+  <label>Camera <select id="camSelect"><option value="">Default camera</option></select></label>
+  <label>FPS <select id="camFps"><option value="30">30</option><option value="24">24</option><option value="15">15</option></select></label>
+  <button id="camRefresh" type="button">Refresh</button>
+  <button id="camStart" type="button">Start browser camera</button>
+  <button id="camStop" type="button" disabled>Stop</button>
+  <video id="browserPreview" autoplay muted playsinline></video>
+  <span id="camStatus">Choose a camera here to send Zap video.</span>
+  <canvas id="browserCanvas" width="1280" height="720" style="display:none"></canvas>
+</section>
 <main id="grid"><div class="empty">No Zap video streams yet</div></main>
 <script>
 const grid=document.getElementById('grid');
 const statusEl=document.getElementById('status');
+const camSelect=document.getElementById('camSelect');
+const camFps=document.getElementById('camFps');
+const camRefresh=document.getElementById('camRefresh');
+const camStart=document.getElementById('camStart');
+const camStop=document.getElementById('camStop');
+const camStatus=document.getElementById('camStatus');
+const browserPreview=document.getElementById('browserPreview');
+const browserCanvas=document.getElementById('browserCanvas');
+const browserCtx=browserCanvas.getContext('2d',{alpha:false});
 const tiles=new Map();
+let browserStream=null;
+let browserTimer=0;
+let browserPosting=false;
+let browserFrameCounter=0;
+let browserSendArmed=false;
 function ms(value){
   const n=Number(value||0);
   return Number.isFinite(n)&&n>0?String(Math.round(n)):'0';
 }
+function setCamStatus(text){ camStatus.textContent=text; }
+async function refreshCameras(){
+  if(!navigator.mediaDevices||!navigator.mediaDevices.enumerateDevices){
+    setCamStatus('Browser camera API unavailable');
+    return;
+  }
+  try{
+    const devices=await navigator.mediaDevices.enumerateDevices();
+    const current=camSelect.value;
+    camSelect.innerHTML='<option value="">Default camera</option>';
+    devices.filter(d=>d.kind==='videoinput').forEach((device,index)=>{
+      const opt=document.createElement('option');
+      opt.value=device.deviceId;
+      opt.textContent=device.label||('Camera '+String(index+1));
+      camSelect.appendChild(opt);
+    });
+    if(current) camSelect.value=current;
+  }catch(e){
+    setCamStatus('Could not list cameras');
+  }
+}
+async function armBrowserZapSend(){
+  const res=await fetch('/zap-browser-camera-enable',{method:'POST',cache:'no-store'});
+  const payload=await res.json().catch(()=>({ok:false,error:'helper did not return JSON'}));
+  if(!res.ok||!payload.ok) throw new Error(payload.error||'Zap camera send could not start');
+  browserSendArmed=true;
+}
+async function disarmBrowserZapSend(){
+  browserSendArmed=false;
+  try{ await fetch('/zap-browser-camera-stop',{method:'POST',cache:'no-store'}); }catch(e){}
+}
+function stopBrowserCamera(disarm=true){
+  if(browserTimer){ clearTimeout(browserTimer); browserTimer=0; }
+  if(browserStream){ browserStream.getTracks().forEach(track=>track.stop()); browserStream=null; }
+  browserPreview.srcObject=null;
+  browserPosting=false;
+  camStart.disabled=false;
+  camStop.disabled=true;
+  if(disarm) disarmBrowserZapSend();
+  setCamStatus('Browser camera stopped');
+}
+function scheduleBrowserFrame(){
+  const fps=Math.max(1,Math.min(30,parseInt(camFps.value||'30',10)||30));
+  browserTimer=setTimeout(captureBrowserFrame,1000/fps);
+}
+async function postBrowserJpeg(blob,captureStartedMs,encodeMs,width,height){
+  const ageMs=Math.max(0,performance.now()-captureStartedMs);
+  if(ageMs>650){
+    setCamStatus('Dropping late browser frame '+Math.round(ageMs)+'ms');
+    return;
+  }
+  const url='/zap-browser-camera-frame?ageMs='+encodeURIComponent(String(Math.round(ageMs)))
+    +'&encodeMs='+encodeURIComponent(String(Math.round(encodeMs)))
+    +'&width='+encodeURIComponent(String(width||0))
+    +'&height='+encodeURIComponent(String(height||0))
+    +'&seq='+encodeURIComponent(String(++browserFrameCounter));
+  const res=await fetch(url,{method:'POST',headers:{'Content-Type':'image/jpeg'},body:blob,cache:'no-store'});
+  if(!res.ok&&res.status!==204) throw new Error('helper rejected frame '+String(res.status));
+  setCamStatus('Browser camera sending MJPEG '+String(width)+'x'+String(height)+' @ '+camFps.value+'fps');
+}
+function captureBrowserFrame(){
+  if(!browserStream||browserPosting){
+    if(browserStream) scheduleBrowserFrame();
+    return;
+  }
+  const width=1280;
+  const height=720;
+  const captureStartedMs=performance.now();
+  try{
+    browserPosting=true;
+    browserCanvas.width=width;
+    browserCanvas.height=height;
+    browserCtx.drawImage(browserPreview,0,0,width,height);
+    browserCanvas.toBlob(async blob=>{
+      const encodeMs=Math.max(0,performance.now()-captureStartedMs);
+      try{
+        if(blob&&blob.size>0) await postBrowserJpeg(blob,captureStartedMs,encodeMs,width,height);
+      }catch(e){
+        setCamStatus(String(e.message||e));
+      }finally{
+        browserPosting=false;
+        if(browserStream) scheduleBrowserFrame();
+      }
+    },'image/jpeg',0.72);
+  }catch(e){
+    browserPosting=false;
+    setCamStatus('Browser capture failed');
+    if(browserStream) scheduleBrowserFrame();
+  }
+}
+async function startBrowserCamera(){
+  stopBrowserCamera(false);
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    setCamStatus('Browser camera API unavailable');
+    return;
+  }
+  const fps=Math.max(1,Math.min(30,parseInt(camFps.value||'30',10)||30));
+  const video={width:{ideal:1280,max:1280},height:{ideal:720,max:720},frameRate:{ideal:fps,max:fps}};
+  if(camSelect.value) video.deviceId={exact:camSelect.value};
+  try{
+    await armBrowserZapSend();
+    browserStream=await navigator.mediaDevices.getUserMedia({audio:false,video});
+    browserPreview.srcObject=browserStream;
+    await browserPreview.play();
+    camStart.disabled=true;
+    camStop.disabled=false;
+    await refreshCameras();
+    setCamStatus('Browser camera started');
+    scheduleBrowserFrame();
+  }catch(e){
+    setCamStatus('Could not start browser camera: '+String(e.message||e));
+    stopBrowserCamera();
+  }
+}
+camRefresh.addEventListener('click',refreshCameras);
+camStart.addEventListener('click',startBrowserCamera);
+camStop.addEventListener('click',stopBrowserCamera);
+refreshCameras();
 function tileFor(stream){
   let tile=tiles.get(stream.streamKey);
   if(tile) return tile;
@@ -277,25 +462,52 @@ setInterval(refresh,33);
 
     void handleClient(juce::StreamingSocket& client)
     {
-        const juce::String request = readRequest(client);
-        if (request.isEmpty())
+        const HttpRequest request = readRequest(client);
+        if (request.method.isEmpty() || request.target.isEmpty())
             return;
 
-        const juce::String requestLine = request.upToFirstOccurrenceOf("\r\n", false, false)
-                                           .upToFirstOccurrenceOf("\n", false, false)
-                                           .trim();
-        const juce::String method = requestLine.upToFirstOccurrenceOf(" ", false, false).trim().toUpperCase();
-        const juce::String remainder = requestLine.fromFirstOccurrenceOf(" ", false, false).trim();
-        const juce::String target = remainder.upToFirstOccurrenceOf(" ", false, false).trim();
-        const HttpResponse response = buildResponse(method, target);
-        sendResponse(client, method, response);
+        const HttpResponse response = buildResponse(request.method, request.target, request.body);
+        sendResponse(client, request.method, response);
     }
 
-    juce::String readRequest(juce::StreamingSocket& client) const
+    static int findHeaderBodyOffset(const juce::MemoryBlock& data)
     {
-        juce::MemoryOutputStream requestData;
+        const auto* bytes = static_cast<const unsigned char*>(data.getData());
+        const size_t size = data.getSize();
+        for (size_t i = 0; i + 3 < size; ++i)
+        {
+            if (bytes[i] == '\r' && bytes[i + 1] == '\n' && bytes[i + 2] == '\r' && bytes[i + 3] == '\n')
+                return (int)i + 4;
+        }
+        for (size_t i = 0; i + 1 < size; ++i)
+        {
+            if (bytes[i] == '\n' && bytes[i + 1] == '\n')
+                return (int)i + 2;
+        }
+        return -1;
+    }
+
+    static int parseContentLength(const juce::String& headerText)
+    {
+        juce::StringArray lines;
+        lines.addLines(headerText);
+        for (const auto& line : lines)
+        {
+            const juce::String name = line.upToFirstOccurrenceOf(":", false, false).trim().toLowerCase();
+            if (name == "content-length")
+                return juce::jmax(0, line.fromFirstOccurrenceOf(":", false, false).trim().getIntValue());
+        }
+        return 0;
+    }
+
+    HttpRequest readRequest(juce::StreamingSocket& client) const
+    {
+        juce::MemoryBlock requestData;
         char buffer[2048] = {};
-        while (!threadShouldExit() && requestData.getDataSize() < 65536)
+        int headerBodyOffset = -1;
+        int contentLength = 0;
+
+        while (!threadShouldExit() && requestData.getSize() < 20 * 1024 * 1024)
         {
             if (client.waitUntilReady(true, 100) <= 0)
                 break;
@@ -304,16 +516,51 @@ setInterval(refresh,33);
             if (bytesRead <= 0)
                 break;
 
-            requestData.write(buffer, (size_t) bytesRead);
-            const juce::String requestText = requestData.toString();
-            if (requestText.contains("\r\n\r\n") || requestText.contains("\n\n"))
-                return requestText;
+            requestData.append(buffer, (size_t) bytesRead);
+            if (headerBodyOffset < 0)
+            {
+                headerBodyOffset = findHeaderBodyOffset(requestData);
+                if (headerBodyOffset >= 0)
+                {
+                    const juce::String headerText = juce::String::fromUTF8(static_cast<const char*>(requestData.getData()),
+                                                                            headerBodyOffset);
+                    contentLength = parseContentLength(headerText);
+                }
+            }
+
+            if (headerBodyOffset >= 0 && requestData.getSize() >= (size_t)headerBodyOffset + (size_t)contentLength)
+                break;
         }
 
-        return requestData.toString();
+        HttpRequest request;
+        if (requestData.getSize() == 0)
+            return request;
+
+        headerBodyOffset = findHeaderBodyOffset(requestData);
+        if (headerBodyOffset < 0)
+            return request;
+
+        const juce::String headerText = juce::String::fromUTF8(static_cast<const char*>(requestData.getData()),
+                                                                headerBodyOffset);
+        const juce::String requestLine = headerText.upToFirstOccurrenceOf("\r\n", false, false)
+                                                   .upToFirstOccurrenceOf("\n", false, false)
+                                                   .trim();
+        request.method = requestLine.upToFirstOccurrenceOf(" ", false, false).trim().toUpperCase();
+        const juce::String remainder = requestLine.fromFirstOccurrenceOf(" ", false, false).trim();
+        request.target = remainder.upToFirstOccurrenceOf(" ", false, false).trim();
+
+        contentLength = parseContentLength(headerText);
+        const size_t availableBodyBytes = requestData.getSize() > (size_t)headerBodyOffset
+            ? requestData.getSize() - (size_t)headerBodyOffset
+            : 0;
+        const size_t bodyBytes = juce::jmin((size_t)contentLength, availableBodyBytes);
+        if (bodyBytes > 0)
+            request.body.append(static_cast<const char*>(requestData.getData()) + headerBodyOffset, bodyBytes);
+
+        return request;
     }
 
-    HttpResponse buildResponse(const juce::String& method, const juce::String& requestTarget)
+    HttpResponse buildResponse(const juce::String& method, const juce::String& requestTarget, const juce::MemoryBlock& requestBody)
     {
         const juce::String path = requestTarget.upToFirstOccurrenceOf("?", false, false).trim();
         const bool isHead = (method == "HEAD");
@@ -337,6 +584,70 @@ setInterval(refresh,33);
             response.body = makeUtf8Body(getZapViewerHtml());
             if (isHead)
                 response.body.reset();
+            return response;
+        }
+
+        if (path == "/zap-browser-camera-enable" || path == "/zap-browser-camera-stop")
+        {
+            HttpResponse response;
+            response.contentType = "application/json; charset=utf-8";
+            response.noStore = true;
+            if (method != "POST")
+            {
+                response.statusCode = 405;
+                response.statusText = "Method Not Allowed";
+                response.body = makeUtf8Body("{\"ok\":false,\"error\":\"POST required\"}");
+                return response;
+            }
+
+            const bool isEnable = path == "/zap-browser-camera-enable";
+            juce::String payload = isEnable
+                ? (zapBrowserCameraEnable ? zapBrowserCameraEnable().trim() : juce::String())
+                : (zapBrowserCameraDisable ? zapBrowserCameraDisable().trim() : juce::String());
+            if (payload.isEmpty())
+                payload = "{\"ok\":false,\"error\":\"camera control unavailable\"}";
+
+            if (!payload.startsWith("{\"ok\":true"))
+            {
+                response.statusCode = 409;
+                response.statusText = "Conflict";
+            }
+            response.body = makeUtf8Body(payload);
+            return response;
+        }
+
+        if (path == "/zap-browser-camera-frame")
+        {
+            HttpResponse response;
+            response.contentType = "application/json; charset=utf-8";
+            response.noStore = true;
+            if (method != "POST")
+            {
+                response.statusCode = 405;
+                response.statusText = "Method Not Allowed";
+                response.body = makeUtf8Body("{\"ok\":false,\"error\":\"POST required\"}");
+                return response;
+            }
+
+            const double ageMs = getQueryParam(requestTarget, "ageMs").getDoubleValue();
+            const double encodeMs = getQueryParam(requestTarget, "encodeMs").getDoubleValue();
+            const int width = getQueryParam(requestTarget, "width").getIntValue();
+            const int height = getQueryParam(requestTarget, "height").getIntValue();
+            const bool accepted = requestBody.getSize() > 0
+                && zapBrowserFrameConsumer
+                && zapBrowserFrameConsumer(requestBody, ageMs, encodeMs, width, height);
+            if (accepted)
+            {
+                response.statusCode = 204;
+                response.statusText = "No Content";
+                response.body.reset();
+            }
+            else
+            {
+                response.statusCode = 409;
+                response.statusText = "Conflict";
+                response.body = makeUtf8Body("{\"ok\":false,\"error\":\"browser camera inactive or frame rejected\"}");
+            }
             return response;
         }
 
@@ -429,7 +740,11 @@ setInterval(refresh,33);
         header << "Content-Length: " << (juce::int64) response.body.getSize() << "\r\n";
         header << "Connection: close\r\n";
         if (response.noStore)
+        {
             header << "Cache-Control: no-store, no-cache, must-revalidate\r\n";
+            header << "Pragma: no-cache\r\n";
+            header << "Expires: 0\r\n";
+        }
         header << "\r\n";
 
         const juce::MemoryBlock headerBytes = makeUtf8Body(header);
@@ -444,32 +759,9 @@ setInterval(refresh,33);
     {
         helperIndexHtml = helperRoot.getChildFile("index.html").loadFileAsString();
         helperAppHtml = helperRoot.getChildFile("app.html").loadFileAsString();
-        if (helperAppHtml.isEmpty())
-            helperAppHtml = extractAppHtmlFromServerScript(helperRoot.getChildFile("server.js"));
 
         helperIconPng.reset();
         helperRoot.getChildFile("icon.png").loadFileAsData(helperIconPng);
-    }
-
-    static juce::String extractAppHtmlFromServerScript(const juce::File& scriptFile)
-    {
-        juce::String scriptText = scriptFile.loadFileAsString().replace("\r\n", "\n");
-        if (scriptText.isEmpty())
-            return {};
-
-        static const char* startMarker = "const htmlPage = `";
-        const int start = scriptText.indexOf(startMarker);
-        if (start < 0)
-            return {};
-
-        const int contentStart = start + (int) std::strlen(startMarker);
-        int end = scriptText.indexOf(contentStart, "`;\n\nconst server = http.createServer");
-        if (end < 0)
-            end = scriptText.indexOf(contentStart, "`;\nconst server = http.createServer");
-        if (end < 0)
-            return {};
-
-        return scriptText.substring(contentStart, end);
     }
 };
 
@@ -3025,6 +3317,8 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
         remoteVideoBufferRefreshIdByUser.clear();
         videoBufferRefreshCounter = 0;
     }
+    vdoRosterRevision.fetch_add(1, std::memory_order_relaxed);
+    intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
     resetIntervalSyncTimingCache();
     opusSyncAvailable.store(false);
     opusSyncHasLegacyClients.store(false);
@@ -3085,6 +3379,8 @@ void NinjamVst3AudioProcessor::disconnectFromServer()
         remoteVideoBufferRefreshIdByUser.clear();
         videoBufferRefreshCounter = 0;
     }
+    vdoRosterRevision.fetch_add(1, std::memory_order_relaxed);
+    intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
     resetIntervalSyncTimingCache();
     {
         const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
@@ -3732,25 +4028,29 @@ juce::File NinjamVst3AudioProcessor::resolveVideoHelperRootDir() const
     {
         if (dir.isDirectory()
             && dir.getChildFile("index.html").existsAsFile()
-            && (dir.getChildFile("app.html").existsAsFile() || dir.getChildFile("server.js").existsAsFile()))
+            && dir.getChildFile("app.html").existsAsFile())
             return dir;
     }
 
     return {};
 }
 
-bool NinjamVst3AudioProcessor::isAdvancedVideoClientAvailable() const
+bool NinjamVst3AudioProcessor::isAdvancedVideoClientAvailable(int port) const
 {
+    if (port <= 0)
+        return false;
+
     // Use a fast localhost TCP probe; if connect succeeds, helper is up.
     juce::StreamingSocket sock;
-    if (!sock.connect("127.0.0.1", 8100, 500))
+    if (!sock.connect("127.0.0.1", port, 500))
         return false;
     return true;
 }
 
 bool NinjamVst3AudioProcessor::ensureAdvancedVideoClientStarted()
 {
-    if (isAdvancedVideoClientAvailable())
+    const int existingPort = advancedVideoHelperPort.load();
+    if (advancedVideoServer != nullptr && existingPort > 0 && isAdvancedVideoClientAvailable(existingPort))
     {
         videoHelperRunning.store(true);
         lastIntervalHelperPayloadWriteMs = 0.0;
@@ -3777,19 +4077,36 @@ bool NinjamVst3AudioProcessor::ensureAdvancedVideoClientStarted()
             [this](const juce::String& streamKey, juce::MemoryBlock& jpegData)
             {
                 return getZapVideoFrameJpeg(streamKey, jpegData);
+            },
+            [this]()
+            {
+                return enableNinjamZapBrowserCameraSendForHelper();
+            },
+            [this]()
+            {
+                stopNinjamZapCameraSend();
+                return juce::String("{\"ok\":true}");
+            },
+            [this](const juce::MemoryBlock& encodedJpeg, double browserAgeMs, double encodeMs, int width, int height)
+            {
+                return handleBrowserNinjamZapCameraFrame(encodedJpeg, browserAgeMs, encodeMs, width, height);
             });
     }
 
-    if (!advancedVideoServer->start())
+    const int preferredPort = existingPort > 0 ? existingPort : advancedVideoHelperBasePort;
+    if (!advancedVideoServer->start(preferredPort, advancedVideoHelperMaxPort))
     {
         advancedVideoServer.reset();
+        advancedVideoHelperPort.store(0);
         return false;
     }
 
+    const int helperPort = advancedVideoServer->getPort();
+    advancedVideoHelperPort.store(helperPort);
     for (int i = 0; i < 10; ++i)
     {
         juce::Thread::sleep(50);
-        if (isAdvancedVideoClientAvailable())
+        if (isAdvancedVideoClientAvailable(helperPort))
         {
             videoHelperRunning.store(true);
             lastIntervalHelperPayloadWriteMs = 0.0;
@@ -3800,6 +4117,7 @@ bool NinjamVst3AudioProcessor::ensureAdvancedVideoClientStarted()
     if (advancedVideoServer)
         advancedVideoServer->stop();
     advancedVideoServer.reset();
+    advancedVideoHelperPort.store(0);
     videoHelperRunning.store(false);
     lastIntervalHelperPayloadWriteMs = 0.0;
     return false;
@@ -3807,14 +4125,12 @@ bool NinjamVst3AudioProcessor::ensureAdvancedVideoClientStarted()
 
 bool NinjamVst3AudioProcessor::ensureZapVideoClientStarted()
 {
-    if (advancedVideoServer != nullptr && isAdvancedVideoClientAvailable())
+    const int existingPort = advancedVideoHelperPort.load();
+    if (advancedVideoServer != nullptr && existingPort > 0 && isAdvancedVideoClientAvailable(existingPort))
     {
         videoHelperRunning.store(true);
         return true;
     }
-
-    if (isAdvancedVideoClientAvailable())
-        return false;
 
     return ensureAdvancedVideoClientStarted();
 }
@@ -3965,7 +4281,8 @@ void NinjamVst3AudioProcessor::launchNinjamZapVideoSession()
 
     if (ensureZapVideoClientStarted())
     {
-        const juce::String helperUrlText = "http://127.0.0.1:8100/zap-video";
+        const int helperPort = advancedVideoHelperPort.load();
+        const juce::String helperUrlText = "http://127.0.0.1:" + juce::String(helperPort) + "/zap-video";
         if (!openUrlExternalOnMessageThread(helperUrlText))
             addSystemChatLine("Failed to open Zap video helper URL: " + helperUrlText);
     }
@@ -4115,6 +4432,7 @@ void NinjamVst3AudioProcessor::startNinjamZapCameraSend(int deviceIndex, ninjamp
     if (zapCameraSender == nullptr)
         zapCameraSender = std::make_unique<ZapCameraSender>(*this);
 
+    ninjamZapBrowserCameraSendEnabled.store(false, std::memory_order_relaxed);
     setNinjamZapCameraCodecPreference(preference);
     ninjamZapCameraActiveCodec.store((int)ninjamplus::zap::VideoCodec::mjpeg, std::memory_order_relaxed);
     {
@@ -4147,10 +4465,89 @@ void NinjamVst3AudioProcessor::startNinjamZapCameraSend(int deviceIndex, ninjamp
     addSystemChatLine("NINJAMZap camera sending enabled (" + ninjamplus::zap::getCodecName(activeCodec) + ").");
 }
 
+void NinjamVst3AudioProcessor::startNinjamZapBrowserCameraSend()
+{
+    vlogStr("[ZapCamBrowser] start requested status=" + njStatusName(ninjamClient.GetStatus())
+            + " err='" + juce::String::fromUTF8(ninjamClient.GetErrorStr()) + "'"
+            + " serverVideo=" + juce::String(ninjamClient.GetServerVideoSupported() ? 1 : 0)
+            + " xmit=" + juce::String(isTransmittingLocal() ? 1 : 0)
+            + " maxLocal=" + juce::String(ninjamClient.GetMaxLocalChannels())
+            + " videoCh=" + juce::String(getNinjamZapVideoChannelIndex()));
+
+    if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
+    {
+        addSystemChatLine("Connect to a server first, then start Zap browser camera.");
+        return;
+    }
+
+    if (!ninjamClient.GetServerVideoSupported())
+    {
+        addSystemChatLine("This server does not advertise NINJAMZap video support.");
+        return;
+    }
+
+    if (!isTransmittingLocal())
+    {
+        addSystemChatLine("Turn on local transmit before starting NINJAMZap browser camera.");
+        return;
+    }
+
+    const int videoChannel = getNinjamZapVideoChannelIndex();
+    if (videoChannel < 0 || videoChannel >= ninjamClient.GetMaxLocalChannels())
+    {
+        addSystemChatLine("This server only allows " + juce::String(ninjamClient.GetMaxLocalChannels())
+                          + " local channel" + (ninjamClient.GetMaxLocalChannels() == 1 ? "" : "s")
+                          + "; NINJAMZap browser camera needs one extra video channel.");
+        return;
+    }
+
+    if (zapCameraSender != nullptr)
+    {
+        zapCameraSender->stop();
+        zapCameraSender.reset();
+    }
+
+    ninjamZapBrowserCameraSendEnabled.store(true, std::memory_order_relaxed);
+    ninjamZapCameraSendEnabled.store(true, std::memory_order_relaxed);
+    ninjamZapVideoEnabled.store(true, std::memory_order_relaxed);
+    ninjamZapCameraActiveCodec.store((int)ninjamplus::zap::VideoCodec::mjpeg, std::memory_order_relaxed);
+    {
+        const juce::ScopedLock lock(zapVideoFrameLock);
+        ninjamZapCameraH264ConfigChunk.reset();
+    }
+    {
+        const juce::SpinLock::ScopedLockType lock(ninjamZapCameraChunkQueueLock);
+        pendingNinjamZapCameraChunks.clear();
+    }
+
+    startZapVideoDecodeWorker();
+    {
+        const juce::ScopedLock clientLock(ninjamClientLock);
+        configureNinjamZapVideoLocalChannel();
+        if (ninjamClient.GetStatus() == NJClient::NJC_STATUS_OK)
+            ninjamClient.NotifyServerOfChannelChange();
+    }
+
+    if (ensureZapVideoClientStarted())
+    {
+        const int helperPort = advancedVideoHelperPort.load();
+        const juce::String helperUrlText = "http://127.0.0.1:" + juce::String(helperPort) + "/zap-video?browserCamera=1";
+        if (!openUrlExternalOnMessageThread(helperUrlText))
+            addSystemChatLine("Failed to open Zap browser camera helper URL: " + helperUrlText);
+        else
+            addSystemChatLine("NINJAMZap browser camera enabled. Select and start your camera in the browser page.");
+    }
+    else
+    {
+        addSystemChatLine("NINJAMZap browser camera is enabled, but the local video helper page could not be started.");
+    }
+}
+
 void NinjamVst3AudioProcessor::stopNinjamZapCameraSend()
 {
     const bool wasEnabled = ninjamZapCameraSendEnabled.exchange(false, std::memory_order_relaxed);
-    if (!wasEnabled && zapCameraSender == nullptr)
+    const bool wasBrowserEnabled = ninjamZapBrowserCameraSendEnabled.exchange(false, std::memory_order_relaxed);
+    if (!wasEnabled && !wasBrowserEnabled && zapCameraSender == nullptr)
         return;
 
     vlogStr("[ZapCam] stop requested wasEnabled=" + juce::String(wasEnabled ? 1 : 0)
@@ -4177,6 +4574,75 @@ void NinjamVst3AudioProcessor::stopNinjamZapCameraSend()
 bool NinjamVst3AudioProcessor::isNinjamZapCameraSending() const
 {
     return ninjamZapCameraSendEnabled.load(std::memory_order_relaxed);
+}
+
+bool NinjamVst3AudioProcessor::isNinjamZapBrowserCameraSending() const
+{
+    return ninjamZapBrowserCameraSendEnabled.load(std::memory_order_relaxed);
+}
+
+juce::String NinjamVst3AudioProcessor::enableNinjamZapBrowserCameraSendForHelper()
+{
+    auto fail = [](const juce::String& message)
+    {
+        return juce::String("{\"ok\":false,\"error\":")
+            + juce::JSON::toString(juce::var(message), true) + "}";
+    };
+
+    vlogStr("[ZapCamBrowser] helper enable requested status=" + njStatusName(ninjamClient.GetStatus())
+            + " err='" + juce::String::fromUTF8(ninjamClient.GetErrorStr()) + "'"
+            + " serverVideo=" + juce::String(ninjamClient.GetServerVideoSupported() ? 1 : 0)
+            + " xmit=" + juce::String(isTransmittingLocal() ? 1 : 0)
+            + " maxLocal=" + juce::String(ninjamClient.GetMaxLocalChannels())
+            + " videoCh=" + juce::String(getNinjamZapVideoChannelIndex()));
+
+    if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
+        return fail("Connect to a server first, then start the Zap camera.");
+
+    if (!ninjamClient.GetServerVideoSupported())
+        return fail("This server does not advertise NINJAMZap video support.");
+
+    if (!isTransmittingLocal())
+        return fail("Turn on local transmit before starting NINJAMZap browser camera.");
+
+    const int videoChannel = getNinjamZapVideoChannelIndex();
+    if (videoChannel < 0 || videoChannel >= ninjamClient.GetMaxLocalChannels())
+    {
+        return fail("This server only allows " + juce::String(ninjamClient.GetMaxLocalChannels())
+                    + " local channel" + (ninjamClient.GetMaxLocalChannels() == 1 ? "" : "s")
+                    + "; NINJAMZap browser camera needs one extra video channel.");
+    }
+
+    if (zapCameraSender != nullptr)
+    {
+        zapCameraSender->stop();
+        zapCameraSender.reset();
+    }
+
+    ninjamZapBrowserCameraSendEnabled.store(true, std::memory_order_relaxed);
+    ninjamZapCameraSendEnabled.store(true, std::memory_order_relaxed);
+    ninjamZapVideoEnabled.store(true, std::memory_order_relaxed);
+    ninjamZapVideoReceivedNotice.store(false, std::memory_order_relaxed);
+    ninjamZapCameraActiveCodec.store((int)ninjamplus::zap::VideoCodec::mjpeg, std::memory_order_relaxed);
+    {
+        const juce::ScopedLock lock(zapVideoFrameLock);
+        ninjamZapCameraH264ConfigChunk.reset();
+    }
+    {
+        const juce::SpinLock::ScopedLockType lock(ninjamZapCameraChunkQueueLock);
+        pendingNinjamZapCameraChunks.clear();
+    }
+
+    syncNinjamZapVideoSubscriptions(true);
+    startZapVideoDecodeWorker();
+    {
+        const juce::ScopedLock clientLock(ninjamClientLock);
+        configureNinjamZapVideoLocalChannel();
+        if (ninjamClient.GetStatus() == NJClient::NJC_STATUS_OK)
+            ninjamClient.NotifyServerOfChannelChange();
+    }
+
+    return juce::String("{\"ok\":true,\"channelIndex\":") + juce::String(videoChannel) + "}";
 }
 
 void NinjamVst3AudioProcessor::beginNinjamZapVideoIntervalStream(const unsigned char audioGuid[16], int intervalCounter)
@@ -4371,6 +4837,50 @@ void NinjamVst3AudioProcessor::flushPendingNinjamZapCameraVideo()
     }
 }
 
+bool NinjamVst3AudioProcessor::handleBrowserNinjamZapCameraFrame(const juce::MemoryBlock& encodedJpeg,
+                                                                 double browserAgeMs,
+                                                                 double encodeMs,
+                                                                 int width,
+                                                                 int height)
+{
+    juce::ignoreUnused(width, height);
+
+    if (!ninjamZapCameraSendEnabled.load(std::memory_order_relaxed)
+        || !ninjamZapBrowserCameraSendEnabled.load(std::memory_order_relaxed)
+        || getNinjamZapCameraActiveCodec() != ninjamplus::zap::VideoCodec::mjpeg)
+        return false;
+
+    if (encodedJpeg.getSize() < 128 || encodedJpeg.getSize() > ninjamplus::zap::kZapMaxChunkPayloadBytes)
+        return false;
+
+    const double safeBrowserAgeMs = std::isfinite(browserAgeMs) ? juce::jmax(0.0, browserAgeMs) : 0.0;
+    if (safeBrowserAgeMs > 650.0)
+    {
+        vlogStr("[ZapCamBrowser] dropped late frame ageMs=" + juce::String(safeBrowserAgeMs, 1)
+                + " bytes=" + juce::String((int)encodedJpeg.getSize()));
+        return true;
+    }
+
+    juce::MemoryBlock chunk;
+    if (!ninjamplus::zap::appendLengthPrefixedChunk(encodedJpeg.getData(), encodedJpeg.getSize(), chunk))
+        return false;
+
+    if (ninjamZapVideoStreamOpen.load(std::memory_order_relaxed))
+        enqueueNinjamZapCameraFrameChunk(std::move(chunk));
+
+    juce::Image previewFrame;
+    if (ninjamplus::zap::decodeMjpegFrame(encodedJpeg.getData(), encodedJpeg.getSize(), previewFrame)
+        && previewFrame.isValid())
+    {
+        publishLocalNinjamZapCameraFrame(previewFrame,
+                                         encodedJpeg,
+                                         safeBrowserAgeMs,
+                                         std::isfinite(encodeMs) ? juce::jmax(0.0, encodeMs) : 0.0);
+    }
+
+    return true;
+}
+
 void NinjamVst3AudioProcessor::startZapVideoDecodeWorker()
 {
     if (zapVideoDecodeWorker == nullptr)
@@ -4527,15 +5037,22 @@ void NinjamVst3AudioProcessor::processPendingNinjamZapVideoPlaybackSwap()
     const double rawPlaybackOffsetMs = callbackBoundaryMs > 0.0 ? juce::jmax(0.0, nowMs - callbackBoundaryMs) : 0.0;
     const double playbackOffsetMs = juce::jlimit(0.0, juce::jmax(0.0, intervalDurationMs - 1.0), rawPlaybackOffsetMs);
     const double playbackStartMs = nowMs - playbackOffsetMs;
-    const juce::ScopedLock lock(zapVideoFrameLock);
+    const juce::ScopedTryLock lock(zapVideoFrameLock);
+    if (!lock.isLocked())
+    {
+        if (callbackBoundaryMs > 0.0)
+            pendingNinjamZapVideoPlaybackBoundaryMs.store(callbackBoundaryMs, std::memory_order_release);
+        pendingNinjamZapVideoPlaybackSwap.store(true, std::memory_order_release);
+        return;
+    }
 
-    auto promote = [this, nowMs, intervalDurationMs, playbackStartMs, playbackOffsetMs](const ZapVideoIntervalFrameBuffer& buffer)
+    auto promote = [this, nowMs, intervalDurationMs, playbackStartMs, playbackOffsetMs](ZapVideoIntervalFrameBuffer buffer)
     {
         if (buffer.frames.empty() || buffer.streamKey.isEmpty())
             return;
 
         ZapVideoPlaybackBuffer playback;
-        playback.frames = buffer.frames;
+        playback.frames = std::move(buffer.frames);
         playback.startedMs = playbackStartMs;
         playback.durationMs = intervalDurationMs;
         playback.playbackOffsetMs = playbackOffsetMs;
@@ -4567,7 +5084,7 @@ void NinjamVst3AudioProcessor::processPendingNinjamZapVideoPlaybackSwap()
 
     for (auto it = zapVideoDeferredPlaybackByStream.begin(); it != zapVideoDeferredPlaybackByStream.end();)
     {
-        promote(it->second);
+        promote(std::move(it->second));
         it = zapVideoDeferredPlaybackByStream.erase(it);
     }
 
@@ -4576,7 +5093,6 @@ void NinjamVst3AudioProcessor::processPendingNinjamZapVideoPlaybackSwap()
         const juce::String streamKey = streamIt->first;
         auto& intervalsByGuid = streamIt->second;
 
-        auto newestIt = intervalsByGuid.end();
         auto prevMatchIt = intervalsByGuid.end();
         auto currentMatchIt = intervalsByGuid.end();
 
@@ -4587,9 +5103,6 @@ void NinjamVst3AudioProcessor::processPendingNinjamZapVideoPlaybackSwap()
                 it = intervalsByGuid.erase(it);
                 continue;
             }
-
-            if (newestIt == intervalsByGuid.end() || it->second.lastUpdateMs > newestIt->second.lastUpdateMs)
-                newestIt = it;
 
             const auto prevSetIt = previousAudioGuidsBySender.find(it->second.sender);
             if (prevSetIt != previousAudioGuidsBySender.end()
@@ -4610,25 +5123,15 @@ void NinjamVst3AudioProcessor::processPendingNinjamZapVideoPlaybackSwap()
 
         if (prevMatchIt != intervalsByGuid.end())
         {
-            promote(prevMatchIt->second);
+            promote(std::move(prevMatchIt->second));
             intervalsByGuid.erase(prevMatchIt);
             zapVideoPlaybackByStream[streamKey].holdCount = 0;
         }
         else if (currentMatchIt != intervalsByGuid.end())
         {
-            zapVideoDeferredPlaybackByStream[streamKey] = currentMatchIt->second;
+            zapVideoDeferredPlaybackByStream[streamKey] = std::move(currentMatchIt->second);
             intervalsByGuid.erase(currentMatchIt);
             zapVideoPlaybackByStream[streamKey].holdCount = 0;
-        }
-        else if (newestIt != intervalsByGuid.end())
-        {
-            auto& playbackState = zapVideoPlaybackByStream[streamKey];
-            if (++playbackState.holdCount >= 3)
-            {
-                promote(newestIt->second);
-                intervalsByGuid.erase(newestIt);
-                zapVideoPlaybackByStream[streamKey].holdCount = 0;
-            }
         }
 
         if (intervalsByGuid.empty())
@@ -4790,6 +5293,7 @@ void NinjamVst3AudioProcessor::stopAdvancedVideoClient()
     if (advancedVideoServer)
         advancedVideoServer->stop();
     advancedVideoServer.reset();
+    advancedVideoHelperPort.store(0);
 }
 
 
@@ -4878,12 +5382,15 @@ void NinjamVst3AudioProcessor::launchVideoSession()
 
     if (ensureAdvancedVideoClientStarted())
     {
-        juce::URL helperUrl("http://127.0.0.1:8100/buffer-room");
+        const int helperPort = advancedVideoHelperPort.load();
+        juce::URL helperUrl("http://127.0.0.1:" + juce::String(helperPort) + "/buffer-room");
         helperUrl = helperUrl.withParameter("room", room)
                              .withParameter("label", label)
                              .withParameter("bufferMode", "remote")
                              .withParameter("buffer", juce::String(launchBufferMs))
-                             .withParameter("chunked", juce::String(chunkMs));
+                             .withParameter("chunked", juce::String(chunkMs))
+                             .withParameter("helperVersion", getVersionString())
+                             .withParameter("cacheBust", juce::String((juce::int64)juce::Time::getMillisecondCounter()));
         {
             juce::ScopedLock lock(chatLock);
             chatHistory.add("Tip: If your cam isn't showing, refresh the video page and select your camera before entering the room.");
@@ -4966,6 +5473,7 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
     const juce::String syncTag = buildIntervalSyncTag(displayInterval, safeLength);
 
     juce::Array<juce::var> entries;
+    juce::Array<juce::var> activeRoster;
     {
         juce::DynamicObject::Ptr infoObj = new juce::DynamicObject();
         infoObj->setProperty("type", "intervalInfo");
@@ -4993,7 +5501,11 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
         const juce::String userName = juce::String::fromUTF8(userNameChars);
         const juce::String senderKey = normaliseOpusPeerId(userName);
         const juce::String canonicalUserKey = canonicalDelayUserKey(userName);
-        const int localServerRouteLatencyMs = juce::jmax(0, localServerLatencyMs.load());
+        const juce::String rosterKey = canonicalUserKey.isNotEmpty() ? canonicalUserKey : senderKey;
+        if (rosterKey.isNotEmpty())
+            activeRoster.add(rosterKey);
+        const int localServerLatencyRawMs = localServerLatencyMs.load();
+        const int localServerRouteLatencyMs = juce::jmax(0, localServerLatencyRawMs);
         bool remoteSub = false;
         float remoteChVol = 1.0f, remoteChPan = 0.0f;
         bool remoteChMute = false, remoteChSolo = false;
@@ -5014,6 +5526,11 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
         int bufferMs = -1;
         int remoteServerLatencyMs = -1;
         int serverRouteLatencyMs = -1;
+        int intervalSampleCount = 0;
+        int lastIntervalMeasurementMs = -1;
+        int averageIntervalMeasurementMs = -1;
+        int firmIntervalMeasurementMs = -1;
+        bool intervalMeasurementSeen = false;
         juce::uint64 bufferRefreshId = 0;
         {
             const juce::ScopedLock lock(intervalSyncAnnouncementLock);
@@ -5061,6 +5578,16 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
                 if (avgIt != remoteLatencyAverageByUser.end())
                 {
                     const auto& state = avgIt->second;
+                    intervalSampleCount = juce::jmax(intervalSampleCount, state.sampleCount);
+                    if (state.lastMeasurementMs >= 0.0)
+                    {
+                        intervalMeasurementSeen = true;
+                        lastIntervalMeasurementMs = juce::jmax(lastIntervalMeasurementMs, (int)std::llround(state.lastMeasurementMs));
+                    }
+                    if (state.averageMs > 0.0)
+                        averageIntervalMeasurementMs = juce::jmax(averageIntervalMeasurementMs, (int)std::llround(state.averageMs));
+                    if (state.firmAverageMs > 0.0)
+                        firmIntervalMeasurementMs = juce::jmax(firmIntervalMeasurementMs, (int)std::llround(state.firmAverageMs));
                     double fallback = state.firmAverageMs;
                     if (!(fallback > 0.0))
                         fallback = state.averageMs;
@@ -5076,6 +5603,16 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
                 if (canonicalAvgIt != remoteLatencyAverageByUser.end())
                 {
                     const auto& state = canonicalAvgIt->second;
+                    intervalSampleCount = juce::jmax(intervalSampleCount, state.sampleCount);
+                    if (state.lastMeasurementMs >= 0.0)
+                    {
+                        intervalMeasurementSeen = true;
+                        lastIntervalMeasurementMs = juce::jmax(lastIntervalMeasurementMs, (int)std::llround(state.lastMeasurementMs));
+                    }
+                    if (state.averageMs > 0.0)
+                        averageIntervalMeasurementMs = juce::jmax(averageIntervalMeasurementMs, (int)std::llround(state.averageMs));
+                    if (state.firmAverageMs > 0.0)
+                        firmIntervalMeasurementMs = juce::jmax(firmIntervalMeasurementMs, (int)std::llround(state.firmAverageMs));
                     double fallback = state.firmAverageMs;
                     if (!(fallback > 0.0))
                         fallback = state.averageMs;
@@ -5083,6 +5620,42 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
                         fallback = state.lastMeasurementMs;
                     if (fallback > 0.0)
                         bufferMs = juce::jmax(0, (int)std::llround(fallback)) + routeLatencyForBufferMs;
+                }
+            }
+            if (!intervalMeasurementSeen)
+            {
+                auto avgIt = remoteLatencyAverageByUser.find(senderKey);
+                if (avgIt != remoteLatencyAverageByUser.end())
+                {
+                    const auto& state = avgIt->second;
+                    intervalSampleCount = juce::jmax(intervalSampleCount, state.sampleCount);
+                    if (state.lastMeasurementMs >= 0.0)
+                    {
+                        intervalMeasurementSeen = true;
+                        lastIntervalMeasurementMs = juce::jmax(lastIntervalMeasurementMs, (int)std::llround(state.lastMeasurementMs));
+                    }
+                    if (state.averageMs > 0.0)
+                        averageIntervalMeasurementMs = juce::jmax(averageIntervalMeasurementMs, (int)std::llround(state.averageMs));
+                    if (state.firmAverageMs > 0.0)
+                        firmIntervalMeasurementMs = juce::jmax(firmIntervalMeasurementMs, (int)std::llround(state.firmAverageMs));
+                }
+            }
+            if (canonicalUserKey.isNotEmpty())
+            {
+                auto canonicalAvgIt = remoteLatencyAverageByUser.find(canonicalUserKey);
+                if (canonicalAvgIt != remoteLatencyAverageByUser.end())
+                {
+                    const auto& state = canonicalAvgIt->second;
+                    intervalSampleCount = juce::jmax(intervalSampleCount, state.sampleCount);
+                    if (state.lastMeasurementMs >= 0.0)
+                    {
+                        intervalMeasurementSeen = true;
+                        lastIntervalMeasurementMs = juce::jmax(lastIntervalMeasurementMs, (int)std::llround(state.lastMeasurementMs));
+                    }
+                    if (state.averageMs > 0.0)
+                        averageIntervalMeasurementMs = juce::jmax(averageIntervalMeasurementMs, (int)std::llround(state.averageMs));
+                    if (state.firmAverageMs > 0.0)
+                        firmIntervalMeasurementMs = juce::jmax(firmIntervalMeasurementMs, (int)std::llround(state.firmAverageMs));
                 }
             }
             // Diagnostic log per-user buffer decision
@@ -5100,6 +5673,19 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
         userObj->setProperty("syncTag", syncTag);
         userObj->setProperty("bufferMode", remoteVoiceChatMode ? "realtime" : "remote");
         userObj->setProperty("voiceChatMode", remoteVoiceChatMode);
+        userObj->setProperty("intervalMeasurementSeen", intervalMeasurementSeen);
+        userObj->setProperty("intervalSampleCount", intervalSampleCount);
+        if (lastIntervalMeasurementMs >= 0)
+            userObj->setProperty("lastIntervalMeasurementMs", lastIntervalMeasurementMs);
+        if (averageIntervalMeasurementMs >= 0)
+            userObj->setProperty("averageIntervalMeasurementMs", averageIntervalMeasurementMs);
+        if (firmIntervalMeasurementMs >= 0)
+            userObj->setProperty("firmIntervalMeasurementMs", firmIntervalMeasurementMs);
+        userObj->setProperty("bufferCalculated", bufferMs >= 0);
+        userObj->setProperty("ourServerLatencyReady", localServerLatencyRawMs >= 0);
+        userObj->setProperty("ourServerLatencyProbeEnabled", false);
+        userObj->setProperty("theirServerLatencyReady", remoteServerLatencyMs >= 0);
+        userObj->setProperty("serverRouteLatencyReady", serverRouteLatencyMs >= 0);
         if (bufferMs >= 0)
         {
             userObj->setProperty("bufferTotalMs", (double)bufferMs);
@@ -5110,7 +5696,7 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
                 userObj->setProperty("senderServerLatencyMs", (double)remoteServerLatencyMs);
             if (serverRouteLatencyMs >= 0)
                 userObj->setProperty("serverRouteLatencyMs", (double)serverRouteLatencyMs);
-            if (localServerRouteLatencyMs >= 0)
+            if (localServerLatencyRawMs >= 0)
                 userObj->setProperty("receiverServerLatencyMs", (double)localServerRouteLatencyMs);
             if (bufferRefreshId != 0)
             {
@@ -5119,6 +5705,15 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
             }
         }
         entries.add(juce::var(userObj.get()));
+    }
+
+    {
+        juce::DynamicObject::Ptr rosterObj = new juce::DynamicObject();
+        rosterObj->setProperty("type", "activeRoster");
+        rosterObj->setProperty("revision", juce::String((juce::int64)vdoRosterRevision.load(std::memory_order_relaxed)));
+        rosterObj->setProperty("videoClockMs", nowMs);
+        rosterObj->setProperty("users", juce::var(activeRoster));
+        entries.add(juce::var(rosterObj.get()));
     }
 
     const juce::String payload = juce::JSON::toString(juce::var(entries), false);
@@ -5598,10 +6193,17 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
         const int userIndex = it->first;
         if (activeUserIndexes.count(userIndex) == 0)
         {
+            const juce::String removedUserKey = it->second;
             userBaseVolume.erase(userIndex);
             userPanOverrides.erase(userIndex);
             userClipEnabled.erase(userIndex);
             it = remoteUserNameByIndex.erase(it);
+            if (removedUserKey.isNotEmpty())
+            {
+                vdoRosterRevision.fetch_add(1, std::memory_order_relaxed);
+                intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
+                lastIntervalHelperPayloadWriteMs = 0.0;
+            }
         }
         else
         {
@@ -13430,6 +14032,8 @@ void NinjamVst3AudioProcessor::timerCallback()
         lastIntervalPos.store(pos);
         if (status == NJClient::NJC_STATUS_OK && videoHelperRunning.load())
         {
+            forceIntervalHelperPayloadWrite = intervalHelperPayloadForceWrite.exchange(false, std::memory_order_acq_rel)
+                || forceIntervalHelperPayloadWrite;
             const double elapsedSinceHelperWriteMs = nowMs - lastIntervalHelperPayloadWriteMs;
             if (forceIntervalHelperPayloadWrite
                 || lastIntervalHelperPayloadWriteMs <= 0.0

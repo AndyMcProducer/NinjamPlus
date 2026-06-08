@@ -395,8 +395,10 @@ public:
     void startNinjamZapCameraSend();
     void startNinjamZapCameraSend(int deviceIndex);
     void startNinjamZapCameraSend(int deviceIndex, ninjamplus::zap::CameraCodecPreference preference);
+    void startNinjamZapBrowserCameraSend();
     void stopNinjamZapCameraSend();
     bool isNinjamZapCameraSending() const;
+    bool isNinjamZapBrowserCameraSending() const;
 
     void rememberUserVolume(int userIndex, float volume, const juce::String& name);
     void resetRemoteUserIndexState(int userIndex, const juce::String& userName);
@@ -903,7 +905,10 @@ private:
     mutable juce::CriticalSection intervalHelperPayloadLock;
     juce::String intervalHelperPayload { "[]" };
     double lastIntervalHelperPayloadWriteMs = 0.0;
+    std::atomic<bool> intervalHelperPayloadForceWrite { false };
+    std::atomic<juce::uint64> vdoRosterRevision { 0 };
     std::atomic<bool> videoHelperRunning { false };
+    std::atomic<int> advancedVideoHelperPort { 0 };
     std::atomic<bool> videoLaunchInProgress { false };
     std::atomic<bool> ninjamZapVideoEnabled { false };
     std::atomic<bool> ninjamZapVideoReceivedNotice { false };
@@ -923,6 +928,7 @@ private:
     std::unique_ptr<ZapVideoDecodeWorker> zapVideoDecodeWorker;
     std::unique_ptr<ZapCameraSender> zapCameraSender;
     std::atomic<bool> ninjamZapCameraSendEnabled { false };
+    std::atomic<bool> ninjamZapBrowserCameraSendEnabled { false };
     std::atomic<int> ninjamZapCameraCodecPreference { (int)ninjamplus::zap::CameraCodecPreference::autoCodec };
     std::atomic<int> ninjamZapCameraActiveCodec { (int)ninjamplus::zap::VideoCodec::mjpeg };
     std::atomic<bool> ninjamZapVideoStreamOpen { false };
@@ -1067,7 +1073,7 @@ private:
     bool consumeVideoTimingChangeEvent(const juce::String& eventId);
     void broadcastVideoTimingChange(double previousBpm, double newBpm, int bpi, int length, int timingDelayDeltaMs);
     juce::File resolveVideoHelperRootDir() const;
-    bool isAdvancedVideoClientAvailable() const;
+    bool isAdvancedVideoClientAvailable(int port) const;
     bool ensureAdvancedVideoClientStarted();
     bool ensureZapVideoClientStarted();
     void stopAdvancedVideoClient();
@@ -1083,6 +1089,12 @@ private:
     void rotateNinjamZapVideoIntervalStream(const unsigned char audioGuid[16], int intervalCounter);
     void flushPendingNinjamZapCameraVideo();
     void enqueueNinjamZapCameraFrameChunk(juce::MemoryBlock chunk);
+    juce::String enableNinjamZapBrowserCameraSendForHelper();
+    bool handleBrowserNinjamZapCameraFrame(const juce::MemoryBlock& encodedJpeg,
+                                           double browserAgeMs,
+                                           double encodeMs,
+                                           int width,
+                                           int height);
     void publishLocalNinjamZapCameraFrame(const juce::Image& frame,
                                           const juce::MemoryBlock& encodedJpeg,
                                           double captureQueueMs = 0.0,

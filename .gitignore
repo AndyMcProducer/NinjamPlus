@@ -38,10 +38,6 @@ CMakeCache.txt
 *.au/
 *.aaxplugin/
 
-# Node
-node_modules/
-npm-debug.log*
-
 # Local logs / scratch
 build_*.txt
 cmake_*.txt
@@ -61,7 +57,6 @@ NINJAM_VST3_mac_source.zip
 # Local backups / old experiments
 ninjam - Copy/
 _tmp_JamTaba/
-/server.js
 advanced-vdo-client/intervals.json
 advanced-vdo-client/vdo.ninja/
 advanced-vdo-client/intervals.json~RF*.TMP

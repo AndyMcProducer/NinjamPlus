@@ -2,6 +2,9 @@
 <html>
 <head>
     <meta charset="utf-8">
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>NINJAM Launcher</title>
     <style>
         * { box-sizing: border-box; }
@@ -65,6 +68,25 @@
             text-overflow: ellipsis;
             white-space: nowrap;
         }
+        .peer-light {
+            width: 11px;
+            height: 11px;
+            border-radius: 50%;
+            border: 1px solid rgba(255,255,255,0.45);
+            background: #cf4343;
+            box-shadow: 0 0 7px rgba(207,67,67,0.75);
+            cursor: pointer;
+            padding: 0;
+            flex: 0 0 auto;
+        }
+        .peer-light.ok {
+            background: #3ed06e;
+            box-shadow: 0 0 7px rgba(62,208,110,0.75);
+        }
+        .peer-light:focus-visible {
+            outline: 2px solid #8fb7ff;
+            outline-offset: 2px;
+        }
         .peer button {
             height: 24px;
             min-width: 34px;
@@ -90,6 +112,12 @@
             font-size: 11px;
             color: #8fa4c9;
             white-space: nowrap;
+        }
+        .peer-latency.warn {
+            color: #f6ba5f;
+        }
+        .peer-latency.ok {
+            color: #91d98e;
         }
         .status {
             margin-left: auto;
@@ -139,6 +167,7 @@
         function buildMainUrl() {
             const p = new URLSearchParams(window.location.search);
             p.delete('view');
+            p.set('helperLoad', String(Date.now()));
             const q = p.toString();
             return q ? ('/app?' + q) : '/app';
         }
@@ -147,6 +176,7 @@
             const p = new URLSearchParams(window.location.search);
             p.delete('view');
             p.set('bg', 'green');
+            p.set('helperLoad', String(Date.now()));
             return window.location.origin + '/app?' + p.toString();
         }
 
@@ -209,8 +239,10 @@
 
         const measuredBufferMsByUser = {};
         const latencyDebugByUser = {};
+        const syncDiagnosticsByUser = {};
         const userLastSeenAt = {};
         const userLastSampleKey = {};
+        let lastRosterRevision = '';
         const userStaleMs = 12000;
 
         function getMeasuredBufferMs(userId) {
@@ -226,6 +258,10 @@
 
         function getLatencyDebug(userId) {
             return latencyDebugByUser[normalizeUserId(userId)] || null;
+        }
+
+        function getSyncDiagnostics(userId) {
+            return syncDiagnosticsByUser[normalizeUserId(userId)] || null;
         }
 
         function fmtMeasured(v) {
@@ -287,6 +323,16 @@
             return isFinite(latencyMs) ? Math.max(0, Math.min(6000, Math.round(latencyMs))) : NaN;
         }
 
+        function getSyncDiagnosticText(userId) {
+            const sync = getSyncDiagnostics(userId);
+            return sync ? sync.text : 'interval pending';
+        }
+
+        function getSyncDiagnosticCopyText(userId) {
+            const key = normalizeUserId(userId);
+            return key + ': ' + getSyncDiagnosticText(key);
+        }
+
         function getUserLatencyText(userId) {
             const measured = getMeasuredBufferMs(userId);
             const debug = getLatencyDebug(userId);
@@ -296,9 +342,75 @@
             const sender = fmtMeasured(debug.senderServerLatencyMs);
             const receiver = fmtMeasured(debug.receiverServerLatencyMs);
             const total = fmtMeasured(measured !== null ? measured : debug.bufferMs);
+            const route = fmtMeasured(debug.serverRouteLatencyMs);
+            const routeText = debug.serverRouteLatencyMs !== null ? (' | route ' + route) : (' | srv ' + sender + ' + ' + receiver);
             const vdoLatency = fmtMeasured(debug.vdoLatencyMs);
             const vdoText = debug.vdoLatencyMs !== null ? (' | vdo ' + vdoLatency) : '';
-            return 'base ' + total + ' | srv ' + sender + ' + ' + receiver + vdoText;
+            return 'base ' + total + routeText + vdoText;
+        }
+
+        function getUserLatencyClass(userId) {
+            const sync = getSyncDiagnostics(userId);
+            if (!sync) {
+                return 'peer-latency warn';
+            }
+            return sync.ok ? 'peer-latency ok' : 'peer-latency warn';
+        }
+
+        function updatePeerSyncLight(userId) {
+            const key = normalizeUserId(userId);
+            const lightId = 'peer-sync-light-' + key.replace(/[^a-zA-Z0-9_-]/g, '_');
+            const light = document.getElementById(lightId);
+            if (!light) {
+                return;
+            }
+            const sync = getSyncDiagnostics(key);
+            const ok = !!(sync && sync.ok);
+            const copyText = getSyncDiagnosticCopyText(key);
+            light.className = ok ? 'peer-light ok' : 'peer-light';
+            light.title = copyText + '\nClick to copy';
+            light.setAttribute('aria-label', copyText);
+        }
+
+        function boolProp(msg, key) {
+            return msg && Object.prototype.hasOwnProperty.call(msg, key) ? msg[key] === true : null;
+        }
+
+        function buildSyncDiagnostics(msg, bufferVal, senderServerLatencyMs, receiverServerLatencyMs) {
+            const serverRouteLatencyMs = getNonNegativeMessageMs(msg, ['serverRouteLatencyMs']);
+            const hasBuffer = (isFinite(bufferVal) && bufferVal >= 0) || boolProp(msg, 'bufferCalculated') === true;
+            const hasInterval = boolProp(msg, 'intervalMeasurementSeen') === true
+                || isFinite(getMessageNumber(msg, ['lastIntervalMeasurementMs', 'averageIntervalMeasurementMs', 'firmIntervalMeasurementMs']))
+                || hasBuffer;
+            const explicitTheirServer = boolProp(msg, 'theirServerLatencyReady');
+            const explicitOurServer = boolProp(msg, 'ourServerLatencyReady');
+            const explicitServerRoute = boolProp(msg, 'serverRouteLatencyReady');
+            const ourServerProbeEnabled = boolProp(msg, 'ourServerLatencyProbeEnabled') !== false;
+            const hasTheirServer = explicitTheirServer !== null ? explicitTheirServer : isFinite(senderServerLatencyMs);
+            const hasOurServer = explicitOurServer !== null ? explicitOurServer : isFinite(receiverServerLatencyMs);
+            const hasServerRoute = explicitServerRoute !== null ? explicitServerRoute : isFinite(serverRouteLatencyMs);
+            const parts = [];
+            if (!hasInterval) {
+                parts.push('interval missing');
+            } else if (!hasBuffer) {
+                parts.push('buffer pending');
+            } else {
+                parts.push('sync ok');
+            }
+            if (hasServerRoute) {
+                parts.push('route ok');
+            } else {
+                if (!hasTheirServer) {
+                    parts.push('their srv ?');
+                }
+                if (!hasOurServer) {
+                    parts.push(ourServerProbeEnabled ? 'our srv ?' : 'srv probe off');
+                }
+            }
+            return {
+                ok: hasInterval && hasBuffer,
+                text: parts.join(' | ')
+            };
         }
 
         function pushOffsetToFrame(userId) {
@@ -359,6 +471,7 @@
                     delete knownUsers[userId];
                     delete measuredBufferMsByUser[userId];
                     delete latencyDebugByUser[userId];
+                    delete syncDiagnosticsByUser[userId];
                     delete userLastSeenAt[userId];
                     delete userLastSampleKey[userId];
                     changed = true;
@@ -367,6 +480,46 @@
             if (changed) {
                 renderUsers();
             }
+        }
+
+        function pruneUsersMissingFromPayload(activeUserKeys) {
+            const activeNow = {};
+            for (let i = 0; i < activeUserKeys.length; i++) {
+                const key = normalizeUserId(activeUserKeys[i]);
+                if (key) {
+                    activeNow[key] = true;
+                }
+            }
+
+            let changed = false;
+            const users = Object.keys(knownUsers);
+            for (let i = 0; i < users.length; i++) {
+                const userId = users[i];
+                if (activeNow[userId]) {
+                    continue;
+                }
+                delete knownUsers[userId];
+                delete measuredBufferMsByUser[userId];
+                delete latencyDebugByUser[userId];
+                delete syncDiagnosticsByUser[userId];
+                delete userLastSeenAt[userId];
+                delete userLastSampleKey[userId];
+                changed = true;
+            }
+            if (changed) {
+                renderUsers();
+            }
+        }
+
+        function applyActiveRosterMessage(msg) {
+            const revision = String(msg.revision ?? msg.videoClockMs ?? '');
+            if (revision && lastRosterRevision === revision) {
+                return;
+            }
+            if (revision) {
+                lastRosterRevision = revision;
+            }
+            pruneUsersMissingFromPayload(Array.isArray(msg.users) ? msg.users : []);
         }
 
         function loadUsersFromStorage() {
@@ -398,6 +551,23 @@
                 nameEl.className = 'peer-name';
                 nameEl.textContent = knownUsers[userId] || userId;
 
+                const statusLight = document.createElement('button');
+                statusLight.type = 'button';
+                statusLight.id = 'peer-sync-light-' + userId.replace(/[^a-zA-Z0-9_-]/g, '_');
+                const syncLight = function () {
+                    const sync = getSyncDiagnostics(userId);
+                    const ok = !!(sync && sync.ok);
+                    const copyText = getSyncDiagnosticCopyText(userId);
+                    statusLight.className = ok ? 'peer-light ok' : 'peer-light';
+                    statusLight.title = copyText + '\nClick to copy';
+                    statusLight.setAttribute('aria-label', copyText);
+                };
+                statusLight.addEventListener('click', function () {
+                    copyTextToClipboard(getSyncDiagnosticCopyText(userId))
+                        .then(function () { statusText.textContent = 'Sync status copied'; })
+                        .catch(function () { statusText.textContent = 'Could not copy sync status'; });
+                });
+
                 const minusBtn = document.createElement('button');
                 minusBtn.type = 'button';
                 minusBtn.textContent = '-20';
@@ -422,8 +592,10 @@
                 latencyEl.id = 'peer-latency-display-' + userId.replace(/[^a-zA-Z0-9_-]/g, '_');
 
                 const syncOffset = function () {
+                    syncLight();
                     offsetEl.textContent = getUserDisplayText(userId);
                     latencyEl.textContent = getUserLatencyText(userId);
+                    latencyEl.className = getUserLatencyClass(userId);
                 };
                 syncOffset();
 
@@ -443,6 +615,7 @@
                     pushOffsetToFrame(userId);
                 });
 
+                wrap.appendChild(statusLight);
                 wrap.appendChild(nameEl);
                 wrap.appendChild(minusBtn);
                 wrap.appendChild(plusBtn);
@@ -462,6 +635,10 @@
             for (let i = 0; i < items.length; i++) {
                 const msg = items[i] || {};
                 const type = String(msg.type || '');
+                if (type === 'activeRoster') {
+                    applyActiveRosterMessage(msg);
+                    continue;
+                }
                 if (type !== 'remoteTimecode' && type !== 'videoTimecode') {
                     continue;
                 }
@@ -473,21 +650,27 @@
                 const bufferVal = resolveIncomingBufferMs(msg);
                 const senderServerLatencyMs = getNonNegativeMessageMs(msg, ['senderServerLatencyMs', 'remoteServerLatencyMs']);
                 const receiverServerLatencyMs = getNonNegativeMessageMs(msg, ['receiverServerLatencyMs', 'localServerLatencyMs']);
+                const serverRouteLatencyMs = getNonNegativeMessageMs(msg, ['serverRouteLatencyMs']);
                 const vdoLatencyMs = getIncomingVdoLatencyMs(msg);
+                const syncDiagnostics = buildSyncDiagnostics(msg, bufferVal, senderServerLatencyMs, receiverServerLatencyMs);
                 const sampleKey = buildUserSampleKey(msg, bufferVal)
                     + '|' + (isFinite(senderServerLatencyMs) ? String(Math.round(senderServerLatencyMs)) : '')
                     + '|' + (isFinite(receiverServerLatencyMs) ? String(Math.round(receiverServerLatencyMs)) : '')
-                    + '|' + (isFinite(vdoLatencyMs) ? String(Math.round(vdoLatencyMs)) : '');
+                    + '|' + (isFinite(serverRouteLatencyMs) ? String(Math.round(serverRouteLatencyMs)) : '')
+                    + '|' + (isFinite(vdoLatencyMs) ? String(Math.round(vdoLatencyMs)) : '')
+                    + '|' + syncDiagnostics.text;
                 if (userLastSampleKey[normalizedUserId] === sampleKey) {
                     continue;
                 }
                 userLastSampleKey[normalizedUserId] = sampleKey;
                 markUserSeen(normalizedUserId);
+                syncDiagnosticsByUser[normalizedUserId] = syncDiagnostics;
                 if (isFinite(bufferVal) && bufferVal >= 0) {
                     measuredBufferMsByUser[normalizedUserId] = Math.round(bufferVal);
                     latencyDebugByUser[normalizedUserId] = {
                         senderServerLatencyMs: (isFinite(senderServerLatencyMs) && senderServerLatencyMs >= 0) ? Math.round(senderServerLatencyMs) : null,
                         receiverServerLatencyMs: (isFinite(receiverServerLatencyMs) && receiverServerLatencyMs >= 0) ? Math.round(receiverServerLatencyMs) : null,
+                        serverRouteLatencyMs: (isFinite(serverRouteLatencyMs) && serverRouteLatencyMs >= 0) ? Math.round(serverRouteLatencyMs) : null,
                         vdoLatencyMs: (isFinite(vdoLatencyMs) && vdoLatencyMs >= 0) ? Math.round(vdoLatencyMs) : null,
                         bufferMs: Math.round(bufferVal)
                     };
@@ -501,7 +684,17 @@
                     const latencyEl = document.getElementById(latencyId);
                     if (latencyEl) {
                         latencyEl.textContent = getUserLatencyText(normalizedUserId);
+                        latencyEl.className = getUserLatencyClass(normalizedUserId);
                     }
+                    updatePeerSyncLight(normalizedUserId);
+                } else {
+                    const latencyId = 'peer-latency-display-' + normalizedUserId.replace(/[^a-zA-Z0-9_-]/g, '_');
+                    const latencyEl = document.getElementById(latencyId);
+                    if (latencyEl) {
+                        latencyEl.textContent = getUserLatencyText(normalizedUserId);
+                        latencyEl.className = getUserLatencyClass(normalizedUserId);
+                    }
+                    updatePeerSyncLight(normalizedUserId);
                 }
             }
             if (changed) {
