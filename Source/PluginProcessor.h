@@ -1114,7 +1114,7 @@ private:
                                      const juce::MemoryBlock& encodedJpeg);
     void processPendingNinjamZapVideoPlaybackSwap();
     juce::String buildZapVideoFrameListJson() const;
-    bool getZapVideoFrameJpeg(const juce::String& streamKey, juce::MemoryBlock& jpegData) const;
+    bool getZapVideoFrameJpeg(const juce::String& streamKey, int requestedFrameIndex, juce::MemoryBlock& jpegData) const;
     void clearZapVideoFrameState();
     void stopNinjamZapVideoTransportForDisconnect();
     void syncLocalIntervalChannelConfig();
