@@ -499,6 +499,8 @@ private:
         double lastSenderCaptureQueueMs = 0.0;
         double lastSenderEncodeMs = 0.0;
         int frameCount = 0;
+        ninjamplus::zap::VideoCodec codec = ninjamplus::zap::VideoCodec::unknown;
+        juce::uint64 codecConfigId = 0;
     };
 
     struct ZapVideoDecodeJob
@@ -528,6 +530,8 @@ private:
         double lastDecodeMs = 0.0;
         double lastReceiveToPublishMs = 0.0;
         int decodedFrameCount = 0;
+        ninjamplus::zap::VideoCodec codec = ninjamplus::zap::VideoCodec::unknown;
+        juce::uint64 codecConfigId = 0;
         std::vector<juce::MemoryBlock> frames;
     };
 
@@ -951,6 +955,8 @@ private:
     std::map<juce::String, std::map<juce::String, ZapVideoIntervalFrameBuffer>> zapVideoDecodedIntervalsByStream;
     std::map<juce::String, ZapVideoIntervalFrameBuffer> zapVideoDeferredPlaybackByStream;
     std::map<juce::String, ZapVideoPlaybackBuffer> zapVideoPlaybackByStream;
+    std::map<juce::String, juce::MemoryBlock> zapVideoCodecConfigByStream;
+    std::map<juce::String, juce::uint64> zapVideoCodecConfigIdByStream;
     juce::uint64 videoBufferRefreshCounter = 0;
 
     std::atomic<bool> opusSyncAvailable { false };
@@ -1081,6 +1087,7 @@ private:
     void startZapVideoDecodeWorker();
     void stopZapVideoDecodeWorker();
     void enqueueZapVideoDecodeJob(ZapVideoDecodeJob job);
+    void publishBrowserDecodedZapVideoFrame(const ZapVideoDecodeJob& job);
     int getNinjamZapVideoChannelIndex() const;
     void configureNinjamZapVideoLocalChannel();
     void beginNinjamZapVideoIntervalStream(const unsigned char audioGuid[16], int intervalCounter);
@@ -1089,8 +1096,10 @@ private:
     void rotateNinjamZapVideoIntervalStream(const unsigned char audioGuid[16], int intervalCounter);
     void flushPendingNinjamZapCameraVideo();
     void enqueueNinjamZapCameraFrameChunk(juce::MemoryBlock chunk);
-    juce::String enableNinjamZapBrowserCameraSendForHelper();
-    bool handleBrowserNinjamZapCameraFrame(const juce::MemoryBlock& encodedJpeg,
+    juce::String enableNinjamZapBrowserCameraSendForHelper(const juce::String& codecName);
+    bool handleBrowserNinjamZapCameraFrame(const juce::MemoryBlock& encodedFrame,
+                                           const juce::String& codecName,
+                                           const juce::String& configBase64,
                                            double browserAgeMs,
                                            double encodeMs,
                                            int width,
