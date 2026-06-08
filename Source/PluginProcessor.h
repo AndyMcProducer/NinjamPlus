@@ -937,6 +937,8 @@ private:
     std::atomic<int> ninjamZapCameraActiveCodec { (int)ninjamplus::zap::VideoCodec::mjpeg };
     std::atomic<bool> ninjamZapVideoStreamOpen { false };
     std::array<unsigned char, 16> ninjamZapVideoStreamGuid {};
+    std::atomic<juce::uint64> ninjamZapBrowserKeyframeRequestCounter { 0 };
+    std::atomic<bool> ninjamZapBrowserAwaitingIntervalKeyframe { false };
     juce::SpinLock pendingNinjamZapIntervalLock;
     std::atomic<bool> pendingNinjamZapIntervalRotate { false };
     std::array<unsigned char, 16> pendingNinjamZapAudioGuid {};
@@ -1097,9 +1099,11 @@ private:
     void flushPendingNinjamZapCameraVideo();
     void enqueueNinjamZapCameraFrameChunk(juce::MemoryBlock chunk);
     juce::String enableNinjamZapBrowserCameraSendForHelper(const juce::String& codecName);
+    juce::String buildNinjamZapBrowserCameraStateJson() const;
     bool handleBrowserNinjamZapCameraFrame(const juce::MemoryBlock& encodedFrame,
                                            const juce::String& codecName,
                                            const juce::String& configBase64,
+                                           bool keyFrame,
                                            double browserAgeMs,
                                            double encodeMs,
                                            int width,

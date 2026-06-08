@@ -72,14 +72,16 @@ public:
                          std::function<juce::String()> zapFrameListProviderIn,
                          std::function<bool(const juce::String&, int, juce::MemoryBlock&)> zapFrameProviderIn,
                          std::function<juce::String(const juce::String&)> zapBrowserCameraEnableIn,
+                         std::function<juce::String()> zapBrowserCameraStateIn,
                          std::function<juce::String()> zapBrowserCameraDisableIn,
-                         std::function<bool(const juce::MemoryBlock&, const juce::String&, const juce::String&, double, double, int, int)> zapBrowserFrameConsumerIn)
+                         std::function<bool(const juce::MemoryBlock&, const juce::String&, const juce::String&, bool, double, double, int, int)> zapBrowserFrameConsumerIn)
         : juce::Thread("NINJAMVideoHelperServer"),
           helperRoot(helperRootDir),
           intervalPayloadProvider(std::move(intervalPayloadProviderIn)),
           zapFrameListProvider(std::move(zapFrameListProviderIn)),
           zapFrameProvider(std::move(zapFrameProviderIn)),
           zapBrowserCameraEnable(std::move(zapBrowserCameraEnableIn)),
+          zapBrowserCameraState(std::move(zapBrowserCameraStateIn)),
           zapBrowserCameraDisable(std::move(zapBrowserCameraDisableIn)),
           zapBrowserFrameConsumer(std::move(zapBrowserFrameConsumerIn))
     {
@@ -156,8 +158,9 @@ private:
     std::function<juce::String()> zapFrameListProvider;
     std::function<bool(const juce::String&, int, juce::MemoryBlock&)> zapFrameProvider;
     std::function<juce::String(const juce::String&)> zapBrowserCameraEnable;
+    std::function<juce::String()> zapBrowserCameraState;
     std::function<juce::String()> zapBrowserCameraDisable;
-    std::function<bool(const juce::MemoryBlock&, const juce::String&, const juce::String&, double, double, int, int)> zapBrowserFrameConsumer;
+    std::function<bool(const juce::MemoryBlock&, const juce::String&, const juce::String&, bool, double, double, int, int)> zapBrowserFrameConsumer;
     std::unique_ptr<juce::StreamingSocket> listener;
     std::atomic<int> listenPort { 0 };
     juce::String helperIndexHtml;
@@ -295,6 +298,9 @@ let browserEncoderCodec='mjpeg';
 let browserEncodeStarts=new Map();
 let browserLastCodecConfig='';
 let browserLastKeyframeMs=0;
+let browserForceNextKeyframe=false;
+let browserLastKeyframeRequestId='';
+let browserCameraStateTimer=0;
 function ms(value){
   const n=Number(value||0);
   return Number.isFinite(n)&&n>0?String(Math.round(n)):'0';
@@ -359,12 +365,33 @@ async function disarmBrowserZapSend(){
   browserSendArmed=false;
   try{ await fetch('/zap-browser-camera-stop',{method:'POST',cache:'no-store'}); }catch(e){}
 }
+async function pollBrowserCameraState(){
+  if(!browserStream||!browserEncoder) return;
+  try{
+    const res=await fetch('/zap-browser-camera-state?seq='+encodeURIComponent(String(browserFrameCounter)),{cache:'no-store'});
+    if(!res.ok) return;
+    const payload=await res.json();
+    const requestId=String(payload.keyframeRequestId||'');
+    if(requestId&&requestId!==browserLastKeyframeRequestId){
+      browserLastKeyframeRequestId=requestId;
+      browserForceNextKeyframe=true;
+    }
+  }catch(e){}
+}
+function startBrowserCameraStatePolling(){
+  if(browserCameraStateTimer) clearInterval(browserCameraStateTimer);
+  browserCameraStateTimer=setInterval(pollBrowserCameraState,25);
+  pollBrowserCameraState();
+}
 function stopBrowserCamera(disarm=true){
   if(browserTimer){ clearTimeout(browserTimer); browserTimer=0; }
+  if(browserCameraStateTimer){ clearInterval(browserCameraStateTimer); browserCameraStateTimer=0; }
   if(browserEncoder){ try{browserEncoder.close();}catch(e){} browserEncoder=null; }
   browserEncodeStarts.clear();
   browserLastCodecConfig='';
   browserLastKeyframeMs=0;
+  browserForceNextKeyframe=false;
+  browserLastKeyframeRequestId='';
 )HTML";
         html << R"HTML(
   if(browserStream){ browserStream.getTracks().forEach(track=>track.stop()); browserStream=null; }
@@ -469,8 +496,9 @@ function captureBrowserFrame(){
       const timestamp=Math.round(captureStartedMs*1000);
       browserEncodeStarts.set(timestamp,{captureStartedMs,width,height});
       const frame=new VideoFrame(browserPreview,{timestamp});
-      const needsKey=(captureStartedMs-browserLastKeyframeMs)>2000;
+      const needsKey=browserForceNextKeyframe||(captureStartedMs-browserLastKeyframeMs)>2000;
       if(needsKey) browserLastKeyframeMs=captureStartedMs;
+      browserForceNextKeyframe=false;
       browserEncoder.encode(frame,{keyFrame:needsKey});
       frame.close();
       scheduleBrowserFrame();
@@ -531,6 +559,7 @@ async function startBrowserCamera(){
   setCamStatus(activeCodec===codec
     ? 'Browser camera started '+activeCodec.toUpperCase()
     : codec.toUpperCase()+' unavailable, sending '+activeCodec.toUpperCase());
+  startBrowserCameraStatePolling();
   scheduleBrowserFrame();
 )HTML";
         html << R"HTML(
@@ -1021,6 +1050,20 @@ setInterval(refresh,33);
             return response;
         }
 
+        if (path == "/zap-browser-camera-state")
+        {
+            HttpResponse response;
+            response.contentType = "application/json; charset=utf-8";
+            response.noStore = true;
+            juce::String payload = zapBrowserCameraState ? zapBrowserCameraState().trim() : juce::String();
+            if (payload.isEmpty())
+                payload = "{\"ok\":false}";
+            response.body = makeUtf8Body(payload);
+            if (isHead)
+                response.body.reset();
+            return response;
+        }
+
         if (path == "/zap-browser-camera-frame")
         {
             HttpResponse response;
@@ -1040,9 +1083,10 @@ setInterval(refresh,33);
             const int height = getQueryParam(requestTarget, "height").getIntValue();
             const juce::String codec = getQueryParam(requestTarget, "codec");
             const juce::String config = getQueryParam(requestTarget, "config");
+            const bool keyFrame = getQueryParam(requestTarget, "key").getIntValue() != 0;
             const bool accepted = requestBody.getSize() > 0
                 && zapBrowserFrameConsumer
-                && zapBrowserFrameConsumer(requestBody, codec, config, ageMs, encodeMs, width, height);
+                && zapBrowserFrameConsumer(requestBody, codec, config, keyFrame, ageMs, encodeMs, width, height);
             if (accepted)
             {
                 response.statusCode = 204;
@@ -4591,18 +4635,23 @@ bool NinjamVst3AudioProcessor::ensureAdvancedVideoClientStarted()
             },
             [this]()
             {
+                return buildNinjamZapBrowserCameraStateJson();
+            },
+            [this]()
+            {
                 stopNinjamZapCameraSend();
                 return juce::String("{\"ok\":true}");
             },
             [this](const juce::MemoryBlock& encodedFrame,
                    const juce::String& codecName,
                    const juce::String& configBase64,
+                   bool keyFrame,
                    double browserAgeMs,
                    double encodeMs,
                    int width,
                    int height)
             {
-                return handleBrowserNinjamZapCameraFrame(encodedFrame, codecName, configBase64, browserAgeMs, encodeMs, width, height);
+                return handleBrowserNinjamZapCameraFrame(encodedFrame, codecName, configBase64, keyFrame, browserAgeMs, encodeMs, width, height);
             });
     }
 
@@ -5074,6 +5123,7 @@ void NinjamVst3AudioProcessor::stopNinjamZapCameraSend()
         zapCameraSender->stop();
     zapCameraSender.reset();
     ninjamZapCameraActiveCodec.store((int)ninjamplus::zap::VideoCodec::mjpeg, std::memory_order_relaxed);
+    ninjamZapBrowserAwaitingIntervalKeyframe.store(false, std::memory_order_relaxed);
     {
         const juce::ScopedLock lock(zapVideoFrameLock);
         ninjamZapCameraH264ConfigChunk.reset();
@@ -5138,6 +5188,7 @@ juce::String NinjamVst3AudioProcessor::enableNinjamZapBrowserCameraSendForHelper
     ninjamZapVideoEnabled.store(true, std::memory_order_relaxed);
     ninjamZapVideoReceivedNotice.store(false, std::memory_order_relaxed);
     ninjamZapCameraActiveCodec.store((int)requestedCodec, std::memory_order_relaxed);
+    ninjamZapBrowserAwaitingIntervalKeyframe.store(false, std::memory_order_relaxed);
     {
         const juce::ScopedLock lock(zapVideoFrameLock);
         ninjamZapCameraH264ConfigChunk.reset();
@@ -5157,6 +5208,19 @@ juce::String NinjamVst3AudioProcessor::enableNinjamZapBrowserCameraSendForHelper
 
     return juce::String("{\"ok\":true,\"channelIndex\":") + juce::String(videoChannel)
         + ",\"codec\":\"" + zapBrowserCodecName(requestedCodec) + "\"}";
+}
+
+juce::String NinjamVst3AudioProcessor::buildNinjamZapBrowserCameraStateJson() const
+{
+    const auto codec = getNinjamZapCameraActiveCodec();
+    juce::DynamicObject::Ptr obj = new juce::DynamicObject();
+    obj->setProperty("ok", true);
+    obj->setProperty("enabled", ninjamZapCameraSendEnabled.load(std::memory_order_relaxed)
+                              && ninjamZapBrowserCameraSendEnabled.load(std::memory_order_relaxed));
+    obj->setProperty("streamOpen", ninjamZapVideoStreamOpen.load(std::memory_order_relaxed));
+    obj->setProperty("codec", zapBrowserCodecName(codec));
+    obj->setProperty("keyframeRequestId", juce::String((juce::int64)ninjamZapBrowserKeyframeRequestCounter.load(std::memory_order_relaxed)));
+    return juce::JSON::toString(juce::var(obj.get()), false);
 }
 
 void NinjamVst3AudioProcessor::beginNinjamZapVideoIntervalStream(const unsigned char audioGuid[16], int intervalCounter)
@@ -5211,6 +5275,17 @@ void NinjamVst3AudioProcessor::beginNinjamZapVideoIntervalStream(const unsigned 
     vlogStr("[ZapCam] begin stream ok videoCh=" + juce::String(videoChannel)
             + " interval=" + juce::String(intervalCounter)
             + " codec=" + ninjamplus::zap::getCodecName(activeCodec));
+
+    if (activeCodec == ninjamplus::zap::VideoCodec::h264
+        || activeCodec == ninjamplus::zap::VideoCodec::vp8)
+    {
+        ninjamZapBrowserKeyframeRequestCounter.fetch_add(1, std::memory_order_relaxed);
+        ninjamZapBrowserAwaitingIntervalKeyframe.store(true, std::memory_order_relaxed);
+    }
+    else
+    {
+        ninjamZapBrowserAwaitingIntervalKeyframe.store(false, std::memory_order_relaxed);
+    }
 
     juce::MemoryBlock markerChunk;
     if (ninjamplus::zap::makeSyncMarkerChunk((juce::uint32)juce::jmax(0, intervalCounter),
@@ -5301,6 +5376,7 @@ void NinjamVst3AudioProcessor::rotateNinjamZapVideoIntervalStream(const unsigned
     if (!ninjamZapCameraSendEnabled.load(std::memory_order_relaxed))
         return;
 
+    flushPendingNinjamZapCameraVideo();
     closeNinjamZapVideoIntervalStream();
     beginNinjamZapVideoIntervalStream(audioGuid, intervalCounter);
 }
@@ -5356,6 +5432,7 @@ void NinjamVst3AudioProcessor::flushPendingNinjamZapCameraVideo()
 bool NinjamVst3AudioProcessor::handleBrowserNinjamZapCameraFrame(const juce::MemoryBlock& encodedFrame,
                                                                  const juce::String& codecName,
                                                                  const juce::String& configBase64,
+                                                                 bool keyFrame,
                                                                  double browserAgeMs,
                                                                  double encodeMs,
                                                                  int width,
@@ -5406,6 +5483,19 @@ bool NinjamVst3AudioProcessor::handleBrowserNinjamZapCameraFrame(const juce::Mem
             }
         }
     }
+
+    const bool predictiveCodec = requestedCodec == ninjamplus::zap::VideoCodec::h264
+                              || requestedCodec == ninjamplus::zap::VideoCodec::vp8;
+    const bool intervalWaitingForKey = predictiveCodec
+        && ninjamZapBrowserAwaitingIntervalKeyframe.load(std::memory_order_relaxed);
+
+    if (intervalWaitingForKey && !keyFrame)
+    {
+        return true;
+    }
+
+    if (intervalWaitingForKey && keyFrame)
+        ninjamZapBrowserAwaitingIntervalKeyframe.store(false, std::memory_order_relaxed);
 
     if (ninjamZapVideoStreamOpen.load(std::memory_order_relaxed))
     {
