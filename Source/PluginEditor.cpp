@@ -9936,7 +9936,8 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
         }
     };
 
-    if (!audioProcessor.isNinjamZapVideoAvailable())
+    const bool connectedToServer = audioProcessor.getClient().GetStatus() == NJClient::NJC_STATUS_OK;
+    if (!connectedToServer)
     {
         disableBackgroundVideo();
         audioProcessor.launchVideoSessionAsync();

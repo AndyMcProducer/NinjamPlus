@@ -5185,8 +5185,7 @@ void NinjamVst3AudioProcessor::launchVideoSessionAsync()
 
 bool NinjamVst3AudioProcessor::isNinjamZapVideoAvailable()
 {
-    return ninjamClient.GetStatus() == NJClient::NJC_STATUS_OK
-        && ninjamClient.GetServerVideoSupported();
+    return ninjamClient.GetStatus() == NJClient::NJC_STATUS_OK;
 }
 
 bool NinjamVst3AudioProcessor::isNinjamZapVideoEnabled() const
@@ -5264,11 +5263,7 @@ void NinjamVst3AudioProcessor::launchNinjamZapVideoSession()
     }
 
     if (!ninjamClient.GetServerVideoSupported())
-    {
-        ninjamZapVideoEnabled.store(false, std::memory_order_relaxed);
-        addSystemChatLine("This server does not advertise NINJAMZap video support.");
-        return;
-    }
+        addSystemChatLine("This server does not advertise NINJAMZap video support; trying relay-compatible mode.");
 
     ninjamZapVideoEnabled.store(true, std::memory_order_relaxed);
     ninjamZapVideoReceivedNotice.store(false, std::memory_order_relaxed);
@@ -5415,9 +5410,8 @@ void NinjamVst3AudioProcessor::startNinjamZapCameraSend(int deviceIndex, ninjamp
 
     if (!ninjamClient.GetServerVideoSupported())
     {
-        vlogStr("[ZapCam] start rejected: server video not advertised");
-        addSystemChatLine("This server does not advertise NINJAMZap video support.");
-        return;
+        vlogStr("[ZapCam] server video not advertised; trying relay-compatible mode");
+        addSystemChatLine("This server does not advertise NINJAMZap video support; trying relay-compatible mode.");
     }
 
     if (!isTransmittingLocal())
@@ -5490,10 +5484,7 @@ void NinjamVst3AudioProcessor::startNinjamZapBrowserCameraSend()
     }
 
     if (!ninjamClient.GetServerVideoSupported())
-    {
-        addSystemChatLine("This server does not advertise NINJAMZap video support.");
-        return;
-    }
+        addSystemChatLine("This server does not advertise NINJAMZap video support; trying relay-compatible mode.");
 
     if (!isTransmittingLocal())
     {
@@ -5609,9 +5600,6 @@ juce::String NinjamVst3AudioProcessor::enableNinjamZapBrowserCameraSendForHelper
 
     if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
         return fail("Connect to a server first, then start the Zap camera.");
-
-    if (!ninjamClient.GetServerVideoSupported())
-        return fail("This server does not advertise NINJAMZap video support.");
 
     if (!isTransmittingLocal())
         return fail("Turn on local transmit before starting NINJAMZap browser camera.");
@@ -15628,9 +15616,7 @@ void NinjamVst3AudioProcessor::timerCallback()
         refreshOpusSyncAvailabilityFromUsers();
         if (ninjamZapVideoEnabled.load(std::memory_order_relaxed))
         {
-            if (!ninjamClient.GetServerVideoSupported())
-                ninjamZapVideoEnabled.store(false, std::memory_order_relaxed);
-            else if ((nowMs - lastNinjamZapVideoSubscriptionSyncMs) >= 750.0)
+            if ((nowMs - lastNinjamZapVideoSubscriptionSyncMs) >= 750.0)
             {
                 syncNinjamZapVideoSubscriptions(true);
                 lastNinjamZapVideoSubscriptionSyncMs = nowMs;
