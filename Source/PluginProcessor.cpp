@@ -9278,11 +9278,16 @@ void NinjamVst3AudioProcessor::loadSamplePadAsync(int padIndex,
 
                     samplePadResyncRequestSerial[(size_t)padIndex].fetch_add(1, std::memory_order_acq_rel);
 
+                    // Pre-copy originalSample before acquiring the lock so the
+                    // lock hold is O(1) moves only — no large buffer copies on
+                    // the audio thread's contended mutex.
+                    juce::AudioBuffer<float> preparedOriginal = prepared.sample;
+
                     {
                         const juce::ScopedLock lock(samplePadsLock);
                         auto& pad = samplePads[(size_t)padIndex];
                         pad.sample = std::move(prepared.sample);
-                        pad.originalSample = pad.sample;
+                        pad.originalSample = std::move(preparedOriginal);
                         if (!pad.nameIsCustom)
                             pad.name = prepared.defaultName;
                         pad.file = prepared.file;
@@ -13034,13 +13039,8 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     monitorSourceRight.fill(-1);
     monitorStereo.fill(false);
 
-    int samplePadTransportPosition = 0;
-    int samplePadTransportLength = 0;
-    {
-        const juce::ScopedTryLock clientLock(ninjamClientLock);
-        if (clientLock.isLocked())
-            ninjamClient.GetPosition(&samplePadTransportPosition, &samplePadTransportLength);
-    }
+    const int samplePadTransportPosition = cachedNinjamTransportPos.load(std::memory_order_relaxed);
+    const int samplePadTransportLength = cachedNinjamTransportLen.load(std::memory_order_relaxed);
     const int samplePadBpi = juce::jmax(1, getBPI());
     double samplePadSamplesPerBeat = 0.0;
     const double samplePadBlockStartBeat = getSamplePadBlockStartBeat(samplePadTransportPosition,
@@ -15425,6 +15425,10 @@ void NinjamVst3AudioProcessor::timerCallback()
         const juce::ScopedLock clientLock(ninjamClientLock);
         while (!ninjamClient.Run() && loopCount < 50)
             loopCount++;
+        int cachePos = 0, cacheLen = 0;
+        ninjamClient.GetPosition(&cachePos, &cacheLen);
+        cachedNinjamTransportPos.store(cachePos, std::memory_order_relaxed);
+        cachedNinjamTransportLen.store(cacheLen, std::memory_order_relaxed);
     }
 
     int status = NJClient::NJC_STATUS_DISCONNECTED;

@@ -781,6 +781,8 @@ private:
     int samplePadLastTransportPosition = 0;
     long long samplePadTransportInterval = 0;
     double lastSamplePadBpmSyncBpm = 0.0;
+    std::atomic<int> cachedNinjamTransportPos { 0 };
+    std::atomic<int> cachedNinjamTransportLen { 0 };
 
     std::atomic<bool> spreadOutputsEnabled { false };
     std::atomic<bool> softLimiterEnabled { true };
