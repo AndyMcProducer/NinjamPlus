@@ -1492,7 +1492,7 @@ public:
     {
         addAndMakeVisible(listBox);
         listBox.setModel(this);
-        listBox.setRowHeight(24);
+        listBox.setRowHeight(34);
 
         addAndMakeVisible(statusLabel);
         statusLabel.setJustificationType(juce::Justification::centred);
@@ -1553,7 +1553,17 @@ public:
              << "  " << juce::String(s.bpm, 1) << " BPM"
              << " / " << s.bpi << " BPI";
 
-        g.drawText(text, 4, 0, width - 8, height, juce::Justification::centredLeft, true);
+        auto row = juce::Rectangle<int>(4, 0, width - 8, height);
+        auto top = row.removeFromTop(s.userNames.isEmpty() ? height : 18);
+        g.drawText(text, top, juce::Justification::centredLeft, true);
+        if (!s.userNames.isEmpty())
+        {
+            g.setColour(juce::Colours::lightgrey);
+            g.drawText("Users: " + s.userNames.joinIntoString(", "),
+                       row,
+                       juce::Justification::centredLeft,
+                       true);
+        }
     }
 
     void listBoxItemDoubleClicked(int row, const juce::MouseEvent&) override { connectServer(row); }

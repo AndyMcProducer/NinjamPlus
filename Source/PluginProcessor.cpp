@@ -127,6 +127,7 @@ public:
         if (listener)
             listener->close();
         stopThread(500);
+        clientThreadPool.removeAllJobs(true, 1000);
         listener.reset();
         listenPort.store(0);
     }
@@ -166,6 +167,29 @@ private:
     juce::String helperIndexHtml;
     juce::String helperAppHtml;
     juce::MemoryBlock helperIconPng;
+    juce::ThreadPool clientThreadPool { 4 };
+
+    class ClientJob final : public juce::ThreadPoolJob
+    {
+    public:
+        ClientJob(LocalVideoHttpServer& ownerIn, std::unique_ptr<juce::StreamingSocket> clientIn)
+            : juce::ThreadPoolJob("NINJAMVideoHelperClient"),
+              owner(ownerIn),
+              client(std::move(clientIn))
+        {
+        }
+
+        JobStatus runJob() override
+        {
+            if (client != nullptr)
+                owner.handleClient(*client);
+            return jobHasFinished;
+        }
+
+    private:
+        LocalVideoHttpServer& owner;
+        std::unique_ptr<juce::StreamingSocket> client;
+    };
 
     void run() override
     {
@@ -179,7 +203,7 @@ private:
 
             std::unique_ptr<juce::StreamingSocket> client(listener->waitForNextConnection());
             if (client)
-                handleClient(*client);
+                clientThreadPool.addJob(new ClientJob(*this, std::move(client)), true);
         }
     }
 
@@ -203,6 +227,18 @@ private:
     {
         const auto* utf8 = text.toRawUTF8();
         return juce::MemoryBlock(utf8, std::strlen(utf8));
+    }
+
+    static void appendBe32(juce::MemoryBlock& outData, juce::uint32 value)
+    {
+        const unsigned char bytes[4]
+        {
+            static_cast<unsigned char>((value >> 24) & 0xff),
+            static_cast<unsigned char>((value >> 16) & 0xff),
+            static_cast<unsigned char>((value >> 8) & 0xff),
+            static_cast<unsigned char>(value & 0xff)
+        };
+        outData.append(bytes, sizeof(bytes));
     }
 
     static juce::String getQueryParam(const juce::String& requestTarget, const juce::String& key)
@@ -265,13 +301,14 @@ img,canvas{display:block;width:100%;height:100%;object-fit:contain}
 <section class="camera-panel">
   <label>Camera <select id="camSelect"><option value="">Default camera</option></select></label>
   <label>Codec <select id="camCodec"><option value="h264">H.264</option><option value="mjpeg">MJPEG</option><option value="vp8">VP8</option></select></label>
-  <label>FPS <select id="camFps"><option value="30">30</option><option value="24">24</option><option value="15">15</option></select></label>
+  <label>Size <select id="camSize"><option value="320x180">320x180</option><option value="640x360" selected>640x360</option><option value="800x450">800x450</option><option value="1280x720">1280x720</option></select></label>
+  <label>FPS <select id="camFps"><option value="10">10</option><option value="15">15</option><option value="24">24</option><option value="30" selected>30</option></select></label>
   <button id="camRefresh" type="button">Refresh</button>
   <button id="camStart" type="button">Start browser camera</button>
   <button id="camStop" type="button" disabled>Stop</button>
   <video id="browserPreview" autoplay muted playsinline></video>
   <span id="camStatus">Choose a camera here to send Zap video.</span>
-  <canvas id="browserCanvas" width="1280" height="720" style="display:none"></canvas>
+  <canvas id="browserCanvas" width="640" height="360" style="display:none"></canvas>
 </section>
 <main id="grid"><div class="empty">No Zap video streams yet</div></main>
 <script>
@@ -279,6 +316,7 @@ const grid=document.getElementById('grid');
 const statusEl=document.getElementById('status');
 const camSelect=document.getElementById('camSelect');
 const camCodec=document.getElementById('camCodec');
+const camSize=document.getElementById('camSize');
 const camFps=document.getElementById('camFps');
 const camRefresh=document.getElementById('camRefresh');
 const camStart=document.getElementById('camStart');
@@ -295,17 +333,34 @@ let browserFrameCounter=0;
 let browserSendArmed=false;
 let browserEncoder=null;
 let browserEncoderCodec='mjpeg';
+let browserEncoderH264Format='avc';
 let browserEncodeStarts=new Map();
 let browserLastCodecConfig='';
 let browserLastKeyframeMs=0;
 let browserForceNextKeyframe=false;
 let browserLastKeyframeRequestId='';
 let browserCameraStateTimer=0;
+let refreshInFlight=false;
 function ms(value){
   const n=Number(value||0);
   return Number.isFinite(n)&&n>0?String(Math.round(n)):'0';
 }
 function setCamStatus(text){ camStatus.textContent=text; }
+function selectedTransportSize(){
+  const parts=String(camSize.value||'640x360').split('x');
+  const width=Math.max(160,Math.min(1280,parseInt(parts[0]||'640',10)||640));
+  const height=Math.max(90,Math.min(720,parseInt(parts[1]||'360',10)||360));
+  return {width,height};
+}
+function selectedTransportFps(){
+  return Math.max(1,Math.min(30,parseInt(camFps.value||'30',10)||30));
+}
+function transportBitrate(codec,width,height,fps){
+  const pixels=width*height;
+  const fpsScale=Math.max(0.5,fps/30);
+  const base=codec==='h264'?650000:850000;
+  return Math.max(codec==='h264'?90000:120000,Math.round(base*(pixels/(640*360))*fpsScale));
+}
 function bytesToBase64(bytes){
   let binary='';
   for(let i=0;i<bytes.length;i+=8192){
@@ -329,6 +384,54 @@ function avccToZapConfigBase64(description){
   const ppsLen=(bytes[p]<<8)|bytes[p+1]; p+=2;
   if(ppsLen<=0||p+ppsLen>bytes.length) return '';
   const pps=bytes.slice(p,p+ppsLen);
+  const out=new Uint8Array(2+sps.length+2+pps.length);
+  out[0]=(sps.length>>8)&255; out[1]=sps.length&255; out.set(sps,2);
+  const ppsOffset=2+sps.length;
+  out[ppsOffset]=(pps.length>>8)&255; out[ppsOffset+1]=pps.length&255; out.set(pps,ppsOffset+2);
+  return bytesToBase64(out);
+}
+function splitAnnexBNals(bytes){
+  const nals=[];
+  const findStart=(from)=>{
+    for(let i=from;i+3<bytes.length;i++){
+      if(bytes[i]===0&&bytes[i+1]===0&&bytes[i+2]===1) return {pos:i,len:3};
+      if(i+4<bytes.length&&bytes[i]===0&&bytes[i+1]===0&&bytes[i+2]===0&&bytes[i+3]===1) return {pos:i,len:4};
+    }
+    return null;
+  };
+  let current=findStart(0);
+  while(current){
+    const nalStart=current.pos+current.len;
+    const next=findStart(nalStart);
+    const nalEnd=next?next.pos:bytes.length;
+    if(nalEnd>nalStart) nals.push(bytes.slice(nalStart,nalEnd));
+    current=next;
+  }
+  return nals;
+}
+function h264NalsToAvcc(nals){
+  const frameNals=nals.filter(nal=>{
+    const type=nal.length?nal[0]&31:0;
+    return type!==7&&type!==8&&type!==9;
+  });
+  let size=0;
+  frameNals.forEach(nal=>{ size+=4+nal.length; });
+  const out=new Uint8Array(size);
+  let p=0;
+  frameNals.forEach(nal=>{
+    out[p++]=(nal.length>>>24)&255;
+    out[p++]=(nal.length>>>16)&255;
+    out[p++]=(nal.length>>>8)&255;
+    out[p++]=nal.length&255;
+    out.set(nal,p);
+    p+=nal.length;
+  });
+  return out;
+}
+function h264ConfigFromNalsBase64(nals){
+  const sps=nals.find(nal=>nal.length&&((nal[0]&31)===7));
+  const pps=nals.find(nal=>nal.length&&((nal[0]&31)===8));
+  if(!sps||!pps||sps.length>65535||pps.length>65535) return '';
   const out=new Uint8Array(2+sps.length+2+pps.length);
   out[0]=(sps.length>>8)&255; out[1]=sps.length&255; out.set(sps,2);
   const ppsOffset=2+sps.length;
@@ -397,13 +500,14 @@ function stopBrowserCamera(disarm=true){
   if(browserStream){ browserStream.getTracks().forEach(track=>track.stop()); browserStream=null; }
   browserPreview.srcObject=null;
   browserPosting=false;
+  browserEncoderH264Format='avc';
   camStart.disabled=false;
   camStop.disabled=true;
   if(disarm) disarmBrowserZapSend();
   setCamStatus('Browser camera stopped');
 }
 function scheduleBrowserFrame(){
-  const fps=Math.max(1,Math.min(30,parseInt(camFps.value||'30',10)||30));
+  const fps=selectedTransportFps();
   browserTimer=setTimeout(captureBrowserFrame,1000/fps);
 }
 async function postBrowserJpeg(blob,captureStartedMs,encodeMs,width,height){
@@ -440,30 +544,57 @@ async function postBrowserEncodedBytes(bytes,codec,captureStartedMs,encodeMs,wid
   setCamStatus('Browser camera sending '+codec.toUpperCase()+' '+String(width)+'x'+String(height)+' @ '+camFps.value+'fps');
 }
 async function handleEncodedBrowserChunk(chunk,metadata){
-  const info=browserEncodeStarts.get(chunk.timestamp)||{captureStartedMs:performance.now(),width:1280,height:720};
+  const fallbackSize=selectedTransportSize();
+  const info=browserEncodeStarts.get(chunk.timestamp)||{captureStartedMs:performance.now(),width:fallbackSize.width,height:fallbackSize.height};
   browserEncodeStarts.delete(chunk.timestamp);
   const bytes=new Uint8Array(chunk.byteLength);
   chunk.copyTo(bytes);
   const encodeMs=Math.max(0,performance.now()-info.captureStartedMs);
   let configBase64='';
-  if(browserEncoderCodec==='h264'&&metadata&&metadata.decoderConfig&&metadata.decoderConfig.description){
-    configBase64=avccToZapConfigBase64(new Uint8Array(metadata.decoderConfig.description));
-    if(configBase64===browserLastCodecConfig) configBase64='';
-    else browserLastCodecConfig=configBase64;
+  let frameBytes=bytes;
+  let keyFrame=chunk.type==='key';
+  if(browserEncoderCodec==='h264'&&browserEncoderH264Format==='annexb'){
+    const nals=splitAnnexBNals(bytes);
+    const annexConfig=h264ConfigFromNalsBase64(nals);
+    if(annexConfig) configBase64=annexConfig;
+    keyFrame=keyFrame||nals.some(nal=>nal.length&&((nal[0]&31)===5));
+    frameBytes=h264NalsToAvcc(nals);
+    if(!frameBytes.length) return;
   }
-  await postBrowserEncodedBytes(bytes,browserEncoderCodec,info.captureStartedMs,encodeMs,info.width,info.height,chunk.type==='key',configBase64);
+  if(browserEncoderCodec==='h264'&&metadata&&metadata.decoderConfig&&metadata.decoderConfig.description){
+    const avcConfig=avccToZapConfigBase64(new Uint8Array(metadata.decoderConfig.description));
+    if(avcConfig) configBase64=avcConfig;
+  }
+  if(configBase64) browserLastCodecConfig=configBase64;
+  else if(browserEncoderCodec==='h264'&&keyFrame&&browserLastCodecConfig) configBase64=browserLastCodecConfig;
+  await postBrowserEncodedBytes(frameBytes,browserEncoderCodec,info.captureStartedMs,encodeMs,info.width,info.height,keyFrame,configBase64);
 }
 async function getSupportedEncoderConfig(codec,width,height,fps){
   if(codec==='mjpeg') return null;
   if(!('VideoEncoder' in window)||!('VideoFrame' in window)) return null;
-  const base=codec==='h264'
-    ? {codec:'avc1.42E01F',width,height,bitrate:1200000,framerate:fps,latencyMode:'realtime',avc:{format:'avc'}}
-    : {codec:'vp8',width,height,bitrate:1000000,framerate:fps,latencyMode:'realtime'};
-  const preferred=Object.assign({},base,{hardwareAcceleration:'prefer-hardware'});
-  const preferredSupport=await VideoEncoder.isConfigSupported(preferred).catch(()=>null);
-  if(!preferredSupport||preferredSupport.supported!==false) return preferred;
-  const fallbackSupport=await VideoEncoder.isConfigSupported(base).catch(()=>null);
-  if(!fallbackSupport||fallbackSupport.supported!==false) return base;
+  browserEncoderH264Format='avc';
+  const bitrate=transportBitrate(codec,width,height,fps);
+  const bases=codec==='h264'
+    ? [
+        {codec:'avc1.42E01F',width,height,bitrate,framerate:fps,latencyMode:'realtime',avc:{format:'annexb'}},
+        {codec:'avc1.42E01F',width,height,bitrate,framerate:fps,latencyMode:'realtime',avc:{format:'avc'}}
+      ]
+    : [
+        {codec:'vp8',width,height,bitrate,framerate:fps,latencyMode:'realtime'}
+      ];
+  for(const base of bases){
+    const preferred=Object.assign({},base,{hardwareAcceleration:'prefer-hardware'});
+    const preferredSupport=await VideoEncoder.isConfigSupported(preferred).catch(()=>null);
+    if(!preferredSupport||preferredSupport.supported!==false){
+      if(codec==='h264') browserEncoderH264Format=base.avc&&base.avc.format==='annexb'?'annexb':'avc';
+      return preferred;
+    }
+    const fallbackSupport=await VideoEncoder.isConfigSupported(base).catch(()=>null);
+    if(!fallbackSupport||fallbackSupport.supported!==false){
+      if(codec==='h264') browserEncoderH264Format=base.avc&&base.avc.format==='annexb'?'annexb':'avc';
+      return base;
+    }
+  }
   return null;
 }
 async function startBrowserVideoEncoder(codec,width,height,fps){
@@ -483,8 +614,7 @@ function captureBrowserFrame(){
     if(browserStream) scheduleBrowserFrame();
     return;
   }
-  const width=1280;
-  const height=720;
+  const {width,height}=selectedTransportSize();
   const captureStartedMs=performance.now();
   try{
     if(browserEncoder){
@@ -495,8 +625,13 @@ function captureBrowserFrame(){
       }
       const timestamp=Math.round(captureStartedMs*1000);
       browserEncodeStarts.set(timestamp,{captureStartedMs,width,height});
-      const frame=new VideoFrame(browserPreview,{timestamp});
-      const needsKey=browserForceNextKeyframe||(captureStartedMs-browserLastKeyframeMs)>2000;
+      browserCanvas.width=width;
+      browserCanvas.height=height;
+      browserCtx.drawImage(browserPreview,0,0,width,height);
+      const frame=new VideoFrame(browserCanvas,{timestamp});
+      const needsKey=browserEncoderCodec==='h264'
+        || browserForceNextKeyframe
+        || (captureStartedMs-browserLastKeyframeMs)>2000;
       if(needsKey) browserLastKeyframeMs=captureStartedMs;
       browserForceNextKeyframe=false;
       browserEncoder.encode(frame,{keyFrame:needsKey});
@@ -532,9 +667,10 @@ async function startBrowserCamera(){
     setCamStatus('Browser camera API unavailable');
     return;
   }
-  const fps=Math.max(1,Math.min(30,parseInt(camFps.value||'30',10)||30));
+  const fps=selectedTransportFps();
   const codec=String(camCodec.value||'h264').toLowerCase();
-  const video={width:{ideal:1280,max:1280},height:{ideal:720,max:720},frameRate:{ideal:fps,max:fps}};
+  const {width,height}=selectedTransportSize();
+  const video={width:{ideal:width,max:width},height:{ideal:height,max:height},frameRate:{ideal:fps,max:fps}};
   if(camSelect.value) video.deviceId={exact:camSelect.value};
   try{
     browserStream=await navigator.mediaDevices.getUserMedia({audio:false,video});
@@ -544,7 +680,7 @@ async function startBrowserCamera(){
     browserEncoderCodec='mjpeg';
     if(codec!=='mjpeg'){
       try{
-        await startBrowserVideoEncoder(codec,1280,720,fps);
+        await startBrowserVideoEncoder(codec,width,height,fps);
       }catch(encoderError){
         activeCodec='mjpeg';
         browserEncoderCodec='mjpeg';
@@ -603,6 +739,10 @@ function tileFor(stream){
   tile._decodeBufferId='';
   tile._lastDecodedFrameIndex=-1;
   tile._targetFrameIndex=-1;
+  tile._latestStream=null;
+  tile._playbackClockBufferId='';
+  tile._playbackClockStartMs=0;
+  tile._playbackClockDurationMs=1000;
   tiles.set(stream.streamKey,tile);
   grid.appendChild(tile);
   return tile;
@@ -650,6 +790,15 @@ function vp8FrameType(bytes){
   return bytes.length>0&&((bytes[0]&1)===0)?'key':'delta';
 }
 function frameIndexOf(stream){
+  const localStart=Number(stream._localPlaybackStartMs||0);
+  const localDuration=Number(stream._localPlaybackDurationMs||0);
+  const localFrameCount=Number(stream.frameCount||0);
+  if(Number.isFinite(localStart)&&localStart>0
+     && Number.isFinite(localDuration)&&localDuration>1
+     && Number.isFinite(localFrameCount)&&localFrameCount>1){
+    const progress=Math.max(0,Math.min(0.999999,(performance.now()-localStart)/localDuration));
+    return Math.max(0,Math.min(localFrameCount-1,Math.floor(progress*localFrameCount)));
+  }
   const n=Number(stream.playbackFrameIndex||0);
   return Number.isFinite(n)&&n>=0?Math.floor(n):0;
 }
@@ -660,6 +809,24 @@ function frameUrl(stream,frameIndex){
   return '/zap-frame?stream='+encodeURIComponent(stream.streamKey)
     +'&frame='+encodeURIComponent(String(frameIndexOf({playbackFrameIndex:frameIndex})))
     +'&r='+encodeURIComponent(String(bufferIdOf(stream))+'-'+String(frameIndex));
+}
+function frameBatchUrl(stream,fromFrame,toFrame){
+  return '/zap-frame-batch?stream='+encodeURIComponent(stream.streamKey)
+    +'&from='+encodeURIComponent(String(Math.max(0,fromFrame|0)))
+    +'&to='+encodeURIComponent(String(Math.max(0,toFrame|0)))
+    +'&r='+encodeURIComponent(String(bufferIdOf(stream))+'-'+String(fromFrame)+'-'+String(toFrame));
+}
+function parseFrameBatch(bytes){
+  const frames=[];
+  let offset=0;
+  while(offset+4<=bytes.length){
+    const len=((bytes[offset]<<24)|(bytes[offset+1]<<16)|(bytes[offset+2]<<8)|bytes[offset+3])>>>0;
+    offset+=4;
+    if(offset+len>bytes.length) break;
+    frames.push(len>0?bytes.slice(offset,offset+len):new Uint8Array());
+    offset+=len;
+  }
+  return frames;
 }
 async function ensureH264Decoder(tile,stream){
   if(!('VideoDecoder' in window)){
@@ -698,7 +865,7 @@ async function ensureH264Decoder(tile,stream){
       tile._note.textContent='';
     },
     error(err){
-      tile._note.textContent='H.264 decode error';
+      tile._note.textContent='H.264 decode error: '+String(err&&err.message?err.message:err);
       tile._h264SeenKey=false;
       try{ if(tile._decoder) tile._decoder.close(); }catch(e){}
       tile._decoder=null;
@@ -750,21 +917,25 @@ async function ensureVp8Decoder(tile){
 async function renderH264(tile,stream){
   const bufferId=bufferIdOf(stream);
   const targetFrameIndex=frameIndexOf(stream);
+  const renderToken=bufferId+'-'+String(targetFrameIndex);
   if(tile._decodeBufferId!==bufferId){
     tile._decodeBufferId=bufferId;
     tile._lastDecodedFrameIndex=-1;
     tile._targetFrameIndex=-1;
   }
   tile._targetFrameIndex=Math.max(tile._targetFrameIndex||0,targetFrameIndex);
-  if(tile._h264Pending||tile._lastRenderedRefreshId===String(stream.refreshId||'')) return;
+  if(tile._h264Pending||tile._lastRenderedRefreshId===renderToken) return;
   tile._h264Pending=true;
   try{
     if(!await ensureH264Decoder(tile,stream)) return;
-    while(tile._lastDecodedFrameIndex<tile._targetFrameIndex){
-      const nextFrame=tile._lastDecodedFrameIndex+1;
-      const res=await fetch(frameUrl(stream,nextFrame),{cache:'no-store'});
-      if(!res.ok) break;
-      const bytes=new Uint8Array(await res.arrayBuffer());
+    const fromFrame=tile._lastDecodedFrameIndex+1;
+    const toFrame=Math.min(tile._targetFrameIndex,fromFrame+89);
+    const res=await fetch(frameBatchUrl(stream,fromFrame,toFrame),{cache:'no-store'});
+    if(!res.ok) return;
+    const batch=parseFrameBatch(new Uint8Array(await res.arrayBuffer()));
+    for(let i=0;i<batch.length;i++){
+      const nextFrame=fromFrame+i;
+      const bytes=batch[i];
       if(!bytes.length) break;
       const type=h264FrameType(bytes);
       if(type==='key') tile._h264SeenKey=true;
@@ -780,9 +951,9 @@ async function renderH264(tile,stream){
       }));
       tile._lastDecodedFrameIndex=nextFrame;
     }
-    tile._lastRenderedRefreshId=String(stream.refreshId||'');
+    tile._lastRenderedRefreshId=renderToken;
   }catch(e){
-    tile._note.textContent='H.264 browser decode failed';
+    tile._note.textContent='H.264 browser decode failed: '+String(e&&e.message?e.message:e);
     if(tile._decoder){ try{tile._decoder.close();}catch(closeErr){} tile._decoder=null; }
   }finally{
     tile._h264Pending=false;
@@ -791,21 +962,25 @@ async function renderH264(tile,stream){
 async function renderVp8(tile,stream){
   const bufferId=bufferIdOf(stream);
   const targetFrameIndex=frameIndexOf(stream);
+  const renderToken=bufferId+'-'+String(targetFrameIndex);
   if(tile._decodeBufferId!==bufferId){
     tile._decodeBufferId=bufferId;
     tile._lastDecodedFrameIndex=-1;
     tile._targetFrameIndex=-1;
   }
   tile._targetFrameIndex=Math.max(tile._targetFrameIndex||0,targetFrameIndex);
-  if(tile._vp8Pending||tile._lastRenderedRefreshId===String(stream.refreshId||'')) return;
+  if(tile._vp8Pending||tile._lastRenderedRefreshId===renderToken) return;
   tile._vp8Pending=true;
   try{
     if(!await ensureVp8Decoder(tile)) return;
-    while(tile._lastDecodedFrameIndex<tile._targetFrameIndex){
-      const nextFrame=tile._lastDecodedFrameIndex+1;
-      const res=await fetch(frameUrl(stream,nextFrame),{cache:'no-store'});
-      if(!res.ok) break;
-      const bytes=new Uint8Array(await res.arrayBuffer());
+    const fromFrame=tile._lastDecodedFrameIndex+1;
+    const toFrame=Math.min(tile._targetFrameIndex,fromFrame+89);
+    const res=await fetch(frameBatchUrl(stream,fromFrame,toFrame),{cache:'no-store'});
+    if(!res.ok) return;
+    const batch=parseFrameBatch(new Uint8Array(await res.arrayBuffer()));
+    for(let i=0;i<batch.length;i++){
+      const nextFrame=fromFrame+i;
+      const bytes=batch[i];
       if(!bytes.length) break;
       const type=vp8FrameType(bytes);
       if(type==='key') tile._vp8SeenKey=true;
@@ -821,7 +996,7 @@ async function renderVp8(tile,stream){
       }));
       tile._lastDecodedFrameIndex=nextFrame;
     }
-    tile._lastRenderedRefreshId=String(stream.refreshId||'');
+    tile._lastRenderedRefreshId=renderToken;
   }catch(e){
     tile._note.textContent='VP8 browser decode failed';
     if(tile._decoder){ try{tile._decoder.close();}catch(closeErr){} tile._decoder=null; }
@@ -853,9 +1028,34 @@ function renderStream(tile,stream){
     nextImg.onload=()=>{ if(tile._lastImgUrl===url) tile._img.src=url; };
     nextImg.src=url;
   }
-  tile._lastRenderedRefreshId=String(stream.refreshId||'');
+  tile._lastRenderedRefreshId=bufferIdOf(stream)+'-'+String(frameIndexOf(stream));
+}
+function updateTilePlaybackClock(tile,stream){
+  const bufferId=bufferIdOf(stream);
+  const duration=Math.max(1,Number(stream.playbackDurationMs||0)||1000);
+  const age=Math.max(0,Number(stream.playbackAgeMs||0)||0);
+  const proposedStart=performance.now()-age;
+  if(tile._playbackClockBufferId!==bufferId
+     || Math.abs(proposedStart-tile._playbackClockStartMs)>250
+     || Math.abs(duration-tile._playbackClockDurationMs)>1){
+    tile._playbackClockBufferId=bufferId;
+    tile._playbackClockStartMs=proposedStart;
+    tile._playbackClockDurationMs=duration;
+  }
+  const localStream=Object.assign({},stream);
+  localStream._localPlaybackStartMs=tile._playbackClockStartMs;
+  localStream._localPlaybackDurationMs=tile._playbackClockDurationMs;
+  tile._latestStream=localStream;
+}
+function renderTiles(){
+  for(const [,tile] of tiles){
+    if(tile._latestStream) renderStream(tile,tile._latestStream);
+  }
+  requestAnimationFrame(renderTiles);
 }
 async function refresh(){
+  if(refreshInFlight) return;
+  refreshInFlight=true;
   try{
     const res=await fetch('/zap-frames',{cache:'no-store'});
     const streams=await res.json();
@@ -864,9 +1064,9 @@ async function refresh(){
     streams.forEach(stream=>{
       live.add(stream.streamKey);
       const tile=tileFor(stream);
-      const timing=' q '+ms(stream.decodeQueueMs)+'ms dec '+ms(stream.decodeMs)+'ms pub '+ms(stream.receiveToPublishMs)+'ms late '+ms(stream.playbackOffsetMs)+'ms cap '+ms(stream.senderCaptureQueueMs)+'ms enc '+ms(stream.senderEncodeMs)+'ms';
+      updateTilePlaybackClock(tile,stream);
+      const timing=' frames '+String(stream.frameCount||0)+' q '+ms(stream.decodeQueueMs)+'ms dec '+ms(stream.decodeMs)+'ms pub '+ms(stream.receiveToPublishMs)+'ms late '+ms(stream.playbackOffsetMs)+'ms dur '+ms(stream.playbackDurationMs)+'ms age '+ms(stream.playbackAgeMs)+'ms cap '+ms(stream.senderCaptureQueueMs)+'ms enc '+ms(stream.senderEncodeMs)+'ms';
       tile._label.textContent=(stream.sender||'Unknown')+' - channel '+String((stream.channelIndex||0)+1)+' '+String(stream.codec||'mjpeg').toUpperCase()+timing;
-      renderStream(tile,stream);
     });
     for(const [key,tile] of tiles){
       if(!live.has(key)){
@@ -884,9 +1084,12 @@ async function refresh(){
     statusEl.textContent=streams.length?String(streams.length)+' stream'+(streams.length===1?'':'s'):'Waiting for video frames';
   }catch(e){
     statusEl.textContent='Waiting for local helper';
+  }finally{
+    refreshInFlight=false;
   }
 }
 refresh();
+requestAnimationFrame(renderTiles);
 setInterval(refresh,33);
 </script>
 </body>
@@ -1136,6 +1339,45 @@ setInterval(refresh,33);
             response.statusText = "Not Found";
             response.contentType = "text/plain; charset=utf-8";
             response.body = makeUtf8Body("No Zap frame");
+            if (isHead)
+                response.body.reset();
+            return response;
+        }
+
+        if (path == "/zap-frame-batch")
+        {
+            HttpResponse response;
+            response.contentType = "application/octet-stream";
+            response.noStore = true;
+            const juce::String streamKey = getQueryParam(requestTarget, "stream");
+            const int fromFrame = juce::jmax(0, getQueryParam(requestTarget, "from").getIntValue());
+            const int toFrame = juce::jmax(fromFrame, getQueryParam(requestTarget, "to").getIntValue());
+            const int limitedToFrame = juce::jmin(toFrame, fromFrame + 119);
+            if (streamKey.isNotEmpty() && zapFrameProvider)
+            {
+                for (int frameIndex = fromFrame; frameIndex <= limitedToFrame; ++frameIndex)
+                {
+                    juce::MemoryBlock frame;
+                    if (zapFrameProvider(streamKey, frameIndex, frame) && frame.getSize() > 0)
+                    {
+                        appendBe32(response.body, static_cast<juce::uint32>(juce::jmin<size_t>(frame.getSize(), 0xffffffffu)));
+                        response.body.append(frame.getData(), frame.getSize());
+                    }
+                    else
+                    {
+                        appendBe32(response.body, 0);
+                    }
+                }
+
+                if (isHead)
+                    response.body.reset();
+                return response;
+            }
+
+            response.statusCode = 404;
+            response.statusText = "Not Found";
+            response.contentType = "text/plain; charset=utf-8";
+            response.body = makeUtf8Body("No Zap frames");
             if (isHead)
                 response.body.reset();
             return response;
@@ -2713,6 +2955,122 @@ static int normaliseSignedIntervalPosition(int positionSamples, int intervalLeng
     return normalised;
 }
 
+static juce::StringArray extractPublicServerUserNames(const juce::var& usersVar)
+{
+    juce::StringArray names;
+    auto* usersArray = usersVar.getArray();
+    if (usersArray == nullptr)
+        return names;
+
+    for (const auto& userVar : *usersArray)
+    {
+        juce::String name;
+        if (auto* userObj = userVar.getDynamicObject())
+        {
+            name = userObj->getProperty("name").toString();
+            if (name.isEmpty())
+                name = userObj->getProperty("username").toString();
+            if (name.isEmpty())
+                name = userObj->getProperty("user").toString();
+        }
+        else
+        {
+            name = userVar.toString();
+        }
+
+        name = name.trim();
+        if (name.isNotEmpty())
+            names.addIfNotAlreadyThere(name);
+    }
+
+    names.sortNatural();
+    return names;
+}
+
+static juce::String stripAnonymousPrefix(juce::String user)
+{
+    user = user.trim();
+    if (user.startsWithIgnoreCase("anonymous:"))
+        return user.fromFirstOccurrenceOf(":", false, false).trim();
+    return user;
+}
+
+static juce::String buildNumberedUserName(const juce::String& originalUser, int attempt)
+{
+    const juce::String trimmed = originalUser.trim();
+    const bool isAnonymous = trimmed.startsWithIgnoreCase("anonymous:");
+    juce::String base = stripAnonymousPrefix(trimmed);
+    if (base.isEmpty())
+        base = "jammer";
+
+    while (base.isNotEmpty() && juce::CharacterFunctions::isDigit(base.getLastCharacter()))
+        base = base.dropLastCharacters(1);
+    base = base.trim();
+    if (base.isEmpty())
+        base = "jammer";
+
+    const juce::String numbered = base + juce::String(juce::jmax(2, attempt + 1));
+    return isAnonymous ? "anonymous:" + numbered : numbered;
+}
+
+static juce::String chooseAvailableUserNameForServer(const juce::String& requestedUser,
+                                                     const std::vector<NinjamVst3AudioProcessor::PublicServerInfo>& servers,
+                                                     const juce::String& host)
+{
+    const juce::String requestedTrimmed = requestedUser.trim();
+    juce::String base = stripAnonymousPrefix(requestedTrimmed);
+    if (base.isEmpty())
+        return requestedTrimmed;
+
+    juce::String hostOnly = host.upToFirstOccurrenceOf(":", false, false).trim();
+    const int requestedPort = host.fromFirstOccurrenceOf(":", false, false).getIntValue();
+    juce::StringArray existing;
+    for (const auto& server : servers)
+    {
+        const bool hostMatches = server.host.equalsIgnoreCase(hostOnly) || server.name.equalsIgnoreCase(host);
+        const bool portMatches = requestedPort <= 0 || server.port == requestedPort;
+        if (hostMatches && portMatches)
+        {
+            existing = server.userNames;
+            break;
+        }
+    }
+
+    if (existing.isEmpty())
+        return requestedTrimmed;
+
+    auto nameExists = [&existing](const juce::String& candidate)
+    {
+        const juce::String shortCandidate = stripAnonymousPrefix(candidate);
+        for (const auto& existingName : existing)
+            if (stripAnonymousPrefix(existingName).equalsIgnoreCase(shortCandidate))
+                return true;
+        return false;
+    };
+
+    if (!nameExists(requestedTrimmed))
+        return requestedTrimmed;
+
+    for (int attempt = 1; attempt <= 3; ++attempt)
+    {
+        const juce::String candidate = buildNumberedUserName(requestedTrimmed, attempt);
+        if (!nameExists(candidate))
+            return candidate;
+    }
+
+    return buildNumberedUserName(requestedTrimmed, 1);
+}
+
+static bool looksLikeDuplicateNameError(const juce::String& errorText)
+{
+    const juce::String err = errorText.trim().toLowerCase();
+    return err.contains("name")
+        && (err.contains("use")
+            || err.contains("taken")
+            || err.contains("duplicate")
+            || err.contains("already"));
+}
+
 static int computeHostIntervalPhasePositionSamples(const juce::AudioPlayHead::CurrentPositionInfo& hostInfo,
                                                    double sampleRate,
                                                    int bpi,
@@ -3848,6 +4206,19 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
         pass = "anon";
     }
 
+    pendingConnectHost = host;
+    pendingConnectOriginalUser = user;
+    pendingConnectPass = pass;
+    pendingConnectNameAttempt = 0;
+    duplicateNameRetryEnabled = true;
+
+    {
+        const juce::ScopedLock lock(serverListLock);
+        user = chooseAvailableUserNameForServer(user, publicServers, host);
+        if (user != pendingConnectOriginalUser)
+            pendingConnectNameAttempt = 1;
+    }
+
     {
         const juce::ScopedLock lock(opusSyncPeerLock);
         opusSyncPeers.clear();
@@ -3903,6 +4274,8 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
 
 void NinjamVst3AudioProcessor::disconnectFromServer()
 {
+    duplicateNameRetryEnabled = false;
+    pendingConnectNameAttempt = 0;
     {
         const juce::ScopedLock clientLock(ninjamClientLock);
         stopNinjamZapVideoTransportForDisconnect();
@@ -5390,7 +5763,8 @@ void NinjamVst3AudioProcessor::enqueueNinjamZapCameraFrameChunk(juce::MemoryBloc
     if (!ninjamZapVideoStreamOpen.load(std::memory_order_relaxed))
         return;
 
-    while (pendingNinjamZapCameraChunks.size() >= 16)
+    static constexpr size_t maxPendingZapCameraChunks = 360;
+    while (pendingNinjamZapCameraChunks.size() >= maxPendingZapCameraChunks)
         pendingNinjamZapCameraChunks.erase(pendingNinjamZapCameraChunks.begin());
 
     PendingNinjamZapCameraChunk pending;
@@ -5602,6 +5976,54 @@ void NinjamVst3AudioProcessor::publishBrowserDecodedZapVideoFrame(const ZapVideo
     if (job.audioGuidHex.isNotEmpty())
     {
         const juce::ScopedLock lock(zapVideoFrameLock);
+        auto& promotedGuids = zapVideoPromotedGuidsByStream[job.streamKey];
+        for (auto it = promotedGuids.begin(); it != promotedGuids.end();)
+        {
+            if (nowMs - it->second > 30000.0)
+                it = promotedGuids.erase(it);
+            else
+                ++it;
+        }
+
+        if (promotedGuids.find(job.audioGuidHex) != promotedGuids.end())
+        {
+            auto playbackIt = zapVideoPlaybackByStream.find(job.streamKey);
+            if (playbackIt != zapVideoPlaybackByStream.end()
+                && playbackIt->second.audioGuidHex == job.audioGuidHex)
+            {
+                auto& playback = playbackIt->second;
+                while (playback.frames.size() >= 360)
+                    playback.frames.erase(playback.frames.begin());
+                playback.frames.push_back(std::move(encodedData));
+                playback.info.lastUpdateMs = nowMs;
+                playback.info.lastReceiveToPublishMs = receiveToPublishMs;
+                playback.info.frameCount = (int)playback.frames.size();
+                playback.info.codec = job.codec;
+                playback.info.codecConfigId = configId;
+                remoteVideoFrameInfoByUser[job.streamKey] = playback.info;
+                return;
+            }
+            return;
+        }
+
+        auto deferredIt = zapVideoDeferredPlaybackByStream.find(job.streamKey);
+        if (deferredIt != zapVideoDeferredPlaybackByStream.end()
+            && deferredIt->second.audioGuidHex == job.audioGuidHex)
+        {
+            auto& intervalBuffer = deferredIt->second;
+            intervalBuffer.lastUpdateMs = nowMs;
+            intervalBuffer.lastDecodeQueueMs = 0.0;
+            intervalBuffer.lastDecodeMs = 0.0;
+            intervalBuffer.lastReceiveToPublishMs = receiveToPublishMs;
+            intervalBuffer.decodedFrameCount += 1;
+            intervalBuffer.codec = job.codec;
+            intervalBuffer.codecConfigId = configId;
+            while (intervalBuffer.frames.size() >= 360)
+                intervalBuffer.frames.erase(intervalBuffer.frames.begin());
+            intervalBuffer.frames.push_back(std::move(encodedData));
+            return;
+        }
+
         auto& byGuid = zapVideoDecodedIntervalsByStream[job.streamKey];
         auto& intervalBuffer = byGuid[job.audioGuidHex];
         intervalBuffer.streamKey = job.streamKey;
@@ -5616,7 +6038,7 @@ void NinjamVst3AudioProcessor::publishBrowserDecodedZapVideoFrame(const ZapVideo
         intervalBuffer.decodedFrameCount += 1;
         intervalBuffer.codec = job.codec;
         intervalBuffer.codecConfigId = configId;
-        while (intervalBuffer.frames.size() >= 180)
+        while (intervalBuffer.frames.size() >= 360)
             intervalBuffer.frames.erase(intervalBuffer.frames.begin());
         intervalBuffer.frames.push_back(std::move(encodedData));
 
@@ -5685,6 +6107,54 @@ void NinjamVst3AudioProcessor::publishDecodedZapVideoFrame(const ZapVideoDecodeJ
     if (job.audioGuidHex.isNotEmpty())
     {
         const juce::ScopedLock lock(zapVideoFrameLock);
+        auto& promotedGuids = zapVideoPromotedGuidsByStream[job.streamKey];
+        for (auto it = promotedGuids.begin(); it != promotedGuids.end();)
+        {
+            if (nowMs - it->second > 30000.0)
+                it = promotedGuids.erase(it);
+            else
+                ++it;
+        }
+
+        if (promotedGuids.find(job.audioGuidHex) != promotedGuids.end())
+        {
+            auto playbackIt = zapVideoPlaybackByStream.find(job.streamKey);
+            if (playbackIt != zapVideoPlaybackByStream.end()
+                && playbackIt->second.audioGuidHex == job.audioGuidHex)
+            {
+                auto& playback = playbackIt->second;
+                while (playback.frames.size() >= 360)
+                    playback.frames.erase(playback.frames.begin());
+                playback.frames.push_back(std::move(jpegData));
+                playback.info.lastUpdateMs = nowMs;
+                playback.info.lastDecodeQueueMs = decodeQueueMs;
+                playback.info.lastDecodeMs = decodeMs;
+                playback.info.lastReceiveToPublishMs = receiveToPublishMs;
+                playback.info.frameCount = (int)playback.frames.size();
+                playback.info.codec = ninjamplus::zap::VideoCodec::mjpeg;
+                remoteVideoFrameInfoByUser[job.streamKey] = playback.info;
+                return;
+            }
+            return;
+        }
+
+        auto deferredIt = zapVideoDeferredPlaybackByStream.find(job.streamKey);
+        if (deferredIt != zapVideoDeferredPlaybackByStream.end()
+            && deferredIt->second.audioGuidHex == job.audioGuidHex)
+        {
+            auto& intervalBuffer = deferredIt->second;
+            intervalBuffer.lastUpdateMs = nowMs;
+            intervalBuffer.lastDecodeQueueMs = decodeQueueMs;
+            intervalBuffer.lastDecodeMs = decodeMs;
+            intervalBuffer.lastReceiveToPublishMs = receiveToPublishMs;
+            intervalBuffer.decodedFrameCount += 1;
+            intervalBuffer.codec = ninjamplus::zap::VideoCodec::mjpeg;
+            while (intervalBuffer.frames.size() >= 360)
+                intervalBuffer.frames.erase(intervalBuffer.frames.begin());
+            intervalBuffer.frames.push_back(std::move(jpegData));
+            return;
+        }
+
         auto& byGuid = zapVideoDecodedIntervalsByStream[job.streamKey];
         auto& intervalBuffer = byGuid[job.audioGuidHex];
         intervalBuffer.streamKey = job.streamKey;
@@ -5698,7 +6168,7 @@ void NinjamVst3AudioProcessor::publishDecodedZapVideoFrame(const ZapVideoDecodeJ
         intervalBuffer.lastReceiveToPublishMs = receiveToPublishMs;
         intervalBuffer.decodedFrameCount += 1;
         intervalBuffer.codec = ninjamplus::zap::VideoCodec::mjpeg;
-        while (intervalBuffer.frames.size() >= 180)
+        while (intervalBuffer.frames.size() >= 360)
             intervalBuffer.frames.erase(intervalBuffer.frames.begin());
         intervalBuffer.frames.push_back(std::move(jpegData));
 
@@ -5752,7 +6222,13 @@ void NinjamVst3AudioProcessor::processPendingNinjamZapVideoPlaybackSwap()
         const juce::ScopedLock clientLock(ninjamClientLock);
         const double bpm = juce::jmax(1.0, (double)ninjamClient.GetActualBPM());
         const int bpi = juce::jmax(1, ninjamClient.GetBPI());
-        intervalDurationMs = juce::jlimit(250.0, 60000.0, (60000.0 * (double)bpi) / bpm);
+        int intervalLengthSamples = 0;
+        ninjamClient.GetPosition(nullptr, &intervalLengthSamples);
+        const double sampleRate = juce::jmax(1.0, getSampleRate());
+        if (intervalLengthSamples > 0)
+            intervalDurationMs = juce::jlimit(250.0, 60000.0, ((double)intervalLengthSamples * 1000.0) / sampleRate);
+        else
+            intervalDurationMs = juce::jlimit(250.0, 60000.0, (60000.0 * (double)bpi) / bpm);
 
         const int numUsers = ninjamClient.GetNumUsers();
         for (int userIndex = 0; userIndex < numUsers; ++userIndex)
@@ -5807,7 +6283,11 @@ void NinjamVst3AudioProcessor::processPendingNinjamZapVideoPlaybackSwap()
         if (buffer.frames.empty() || buffer.streamKey.isEmpty())
             return;
 
+        if (buffer.audioGuidHex.isNotEmpty())
+            zapVideoPromotedGuidsByStream[buffer.streamKey][buffer.audioGuidHex] = nowMs;
+
         ZapVideoPlaybackBuffer playback;
+        playback.audioGuidHex = buffer.audioGuidHex;
         playback.frames = std::move(buffer.frames);
         playback.startedMs = playbackStartMs;
         playback.durationMs = intervalDurationMs;
@@ -5982,6 +6462,8 @@ juce::String NinjamVst3AudioProcessor::buildZapVideoFrameListJson() const
         juce::uint64 refreshId = info.refreshId;
         obj->setProperty("playbackBufferId", juce::String((juce::int64) info.refreshId));
         obj->setProperty("playbackFrameIndex", 0);
+        obj->setProperty("playbackDurationMs", 0.0);
+        obj->setProperty("playbackAgeMs", 0.0);
         auto playbackIt = zapVideoPlaybackByStream.find(info.streamKey);
         if (playbackIt != zapVideoPlaybackByStream.end() && playbackIt->second.frames.size() > 1)
         {
@@ -5991,6 +6473,8 @@ juce::String NinjamVst3AudioProcessor::buildZapVideoFrameListJson() const
                                                            (size_t)std::floor(progress * (double)playback.frames.size()));
             refreshId += (juce::uint64)frameIndex;
             obj->setProperty("playbackFrameIndex", (int)frameIndex);
+            obj->setProperty("playbackDurationMs", playback.durationMs);
+            obj->setProperty("playbackAgeMs", juce::jmax(0.0, nowMs - playback.startedMs));
         }
         obj->setProperty("refreshId", juce::String((juce::int64) refreshId));
         obj->setProperty("frameCount", info.frameCount);
@@ -6051,6 +6535,7 @@ void NinjamVst3AudioProcessor::clearZapVideoFrameState()
         zapVideoDecodedIntervalsByStream.clear();
         zapVideoDeferredPlaybackByStream.clear();
         zapVideoPlaybackByStream.clear();
+        zapVideoPromotedGuidsByStream.clear();
         zapVideoCodecConfigByStream.clear();
         zapVideoCodecConfigIdByStream.clear();
     }
@@ -8256,9 +8741,14 @@ void NinjamVst3AudioProcessor::refreshPublicServers()
 
         juce::var usersVar = obj->getProperty("users");
         if (usersVar.isArray() && usersVar.getArray() != nullptr)
+        {
             info.userCount = usersVar.getArray()->size();
+            info.userNames = extractPublicServerUserNames(usersVar);
+        }
         else
+        {
             info.userCount = obj->getProperty("user_count").toString().getIntValue();
+        }
 
         info.userMax = obj->getProperty("user_max").toString().getIntValue();
         result.push_back(info);
@@ -8358,9 +8848,14 @@ void NinjamVst3AudioProcessor::refreshPublicServers()
 
         juce::var usersVar = obj->getProperty("users");
         if (usersVar.isArray() && usersVar.getArray() != nullptr)
+        {
             info.userCount = usersVar.getArray()->size();
+            info.userNames = extractPublicServerUserNames(usersVar);
+        }
         else
+        {
             info.userCount = obj->getProperty("user_count").toString().getIntValue();
+        }
 
         info.userMax = obj->getProperty("user_max").toString().getIntValue();
         result.push_back(info);
@@ -14546,9 +15041,47 @@ void NinjamVst3AudioProcessor::timerCallback()
         {
             juce::String err = juce::String::fromUTF8(ninjamClient.GetErrorStr());
             juce::Logger::writeToLog("NINJAM Error (" + juce::String(status) + "): " + err);
+
+            if (status == NJClient::NJC_STATUS_INVALIDAUTH
+                && duplicateNameRetryEnabled
+                && looksLikeDuplicateNameError(err))
+            {
+                if (pendingConnectNameAttempt < 3)
+                {
+                    const int nextAttempt = ++pendingConnectNameAttempt;
+                    const juce::String nextUser = buildNumberedUserName(pendingConnectOriginalUser, nextAttempt);
+                    addSystemChatLine("Username is already in use; retrying as " + stripAnonymousPrefix(nextUser) + ".");
+                    {
+                        const juce::ScopedLock clientLock(ninjamClientLock);
+                        applyCodecPreference();
+                        ninjamClient.Connect(pendingConnectHost.toRawUTF8(),
+                                             nextUser.toRawUTF8(),
+                                             pendingConnectPass.toRawUTF8());
+                    }
+                    currentServer = pendingConnectHost;
+                    currentUser = nextUser;
+                    refreshAbletonLinkActivation();
+                    lastStatus = NJClient::NJC_STATUS_PRECONNECT;
+                    return;
+                }
+
+                duplicateNameRetryEnabled = false;
+                pendingConnectNameAttempt = 0;
+                addSystemChatLine("Username retry failed after 3 attempts; disconnected.");
+                {
+                    const juce::ScopedLock clientLock(ninjamClientLock);
+                    ninjamClient.Disconnect();
+                }
+                currentServer = {};
+                currentUser = {};
+                refreshAbletonLinkActivation();
+                status = NJClient::NJC_STATUS_DISCONNECTED;
+            }
         }
         else if (status == NJClient::NJC_STATUS_OK)
         {
+            duplicateNameRetryEnabled = false;
+            pendingConnectNameAttempt = 0;
             juce::Logger::writeToLog("NINJAM Connected Successfully");
             opusSyncServerSupported.store(false);
             juce::Logger::writeToLog("Sending VIDEO_CAP 1");

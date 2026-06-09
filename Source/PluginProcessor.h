@@ -127,6 +127,7 @@ public:
         float bpm;
         int userCount;
         int userMax;
+        juce::StringArray userNames;
     };
 
     std::vector<PublicServerInfo> getPublicServers() const;
@@ -538,6 +539,7 @@ private:
     struct ZapVideoPlaybackBuffer
     {
         ZapVideoFrameInfo info;
+        juce::String audioGuidHex;
         std::vector<juce::MemoryBlock> frames;
         double startedMs = 0.0;
         double durationMs = 1000.0;
@@ -565,6 +567,11 @@ private:
     juce::CriticalSection processLock;
     mutable juce::CriticalSection serverListLock;
     std::vector<PublicServerInfo> publicServers;
+    juce::String pendingConnectHost;
+    juce::String pendingConnectOriginalUser;
+    juce::String pendingConnectPass;
+    int pendingConnectNameAttempt = 0;
+    bool duplicateNameRetryEnabled = false;
     
     // Chat storage
     juce::CriticalSection chatLock;
@@ -957,6 +964,7 @@ private:
     std::map<juce::String, std::map<juce::String, ZapVideoIntervalFrameBuffer>> zapVideoDecodedIntervalsByStream;
     std::map<juce::String, ZapVideoIntervalFrameBuffer> zapVideoDeferredPlaybackByStream;
     std::map<juce::String, ZapVideoPlaybackBuffer> zapVideoPlaybackByStream;
+    std::map<juce::String, std::map<juce::String, double>> zapVideoPromotedGuidsByStream;
     std::map<juce::String, juce::MemoryBlock> zapVideoCodecConfigByStream;
     std::map<juce::String, juce::uint64> zapVideoCodecConfigIdByStream;
     juce::uint64 videoBufferRefreshCounter = 0;
