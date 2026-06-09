@@ -4248,7 +4248,7 @@ private:
                                }
                                else if (result == 5)
                                {
-                                   safeThis->processor.resyncSamplePadToNinjamBpm(safeThis->padIndex);
+                                   safeThis->processor.requestSamplePadResyncToNinjamBpm(safeThis->padIndex, true);
                                    safeThis->refreshFromProcessor();
                                }
                                else if (result == 6)
@@ -4317,19 +4317,31 @@ private:
 
     void loadFile(const juce::File& file)
     {
-        if (!processor.loadSamplePad(padIndex, file))
-        {
-            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
-                                                   "Sample load failed",
-                                                   "That sample could not be loaded.");
-        }
-        else
-        {
-            processor.resyncSamplePadToNinjamBpm(padIndex);
-        }
+        juce::Component::SafePointer<SamplePadComponent> safeThis(this);
+        processor.loadSamplePadAsync(padIndex,
+                                     file,
+                                     [safeThis](bool loaded, const juce::String& error)
+                                     {
+                                         if (safeThis == nullptr)
+                                             return;
+
+                                         if (!loaded)
+                                         {
+                                             juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                                                    "Sample load failed",
+                                                                                    error.isNotEmpty()
+                                                                                        ? error
+                                                                                        : juce::String("That sample could not be loaded."));
+                                         }
+                                         else
+                                         {
+                                             safeThis->processor.requestSamplePadResyncToNinjamBpm(safeThis->padIndex, true);
+                                         }
+
+                                         safeThis->refreshFromProcessor();
+                                     });
         refreshFromProcessor();
     }
-
     void pulseHitGlow()
     {
         hitGlowUntilMs = juce::Time::getMillisecondCounterHiRes() + hitGlowDurationMs;
@@ -5647,22 +5659,28 @@ private:
 
     void loadBankFolder(const juce::File& folder)
     {
-        juce::String error;
-        if (!processor.loadSamplePadBank(folder, error))
-        {
-            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
-                                                   "Bank load failed",
-                                                   error);
-            return;
-        }
+        juce::Component::SafePointer<SamplePadsComponent> safeThis(this);
+        processor.loadSamplePadBankAsync(folder,
+                                         [safeThis, folder](bool loaded, const juce::String& error)
+                                         {
+                                             if (safeThis == nullptr)
+                                                 return;
 
-        refreshBankList(folder.getFileName());
-        refreshSampleFxControls();
-        for (auto& pad : pads)
-            if (pad != nullptr)
-                pad->refreshFromProcessor();
+                                             if (!loaded)
+                                             {
+                                                 juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                                                        "Bank load failed",
+                                                                                        error);
+                                                 return;
+                                             }
+
+                                             safeThis->refreshBankList(folder.getFileName());
+                                             safeThis->refreshSampleFxControls();
+                                             for (auto& pad : safeThis->pads)
+                                                 if (pad != nullptr)
+                                                     pad->refreshFromProcessor();
+                                         });
     }
-
     void showSaveBankDialog()
     {
         auto* alert = new juce::AlertWindow("Save Sample Bank",

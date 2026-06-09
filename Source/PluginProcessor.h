@@ -271,6 +271,9 @@ public:
         return inputIndex <= looperInputRemoteUserBase && userIndex >= 0 && userIndex < maxRemoteChordUsers;
     }
     bool loadSamplePad(int padIndex, const juce::File& file);
+    void loadSamplePadAsync(int padIndex,
+                            const juce::File& file,
+                            std::function<void(bool, const juce::String&)> completion = {});
     void clearSamplePad(int padIndex);
     void clearAllSamplePads();
     void resetSamplePadSettings();
@@ -298,6 +301,8 @@ public:
     void setSamplePadPlaybackSpeed(int padIndex, SamplePadPlaybackSpeed speed);
     SamplePadPlaybackSpeed getSamplePadPlaybackSpeed(int padIndex) const;
     void resyncSamplePadToNinjamBpm(int padIndex);
+    void requestSamplePadResyncToNinjamBpm(int padIndex, bool force = true);
+    void requestLoopedSamplePadsResync(double targetBpm);
     void syncSamplePadLoopToBeat(int padIndex);
     void undoSamplePadBpmResync(int padIndex);
     bool canUndoSamplePadBpmResync(int padIndex) const;
@@ -357,7 +362,11 @@ public:
     juce::File getSamplePadBankDirectory(const juce::String& bankName) const;
     juce::StringArray getSamplePadBankNames() const;
     bool saveSamplePadBank(const juce::String& bankName, juce::String& errorMessage);
+    void saveSamplePadBankAsync(const juce::String& bankName,
+                                std::function<void(bool, const juce::String&, const juce::String&)> completion = {});
     bool loadSamplePadBank(const juce::File& bankDirectory, juce::String& errorMessage);
+    void loadSamplePadBankAsync(const juce::File& bankDirectory,
+                                std::function<void(bool, const juce::String&)> completion = {});
     void beginStandaloneShutdown();
 
     // NINJAM callbacks
@@ -731,6 +740,12 @@ private:
     };
 
     juce::AudioFormatManager samplePadFormatManager;
+    juce::ThreadPool samplePadBackgroundPool { 1 };
+    std::shared_ptr<std::atomic<bool>> samplePadBackgroundAlive { std::make_shared<std::atomic<bool>>(true) };
+    std::array<std::atomic<juce::uint64>, numSamplePads> samplePadLoadRequestSerial {};
+    std::array<std::atomic<juce::uint64>, numSamplePads> samplePadResyncRequestSerial {};
+    std::atomic<juce::uint64> samplePadBankLoadRequestSerial { 0 };
+    std::atomic<juce::uint64> samplePadBankSaveRequestSerial { 0 };
     mutable juce::CriticalSection samplePadsLock;
     std::array<SamplePadState, numSamplePads> samplePads;
     juce::AudioBuffer<float> samplePadsRenderBuffer;
@@ -1153,6 +1168,7 @@ private:
     float getSamplePadFxSendAmount(SamplePadFxType type) const;
     void resyncLoopedSamplePadsToBpm(double targetBpm);
     void resyncSamplePadToBpm(int padIndex, double targetBpm, bool force);
+    void enqueueSamplePadResyncJob(int padIndex, double targetBpm, bool force);
     static void RemoteChannelAudioTap_Callback(void* userData,
                                                int useridx,
                                                const char* username,
