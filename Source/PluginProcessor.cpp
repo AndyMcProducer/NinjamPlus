@@ -766,7 +766,7 @@ function parseH264Config(configText){
   const pps=bytes.slice(ppsOffset+2,ppsOffset+2+ppsLen);
   if(sps.length<4||pps.length<1) return null;
   const codec='avc1.'+[sps[1],sps[2],sps[3]].map(v=>v.toString(16).padStart(2,'0')).join('').toUpperCase();
-  const avcc=new Uint8Array(7+sps.length+3+pps.length);
+  const avcc=new Uint8Array(11+sps.length+pps.length);
   let p=0;
   avcc[p++]=1; avcc[p++]=sps[1]; avcc[p++]=sps[2]; avcc[p++]=sps[3]; avcc[p++]=0xff; avcc[p++]=0xe1;
   avcc[p++]=(sps.length>>8)&255; avcc[p++]=sps.length&255; avcc.set(sps,p); p+=sps.length;
