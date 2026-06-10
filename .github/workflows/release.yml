@@ -57,9 +57,33 @@ jobs:
           "SRC_DIR=$srcDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Using SRC_DIR=$srcDir"
 
+      - name: Detect Visual Studio CMake generator
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found at $vswhere"
+          }
+
+          $installationVersion = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion
+          if ([string]::IsNullOrWhiteSpace($installationVersion)) {
+            throw "Could not detect a Visual Studio installation with C++ tools"
+          }
+
+          $majorVersion = [int]($installationVersion.Split('.')[0])
+          switch ($majorVersion) {
+            18 { $generator = "Visual Studio 18 2026" }
+            17 { $generator = "Visual Studio 17 2022" }
+            default { throw "Unsupported Visual Studio major version: $installationVersion" }
+          }
+
+          "WIN_CMAKE_GENERATOR=$generator" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Using Windows CMake generator $generator"
+
       - name: Configure
         run: >
-          cmake -S $env:SRC_DIR -B build -G "Visual Studio 17 2022" -A x64
+          cmake -S $env:SRC_DIR -B build -G "$env:WIN_CMAKE_GENERATOR" -A x64
 
       - name: Build
         run: >
