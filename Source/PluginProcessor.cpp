@@ -12112,8 +12112,6 @@ int NinjamVst3AudioProcessor::LicenseAgreementCallback(void* userData, const cha
 
 void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, const juce::String& type, const juce::String& payload)
 {
-    if (type == "intervalLatencyReport")
-        return;
     if (type == "chatAttachment")
     {
         juce::String payloadUserId;
@@ -15385,24 +15383,6 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
             line << " avg " << juce::String(averageMs) << "ms";
         if (displayServerRouteLatencyMs > 0)
             line << " srv " << juce::String(displaySenderServerLatencyMs) << "+" << juce::String(displayReceiverServerLatencyMs) << "ms";
-        line << " => " << juce::String(displayCorrectedDelayMs) << "ms";
-        juce::DynamicObject::Ptr reportObj = new juce::DynamicObject();
-        reportObj->setProperty("line", line);
-        reportObj->setProperty("interval", pending.remoteIntervalAbsolute >= 0 ? pending.remoteIntervalAbsolute : pending.remoteInterval);
-        reportObj->setProperty("beatIndex", pending.remoteBeat);
-        reportObj->setProperty("targetUserId", canonicalDelayUserKey(displaySender));
-        reportObj->setProperty("elapsedMs", elapsedMs);
-        if (averageMs >= 0)
-            reportObj->setProperty("avgMs", averageMs);
-        if (firmAverageMs >= 0)
-            reportObj->setProperty("firmMs", firmAverageMs);
-        reportObj->setProperty("senderServerLatencyMs", displaySenderServerLatencyMs);
-        reportObj->setProperty("receiverServerLatencyMs", displayReceiverServerLatencyMs);
-        reportObj->setProperty("serverRouteLatencyMs", displayServerRouteLatencyMs);
-        reportObj->setProperty("correctedDelayMs", displayCorrectedDelayMs);
-        reportObj->setProperty("eventId", "latencyReport:" + senderKey + ":" + juce::String(++sideSignalEventCounter));
-        const juce::String reportPayload = juce::JSON::toString(juce::var(reportObj.get()));
-        sendIntervalSignal("intervalLatencyReport", reportPayload);
     }
 }
 

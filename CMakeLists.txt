@@ -272,13 +272,36 @@ set(NINJAMPLUS_LOCAL_AUBIO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/local_deps/aubio-in
 find_path(AUBIO_INCLUDE_DIR
     NAMES aubio.h aubio/aubio.h
     HINTS "${NINJAMPLUS_LOCAL_AUBIO_ROOT}/include")
-find_library(AUBIO_LIBRARY
+find_library(AUBIO_LIBRARY_RELEASE
     NAMES aubio libaubio
-    HINTS "${NINJAMPLUS_LOCAL_AUBIO_ROOT}/lib")
-if (AUBIO_INCLUDE_DIR AND AUBIO_LIBRARY)
+    HINTS
+        "${NINJAMPLUS_LOCAL_AUBIO_ROOT}/lib"
+        "${CMAKE_CURRENT_SOURCE_DIR}/local_deps/aubio-build/src/Release")
+find_library(AUBIO_LIBRARY_DEBUG
+    NAMES aubiod libaubiod aubio_d libaubio_d
+    HINTS
+        "${NINJAMPLUS_LOCAL_AUBIO_ROOT}/lib"
+        "${CMAKE_CURRENT_SOURCE_DIR}/local_deps/aubio-build/src/Debug")
+if (AUBIO_INCLUDE_DIR AND (AUBIO_LIBRARY_RELEASE OR AUBIO_LIBRARY_DEBUG))
     target_include_directories(NINJAM_VST3 PRIVATE ${AUBIO_INCLUDE_DIR})
-    target_link_libraries(NINJAM_VST3 PRIVATE ${AUBIO_LIBRARY})
-    target_compile_definitions(NINJAM_VST3 PRIVATE NINJAMPLUS_HAS_AUBIO=1)
+
+    if (AUBIO_LIBRARY_RELEASE)
+        target_link_libraries(NINJAM_VST3 PRIVATE $<$<NOT:$<CONFIG:Debug>>:${AUBIO_LIBRARY_RELEASE}>)
+    endif()
+
+    if (AUBIO_LIBRARY_DEBUG)
+        target_link_libraries(NINJAM_VST3 PRIVATE $<$<CONFIG:Debug>:${AUBIO_LIBRARY_DEBUG}>)
+    endif()
+
+    if (AUBIO_LIBRARY_DEBUG)
+        target_compile_definitions(NINJAM_VST3 PRIVATE NINJAMPLUS_HAS_AUBIO=1)
+    elseif (AUBIO_LIBRARY_RELEASE)
+        target_compile_definitions(NINJAM_VST3 PRIVATE
+            $<$<CONFIG:Debug>:NINJAMPLUS_HAS_AUBIO=0>
+            $<$<NOT:$<CONFIG:Debug>>:NINJAMPLUS_HAS_AUBIO=1>)
+    else()
+        target_compile_definitions(NINJAM_VST3 PRIVATE NINJAMPLUS_HAS_AUBIO=0)
+    endif()
 else()
     target_compile_definitions(NINJAM_VST3 PRIVATE NINJAMPLUS_HAS_AUBIO=0)
 endif()

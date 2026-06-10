@@ -3813,10 +3813,10 @@ public:
     void paint(juce::Graphics& g) override
     {
         auto bounds = getLocalBounds().toFloat().reduced(1.0f);
-        const bool loaded = processor.hasSamplePadSample(padIndex);
-        const bool recording = processor.isSamplePadRecording(padIndex);
-        const bool playing = processor.isSamplePadPlaying(padIndex);
-        const bool waitingForBpiLoop = processor.isSamplePadWaitingForBpiLoop(padIndex);
+        const bool loaded = cachedLoaded;
+        const bool recording = cachedRecording;
+        const bool playing = cachedPlaying;
+        const bool waitingForBpiLoop = cachedWaitingForBpiLoop;
         const bool hover = isMouseOverOrDragging();
 
         const double nowMs = juce::Time::getMillisecondCounterHiRes();
@@ -3941,10 +3941,10 @@ public:
             g.drawRoundedRectangle(bounds.reduced(2.0f), 8.0f, 2.2f);
         }
 
-        const int loopBeats = processor.getSamplePadLoopLengthBeats(padIndex);
+        const int loopBeats = cachedLoopBeats;
         if (loopBeats > 0)
         {
-            const float progress = processor.getSamplePadLoopProgress(padIndex);
+            const float progress = cachedLoopProgress;
             const float remaining = playing ? juce::jlimit(0.0f, 1.0f, 1.0f - progress) : 1.0f;
             auto indicator = juce::Rectangle<float>(bounds.getRight() - 58.0f,
                                                     bounds.getBottom() - 30.0f,
@@ -4132,8 +4132,9 @@ public:
 
     void refreshFromProcessor()
     {
-        if (!nameLabel.isBeingEdited())
-            nameLabel.setText(processor.getSamplePadName(padIndex), juce::dontSendNotification);
+        const auto nextName = processor.getSamplePadName(padIndex);
+        if (!nameLabel.isBeingEdited() && nameLabel.getText() != nextName)
+            nameLabel.setText(nextName, juce::dontSendNotification);
         // If the editor was closed, ensure single-click editing is disabled again
         if (!nameLabel.isBeingEdited() && nameLabel.isEditable())
         {
@@ -4152,13 +4153,44 @@ public:
             }
         }
 
-        recordButton.setToggleState(processor.isSamplePadRecordArmed(padIndex)
-                                        || processor.isSamplePadRecording(padIndex),
-                                    juce::dontSendNotification);
-        matchBpiButton.setToggleState(processor.isSamplePadMatchBpiEnabled(padIndex), juce::dontSendNotification);
-        loopButton.setToggleState(processor.isSamplePadLoopEnabled(padIndex), juce::dontSendNotification);
-        reverseButton.setToggleState(processor.isSamplePadReverseEnabled(padIndex), juce::dontSendNotification);
-        duckRouteButton.setToggleState(processor.isSamplePadDuckRouteEnabled(padIndex), juce::dontSendNotification);
+        const bool recordArmed = processor.isSamplePadRecordArmed(padIndex);
+        const bool recording = processor.isSamplePadRecording(padIndex);
+        const bool matchBpiEnabled = processor.isSamplePadMatchBpiEnabled(padIndex);
+        const bool loopEnabled = processor.isSamplePadLoopEnabled(padIndex);
+        const bool reverseEnabled = processor.isSamplePadReverseEnabled(padIndex);
+        const bool duckRouteEnabled = processor.isSamplePadDuckRouteEnabled(padIndex);
+        const bool loaded = processor.hasSamplePadSample(padIndex);
+        const bool playing = processor.isSamplePadPlaying(padIndex);
+        const bool waitingForBpiLoop = processor.isSamplePadWaitingForBpiLoop(padIndex);
+        const int loopBeats = processor.getSamplePadLoopLengthBeats(padIndex);
+        const float loopProgress = loopBeats > 0 ? processor.getSamplePadLoopProgress(padIndex) : 0.0f;
+
+        const bool shouldShowRecordToggle = recordArmed || recording;
+        if (recordButton.getToggleState() != shouldShowRecordToggle)
+            recordButton.setToggleState(shouldShowRecordToggle, juce::dontSendNotification);
+        if (matchBpiButton.getToggleState() != matchBpiEnabled)
+            matchBpiButton.setToggleState(matchBpiEnabled, juce::dontSendNotification);
+        if (loopButton.getToggleState() != loopEnabled)
+            loopButton.setToggleState(loopEnabled, juce::dontSendNotification);
+        if (reverseButton.getToggleState() != reverseEnabled)
+            reverseButton.setToggleState(reverseEnabled, juce::dontSendNotification);
+        if (duckRouteButton.getToggleState() != duckRouteEnabled)
+            duckRouteButton.setToggleState(duckRouteEnabled, juce::dontSendNotification);
+
+        bool visualStateChanged = loaded != cachedLoaded
+            || recording != cachedRecording
+            || playing != cachedPlaying
+            || waitingForBpiLoop != cachedWaitingForBpiLoop
+            || loopBeats != cachedLoopBeats;
+        if (std::abs(loopProgress - cachedLoopProgress) >= 0.01f)
+            visualStateChanged = true;
+
+        cachedLoaded = loaded;
+        cachedRecording = recording;
+        cachedPlaying = playing;
+        cachedWaitingForBpiLoop = waitingForBpiLoop;
+        cachedLoopBeats = loopBeats;
+        cachedLoopProgress = loopProgress;
 
         const int triggerFlashCounter = processor.getSamplePadTriggerFlashCounter(padIndex);
         if (triggerFlashCounter != lastTriggerFlashCounter)
@@ -4167,7 +4199,10 @@ public:
             pulseHitGlow();
         }
 
-        repaint();
+        const double nowMs = juce::Time::getMillisecondCounterHiRes();
+        const bool animatedVisual = recording || playing || waitingForBpiLoop || hitGlowUntilMs > nowMs;
+        if (visualStateChanged || animatedVisual)
+            repaint();
     }
 
 private:
@@ -4371,6 +4406,12 @@ private:
     static constexpr double hitGlowDurationMs = 240.0;
     double hitGlowUntilMs = 0.0;
     int lastTriggerFlashCounter = 0;
+    bool cachedLoaded = false;
+    bool cachedRecording = false;
+    bool cachedPlaying = false;
+    bool cachedWaitingForBpiLoop = false;
+    int cachedLoopBeats = 0;
+    float cachedLoopProgress = 0.0f;
     // Hold-to-arm state
     double mouseDownAtMs = 0.0;
     bool mouseDownActive = false;
@@ -4774,8 +4815,11 @@ private:
         if (bpiLabel.getText() != bpiText)
             bpiLabel.setText(bpiText, juce::dontSendNotification);
         bpiCounter.repaint();
-        if (canDoHeavyRefresh)
+        if (canDoHeavyRefresh && (now - lastQuickSelectorRefreshMs) >= quickSelectorRefreshIntervalMs)
+        {
             refreshQuickSelectors(false);
+            lastQuickSelectorRefreshMs = now;
+        }
 
         const bool samplerControlIsBusy = samplerPopupActive
             || juce::ModifierKeys::currentModifiers.isAnyMouseButtonDown();
@@ -5767,6 +5811,7 @@ private:
     static constexpr double padAlphaFadeMs = 320.0;
     static constexpr double routeFocusHoverDelayMs = 300.0;
     static constexpr double samplerResizeRefreshSuppressMs = 220.0;
+    static constexpr double quickSelectorRefreshIntervalMs = 250.0;
     NonlinearFaderSlider volumeSlider;
     juce::Label volumeLabel;
     MasterPeakMeter peakMeter;
@@ -5775,6 +5820,7 @@ private:
     LeftClickOnlyTextButton defaultFxButton{ "NJ FX" };
     juce::Label bpiLabel;
     IntervalDisplayComponent bpiCounter;
+    double lastQuickSelectorRefreshMs = 0.0;
 };
 
 class SamplePadsWindow : public juce::DocumentWindow,
