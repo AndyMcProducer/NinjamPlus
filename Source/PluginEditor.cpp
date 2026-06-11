@@ -9499,6 +9499,16 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
             }
         }
     }
+
+    // Reapply the selected skin after restoring videoBgEnabled so a skin with
+    // bg.mp4 cannot keep playing when the saved toggle state is off.
+    {
+        const int selectedTextureIndex = backgroundSelector.getSelectedItemIndex();
+        if (selectedTextureIndex >= 0 && selectedTextureIndex < textureFiles.size())
+            loadControlImages(textureFiles[selectedTextureIndex]);
+        else
+            stopBackgroundVideoReader();
+    }
 }
 
 void NinjamVst3AudioProcessorEditor::clearLearnMappings()

@@ -944,6 +944,8 @@ private:
     std::map<juce::String, ninjamplus::zap::ChunkReassembler> ninjamZapVideoChunkReassemblers;
     std::map<juce::String, juce::String> ninjamZapVideoAudioGuidByReassemblyKey;
     std::map<juce::String, int> ninjamZapVideoMarkerIntervalByReassemblyKey;
+    std::map<juce::String, bool> ninjamZapVideoMarkerSeenByReassemblyKey;
+    std::map<juce::String, int> ninjamZapH264DebugLogCountByStream;
     // Per-user reassembly + decode state (used by helper HTTP server)
     std::map<juce::String, ninjamplus::zap::ChunkReassembler> remoteVideoChunkReassemblersByUser;
 #if defined(NINJAMPLUS_HAS_PROVIDEO) && NINJAMPLUS_HAS_PROVIDEO

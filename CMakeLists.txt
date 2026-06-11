@@ -296,6 +296,8 @@ if (AUBIO_INCLUDE_DIR AND (AUBIO_LIBRARY_RELEASE OR AUBIO_LIBRARY_DEBUG))
     if (AUBIO_LIBRARY_DEBUG)
         target_compile_definitions(NINJAM_VST3 PRIVATE NINJAMPLUS_HAS_AUBIO=1)
     elseif (AUBIO_LIBRARY_RELEASE)
+        # The local aubio dependency is currently release-only, so keep it out of
+        # Debug links to avoid mixing MSVCRT with the project's Debug CRT.
         target_compile_definitions(NINJAM_VST3 PRIVATE
             $<$<CONFIG:Debug>:NINJAMPLUS_HAS_AUBIO=0>
             $<$<NOT:$<CONFIG:Debug>>:NINJAMPLUS_HAS_AUBIO=1>)
@@ -364,6 +366,9 @@ if (TARGET NINJAM_VST3_Standalone)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/icon.png"
             "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/icon.png"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/masks"
+            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/masks"
         VERBATIM
     )
     add_dependencies(NINJAM_VST3_Standalone NINJAM_VST3_SyncWebAssets)
@@ -383,6 +388,9 @@ if (TARGET NINJAM_VST3_VST3)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/icon.png"
             "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/icon.png"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/masks"
+            "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/masks"
         VERBATIM
     )
     add_dependencies(NINJAM_VST3_VST3 NINJAM_VST3_SyncVst3WebAssets)
@@ -401,6 +409,9 @@ if (TARGET NINJAM_VST3_LV2)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/icon.png"
             "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client/icon.png"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/masks"
+            "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client/masks"
         VERBATIM
     )
     add_dependencies(NINJAM_VST3_LV2 NINJAM_VST3_SyncLv2WebAssets)

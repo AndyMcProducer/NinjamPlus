@@ -12,7 +12,8 @@ namespace ninjamplus::zap
         unknown,
         mjpeg,
         h264,
-        vp8
+        vp8,
+        vp9
     };
 
     struct VideoCodecCapability

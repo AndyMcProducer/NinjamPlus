@@ -96,6 +96,7 @@ namespace ninjamplus::zap
             case VideoCodec::mjpeg: return "MJPEG";
             case VideoCodec::h264:  return "H.264";
             case VideoCodec::vp8:   return "VP8";
+            case VideoCodec::vp9:   return "VP9";
             case VideoCodec::unknown:
             default:                return "Unknown";
         }
@@ -128,6 +129,7 @@ namespace ninjamplus::zap
                #endif
 
             case VideoCodec::vp8:
+            case VideoCodec::vp9:
                #if NINJAMPLUS_HAS_LIBVPX
                 return { false, true, false, "libvpx decode" };
                #else
@@ -144,7 +146,7 @@ namespace ninjamplus::zap
     {
         juce::StringArray parts;
 
-        for (auto codec : { VideoCodec::mjpeg, VideoCodec::h264, VideoCodec::vp8 })
+        for (auto codec : { VideoCodec::mjpeg, VideoCodec::h264, VideoCodec::vp8, VideoCodec::vp9 })
         {
             const auto cap = getCodecCapability(codec);
             juce::String text = getCodecName(codec) + ": ";
@@ -412,6 +414,8 @@ namespace ninjamplus::zap
         LONGLONG frameTime = 0;
         LONGLONG frameDuration = 0;
         juce::MemoryBlock lastConfigInner;
+        juce::MemoryBlock cachedSpsNal;
+        juce::MemoryBlock cachedPpsNal;
         juce::String backendName;
 
         ~Impl()
@@ -425,6 +429,8 @@ namespace ninjamplus::zap
                 encoder->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
             encoder.reset();
             lastConfigInner.reset();
+            cachedSpsNal.reset();
+            cachedPpsNal.reset();
             backendName.clear();
             if (mfStarted)
             {
@@ -685,8 +691,6 @@ namespace ninjamplus::zap
             if (nals.empty())
                 return;
 
-            NalUnit sps;
-            NalUnit pps;
             juce::MemoryBlock frameInner;
 
             for (const auto& nal : nals)
@@ -696,9 +700,15 @@ namespace ninjamplus::zap
 
                 const unsigned char nalType = nal.data[0] & 0x1f;
                 if (nalType == 7)
-                    sps = nal;
+                {
+                    cachedSpsNal.reset();
+                    cachedSpsNal.append(nal.data, nal.size);
+                }
                 else if (nalType == 8)
-                    pps = nal;
+                {
+                    cachedPpsNal.reset();
+                    cachedPpsNal.append(nal.data, nal.size);
+                }
                 else
                 {
                     appendBigEndian32(frameInner, (juce::uint32) nal.size);
@@ -706,14 +716,14 @@ namespace ninjamplus::zap
                 }
             }
 
-            if (sps.size > 0 && pps.size > 0
-                && sps.size <= 0xffff && pps.size <= 0xffff)
+            if (cachedSpsNal.getSize() > 0 && cachedPpsNal.getSize() > 0
+                && cachedSpsNal.getSize() <= 0xffff && cachedPpsNal.getSize() <= 0xffff)
             {
                 juce::MemoryBlock configInner;
-                appendBigEndian16(configInner, (juce::uint16) sps.size);
-                configInner.append(sps.data, sps.size);
-                appendBigEndian16(configInner, (juce::uint16) pps.size);
-                configInner.append(pps.data, pps.size);
+                appendBigEndian16(configInner, (juce::uint16) cachedSpsNal.getSize());
+                configInner.append(cachedSpsNal.getData(), cachedSpsNal.getSize());
+                appendBigEndian16(configInner, (juce::uint16) cachedPpsNal.getSize());
+                configInner.append(cachedPpsNal.getData(), cachedPpsNal.getSize());
 
                 if (configInner.getSize() > 0
                     && (lastConfigInner.getSize() != configInner.getSize()

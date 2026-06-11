@@ -167,6 +167,7 @@ private:
     juce::String helperIndexHtml;
     juce::String helperAppHtml;
     juce::MemoryBlock helperIconPng;
+    juce::MemoryBlock helperCloudMaskPng;
     juce::ThreadPool clientThreadPool { 4 };
 
     class ClientJob final : public juce::ThreadPoolJob
@@ -275,20 +276,38 @@ private:
 <style>
 html,body{margin:0;min-height:100%;background:#101719;color:#edf5f5;font-family:system-ui,-apple-system,Segoe UI,sans-serif}
 body{display:flex;flex-direction:column}
+html.obs,html.obs body{background:transparent}
+html.obs header,html.obs .camera-panel{display:none}
+html.obs #grid{padding:0;background:transparent}
+html.obs .tile{background:transparent;border:0;border-radius:0}
+html.obs .label{background:rgba(0,0,0,.42);border-bottom:0}
+html.obs .stage{background:transparent}
 header{display:flex;align-items:center;gap:12px;padding:10px 14px;background:#172326;border-bottom:1px solid #34464a}
 h1{font-size:15px;margin:0;font-weight:700}
 #status{font-size:12px;color:#a8b8bb}
 .camera-panel{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 12px;background:#111b1e;border-bottom:1px solid #2f4145}
-.camera-panel select,.camera-panel button{height:28px;border:1px solid #3b5358;border-radius:4px;background:#19272b;color:#edf5f5}
+.camera-panel select,.camera-panel button,.camera-panel input{height:28px;border:1px solid #3b5358;border-radius:4px;background:#19272b;color:#edf5f5}
+.camera-panel input[type="range"]{width:96px;padding:0}
+.camera-panel input[type="color"]{width:34px;padding:2px}
+.camera-panel input[type="checkbox"]{width:16px;height:16px}
 .camera-panel button{padding:0 10px;cursor:pointer}
 .camera-panel button:hover{background:#22343a}
 .camera-panel button:disabled{opacity:.45;cursor:default}
 .camera-panel label{font-size:12px;color:#aebfc2;display:flex;align-items:center;gap:5px}
 #camStatus{font-size:12px;color:#a8b8bb}
-#browserPreview{width:128px;height:72px;object-fit:contain;background:#050808;border:1px solid #2c3b3e;border-radius:4px}
-#grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;padding:10px;flex:1}
+#browserPreview{position:absolute;left:-10000px;width:1px;height:1px;opacity:0;pointer-events:none}
+#browserFxPreview{width:128px;height:72px;object-fit:contain;background:#050808;border:1px solid #2c3b3e;border-radius:4px}
+#grid{display:grid;gap:10px;padding:10px;flex:1}
+#grid.layout-tiles{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+#grid.layout-rows{grid-template-columns:minmax(280px,1fr)}
+#grid.layout-columns{grid-auto-flow:column;grid-auto-columns:minmax(280px,1fr);overflow-x:auto}
+#grid.layout-columns .tile{min-width:280px}
 .tile{background:#0c1113;border:1px solid #2c3b3e;border-radius:8px;overflow:hidden;min-height:210px;display:flex;flex-direction:column}
-.label{font-size:12px;color:#cbd8d9;padding:7px 9px;background:#162124;border-bottom:1px solid #2c3b3e}
+.label{font-size:12px;color:#cbd8d9;padding:7px 9px;background:#162124;border-bottom:1px solid #2c3b3e;display:flex;align-items:center;gap:8px}
+.label-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.copy-link{height:22px;border:1px solid #3b5358;border-radius:4px;background:#19272b;color:#edf5f5;font-size:11px;cursor:pointer}
+.copy-link:hover{background:#22343a}
+html.obs .copy-link{display:none}
 .stage{position:relative;flex:1;display:grid;place-items:center;background:#050808}
 img,canvas{display:block;width:100%;height:100%;object-fit:contain}
 .stage-note{position:absolute;left:8px;right:8px;bottom:8px;padding:4px 6px;border-radius:4px;background:rgba(0,0,0,.58);color:#d7e4e6;font-size:11px;text-align:center;pointer-events:none}
@@ -300,13 +319,22 @@ img,canvas{display:block;width:100%;height:100%;object-fit:contain}
 <header><h1>NINJAMZap Video</h1><div id="status">Waiting for video frames</div></header>
 <section class="camera-panel">
   <label>Camera <select id="camSelect"><option value="">Default camera</option></select></label>
-  <label>Codec <select id="camCodec"><option value="h264">H.264</option><option value="mjpeg">MJPEG</option><option value="vp8">VP8</option></select></label>
+  <label>Codec <select id="camCodec"><option value="h264">H.264</option><option value="mjpeg">MJPEG</option><option value="vp8">VP8</option><option value="vp9">VP9</option></select></label>
   <label>Size <select id="camSize"><option value="320x180">320x180</option><option value="640x360" selected>640x360</option><option value="800x450">800x450</option><option value="1280x720">1280x720</option></select></label>
   <label>FPS <select id="camFps"><option value="10">10</option><option value="15">15</option><option value="24">24</option><option value="30" selected>30</option></select></label>
+  <label>Quality <select id="camQuality"><option value="balanced">Balanced</option><option value="high" selected>High</option><option value="low">Low</option></select></label>
+  <label>View <select id="camLayout"><option value="tiles" selected>Tiles</option><option value="rows">Rows</option><option value="columns">Columns</option></select></label>
+  <label>Mask <select id="camMask"><option value="none" selected>None</option><option value="cloud">Cloud</option><option value="circle">Circle</option><option value="rounded">Rounded</option><option value="square">Square</option><option value="tree">Xmas tree</option><option value="pumpkin">Pumpkin</option><option value="star">Star</option><option value="heart">Heart</option></select></label>
+  <label>FX <select id="camFx"><option value="off" selected>Off</option><option value="blur">Blur</option><option value="bg-blur">Blur background</option><option value="green-bg">Green background</option><option value="black-bg">Black background</option><option value="custom-bg">Custom background</option><option value="grayscale">Grayscale</option><option value="sepia">Sepia</option></select></label>
+  <label>Strength <input id="camFxStrength" type="range" min="0" max="24" value="10"></label>
+  <label>BG <input id="camBgColor" type="color" value="#00ff00"></label>
+  <label>Mirror <input id="camMirror" type="checkbox"></label>
   <button id="camRefresh" type="button">Refresh</button>
   <button id="camStart" type="button">Start browser camera</button>
   <button id="camStop" type="button" disabled>Stop</button>
+  <button id="camObs" type="button">OBS view</button>
   <video id="browserPreview" autoplay muted playsinline></video>
+  <canvas id="browserFxPreview" width="256" height="144"></canvas>
   <span id="camStatus">Choose a camera here to send Zap video.</span>
   <canvas id="browserCanvas" width="640" height="360" style="display:none"></canvas>
 </section>
@@ -318,13 +346,27 @@ const camSelect=document.getElementById('camSelect');
 const camCodec=document.getElementById('camCodec');
 const camSize=document.getElementById('camSize');
 const camFps=document.getElementById('camFps');
+const camQuality=document.getElementById('camQuality');
+const camLayout=document.getElementById('camLayout');
+const camMask=document.getElementById('camMask');
+const camFx=document.getElementById('camFx');
+const camFxStrength=document.getElementById('camFxStrength');
+const camBgColor=document.getElementById('camBgColor');
+const camMirror=document.getElementById('camMirror');
 const camRefresh=document.getElementById('camRefresh');
 const camStart=document.getElementById('camStart');
 const camStop=document.getElementById('camStop');
+const camObs=document.getElementById('camObs');
 const camStatus=document.getElementById('camStatus');
 const browserPreview=document.getElementById('browserPreview');
+const browserFxPreview=document.getElementById('browserFxPreview');
+const browserFxPreviewCtx=browserFxPreview.getContext('2d',{alpha:false});
 const browserCanvas=document.getElementById('browserCanvas');
 const browserCtx=browserCanvas.getContext('2d',{alpha:false});
+const browserFxMaskCanvas=document.createElement('canvas');
+const browserFxMaskCtx=browserFxMaskCanvas.getContext('2d',{alpha:true});
+const browserFxPersonCanvas=document.createElement('canvas');
+const browserFxPersonCtx=browserFxPersonCanvas.getContext('2d',{alpha:true});
 const tiles=new Map();
 let browserStream=null;
 let browserTimer=0;
@@ -341,11 +383,120 @@ let browserForceNextKeyframe=false;
 let browserLastKeyframeRequestId='';
 let browserCameraStateTimer=0;
 let refreshInFlight=false;
+let browserFxSegmenter=null;
+let browserFxSegmenterLoading=null;
+let browserFxSegmenterFailed=false;
+let browserFxSegmentationInFlight=false;
+let browserFxLastSegmentationMs=0;
+let browserFxMaskReady=false;
+const showStreamDebug=false;
+const urlParams=new URLSearchParams(location.search);
+const obsMode=location.pathname==='/zap-wall'||urlParams.get('obs')==='1';
+const obsStreamFilter=urlParams.get('stream')||'';
+const obsSlotFilter=Math.max(0,parseInt(urlParams.get('slot')||'0',10)||0);
+if(obsMode) document.documentElement.classList.add('obs');
+if(urlParams.get('layout')) camLayout.value=urlParams.get('layout');
+if(urlParams.get('mask')) camMask.value=urlParams.get('mask');
 function ms(value){
   const n=Number(value||0);
   return Number.isFinite(n)&&n>0?String(Math.round(n)):'0';
 }
 function setCamStatus(text){ camStatus.textContent=text; }
+function applyGridLayout(){
+  const value=String(camLayout.value||'tiles').toLowerCase();
+  const layout=value==='rows'||value==='columns'?value:'tiles';
+  grid.classList.remove('layout-tiles','layout-rows','layout-columns');
+  grid.classList.add('layout-'+layout);
+}
+function selectedDisplayMask(){
+  const value=String(camMask.value||'none').toLowerCase();
+  return ['none','cloud','circle','rounded','square','tree','pumpkin','star','heart'].includes(value)?value:'none';
+}
+function svgDisplayMaskUrl(shape){
+  let inner='';
+  if(shape==='tree')
+    inner='<path fill="white" d="M50 4 L74 36 H62 L82 63 H66 L91 94 H58 V100 H42 V94 H9 L34 63 H18 L38 36 H26 Z"/>';
+  else if(shape==='pumpkin')
+    inner='<path fill="white" d="M47 7 H57 V23 H47 Z M50 18 C34 7 12 20 12 53 C12 82 31 98 50 88 C69 98 88 82 88 53 C88 20 66 7 50 18 Z"/>';
+  else if(shape==='star')
+    inner='<polygon fill="white" points="50,4 61,37 96,37 68,57 79,92 50,71 21,92 32,57 4,37 39,37"/>';
+  else if(shape==='heart')
+    inner='<path fill="white" d="M50 91 C23 68 8 54 8 33 C8 18 19 8 34 8 C42 8 48 12 50 19 C52 12 58 8 66 8 C81 8 92 18 92 33 C92 54 77 68 50 91 Z"/>';
+  if(!inner) return '';
+  return 'url("data:image/svg+xml;utf8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" preserveAspectRatio="none">'+inner+'</svg>')+'")';
+}
+function clearDisplayMask(el){
+  if(!el) return;
+  el.style.clipPath='';
+  el.style.webkitClipPath='';
+  el.style.maskImage='none';
+  el.style.webkitMaskImage='none';
+  el.style.maskSize='';
+  el.style.webkitMaskSize='';
+  el.style.maskRepeat='';
+  el.style.webkitMaskRepeat='';
+  el.style.maskPosition='';
+  el.style.webkitMaskPosition='';
+}
+function applyDisplayMaskToElement(el,shape){
+  clearDisplayMask(el);
+  if(!el||obsMode||shape==='none') return;
+  if(shape==='circle'){
+    el.style.clipPath='circle(47% at 50% 50%)';
+    el.style.webkitClipPath='circle(47% at 50% 50%)';
+    return;
+  }
+  if(shape==='rounded'){
+    el.style.clipPath='inset(0 round 10%)';
+    el.style.webkitClipPath='inset(0 round 10%)';
+    return;
+  }
+  if(shape==='square'){
+    el.style.clipPath='inset(0)';
+    el.style.webkitClipPath='inset(0)';
+    return;
+  }
+  const maskUrl=shape==='cloud'?'url("/zap-mask/cloud.png")':svgDisplayMaskUrl(shape);
+  if(!maskUrl) return;
+  el.style.maskImage=maskUrl;
+  el.style.webkitMaskImage=maskUrl;
+  el.style.maskSize='100% 100%';
+  el.style.webkitMaskSize='100% 100%';
+  el.style.maskRepeat='no-repeat';
+  el.style.webkitMaskRepeat='no-repeat';
+  el.style.maskPosition='center';
+  el.style.webkitMaskPosition='center';
+}
+function applyDisplayMaskToTile(tile){
+  const shape=obsMode?'none':selectedDisplayMask();
+  if(tile._displayMask===shape) return;
+  tile._displayMask=shape;
+  applyDisplayMaskToElement(tile._img,shape);
+  applyDisplayMaskToElement(tile._canvas,shape);
+}
+function refreshDisplayMasks(){
+  const shape=obsMode?'none':selectedDisplayMask();
+  applyDisplayMaskToElement(browserFxPreview,shape);
+  for(const [,tile] of tiles){
+    tile._displayMask='';
+    applyDisplayMaskToTile(tile);
+  }
+}
+function obsUrlForSlot(slot){
+  const url=new URL('/zap-wall',location.href);
+  url.searchParams.set('layout',camLayout.value||'tiles');
+  if(slot>0) url.searchParams.set('slot',String(slot));
+  return url.toString();
+}
+async function copyObsLink(slot){
+  const url=obsUrlForSlot(slot);
+  try{
+    await navigator.clipboard.writeText(url);
+    statusEl.textContent='OBS link copied';
+  }catch(e){
+    window.prompt('OBS camera URL',url);
+  }
+}
 function selectedTransportSize(){
   const parts=String(camSize.value||'640x360').split('x');
   const width=Math.max(160,Math.min(1280,parseInt(parts[0]||'640',10)||640));
@@ -355,11 +506,166 @@ function selectedTransportSize(){
 function selectedTransportFps(){
   return Math.max(1,Math.min(30,parseInt(camFps.value||'30',10)||30));
 }
+function selectedTransportQuality(){
+  const value=String(camQuality.value||'high').toLowerCase();
+  return value==='low'||value==='balanced'||value==='high'?value:'high';
+}
+function selectedCameraFx(){
+  const value=String(camFx.value||'off').toLowerCase();
+  return ['off','blur','bg-blur','green-bg','black-bg','custom-bg','grayscale','sepia'].includes(value)?value:'off';
+}
+function selectedFxStrength(){
+  const value=parseInt(camFxStrength.value||'10',10);
+  return Number.isFinite(value)?Math.max(0,Math.min(24,value)):10;
+}
+function selectedFxBgColor(){
+  const value=String(camBgColor.value||'#00ff00');
+  return /^#[0-9a-f]{6}$/i.test(value)?value:'#00ff00';
+}
+function isSegmentationFx(value){
+  const fx=value||selectedCameraFx();
+  return fx==='bg-blur'||fx==='green-bg'||fx==='black-bg'||fx==='custom-bg';
+}
+function updateFxControls(){
+  const fx=selectedCameraFx();
+  camFxStrength.disabled=!(fx==='blur'||fx==='bg-blur');
+  camBgColor.disabled=fx!=='custom-bg';
+  if(!isSegmentationFx(fx)) browserFxMaskReady=false;
+}
+function ensureCanvasSize(canvas,width,height){
+  if(canvas.width!==width) canvas.width=width;
+  if(canvas.height!==height) canvas.height=height;
+}
+function browserFxFilterFor(fx){
+  const strength=selectedFxStrength();
+  if(fx==='blur') return 'blur('+String(strength)+'px)';
+  if(fx==='grayscale') return 'grayscale(1)';
+  if(fx==='sepia') return 'sepia(1)';
+  return 'none';
+}
+function drawBrowserVideoTo(ctx,width,height,filter,mirror,scale){
+  if(!browserPreview||browserPreview.readyState<2) return false;
+  const drawScale=scale||1;
+  const drawWidth=width*drawScale;
+  const drawHeight=height*drawScale;
+  const drawX=(width-drawWidth)/2;
+  const drawY=(height-drawHeight)/2;
+  ctx.save();
+  ctx.filter=filter||'none';
+  if(mirror){
+    ctx.translate(width,0);
+    ctx.scale(-1,1);
+  }
+  ctx.drawImage(browserPreview,drawX,drawY,drawWidth,drawHeight);
+  ctx.restore();
+  return true;
+}
+function drawBrowserMaskTo(ctx,width,height,mirror){
+  ctx.save();
+  if(mirror){
+    ctx.translate(width,0);
+    ctx.scale(-1,1);
+  }
+  ctx.drawImage(browserFxMaskCanvas,0,0,width,height);
+  ctx.restore();
+}
+function resetBrowserFxMask(){
+  browserFxMaskReady=false;
+  browserFxSegmentationInFlight=false;
+  browserFxLastSegmentationMs=0;
+}
+function loadSelfieSegmentationScript(){
+  if(window.SelfieSegmentation) return Promise.resolve();
+  if(browserFxSegmenterLoading) return browserFxSegmenterLoading;
+  browserFxSegmenterLoading=new Promise((resolve,reject)=>{
+    const script=document.createElement('script');
+    script.src='https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js';
+    script.crossOrigin='anonymous';
+    script.onload=()=>resolve();
+    script.onerror=()=>reject(new Error('Selfie Segmentation could not load'));
+    document.head.appendChild(script);
+  });
+  return browserFxSegmenterLoading;
+}
+async function ensureBrowserFxSegmenter(){
+  if(browserFxSegmenter) return browserFxSegmenter;
+  if(browserFxSegmenterFailed) return null;
+  await loadSelfieSegmentationScript();
+  if(!window.SelfieSegmentation) throw new Error('Selfie Segmentation unavailable');
+  browserFxSegmenter=new window.SelfieSegmentation({
+    locateFile:file=>'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/'+file
+  });
+  browserFxSegmenter.setOptions({modelSelection:1,selfieMode:false});
+  browserFxSegmenter.onResults(results=>{
+    const mask=results&&results.segmentationMask;
+    if(!mask) return;
+    const width=browserPreview.videoWidth||selectedTransportSize().width;
+    const height=browserPreview.videoHeight||selectedTransportSize().height;
+    ensureCanvasSize(browserFxMaskCanvas,width,height);
+    browserFxMaskCtx.clearRect(0,0,width,height);
+    browserFxMaskCtx.drawImage(mask,0,0,width,height);
+    browserFxMaskReady=true;
+  });
+  return browserFxSegmenter;
+}
+function updateBrowserFxSegmentation(){
+  const fx=selectedCameraFx();
+  if(!isSegmentationFx(fx)||!browserStream||browserPreview.readyState<2||browserFxSegmentationInFlight||browserFxSegmenterFailed) return;
+  const now=performance.now();
+  if(now-browserFxLastSegmentationMs<90) return;
+  browserFxLastSegmentationMs=now;
+  browserFxSegmentationInFlight=true;
+  ensureBrowserFxSegmenter()
+    .then(segmenter=>{
+      if(segmenter) return segmenter.send({image:browserPreview});
+    })
+    .catch(err=>{
+      browserFxSegmenterFailed=true;
+      browserFxMaskReady=false;
+      setCamStatus('Background FX unavailable: '+String(err&&err.message?err.message:err));
+    })
+    .finally(()=>{ browserFxSegmentationInFlight=false; });
+}
+function drawBrowserFxFrame(ctx,width,height){
+  ctx.save();
+  ctx.filter='none';
+  ctx.globalCompositeOperation='source-over';
+  ctx.clearRect(0,0,width,height);
+  ctx.fillStyle='#050808';
+  ctx.fillRect(0,0,width,height);
+  ctx.restore();
+  if(!browserStream||browserPreview.readyState<2) return false;
+  const fx=selectedCameraFx();
+  const mirror=!!camMirror.checked;
+  updateBrowserFxSegmentation();
+  if(isSegmentationFx(fx)&&browserFxMaskReady){
+    if(fx==='bg-blur'){
+      drawBrowserVideoTo(ctx,width,height,'blur('+String(selectedFxStrength())+'px)',mirror,1.08);
+    }else{
+      ctx.fillStyle=fx==='black-bg'?'#000000':(fx==='custom-bg'?selectedFxBgColor():'#00ff00');
+      ctx.fillRect(0,0,width,height);
+    }
+    ensureCanvasSize(browserFxPersonCanvas,width,height);
+    browserFxPersonCtx.clearRect(0,0,width,height);
+    drawBrowserVideoTo(browserFxPersonCtx,width,height,'none',mirror,1);
+    browserFxPersonCtx.save();
+    browserFxPersonCtx.globalCompositeOperation='destination-in';
+    drawBrowserMaskTo(browserFxPersonCtx,width,height,mirror);
+    browserFxPersonCtx.restore();
+    browserFxPersonCtx.globalCompositeOperation='source-over';
+    ctx.drawImage(browserFxPersonCanvas,0,0,width,height);
+    return true;
+  }
+  return drawBrowserVideoTo(ctx,width,height,browserFxFilterFor(fx),mirror,1);
+}
 function transportBitrate(codec,width,height,fps){
   const pixels=width*height;
   const fpsScale=Math.max(0.5,fps/30);
-  const base=codec==='h264'?650000:850000;
-  return Math.max(codec==='h264'?90000:120000,Math.round(base*(pixels/(640*360))*fpsScale));
+  const quality=selectedTransportQuality();
+  const qualityScale=quality==='low'?0.65:(quality==='balanced'?1.0:1.35);
+  const base=codec==='h264'?1150000:(codec==='vp9'?900000:950000);
+  const min=codec==='h264'?180000:(codec==='vp9'?140000:150000);
+  return Math.max(min,Math.round(base*(pixels/(640*360))*fpsScale*qualityScale));
 }
 function bytesToBase64(bytes){
   let binary='';
@@ -438,6 +744,27 @@ function h264ConfigFromNalsBase64(nals){
   out[ppsOffset]=(pps.length>>8)&255; out[ppsOffset+1]=pps.length&255; out.set(pps,ppsOffset+2);
   return bytesToBase64(out);
 }
+function h264ConfigFromAvccFrameBase64(bytes){
+    let offset=0;
+    let sps=null;
+    let pps=null;
+    while(offset+4<=bytes.length){
+        const nalLen=((bytes[offset]<<24)|(bytes[offset+1]<<16)|(bytes[offset+2]<<8)|bytes[offset+3])>>>0;
+        offset+=4;
+        if(nalLen<=0||offset+nalLen>bytes.length) break;
+        const nal=bytes.slice(offset,offset+nalLen);
+        const nalType=nal.length?(nal[0]&31):0;
+        if(nalType===7&&!sps) sps=nal;
+        else if(nalType===8&&!pps) pps=nal;
+        offset+=nalLen;
+    }
+    if(!sps||!pps||sps.length>65535||pps.length>65535) return '';
+    const out=new Uint8Array(2+sps.length+2+pps.length);
+    out[0]=(sps.length>>8)&255; out[1]=sps.length&255; out.set(sps,2);
+    const ppsOffset=2+sps.length;
+    out[ppsOffset]=(pps.length>>8)&255; out[ppsOffset+1]=pps.length&255; out.set(pps,ppsOffset+2);
+    return bytesToBase64(out);
+}
 async function refreshCameras(){
   if(!navigator.mediaDevices||!navigator.mediaDevices.enumerateDevices){
     setCamStatus('Browser camera API unavailable');
@@ -495,10 +822,13 @@ function stopBrowserCamera(disarm=true){
   browserLastKeyframeMs=0;
   browserForceNextKeyframe=false;
   browserLastKeyframeRequestId='';
+  resetBrowserFxMask();
 )HTML";
         html << R"HTML(
   if(browserStream){ browserStream.getTracks().forEach(track=>track.stop()); browserStream=null; }
   browserPreview.srcObject=null;
+  browserFxPreviewCtx.fillStyle='#050808';
+  browserFxPreviewCtx.fillRect(0,0,browserFxPreview.width,browserFxPreview.height);
   browserPosting=false;
   browserEncoderH264Format='avc';
   camStart.disabled=false;
@@ -527,7 +857,8 @@ async function postBrowserJpeg(blob,captureStartedMs,encodeMs,width,height){
 }
 async function postBrowserEncodedBytes(bytes,codec,captureStartedMs,encodeMs,width,height,keyFrame,configBase64){
   const ageMs=Math.max(0,performance.now()-captureStartedMs);
-  if(ageMs>650){
+    const configOnly=codec==='h264'&&configBase64&&(!bytes||!bytes.length);
+    if(ageMs>650&&!configOnly){
     setCamStatus('Dropping late browser frame '+Math.round(ageMs)+'ms');
     return;
   }
@@ -541,7 +872,8 @@ async function postBrowserEncodedBytes(bytes,codec,captureStartedMs,encodeMs,wid
     +'&seq='+encodeURIComponent(String(++browserFrameCounter));
   const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:bytes,cache:'no-store'});
   if(!res.ok&&res.status!==204) throw new Error('helper rejected frame '+String(res.status));
-  setCamStatus('Browser camera sending '+codec.toUpperCase()+' '+String(width)+'x'+String(height)+' @ '+camFps.value+'fps');
+    const payloadLabel=bytes&&bytes.length?'frame':'config';
+    setCamStatus('Browser camera sending '+codec.toUpperCase()+' '+payloadLabel+' '+String(width)+'x'+String(height)+' @ '+camFps.value+'fps');
 }
 async function handleEncodedBrowserChunk(chunk,metadata){
   const fallbackSize=selectedTransportSize();
@@ -559,14 +891,23 @@ async function handleEncodedBrowserChunk(chunk,metadata){
     if(annexConfig) configBase64=annexConfig;
     keyFrame=keyFrame||nals.some(nal=>nal.length&&((nal[0]&31)===5));
     frameBytes=h264NalsToAvcc(nals);
-    if(!frameBytes.length) return;
+        if(!frameBytes.length&&configBase64)
+            return await postBrowserEncodedBytes(new Uint8Array(),browserEncoderCodec,info.captureStartedMs,encodeMs,info.width,info.height,keyFrame,configBase64);
+        if(!frameBytes.length) return;
   }
   if(browserEncoderCodec==='h264'&&metadata&&metadata.decoderConfig&&metadata.decoderConfig.description){
     const avcConfig=avccToZapConfigBase64(new Uint8Array(metadata.decoderConfig.description));
     if(avcConfig) configBase64=avcConfig;
   }
-  if(configBase64) browserLastCodecConfig=configBase64;
+    if(browserEncoderCodec==='h264'&&!configBase64){
+        const avccConfig=h264ConfigFromAvccFrameBase64(frameBytes);
+        if(avccConfig) configBase64=avccConfig;
+    }
+    const configChanged=browserEncoderCodec==='h264'&&configBase64&&configBase64!==browserLastCodecConfig;
+    if(configBase64) browserLastCodecConfig=configBase64;
   else if(browserEncoderCodec==='h264'&&keyFrame&&browserLastCodecConfig) configBase64=browserLastCodecConfig;
+    if(configChanged)
+        await postBrowserEncodedBytes(new Uint8Array(),browserEncoderCodec,info.captureStartedMs,encodeMs,info.width,info.height,false,configBase64);
   await postBrowserEncodedBytes(frameBytes,browserEncoderCodec,info.captureStartedMs,encodeMs,info.width,info.height,keyFrame,configBase64);
 }
 async function getSupportedEncoderConfig(codec,width,height,fps){
@@ -579,9 +920,13 @@ async function getSupportedEncoderConfig(codec,width,height,fps){
         {codec:'avc1.42E01F',width,height,bitrate,framerate:fps,latencyMode:'realtime',avc:{format:'annexb'}},
         {codec:'avc1.42E01F',width,height,bitrate,framerate:fps,latencyMode:'realtime',avc:{format:'avc'}}
       ]
-    : [
-        {codec:'vp8',width,height,bitrate,framerate:fps,latencyMode:'realtime'}
-      ];
+    : (codec==='vp9'
+      ? [
+          {codec:'vp09.00.10.08',width,height,bitrate,framerate:fps,latencyMode:'realtime'}
+        ]
+      : [
+          {codec:'vp8',width,height,bitrate,framerate:fps,latencyMode:'realtime'}
+        ]);
   for(const base of bases){
     const preferred=Object.assign({},base,{hardwareAcceleration:'prefer-hardware'});
     const preferredSupport=await VideoEncoder.isConfigSupported(preferred).catch(()=>null);
@@ -627,9 +972,13 @@ function captureBrowserFrame(){
       browserEncodeStarts.set(timestamp,{captureStartedMs,width,height});
       browserCanvas.width=width;
       browserCanvas.height=height;
-      browserCtx.drawImage(browserPreview,0,0,width,height);
+      if(!drawBrowserFxFrame(browserCtx,width,height)){
+        browserEncodeStarts.delete(timestamp);
+        scheduleBrowserFrame();
+        return;
+      }
       const frame=new VideoFrame(browserCanvas,{timestamp});
-      const needsKey=browserEncoderCodec==='h264'
+      const needsKey=browserLastKeyframeMs<=0
         || browserForceNextKeyframe
         || (captureStartedMs-browserLastKeyframeMs)>2000;
       if(needsKey) browserLastKeyframeMs=captureStartedMs;
@@ -642,7 +991,11 @@ function captureBrowserFrame(){
     browserPosting=true;
     browserCanvas.width=width;
     browserCanvas.height=height;
-    browserCtx.drawImage(browserPreview,0,0,width,height);
+    if(!drawBrowserFxFrame(browserCtx,width,height)){
+      browserPosting=false;
+      scheduleBrowserFrame();
+      return;
+    }
     browserCanvas.toBlob(async blob=>{
       const encodeMs=Math.max(0,performance.now()-captureStartedMs);
       try{
@@ -676,6 +1029,8 @@ async function startBrowserCamera(){
     browserStream=await navigator.mediaDevices.getUserMedia({audio:false,video});
     browserPreview.srcObject=browserStream;
     await browserPreview.play();
+    resetBrowserFxMask();
+    browserFxSegmenterFailed=false;
     let activeCodec=codec;
     browserEncoderCodec='mjpeg';
     if(codec!=='mjpeg'){
@@ -707,6 +1062,16 @@ async function startBrowserCamera(){
 camRefresh.addEventListener('click',refreshCameras);
 camStart.addEventListener('click',startBrowserCamera);
 camStop.addEventListener('click',stopBrowserCamera);
+camLayout.addEventListener('change',applyGridLayout);
+camMask.addEventListener('change',refreshDisplayMasks);
+camFx.addEventListener('change',()=>{
+  resetBrowserFxMask();
+  browserFxSegmenterFailed=false;
+  updateFxControls();
+});
+camObs.addEventListener('click',()=>window.open('/zap-wall?layout='+encodeURIComponent(camLayout.value||'tiles'),'_blank'));
+applyGridLayout();
+updateFxControls();
 refreshCameras();
 function tileFor(stream){
   let tile=tiles.get(stream.streamKey);
@@ -715,6 +1080,15 @@ function tileFor(stream){
   tile.className='tile';
   const label=document.createElement('div');
   label.className='label';
+  const labelName=document.createElement('span');
+  labelName.className='label-name';
+  const copyButton=document.createElement('button');
+  copyButton.className='copy-link';
+  copyButton.type='button';
+  copyButton.textContent='OBS';
+  copyButton.title='Copy stable OBS slot link';
+  label.appendChild(labelName);
+  label.appendChild(copyButton);
   const stage=document.createElement('div');
   stage.className='stage';
   const img=document.createElement('img');
@@ -730,19 +1104,29 @@ function tileFor(stream){
   tile.appendChild(label);
   tile.appendChild(stage);
   tile._label=label;
+  tile._labelName=labelName;
+  tile._copyButton=copyButton;
+  tile._obsSlot=0;
   tile._img=img;
   tile._canvas=canvas;
   tile._ctx=canvas.getContext('2d',{alpha:false});
   tile._note=note;
   tile._h264Timestamp=0;
   tile._h264SeenKey=false;
+  tile._vpxSeenKey=false;
   tile._decodeBufferId='';
   tile._lastDecodedFrameIndex=-1;
   tile._targetFrameIndex=-1;
   tile._latestStream=null;
+  tile._localPreview=false;
+  tile._displayMask='';
   tile._playbackClockBufferId='';
   tile._playbackClockStartMs=0;
   tile._playbackClockDurationMs=1000;
+  copyButton.addEventListener('click',event=>{
+    event.stopPropagation();
+    copyObsLink(tile._obsSlot);
+  });
   tiles.set(stream.streamKey,tile);
   grid.appendChild(tile);
   return tile;
@@ -788,6 +1172,17 @@ function h264FrameType(bytes){
 }
 function vp8FrameType(bytes){
   return bytes.length>0&&((bytes[0]&1)===0)?'key':'delta';
+}
+function vp9FrameType(bytes){
+  if(!bytes.length) return 'delta';
+  const b=bytes[0];
+  const profile=((b>>2)&1)|(((b>>3)&1)<<1);
+  let bit=4;
+  if(profile===3) bit++;
+  const showExisting=((b>>bit)&1)!==0;
+  bit++;
+  if(showExisting) return 'delta';
+  return ((b>>bit)&1)===0?'key':'delta';
 }
 function frameIndexOf(stream){
   const localStart=Number(stream._localPlaybackStartMs||0);
@@ -875,24 +1270,25 @@ async function ensureH264Decoder(tile,stream){
   tile._decoderConfigKey=configKey;
   return true;
 }
-async function ensureVp8Decoder(tile){
+async function ensureVpxDecoder(tile,codec){
   if(!('VideoDecoder' in window)){
-    tile._note.textContent='Browser VP8 decode unavailable';
+    tile._note.textContent='Browser '+codec.toUpperCase()+' decode unavailable';
     return false;
   }
-  if(tile._decoder&&tile._decoderConfigKey==='vp8') return true;
+  const decoderCodec=codec==='vp9'?'vp09.00.10.08':'vp8';
+  if(tile._decoder&&tile._decoderConfigKey===decoderCodec) return true;
   if(tile._decoder){ try{tile._decoder.close();}catch(e){} }
   tile._decoder=null;
   tile._decoderConfigKey='';
-  tile._vp8SeenKey=false;
-  let config={codec:'vp8',hardwareAcceleration:'prefer-hardware',optimizeForLatency:true};
+  tile._vpxSeenKey=false;
+  let config={codec:decoderCodec,hardwareAcceleration:'prefer-hardware',optimizeForLatency:true};
   let support=await VideoDecoder.isConfigSupported(config).catch(()=>null);
   if(support&&support.supported===false){
-    config={codec:'vp8',optimizeForLatency:true};
+    config={codec:decoderCodec,optimizeForLatency:true};
     support=await VideoDecoder.isConfigSupported(config).catch(()=>null);
   }
   if(support&&support.supported===false){
-    tile._note.textContent='Browser VP8 codec unsupported';
+    tile._note.textContent='Browser '+codec.toUpperCase()+' codec unsupported';
     return false;
   }
   tile._decoder=new VideoDecoder({
@@ -904,16 +1300,18 @@ async function ensureVp8Decoder(tile){
       tile._note.textContent='';
     },
     error(err){
-      tile._note.textContent='VP8 decode error';
-      tile._vp8SeenKey=false;
+      tile._note.textContent=codec.toUpperCase()+' decode error';
+      tile._vpxSeenKey=false;
       try{ if(tile._decoder) tile._decoder.close(); }catch(e){}
       tile._decoder=null;
     }
   });
   tile._decoder.configure(config);
-  tile._decoderConfigKey='vp8';
+  tile._decoderConfigKey=decoderCodec;
   return true;
 }
+async function ensureVp8Decoder(tile){ return ensureVpxDecoder(tile,'vp8'); }
+async function ensureVp9Decoder(tile){ return ensureVpxDecoder(tile,'vp9'); }
 async function renderH264(tile,stream){
   const bufferId=bufferIdOf(stream);
   const targetFrameIndex=frameIndexOf(stream);
@@ -959,7 +1357,7 @@ async function renderH264(tile,stream){
     tile._h264Pending=false;
   }
 }
-async function renderVp8(tile,stream){
+async function renderVpx(tile,stream,codec){
   const bufferId=bufferIdOf(stream);
   const targetFrameIndex=frameIndexOf(stream);
   const renderToken=bufferId+'-'+String(targetFrameIndex);
@@ -969,10 +1367,10 @@ async function renderVp8(tile,stream){
     tile._targetFrameIndex=-1;
   }
   tile._targetFrameIndex=Math.max(tile._targetFrameIndex||0,targetFrameIndex);
-  if(tile._vp8Pending||tile._lastRenderedRefreshId===renderToken) return;
-  tile._vp8Pending=true;
+  if(tile._vpxPending||tile._lastRenderedRefreshId===renderToken) return;
+  tile._vpxPending=true;
   try{
-    if(!await ensureVp8Decoder(tile)) return;
+    if(!await ensureVpxDecoder(tile,codec)) return;
     const fromFrame=tile._lastDecodedFrameIndex+1;
     const toFrame=Math.min(tile._targetFrameIndex,fromFrame+89);
     const res=await fetch(frameBatchUrl(stream,fromFrame,toFrame),{cache:'no-store'});
@@ -982,10 +1380,10 @@ async function renderVp8(tile,stream){
       const nextFrame=fromFrame+i;
       const bytes=batch[i];
       if(!bytes.length) break;
-      const type=vp8FrameType(bytes);
-      if(type==='key') tile._vp8SeenKey=true;
-      if(!tile._vp8SeenKey&&type!=='key'){
-        tile._note.textContent='Waiting for VP8 keyframe';
+      const type=codec==='vp9'?vp9FrameType(bytes):vp8FrameType(bytes);
+      if(type==='key') tile._vpxSeenKey=true;
+      if(!tile._vpxSeenKey&&type!=='key'){
+        tile._note.textContent='Waiting for '+codec.toUpperCase()+' keyframe';
         tile._lastDecodedFrameIndex=nextFrame;
         continue;
       }
@@ -998,12 +1396,14 @@ async function renderVp8(tile,stream){
     }
     tile._lastRenderedRefreshId=renderToken;
   }catch(e){
-    tile._note.textContent='VP8 browser decode failed';
+    tile._note.textContent=codec.toUpperCase()+' browser decode failed';
     if(tile._decoder){ try{tile._decoder.close();}catch(closeErr){} tile._decoder=null; }
   }finally{
-    tile._vp8Pending=false;
+    tile._vpxPending=false;
   }
 }
+async function renderVp8(tile,stream){ return renderVpx(tile,stream,'vp8'); }
+async function renderVp9(tile,stream){ return renderVpx(tile,stream,'vp9'); }
 function renderStream(tile,stream){
   const codec=String(stream.codec||'mjpeg').toLowerCase();
   if(codec==='h264'){
@@ -1016,6 +1416,12 @@ function renderStream(tile,stream){
     tile._img.style.display='none';
     tile._canvas.style.display='block';
     renderVp8(tile,stream);
+    return;
+  }
+  if(codec==='vp9'){
+    tile._img.style.display='none';
+    tile._canvas.style.display='block';
+    renderVp9(tile,stream);
     return;
   }
   tile._canvas.style.display='none';
@@ -1047,9 +1453,31 @@ function updateTilePlaybackClock(tile,stream){
   localStream._localPlaybackDurationMs=tile._playbackClockDurationMs;
   tile._latestStream=localStream;
 }
+function renderLocalPreviewTile(tile){
+  tile._img.style.display='none';
+  tile._canvas.style.display='block';
+  tile._note.textContent='';
+  const width=browserPreview.videoWidth||640;
+  const height=browserPreview.videoHeight||360;
+  if(tile._canvas.width!==width) tile._canvas.width=width;
+  if(tile._canvas.height!==height) tile._canvas.height=height;
+  try{ drawBrowserFxFrame(tile._ctx,width,height); }catch(e){}
+}
+function renderBrowserFxPreview(){
+  applyDisplayMaskToElement(browserFxPreview,obsMode?'none':selectedDisplayMask());
+  if(!browserStream){
+    browserFxPreviewCtx.fillStyle='#050808';
+    browserFxPreviewCtx.fillRect(0,0,browserFxPreview.width,browserFxPreview.height);
+    return;
+  }
+  try{ drawBrowserFxFrame(browserFxPreviewCtx,browserFxPreview.width,browserFxPreview.height); }catch(e){}
+}
 function renderTiles(){
+  renderBrowserFxPreview();
   for(const [,tile] of tiles){
-    if(tile._latestStream) renderStream(tile,tile._latestStream);
+    applyDisplayMaskToTile(tile);
+    if(tile._localPreview) renderLocalPreviewTile(tile);
+    else if(tile._latestStream) renderStream(tile,tile._latestStream);
   }
   requestAnimationFrame(renderTiles);
 }
@@ -1058,16 +1486,38 @@ async function refresh(){
   refreshInFlight=true;
   try{
     const res=await fetch('/zap-frames',{cache:'no-store'});
-    const streams=await res.json();
+    const allStreams=await res.json();
+    const localZapIndex=allStreams.findIndex(stream=>String(stream.streamKey||'')==='local:zap-camera');
+    const showDirectLocalPreview=browserStream&&!obsMode&&!obsStreamFilter&&obsSlotFilter===0;
+    let streams=obsStreamFilter?allStreams.filter(stream=>String(stream.streamKey||'')===obsStreamFilter):allStreams;
+    if(showDirectLocalPreview)
+      streams=streams.filter(stream=>String(stream.streamKey||'')!=='local:zap-camera');
+    if(!obsStreamFilter&&obsSlotFilter>0)
+      streams=allStreams[obsSlotFilter-1]?[allStreams[obsSlotFilter-1]]:[];
     grid.querySelectorAll('.empty').forEach(el=>el.remove());
     const live=new Set();
     streams.forEach(stream=>{
       live.add(stream.streamKey);
       const tile=tileFor(stream);
+      tile._localPreview=false;
+      const slotIndex=obsSlotFilter>0?obsSlotFilter:(allStreams.findIndex(candidate=>String(candidate.streamKey||'')===String(stream.streamKey||''))+1);
+      tile._obsSlot=slotIndex;
+      tile._copyButton.style.display=obsMode?'none':'';
       updateTilePlaybackClock(tile,stream);
       const timing=' frames '+String(stream.frameCount||0)+' q '+ms(stream.decodeQueueMs)+'ms dec '+ms(stream.decodeMs)+'ms pub '+ms(stream.receiveToPublishMs)+'ms late '+ms(stream.playbackOffsetMs)+'ms dur '+ms(stream.playbackDurationMs)+'ms age '+ms(stream.playbackAgeMs)+'ms cap '+ms(stream.senderCaptureQueueMs)+'ms enc '+ms(stream.senderEncodeMs)+'ms';
-      tile._label.textContent=(stream.sender||'Unknown')+' - channel '+String((stream.channelIndex||0)+1)+' '+String(stream.codec||'mjpeg').toUpperCase()+timing;
+      const title=(stream.sender||'Unknown');
+      tile._labelName.textContent=showStreamDebug?title+' '+String(stream.codec||'mjpeg').toUpperCase()+timing:title;
     });
+    if(showDirectLocalPreview){
+      const localKey='local:browser-camera';
+      live.add(localKey);
+      const tile=tileFor({streamKey:localKey});
+      tile._localPreview=true;
+      tile._latestStream=null;
+      tile._obsSlot=localZapIndex>=0?localZapIndex+1:0;
+      tile._copyButton.style.display=tile._obsSlot>0?'':'none';
+      tile._labelName.textContent='Local camera';
+    }
     for(const [key,tile] of tiles){
       if(!live.has(key)){
         if(tile._decoder){ try{tile._decoder.close();}catch(e){} }
@@ -1075,13 +1525,14 @@ async function refresh(){
         tiles.delete(key);
       }
     }
-    if(streams.length===0 && !grid.querySelector('.empty')){
+    if(streams.length===0 && !showDirectLocalPreview && !grid.querySelector('.empty')){
       const empty=document.createElement('div');
       empty.className='empty';
       empty.textContent='No Zap video streams yet';
       grid.appendChild(empty);
     }
-    statusEl.textContent=streams.length?String(streams.length)+' stream'+(streams.length===1?'':'s'):'Waiting for video frames';
+    const streamCount=streams.length+(showDirectLocalPreview?1:0);
+    statusEl.textContent=streamCount?String(streamCount)+' stream'+(streamCount===1?'':'s'):'Waiting for video frames';
   }catch(e){
     statusEl.textContent='Waiting for local helper';
   }finally{
@@ -1213,7 +1664,7 @@ setInterval(refresh,33);
             return response;
         }
 
-        if (path == "/zap-video")
+        if (path == "/zap-video" || path == "/zap-wall")
         {
             HttpResponse response;
             response.contentType = "text/html; charset=utf-8";
@@ -1287,7 +1738,8 @@ setInterval(refresh,33);
             const juce::String codec = getQueryParam(requestTarget, "codec");
             const juce::String config = getQueryParam(requestTarget, "config");
             const bool keyFrame = getQueryParam(requestTarget, "key").getIntValue() != 0;
-            const bool accepted = requestBody.getSize() > 0
+            const bool allowConfigOnly = config.trim().isNotEmpty();
+            const bool accepted = (requestBody.getSize() > 0 || allowConfigOnly)
                 && zapBrowserFrameConsumer
                 && zapBrowserFrameConsumer(requestBody, codec, config, keyFrame, ageMs, encodeMs, width, height);
             if (accepted)
@@ -1423,6 +1875,17 @@ setInterval(refresh,33);
             return response;
         }
 
+        if ((path == "/zap-mask/cloud.png" || path == "/masks/cloud.png") && helperCloudMaskPng.getSize() > 0)
+        {
+            HttpResponse response;
+            response.contentType = "image/png";
+            response.noStore = true;
+            response.body = helperCloudMaskPng;
+            if (isHead)
+                response.body.reset();
+            return response;
+        }
+
         HttpResponse response;
         response.statusCode = 404;
         response.statusText = "Not Found";
@@ -1462,6 +1925,9 @@ setInterval(refresh,33);
 
         helperIconPng.reset();
         helperRoot.getChildFile("icon.png").loadFileAsData(helperIconPng);
+
+        helperCloudMaskPng.reset();
+        helperRoot.getChildFile("masks").getChildFile("cloud.png").loadFileAsData(helperCloudMaskPng);
     }
 };
 
@@ -1760,7 +2226,7 @@ public:
             if (h264Encoder.open(ninjamplus::zap::kZapVideoWidth,
                                  ninjamplus::zap::kZapVideoHeight,
                                  ninjamplus::zap::kZapVideoFps,
-                                 1200000,
+                                 2500000,
                                  encoderPreference))
             {
                 activeCodec = ninjamplus::zap::VideoCodec::h264;
@@ -1862,6 +2328,8 @@ private:
                         const juce::ScopedLock lock(owner.zapVideoFrameLock);
                         owner.ninjamZapCameraH264ConfigChunk = encoded.configChunk;
                         owner.enqueueNinjamZapCameraFrameChunk(encoded.configChunk);
+                        vlogStr("[ZapCam] encoder queued H.264 config bytes=" + juce::String((int)encoded.configChunk.getSize())
+                                + " streamOpen=" + juce::String(owner.ninjamZapVideoStreamOpen.load(std::memory_order_relaxed) ? 1 : 0));
                     }
                     if (encoded.frameChunk.getSize() > 0)
                         owner.enqueueNinjamZapCameraFrameChunk(std::move(encoded.frameChunk));
@@ -3214,6 +3682,7 @@ namespace
     constexpr unsigned int kSyncSignalFourcc  = makeNjFourcc('N','J','S','4');
     constexpr unsigned int kNinjamZapVideoH264Fourcc = makeNjFourcc('H','2','6','4');
     constexpr unsigned int kNinjamZapVideoVp8Fourcc  = makeNjFourcc('V','P','8',' ');
+    constexpr unsigned int kNinjamZapVideoVp9Fourcc  = makeNjFourcc('V','P','9',' ');
     constexpr unsigned int kNinjamZapVideoMjpgFourcc = makeNjFourcc('M','J','P','G');
     constexpr int kNinjamZapVideoOnlyChannelFlag = NJClient::NJCLIENT_CHANNEL_FLAG_VIDEO_ONLY;
     constexpr const char* sideSignalChatPrefix = "__NINJAM_VST3_SIDESIGNAL__ ";
@@ -3228,6 +3697,7 @@ namespace
     {
         return fourcc == kNinjamZapVideoH264Fourcc
             || fourcc == kNinjamZapVideoVp8Fourcc
+            || fourcc == kNinjamZapVideoVp9Fourcc
             || fourcc == kNinjamZapVideoMjpgFourcc;
     }
 
@@ -3236,6 +3706,7 @@ namespace
         if (fourcc == kNinjamZapVideoMjpgFourcc) return ninjamplus::zap::VideoCodec::mjpeg;
         if (fourcc == kNinjamZapVideoH264Fourcc) return ninjamplus::zap::VideoCodec::h264;
         if (fourcc == kNinjamZapVideoVp8Fourcc)  return ninjamplus::zap::VideoCodec::vp8;
+        if (fourcc == kNinjamZapVideoVp9Fourcc)  return ninjamplus::zap::VideoCodec::vp9;
         return ninjamplus::zap::VideoCodec::unknown;
     }
 
@@ -3246,6 +3717,8 @@ namespace
             return ninjamplus::zap::VideoCodec::h264;
         if (codec == "vp8")
             return ninjamplus::zap::VideoCodec::vp8;
+        if (codec == "vp9")
+            return ninjamplus::zap::VideoCodec::vp9;
         return ninjamplus::zap::VideoCodec::mjpeg;
     }
 
@@ -3255,6 +3728,8 @@ namespace
             return "h264";
         if (codec == ninjamplus::zap::VideoCodec::vp8)
             return "vp8";
+        if (codec == ninjamplus::zap::VideoCodec::vp9)
+            return "vp9";
         return "mjpeg";
     }
 
@@ -3275,6 +3750,127 @@ namespace
             return false;
 
         return ((bytes[2] & 0x1f) == 7) && ((bytes[ppsOffset + 2] & 0x1f) == 8);
+    }
+
+    bool makeNinjamZapH264ConfigChunk(const unsigned char* sps,
+                                      size_t spsSize,
+                                      const unsigned char* pps,
+                                      size_t ppsSize,
+                                      juce::MemoryBlock& configInner)
+    {
+        if (sps == nullptr || pps == nullptr || spsSize == 0 || ppsSize == 0
+            || spsSize > 0xffff || ppsSize > 0xffff)
+            return false;
+
+        configInner.reset();
+        const unsigned char spsLen[2]
+        {
+            static_cast<unsigned char>((spsSize >> 8) & 0xff),
+            static_cast<unsigned char>(spsSize & 0xff)
+        };
+        const unsigned char ppsLen[2]
+        {
+            static_cast<unsigned char>((ppsSize >> 8) & 0xff),
+            static_cast<unsigned char>(ppsSize & 0xff)
+        };
+        configInner.append(spsLen, sizeof(spsLen));
+        configInner.append(sps, spsSize);
+        configInner.append(ppsLen, sizeof(ppsLen));
+        configInner.append(pps, ppsSize);
+        return isNinjamZapH264ConfigChunk(configInner);
+    }
+
+    bool extractNinjamZapH264ConfigFromAvcDecoderConfig(const juce::MemoryBlock& payload,
+                                                        juce::MemoryBlock& configInner)
+    {
+        const auto* bytes = static_cast<const unsigned char*>(payload.getData());
+        const size_t size = payload.getSize();
+        if (bytes == nullptr || size < 7 || bytes[0] != 1)
+            return false;
+
+        size_t offset = 5;
+        const int spsCount = bytes[offset++] & 0x1f;
+        const unsigned char* sps = nullptr;
+        const unsigned char* pps = nullptr;
+        size_t spsSize = 0;
+        size_t ppsSize = 0;
+
+        for (int i = 0; i < spsCount; ++i)
+        {
+            if (offset + 2 > size)
+                return false;
+            const size_t nalSize = ((size_t)bytes[offset] << 8) | (size_t)bytes[offset + 1];
+            offset += 2;
+            if (nalSize == 0 || offset + nalSize > size)
+                return false;
+            if (sps == nullptr && ((bytes[offset] & 0x1f) == 7))
+            {
+                sps = bytes + offset;
+                spsSize = nalSize;
+            }
+            offset += nalSize;
+        }
+
+        if (offset >= size)
+            return false;
+
+        const int ppsCount = bytes[offset++];
+        for (int i = 0; i < ppsCount; ++i)
+        {
+            if (offset + 2 > size)
+                return false;
+            const size_t nalSize = ((size_t)bytes[offset] << 8) | (size_t)bytes[offset + 1];
+            offset += 2;
+            if (nalSize == 0 || offset + nalSize > size)
+                return false;
+            if (pps == nullptr && ((bytes[offset] & 0x1f) == 8))
+            {
+                pps = bytes + offset;
+                ppsSize = nalSize;
+            }
+            offset += nalSize;
+        }
+
+        return makeNinjamZapH264ConfigChunk(sps, spsSize, pps, ppsSize, configInner);
+    }
+
+    bool extractNinjamZapH264ConfigFromLength16Nals(const juce::MemoryBlock& payload,
+                                                    juce::MemoryBlock& configInner)
+    {
+        const auto* bytes = static_cast<const unsigned char*>(payload.getData());
+        const size_t size = payload.getSize();
+        if (bytes == nullptr || size < 8)
+            return false;
+
+        const unsigned char* sps = nullptr;
+        const unsigned char* pps = nullptr;
+        size_t spsSize = 0;
+        size_t ppsSize = 0;
+        size_t offset = 0;
+
+        while (offset + 2 <= size)
+        {
+            const size_t nalSize = ((size_t)bytes[offset] << 8) | (size_t)bytes[offset + 1];
+            offset += 2;
+            if (nalSize == 0 || offset + nalSize > size)
+                break;
+
+            const unsigned char nalType = bytes[offset] & 0x1f;
+            if (nalType == 7 && sps == nullptr)
+            {
+                sps = bytes + offset;
+                spsSize = nalSize;
+            }
+            else if (nalType == 8 && pps == nullptr)
+            {
+                pps = bytes + offset;
+                ppsSize = nalSize;
+            }
+
+            offset += nalSize;
+        }
+
+        return makeNinjamZapH264ConfigChunk(sps, spsSize, pps, ppsSize, configInner);
     }
 
     bool extractNinjamZapH264ConfigFromAvccFrame(const juce::MemoryBlock& payload, juce::MemoryBlock& configInner)
@@ -3314,26 +3910,83 @@ namespace
             offset += nalSize;
         }
 
-        if (sps == nullptr || pps == nullptr || spsSize == 0 || ppsSize == 0
-            || spsSize > 0xffff || ppsSize > 0xffff)
-            return false;
+        return makeNinjamZapH264ConfigChunk(sps, spsSize, pps, ppsSize, configInner);
+    }
+
+    bool normaliseNinjamZapH264ConfigPayload(const juce::MemoryBlock& payload,
+                                             juce::MemoryBlock& configInner)
+    {
+        if (isNinjamZapH264ConfigChunk(payload))
+        {
+            configInner.reset();
+            configInner.append(payload.getData(), payload.getSize());
+            return true;
+        }
+
+        if (extractNinjamZapH264ConfigFromLength16Nals(payload, configInner))
+            return true;
+
+        if (extractNinjamZapH264ConfigFromAvcDecoderConfig(payload, configInner))
+            return true;
+
+        if (extractNinjamZapH264ConfigFromAvccFrame(payload, configInner))
+            return true;
 
         configInner.reset();
-        const unsigned char spsLen[2]
+        return false;
+    }
+
+    juce::String hexPrefix(const void* data, size_t size, size_t maxBytes = 24)
+    {
+        if (data == nullptr || size == 0)
+            return {};
+
+        static constexpr char hex[] = "0123456789abcdef";
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        const size_t count = std::min(size, maxBytes);
+        juce::String out;
+        for (size_t i = 0; i < count; ++i)
         {
-            static_cast<unsigned char>((spsSize >> 8) & 0xff),
-            static_cast<unsigned char>(spsSize & 0xff)
-        };
-        const unsigned char ppsLen[2]
+            if (i != 0)
+                out << " ";
+            const char pair[3]
+            {
+                hex[(bytes[i] >> 4) & 0x0f],
+                hex[bytes[i] & 0x0f],
+                0
+            };
+            out << pair;
+        }
+        if (size > count)
+            out << " ...";
+        return out;
+    }
+
+    bool h264AvccFrameContainsIdr(const juce::MemoryBlock& payload)
+    {
+        const auto* bytes = static_cast<const unsigned char*>(payload.getData());
+        const size_t size = payload.getSize();
+        if (bytes == nullptr || size < 5)
+            return false;
+
+        size_t offset = 0;
+        while (offset + 4 <= size)
         {
-            static_cast<unsigned char>((ppsSize >> 8) & 0xff),
-            static_cast<unsigned char>(ppsSize & 0xff)
-        };
-        configInner.append(spsLen, sizeof(spsLen));
-        configInner.append(sps, spsSize);
-        configInner.append(ppsLen, sizeof(ppsLen));
-        configInner.append(pps, ppsSize);
-        return isNinjamZapH264ConfigChunk(configInner);
+            const size_t nalSize = ((size_t)bytes[offset] << 24)
+                                 | ((size_t)bytes[offset + 1] << 16)
+                                 | ((size_t)bytes[offset + 2] << 8)
+                                 | (size_t)bytes[offset + 3];
+            offset += 4;
+            if (nalSize == 0 || offset + nalSize > size)
+                break;
+
+            if ((bytes[offset] & 0x1f) == 5)
+                return true;
+
+            offset += nalSize;
+        }
+
+        return false;
     }
 
     juce::String guidToHexString(const unsigned char* guid)
@@ -5270,6 +5923,10 @@ void NinjamVst3AudioProcessor::launchNinjamZapVideoSession()
     {
         const juce::ScopedLock lock(ninjamZapVideoChunkLock);
         ninjamZapVideoChunkReassemblers.clear();
+        ninjamZapVideoAudioGuidByReassemblyKey.clear();
+        ninjamZapVideoMarkerIntervalByReassemblyKey.clear();
+        ninjamZapVideoMarkerSeenByReassemblyKey.clear();
+        ninjamZapH264DebugLogCountByStream.clear();
     }
     const int videoChannels = syncNinjamZapVideoSubscriptions(true);
 
@@ -5329,6 +5986,8 @@ ninjamplus::zap::VideoCodec NinjamVst3AudioProcessor::getNinjamZapCameraActiveCo
         return ninjamplus::zap::VideoCodec::h264;
     if (value == (int)ninjamplus::zap::VideoCodec::vp8)
         return ninjamplus::zap::VideoCodec::vp8;
+    if (value == (int)ninjamplus::zap::VideoCodec::vp9)
+        return ninjamplus::zap::VideoCodec::vp9;
     return ninjamplus::zap::VideoCodec::mjpeg;
 }
 
@@ -5648,6 +6307,11 @@ juce::String NinjamVst3AudioProcessor::enableNinjamZapBrowserCameraSendForHelper
 juce::String NinjamVst3AudioProcessor::buildNinjamZapBrowserCameraStateJson() const
 {
     const auto codec = getNinjamZapCameraActiveCodec();
+    int h264ConfigBytes = 0;
+    {
+        const juce::ScopedLock lock(zapVideoFrameLock);
+        h264ConfigBytes = (int) ninjamZapCameraH264ConfigChunk.getSize();
+    }
     juce::DynamicObject::Ptr obj = new juce::DynamicObject();
     obj->setProperty("ok", true);
     obj->setProperty("enabled", ninjamZapCameraSendEnabled.load(std::memory_order_relaxed)
@@ -5655,6 +6319,8 @@ juce::String NinjamVst3AudioProcessor::buildNinjamZapBrowserCameraStateJson() co
     obj->setProperty("streamOpen", ninjamZapVideoStreamOpen.load(std::memory_order_relaxed));
     obj->setProperty("codec", zapBrowserCodecName(codec));
     obj->setProperty("keyframeRequestId", juce::String((juce::int64)ninjamZapBrowserKeyframeRequestCounter.load(std::memory_order_relaxed)));
+    obj->setProperty("h264ConfigBytes", h264ConfigBytes);
+    obj->setProperty("hasH264Config", h264ConfigBytes > 0);
     return juce::JSON::toString(juce::var(obj.get()), false);
 }
 
@@ -5691,6 +6357,8 @@ void NinjamVst3AudioProcessor::beginNinjamZapVideoIntervalStream(const unsigned 
         videoFourcc = kNinjamZapVideoH264Fourcc;
     else if (activeCodec == ninjamplus::zap::VideoCodec::vp8)
         videoFourcc = kNinjamZapVideoVp8Fourcc;
+    else if (activeCodec == ninjamplus::zap::VideoCodec::vp9)
+        videoFourcc = kNinjamZapVideoVp9Fourcc;
     const int beginResult = ninjamClient.BeginRawIntervalStream(videoChannel,
                                                                videoFourcc,
                                                                guid.data());
@@ -5712,7 +6380,8 @@ void NinjamVst3AudioProcessor::beginNinjamZapVideoIntervalStream(const unsigned 
             + " codec=" + ninjamplus::zap::getCodecName(activeCodec));
 
     if (activeCodec == ninjamplus::zap::VideoCodec::h264
-        || activeCodec == ninjamplus::zap::VideoCodec::vp8)
+        || activeCodec == ninjamplus::zap::VideoCodec::vp8
+        || activeCodec == ninjamplus::zap::VideoCodec::vp9)
     {
         ninjamZapBrowserKeyframeRequestCounter.fetch_add(1, std::memory_order_relaxed);
         ninjamZapBrowserAwaitingIntervalKeyframe.store(true, std::memory_order_relaxed);
@@ -5749,6 +6418,9 @@ void NinjamVst3AudioProcessor::beginNinjamZapVideoIntervalStream(const unsigned 
                                                                        (int)configChunk.getSize());
             if (writeResult != 0)
                 vlogStr("[ZapCam] H.264 config write failed result=" + juce::String(writeResult));
+            else
+                vlogStr("[ZapCam] H.264 cached config write ok bytes=" + juce::String((int)configChunk.getSize())
+                        + " interval=" + juce::String(intervalCounter));
         }
     }
 }
@@ -5876,6 +6548,8 @@ bool NinjamVst3AudioProcessor::handleBrowserNinjamZapCameraFrame(const juce::Mem
 {
     juce::ignoreUnused(width, height, encodeMs);
     const auto requestedCodec = parseZapBrowserCodec(codecName);
+    const bool hasH264Config = requestedCodec == ninjamplus::zap::VideoCodec::h264
+        && configBase64.trim().isNotEmpty();
 
     if (!ninjamZapCameraSendEnabled.load(std::memory_order_relaxed)
         || !ninjamZapBrowserCameraSendEnabled.load(std::memory_order_relaxed))
@@ -5884,14 +6558,19 @@ bool NinjamVst3AudioProcessor::handleBrowserNinjamZapCameraFrame(const juce::Mem
     if (getNinjamZapCameraActiveCodec() != requestedCodec)
         return false;
 
-    if (encodedFrame.getSize() == 0 || encodedFrame.getSize() > ninjamplus::zap::kZapMaxChunkPayloadBytes)
+    const bool hasConfigOnly = hasH264Config
+        && encodedFrame.getSize() == 0;
+
+    if ((!hasConfigOnly && encodedFrame.getSize() == 0)
+        || encodedFrame.getSize() > ninjamplus::zap::kZapMaxChunkPayloadBytes)
         return false;
 
     if (requestedCodec == ninjamplus::zap::VideoCodec::mjpeg && encodedFrame.getSize() < 128)
         return false;
 
     const double safeBrowserAgeMs = std::isfinite(browserAgeMs) ? juce::jmax(0.0, browserAgeMs) : 0.0;
-    if (safeBrowserAgeMs > 650.0)
+    const bool lateFrame = safeBrowserAgeMs > 650.0;
+    if (lateFrame && !hasH264Config)
     {
         vlogStr("[ZapCamBrowser] dropped late frame ageMs=" + juce::String(safeBrowserAgeMs, 1)
                 + " codec=" + zapBrowserCodecName(requestedCodec)
@@ -5900,6 +6579,7 @@ bool NinjamVst3AudioProcessor::handleBrowserNinjamZapCameraFrame(const juce::Mem
     }
 
     juce::MemoryBlock configChunkToSend;
+    juce::MemoryBlock localH264ConfigInner;
     if (requestedCodec == ninjamplus::zap::VideoCodec::h264 && configBase64.trim().isNotEmpty())
     {
         juce::MemoryBlock configInner;
@@ -5908,41 +6588,116 @@ bool NinjamVst3AudioProcessor::handleBrowserNinjamZapCameraFrame(const juce::Mem
             && configInner.getSize() > 0
             && configInner.getSize() <= ninjamplus::zap::kZapMaxChunkPayloadBytes)
         {
-            juce::MemoryBlock configChunk;
-            if (ninjamplus::zap::appendLengthPrefixedChunk(configInner.getData(), configInner.getSize(), configChunk))
+            juce::MemoryBlock normalisedConfig;
+            if (!normaliseNinjamZapH264ConfigPayload(configInner, normalisedConfig))
             {
+                vlogStr("[ZapCamBrowser] ignored invalid H.264 config bytes="
+                        + juce::String((int)configInner.getSize())
+                        + " hex=" + hexPrefix(configInner.getData(), configInner.getSize()));
+                normalisedConfig.reset();
+            }
+
+            juce::MemoryBlock configChunk;
+            if (normalisedConfig.getSize() > 0
+                && ninjamplus::zap::appendLengthPrefixedChunk(normalisedConfig.getData(),
+                                                              normalisedConfig.getSize(),
+                                                              configChunk))
+            {
+                localH264ConfigInner = normalisedConfig;
                 {
                     const juce::ScopedLock lock(zapVideoFrameLock);
                     ninjamZapCameraH264ConfigChunk = configChunk;
                 }
                 configChunkToSend = std::move(configChunk);
+                if (normalisedConfig.getSize() != configInner.getSize())
+                {
+                    vlogStr("[ZapCamBrowser] normalised H.264 config bytes="
+                            + juce::String((int)configInner.getSize())
+                            + "->" + juce::String((int)normalisedConfig.getSize()));
+                }
             }
         }
     }
 
+    if (requestedCodec == ninjamplus::zap::VideoCodec::h264 && configChunkToSend.getSize() == 0)
+    {
+        const juce::ScopedLock lock(zapVideoFrameLock);
+        if (ninjamZapCameraH264ConfigChunk.getSize() > 0)
+            configChunkToSend = ninjamZapCameraH264ConfigChunk;
+    }
+
+    auto publishLocalBrowserPayload = [&](const juce::MemoryBlock& payload)
+    {
+        if (payload.getSize() == 0)
+            return;
+
+        ZapVideoDecodeJob job;
+        job.streamKey = "local:zap-camera";
+        job.sender = "Local camera";
+        job.channelIndex = getNinjamZapVideoChannelIndex();
+        job.codec = requestedCodec;
+        job.payload.append(payload.getData(), payload.getSize());
+        job.receivedMs = juce::Time::getMillisecondCounterHiRes();
+        publishBrowserDecodedZapVideoFrame(job);
+    };
+
+    if (localH264ConfigInner.getSize() > 0)
+        publishLocalBrowserPayload(localH264ConfigInner);
+
     const bool predictiveCodec = requestedCodec == ninjamplus::zap::VideoCodec::h264
-                              || requestedCodec == ninjamplus::zap::VideoCodec::vp8;
+                              || requestedCodec == ninjamplus::zap::VideoCodec::vp8
+                              || requestedCodec == ninjamplus::zap::VideoCodec::vp9;
+    const bool effectiveKeyFrame = keyFrame
+        || (requestedCodec == ninjamplus::zap::VideoCodec::h264
+            && encodedFrame.getSize() > 0
+            && h264AvccFrameContainsIdr(encodedFrame));
     const bool intervalWaitingForKey = predictiveCodec
         && ninjamZapBrowserAwaitingIntervalKeyframe.load(std::memory_order_relaxed);
+    const bool streamOpen = ninjamZapVideoStreamOpen.load(std::memory_order_relaxed);
 
-    if (intervalWaitingForKey && !keyFrame)
+    if (streamOpen
+        && configChunkToSend.getSize() > 0
+        && (hasConfigOnly || lateFrame || (intervalWaitingForKey && !effectiveKeyFrame)))
+    {
+        enqueueNinjamZapCameraFrameChunk(configChunkToSend);
+        vlogStr("[ZapCamBrowser] queued H.264 config-only bytes=" + juce::String((int)configChunkToSend.getSize())
+                + " reason=" + (hasConfigOnly ? "config-only" : (lateFrame ? "late-frame" : "waiting-keyframe")));
+    }
+
+    if (hasConfigOnly || lateFrame)
+        return true;
+
+    if (intervalWaitingForKey && !effectiveKeyFrame)
     {
         return true;
     }
 
-    if (intervalWaitingForKey && keyFrame)
-        ninjamZapBrowserAwaitingIntervalKeyframe.store(false, std::memory_order_relaxed);
-
-    if (ninjamZapVideoStreamOpen.load(std::memory_order_relaxed))
+    if (intervalWaitingForKey && effectiveKeyFrame)
     {
-        if (configChunkToSend.getSize() > 0)
-            enqueueNinjamZapCameraFrameChunk(std::move(configChunkToSend));
+        if (!keyFrame)
+            vlogStr("[ZapCamBrowser] accepted H.264 IDR detected in AVCC payload while key flag was false");
+        ninjamZapBrowserAwaitingIntervalKeyframe.store(false, std::memory_order_relaxed);
+    }
 
+    publishLocalBrowserPayload(encodedFrame);
+
+    if (streamOpen)
+    {
         juce::MemoryBlock chunk;
         if (!ninjamplus::zap::appendLengthPrefixedChunk(encodedFrame.getData(), encodedFrame.getSize(), chunk))
             return false;
 
-        enqueueNinjamZapCameraFrameChunk(std::move(chunk));
+        if (configChunkToSend.getSize() > 0)
+        {
+            juce::MemoryBlock combinedChunk;
+            combinedChunk.append(configChunkToSend.getData(), configChunkToSend.getSize());
+            combinedChunk.append(chunk.getData(), chunk.getSize());
+            enqueueNinjamZapCameraFrameChunk(std::move(combinedChunk));
+        }
+        else
+        {
+            enqueueNinjamZapCameraFrameChunk(std::move(chunk));
+        }
     }
 
     return true;
@@ -5987,11 +6742,19 @@ void NinjamVst3AudioProcessor::publishBrowserDecodedZapVideoFrame(const ZapVideo
         if (job.codec == ninjamplus::zap::VideoCodec::h264)
         {
             juce::MemoryBlock configInner;
-            const bool configOnlyChunk = isNinjamZapH264ConfigChunk(encodedData);
-            if (configOnlyChunk)
-                configInner.append(encodedData.getData(), encodedData.getSize());
+            bool configOnlyChunk = false;
+            if (isNinjamZapH264ConfigChunk(encodedData)
+                || extractNinjamZapH264ConfigFromLength16Nals(encodedData, configInner)
+                || extractNinjamZapH264ConfigFromAvcDecoderConfig(encodedData, configInner))
+            {
+                configOnlyChunk = true;
+                if (configInner.getSize() == 0)
+                    normaliseNinjamZapH264ConfigPayload(encodedData, configInner);
+            }
             else
+            {
                 extractNinjamZapH264ConfigFromAvccFrame(encodedData, configInner);
+            }
 
             if (configInner.getSize() > 0)
             {
@@ -6014,6 +6777,12 @@ void NinjamVst3AudioProcessor::publishBrowserDecodedZapVideoFrame(const ZapVideo
                 auto configIdIt = zapVideoCodecConfigIdByStream.find(job.streamKey);
                 if (configIdIt != zapVideoCodecConfigIdByStream.end())
                     configId = configIdIt->second;
+
+                vlogStr("[ZapRx] H.264 config received stream=" + job.streamKey
+                        + " bytes=" + juce::String((int)configInner.getSize())
+                        + " changed=" + juce::String(changed ? 1 : 0)
+                        + " configOnly=" + juce::String(configOnlyChunk ? 1 : 0)
+                        + " id=" + juce::String((juce::int64)configId));
 
                 auto infoIt = remoteVideoFrameInfoByUser.find(job.streamKey);
                 if (infoIt != remoteVideoFrameInfoByUser.end())
@@ -6507,11 +7276,17 @@ juce::String NinjamVst3AudioProcessor::buildZapVideoFrameListJson() const
             codecName = "h264";
         else if (info.codec == ninjamplus::zap::VideoCodec::vp8)
             codecName = "vp8";
+        else if (info.codec == ninjamplus::zap::VideoCodec::vp9)
+            codecName = "vp9";
         obj->setProperty("codec", codecName);
         obj->setProperty("browserDecode", true);
         if (info.codec == ninjamplus::zap::VideoCodec::h264)
         {
             auto configIt = zapVideoCodecConfigByStream.find(info.streamKey);
+            const int h264ConfigBytes = (configIt != zapVideoCodecConfigByStream.end())
+                ? (int) configIt->second.getSize()
+                : 0;
+            obj->setProperty("debugH264ConfigBytes", h264ConfigBytes);
             if (configIt != zapVideoCodecConfigByStream.end() && configIt->second.getSize() > 0)
             {
                 obj->setProperty("h264Config", juce::Base64::toBase64(configIt->second.getData(),
@@ -6519,6 +7294,12 @@ juce::String NinjamVst3AudioProcessor::buildZapVideoFrameListJson() const
                 auto configIdIt = zapVideoCodecConfigIdByStream.find(info.streamKey);
                 if (configIdIt != zapVideoCodecConfigIdByStream.end())
                     obj->setProperty("h264ConfigId", juce::String((juce::int64)configIdIt->second));
+            }
+            else
+            {
+                auto configIdIt = zapVideoCodecConfigIdByStream.find(info.streamKey);
+                if (configIdIt != zapVideoCodecConfigIdByStream.end())
+                    obj->setProperty("debugH264ConfigIdOnly", juce::String((juce::int64)configIdIt->second));
             }
         }
         juce::uint64 refreshId = info.refreshId;
@@ -6606,6 +7387,8 @@ void NinjamVst3AudioProcessor::clearZapVideoFrameState()
         ninjamZapVideoChunkReassemblers.clear();
         ninjamZapVideoAudioGuidByReassemblyKey.clear();
         ninjamZapVideoMarkerIntervalByReassemblyKey.clear();
+        ninjamZapVideoMarkerSeenByReassemblyKey.clear();
+        ninjamZapH264DebugLogCountByStream.clear();
         remoteVideoChunkReassemblersByUser.clear();
     }
 }
@@ -14046,13 +14829,23 @@ void NinjamVst3AudioProcessor::IntervalChunkCallback_cb(void* userData, NJClient
             // Sync markers may be sent as zero-length payloads wrapped by the
             // chunk framing; detect and log them but otherwise ignore.
             ninjamplus::zap::SyncMarker marker;
-            if (ninjamplus::zap::parseSyncMarkerPayload(chunk.getData(), chunk.getSize(), marker))
+            bool markerAlreadySeen = false;
+            {
+                const juce::ScopedLock lock(self->ninjamZapVideoChunkLock);
+                auto markerSeenIt = self->ninjamZapVideoMarkerSeenByReassemblyKey.find(reassemblyKey);
+                markerAlreadySeen = markerSeenIt != self->ninjamZapVideoMarkerSeenByReassemblyKey.end()
+                    && markerSeenIt->second;
+            }
+
+            if (!markerAlreadySeen
+                && ninjamplus::zap::parseSyncMarkerPayload(chunk.getData(), chunk.getSize(), marker))
             {
                 const juce::String audioGuidHex = guidToHexString(marker.audioGuid.data());
                 {
                     const juce::ScopedLock lock(self->ninjamZapVideoChunkLock);
                     self->ninjamZapVideoAudioGuidByReassemblyKey[reassemblyKey] = audioGuidHex;
                     self->ninjamZapVideoMarkerIntervalByReassemblyKey[reassemblyKey] = (int)marker.intervalCounter;
+                    self->ninjamZapVideoMarkerSeenByReassemblyKey[reassemblyKey] = true;
                 }
                 vlogStr("Zap video sync marker from=" + sender
                         + " ch=" + juce::String(chidx + 1)
@@ -14063,8 +14856,34 @@ void NinjamVst3AudioProcessor::IntervalChunkCallback_cb(void* userData, NJClient
 
             if (codec == ninjamplus::zap::VideoCodec::mjpeg
                 || codec == ninjamplus::zap::VideoCodec::h264
-                || codec == ninjamplus::zap::VideoCodec::vp8)
+                || codec == ninjamplus::zap::VideoCodec::vp8
+                || codec == ninjamplus::zap::VideoCodec::vp9)
             {
+                if (codec == ninjamplus::zap::VideoCodec::h264)
+                {
+                    const bool configShape = isNinjamZapH264ConfigChunk(chunk);
+                    if (configShape || chunk.getSize() <= 64)
+                    {
+                        int debugLogCount = 0;
+                        {
+                            const juce::ScopedLock lock(self->ninjamZapVideoChunkLock);
+                            auto& count = self->ninjamZapH264DebugLogCountByStream[streamKey];
+                            if (count < 12 || configShape)
+                                debugLogCount = ++count;
+                        }
+
+                        if (debugLogCount > 0)
+                        {
+                            vlogStr("[ZapRx] H.264 media chunk stream=" + streamKey
+                                    + " bytes=" + juce::String((int)chunk.getSize())
+                                    + " configShape=" + juce::String(configShape ? 1 : 0)
+                                    + " markerAlreadySeen=" + juce::String(markerAlreadySeen ? 1 : 0)
+                                    + " sample=" + juce::String(debugLogCount)
+                                    + " hex=" + hexPrefix(chunk.getData(), chunk.getSize()));
+                        }
+                    }
+                }
+
                 juce::String audioGuidHex;
                 int markerInterval = -1;
                 {
@@ -14098,6 +14917,8 @@ void NinjamVst3AudioProcessor::IntervalChunkCallback_cb(void* userData, NJClient
         self->ninjamZapVideoChunkReassemblers.erase(reassemblyKey);
         self->ninjamZapVideoAudioGuidByReassemblyKey.erase(reassemblyKey);
         self->ninjamZapVideoMarkerIntervalByReassemblyKey.erase(reassemblyKey);
+        self->ninjamZapVideoMarkerSeenByReassemblyKey.erase(reassemblyKey);
+        self->ninjamZapH264DebugLogCountByStream.erase(streamKey);
     }
 }
 
@@ -15368,21 +16189,6 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
                     + " priorApplied=" + juce::String((juce::int64)priorAppliedMarker));
             }
         }
-        const juce::String displaySender = pending.displaySender.isNotEmpty() ? pending.displaySender : senderKey;
-        const int displaySenderServerLatencyMs = pending.remoteServerLatencyMs >= 0 ? juce::jmax(0, pending.remoteServerLatencyMs) : 0;
-        const int displayReceiverServerLatencyMs = juce::jmax(0, localServerLatencyMs.load());
-        const int displayServerRouteLatencyMs = displaySenderServerLatencyMs + displayReceiverServerLatencyMs;
-        const int displayCorrectedDelayMs = correctedDelayMs >= 0
-            ? correctedDelayMs
-            : juce::jmax(0, elapsedMs + displayServerRouteLatencyMs);
-        juce::String line = displaySender + " " + formatIntervalSyncMarkerBeat(pending.remoteBeat)
-            + "->our " + formatIntervalSyncMarkerBeat(safeLocalMarkerBeat) + " " + juce::String(elapsedMs) + "ms";
-        if (firmAverageMs >= 0)
-            line << " avg " << juce::String(firmAverageMs) << "ms";
-        else if (averageMs >= 0)
-            line << " avg " << juce::String(averageMs) << "ms";
-        if (displayServerRouteLatencyMs > 0)
-            line << " srv " << juce::String(displaySenderServerLatencyMs) << "+" << juce::String(displayReceiverServerLatencyMs) << "ms";
     }
 }
 
@@ -15490,6 +16296,10 @@ void NinjamVst3AudioProcessor::timerCallback()
                 {
                     const juce::ScopedLock lock(ninjamZapVideoChunkLock);
                     ninjamZapVideoChunkReassemblers.clear();
+                    ninjamZapVideoAudioGuidByReassemblyKey.clear();
+                    ninjamZapVideoMarkerIntervalByReassemblyKey.clear();
+                    ninjamZapVideoMarkerSeenByReassemblyKey.clear();
+                    ninjamZapH264DebugLogCountByStream.clear();
                 }
             }
             lastNinjamZapVideoSubscriptionSyncMs = 0.0;

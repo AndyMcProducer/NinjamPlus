@@ -28,17 +28,47 @@
             border: 1px solid #2a3450;
             background: #151d2d;
         }
-        .bar button {
+        .bar button,
+        .bar select,
+        .bar input {
             height: 30px;
             border: 1px solid #3f4f73;
             border-radius: 4px;
             background: #1d2740;
             color: #e7eaf0;
+        }
+        .bar button {
             cursor: pointer;
             padding: 0 10px;
         }
+        .bar select {
+            padding: 0 8px;
+        }
+        .bar input[type="range"] {
+            width: 88px;
+            padding: 0;
+        }
+        .bar input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+        }
         .bar button:hover {
             background: #293655;
+        }
+        .obs-tools,
+        .display-tools {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: center;
+        }
+        .obs-control {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 12px;
+            color: #afbbd3;
+            white-space: nowrap;
         }
         .room {
             font-size: 12px;
@@ -142,7 +172,62 @@
 <body>
     <div class="bar">
         <span class="room" id="roomText"></span>
-        <button id="obsBtn">Copy OBS Link</button>
+        <div class="obs-tools">
+            <label class="obs-control" for="obsLayout">OBS view
+                <select id="obsLayout">
+                    <option value="tiles">Tiles</option>
+                    <option value="rows">Rows</option>
+                    <option value="columns">Columns</option>
+                </select>
+            </label>
+            <label class="obs-control" for="obsSource">Source
+                <select id="obsSource">
+                    <option value="0">All cams</option>
+                    <option value="1">Cam slot 1</option>
+                    <option value="2">Cam slot 2</option>
+                    <option value="3">Cam slot 3</option>
+                    <option value="4">Cam slot 4</option>
+                    <option value="5">Cam slot 5</option>
+                    <option value="6">Cam slot 6</option>
+                    <option value="7">Cam slot 7</option>
+                    <option value="8">Cam slot 8</option>
+                    <option value="9">Cam slot 9</option>
+                    <option value="10">Cam slot 10</option>
+                    <option value="11">Cam slot 11</option>
+                    <option value="12">Cam slot 12</option>
+                </select>
+            </label>
+            <button id="obsBtn">Copy OBS Link</button>
+        </div>
+        <div class="display-tools">
+            <label class="obs-control" for="vdoDisplayFx">Display FX
+                <select id="vdoDisplayFx">
+                    <option value="off">Off</option>
+                    <option value="blur">Blur</option>
+                    <option value="grayscale">Grayscale</option>
+                    <option value="sepia">Sepia</option>
+                </select>
+            </label>
+            <label class="obs-control" for="vdoDisplayFxStrength">Strength
+                <input id="vdoDisplayFxStrength" type="range" min="0" max="24" value="8">
+            </label>
+            <label class="obs-control" for="vdoDisplayMask">Mask
+                <select id="vdoDisplayMask">
+                    <option value="none">None</option>
+                    <option value="cloud">Cloud</option>
+                    <option value="circle">Circle</option>
+                    <option value="rounded">Rounded</option>
+                    <option value="square">Square</option>
+                    <option value="tree">Xmas tree</option>
+                    <option value="pumpkin">Pumpkin</option>
+                    <option value="star">Star</option>
+                    <option value="heart">Heart</option>
+                </select>
+            </label>
+            <label class="obs-control" for="vdoDisplayMirror">Mirror
+                <input id="vdoDisplayMirror" type="checkbox">
+            </label>
+        </div>
         <div class="peer-offsets" id="peerOffsets"></div>
         <span class="status" id="statusText"></span>
     </div>
@@ -153,6 +238,12 @@
         const query = new URLSearchParams(window.location.search);
         const roomText = document.getElementById('roomText');
         const obsBtn = document.getElementById('obsBtn');
+        const obsLayout = document.getElementById('obsLayout');
+        const obsSource = document.getElementById('obsSource');
+        const vdoDisplayFx = document.getElementById('vdoDisplayFx');
+        const vdoDisplayFxStrength = document.getElementById('vdoDisplayFxStrength');
+        const vdoDisplayMask = document.getElementById('vdoDisplayMask');
+        const vdoDisplayMirror = document.getElementById('vdoDisplayMirror');
         const peerOffsets = document.getElementById('peerOffsets');
         const statusText = document.getElementById('statusText');
         const appFrame = document.getElementById('appFrame');
@@ -164,6 +255,118 @@
         const intervalSource = query.get('intervalSource') || (window.location.origin + '/intervals');
         roomText.textContent = 'Room: ' + resolvedRoom;
 
+        function normalizeObsLayout(value) {
+            const layout = String(value || 'tiles').toLowerCase();
+            return layout === 'rows' || layout === 'columns' ? layout : 'tiles';
+        }
+
+        function normalizeObsSlot(value) {
+            const slot = parseInt(value || '0', 10);
+            return isFinite(slot) ? Math.max(0, Math.min(12, slot)) : 0;
+        }
+
+        if (obsLayout) {
+            obsLayout.value = normalizeObsLayout(query.get('obsLayout') || query.get('layout') || 'tiles');
+        }
+        if (obsSource) {
+            obsSource.value = String(normalizeObsSlot(query.get('obsSlot') || query.get('slot') || '0'));
+        }
+
+        function normalizeDisplayFx(value) {
+            const fx = String(value || 'off').toLowerCase();
+            return fx === 'blur' || fx === 'grayscale' || fx === 'sepia' ? fx : 'off';
+        }
+
+        function normalizeDisplayMask(value) {
+            const mask = String(value || 'none').toLowerCase();
+            return ['none', 'cloud', 'circle', 'rounded', 'square', 'tree', 'pumpkin', 'star', 'heart'].includes(mask) ? mask : 'none';
+        }
+
+        function displaySvgMaskUrl(shape) {
+            let inner = '';
+            if (shape === 'tree') {
+                inner = '<path fill="white" d="M50 4 L74 36 H62 L82 63 H66 L91 94 H58 V100 H42 V94 H9 L34 63 H18 L38 36 H26 Z"/>';
+            } else if (shape === 'pumpkin') {
+                inner = '<path fill="white" d="M47 7 H57 V23 H47 Z M50 18 C34 7 12 20 12 53 C12 82 31 98 50 88 C69 98 88 82 88 53 C88 20 66 7 50 18 Z"/>';
+            } else if (shape === 'star') {
+                inner = '<polygon fill="white" points="50,4 61,37 96,37 68,57 79,92 50,71 21,92 32,57 4,37 39,37"/>';
+            } else if (shape === 'heart') {
+                inner = '<path fill="white" d="M50 91 C23 68 8 54 8 33 C8 18 19 8 34 8 C42 8 48 12 50 19 C52 12 58 8 66 8 C81 8 92 18 92 33 C92 54 77 68 50 91 Z"/>';
+            }
+            if (!inner) return '';
+            return 'url("data:image/svg+xml;utf8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" preserveAspectRatio="none">' + inner + '</svg>') + '")';
+        }
+
+        function clearDisplayMask(el) {
+            if (!el) return;
+            el.style.clipPath = '';
+            el.style.webkitClipPath = '';
+            el.style.maskImage = 'none';
+            el.style.webkitMaskImage = 'none';
+            el.style.maskSize = '';
+            el.style.webkitMaskSize = '';
+            el.style.maskRepeat = '';
+            el.style.webkitMaskRepeat = '';
+            el.style.maskPosition = '';
+            el.style.webkitMaskPosition = '';
+        }
+
+        function applyDisplayMask(el, shape) {
+            clearDisplayMask(el);
+            if (!el || shape === 'none') return;
+            if (shape === 'circle') {
+                el.style.clipPath = 'circle(47% at 50% 50%)';
+                el.style.webkitClipPath = 'circle(47% at 50% 50%)';
+                return;
+            }
+            if (shape === 'rounded') {
+                el.style.clipPath = 'inset(0 round 10%)';
+                el.style.webkitClipPath = 'inset(0 round 10%)';
+                return;
+            }
+            if (shape === 'square') {
+                el.style.clipPath = 'inset(0)';
+                el.style.webkitClipPath = 'inset(0)';
+                return;
+            }
+            const maskUrl = shape === 'cloud' ? 'url("/zap-mask/cloud.png")' : displaySvgMaskUrl(shape);
+            if (!maskUrl) return;
+            el.style.maskImage = maskUrl;
+            el.style.webkitMaskImage = maskUrl;
+            el.style.maskSize = '100% 100%';
+            el.style.webkitMaskSize = '100% 100%';
+            el.style.maskRepeat = 'no-repeat';
+            el.style.webkitMaskRepeat = 'no-repeat';
+            el.style.maskPosition = 'center';
+            el.style.webkitMaskPosition = 'center';
+        }
+
+        function applyVdoDisplayEffects() {
+            const fx = normalizeDisplayFx(vdoDisplayFx ? vdoDisplayFx.value : 'off');
+            const mask = normalizeDisplayMask(vdoDisplayMask ? vdoDisplayMask.value : 'none');
+            const strength = Math.max(0, Math.min(24, parseInt(vdoDisplayFxStrength ? vdoDisplayFxStrength.value : '8', 10) || 0));
+            if (vdoDisplayFxStrength) {
+                vdoDisplayFxStrength.disabled = fx !== 'blur';
+            }
+            if (!appFrame) return;
+            appFrame.style.filter = fx === 'blur'
+                ? 'blur(' + String(strength) + 'px)'
+                : (fx === 'grayscale' ? 'grayscale(1)' : (fx === 'sepia' ? 'sepia(1)' : 'none'));
+            appFrame.style.transformOrigin = 'center center';
+            appFrame.style.transform = vdoDisplayMirror && vdoDisplayMirror.checked ? 'scaleX(-1)' : '';
+            applyDisplayMask(appFrame, mask);
+        }
+
+        if (vdoDisplayFx) {
+            vdoDisplayFx.value = normalizeDisplayFx(query.get('displayFx') || 'off');
+        }
+        if (vdoDisplayMask) {
+            vdoDisplayMask.value = normalizeDisplayMask(query.get('displayMask') || query.get('mask') || 'none');
+        }
+        if (vdoDisplayMirror) {
+            vdoDisplayMirror.checked = query.get('displayMirror') === '1';
+        }
+
         function buildMainUrl() {
             const p = new URLSearchParams(window.location.search);
             p.delete('view');
@@ -173,11 +376,14 @@
         }
 
         function buildObsUrl() {
-            const p = new URLSearchParams(window.location.search);
-            p.delete('view');
-            p.set('bg', 'green');
-            p.set('helperLoad', String(Date.now()));
-            return window.location.origin + '/app?' + p.toString();
+            const url = new URL('/zap-wall', window.location.origin);
+            const layout = normalizeObsLayout(obsLayout ? obsLayout.value : 'tiles');
+            const slot = normalizeObsSlot(obsSource ? obsSource.value : '0');
+            url.searchParams.set('layout', layout);
+            if (slot > 0) {
+                url.searchParams.set('slot', String(slot));
+            }
+            return url.toString();
         }
 
         function copyTextToClipboard(text) {
@@ -737,14 +943,33 @@
         }
 
         obsBtn.addEventListener('click', function () {
+            const slot = normalizeObsSlot(obsSource ? obsSource.value : '0');
             copyTextToClipboard(buildObsUrl())
-                .then(function () { statusText.textContent = 'OBS link copied'; })
+                .then(function () {
+                    statusText.textContent = slot > 0
+                        ? ('OBS cam slot ' + slot + ' link copied')
+                        : 'OBS all cams link copied';
+                })
                 .catch(function () { statusText.textContent = 'Could not copy OBS link'; });
         });
+
+        if (vdoDisplayFx) {
+            vdoDisplayFx.addEventListener('change', applyVdoDisplayEffects);
+        }
+        if (vdoDisplayFxStrength) {
+            vdoDisplayFxStrength.addEventListener('input', applyVdoDisplayEffects);
+        }
+        if (vdoDisplayMask) {
+            vdoDisplayMask.addEventListener('change', applyVdoDisplayEffects);
+        }
+        if (vdoDisplayMirror) {
+            vdoDisplayMirror.addEventListener('change', applyVdoDisplayEffects);
+        }
 
         renderUsers();
         appFrame.addEventListener('load', pushAllOffsetsToFrame);
         appFrame.src = buildMainUrl();
+        applyVdoDisplayEffects();
         startUserDiscovery();
         setInterval(pruneInactiveUsers, 1500);
     </script>
