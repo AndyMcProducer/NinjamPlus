@@ -7833,7 +7833,6 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         const juce::ScopedLock lock(audioProcessor.chatLock);
         applyColoredChat(chatDisplay, audioProcessor.chatHistory, audioProcessor.chatSenders, audioProcessor);
         lastChatRevision = audioProcessor.chatRevision.load();
-        juce::Logger::writeToLog("Chat UI init revision=" + juce::String(lastChatRevision));
     }
 
     // Initialize metronome UI from processor state so mute/volume persist across GUI reopen
@@ -7851,11 +7850,12 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
             metronomeSlider.setValue(vol, juce::dontSendNotification);
         }
         updateMetronomeButtonColor();
-        juce::Logger::writeToLog("Metronome UI init vol=" + juce::String(vol));
     }
 
     if (settingsFileReady)
         loadPersistentSettingsFromDisk();
+    updateSamplePadsFeatureVisibility();
+    refreshExternalMidiInputDevices();
     lastPersistentSettingsSaveMs = juce::Time::getMillisecondCounterHiRes();
     lastSavedUiSettingsFingerprint = buildPersistentSettingsFingerprint(false);
     persistentSettingsDirty = false;
@@ -8167,8 +8167,15 @@ void NinjamVst3AudioProcessorEditor::resized()
     auto controlsRow = area.removeFromTop(30);
     videoButton.setBounds(controlsRow.removeFromRight(100));
     controlsRow.removeFromRight(5);
-    samplePadsButton.setBounds(controlsRow.removeFromRight(42));
-    controlsRow.removeFromRight(5);
+    if (samplePadsButton.isVisible())
+    {
+        samplePadsButton.setBounds(controlsRow.removeFromRight(42));
+        controlsRow.removeFromRight(5);
+    }
+    else
+    {
+        samplePadsButton.setBounds({});
+    }
     chatButton.setBounds(controlsRow.removeFromRight(80));
     controlsRow.removeFromRight(10);
     layoutButton.setBounds(controlsRow.removeFromLeft(40));  // icon-only button
@@ -8497,7 +8504,6 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
 
         if (revision != lastChatRevision)
         {
-            juce::Logger::writeToLog("UI Chat update: history=" + juce::String(history.size()) + " revision=" + juce::String(revision));
             applyColoredChat(chatDisplay, history, senders, audioProcessor);
             lastChatRevision = revision;
 
@@ -9723,8 +9729,26 @@ void NinjamVst3AudioProcessorEditor::chatPopoutClicked()
     resized();
 }
 
+void NinjamVst3AudioProcessorEditor::updateSamplePadsFeatureVisibility()
+{
+    const bool enabled = audioProcessor.isSamplePadsFeatureEnabled();
+    samplePadsButton.setVisible(enabled);
+    samplePadsButton.setEnabled(enabled);
+
+    if (!enabled && samplePadsWindow)
+    {
+        samplePadsWindow->setVisible(false);
+        samplePadsWindow.reset();
+    }
+
+    updateEditorTimerInterval();
+}
+
 void NinjamVst3AudioProcessorEditor::showSamplePadsWindow()
 {
+    if (!audioProcessor.isSamplePadsFeatureEnabled())
+        return;
+
     if (samplePadsWindow)
     {
         if (auto* samplerWindow = dynamic_cast<SamplePadsWindow*>(samplePadsWindow.get()))
@@ -9739,7 +9763,9 @@ void NinjamVst3AudioProcessorEditor::showSamplePadsWindow()
     juce::Component::SafePointer<NinjamVst3AudioProcessorEditor> safeThis(this);
     auto openWindow = [safeThis, abletonHostedWindow]
     {
-        if (safeThis == nullptr || safeThis->samplePadsWindow)
+        if (safeThis == nullptr
+            || safeThis->samplePadsWindow
+            || !safeThis->audioProcessor.isSamplePadsFeatureEnabled())
             return;
 
         auto* editorPtr = safeThis.getComponent();
@@ -9994,6 +10020,13 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
 
     const bool connectedToServer = audioProcessor.getClient().GetStatus() == NJClient::NJC_STATUS_OK;
     if (!connectedToServer)
+    {
+        disableBackgroundVideo();
+        audioProcessor.launchVideoSessionAsync();
+        return;
+    }
+
+    if (!audioProcessor.isNinjamZapServerSupported())
     {
         disableBackgroundVideo();
         audioProcessor.launchVideoSessionAsync();
@@ -10866,6 +10899,7 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
 
     menu.addItem(41, "Midi Settings");
     menu.addItem(42, "Enable Chord Detection", true, audioProcessor.isChordDetectionEnabled());
+    menu.addItem(46, "Enable Sample Pads / Looper", true, audioProcessor.isSamplePadsFeatureEnabled());
     menu.addItem(43, "Ableton Link Audio");
     menu.addSubMenu("Transport Sync Source", syncSourceMenu);
     if (isAbletonLiveHost() && !audioProcessor.isStandaloneWrapper())
@@ -10900,6 +10934,15 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
                 audioProcessor.setChordDetectionEnabled(!audioProcessor.isChordDetectionEnabled());
             if (result == 43)
                 showLinkAudioOptionsPopup();
+            if (result == 46)
+            {
+                audioProcessor.setSamplePadsFeatureEnabled(!audioProcessor.isSamplePadsFeatureEnabled());
+                updateSamplePadsFeatureVisibility();
+                refreshExternalMidiInputDevices();
+                resized();
+                repaint();
+                markPersistentSettingsDirty();
+            }
             if (result == 44 || result == 45)
             {
                 preferredSyncMode = (result == 45)
@@ -10974,7 +11017,9 @@ void NinjamVst3AudioProcessorEditor::refreshExternalMidiInputDevices()
 {
     const juce::String desiredLearnId = audioProcessor.getMidiLearnInputDeviceId();
     const juce::String desiredRelayId = audioProcessor.getMidiRelayInputDeviceId();
-    const juce::String desiredPadsId = audioProcessor.getSamplePadsMidiInputDeviceId();
+    const bool samplePadsFeatureEnabled = audioProcessor.isSamplePadsFeatureEnabled();
+    const juce::String desiredPadsId = samplePadsFeatureEnabled ? audioProcessor.getSamplePadsMidiInputDeviceId()
+                                                                : juce::String();
     const bool desiredPadsRelay = desiredPadsId == NinjamVst3AudioProcessor::samplePadsMidiInputRelayId;
 
     if (desiredLearnId != openedMidiLearnInputDeviceId)
@@ -11051,8 +11096,10 @@ void NinjamVst3AudioProcessorEditor::handleIncomingMidiMessage(juce::MidiInput* 
     const juce::String sourceId = source->getIdentifier();
     const juce::String learnDeviceId = audioProcessor.getMidiLearnInputDeviceId();
     const juce::String relayDeviceId = audioProcessor.getMidiRelayInputDeviceId();
-    const juce::String padsDeviceId = audioProcessor.getSamplePadsMidiInputDeviceId();
-    const bool forPads = padsDeviceId.isNotEmpty() && sourceId == padsDeviceId;
+    const bool samplePadsFeatureEnabled = audioProcessor.isSamplePadsFeatureEnabled();
+    const juce::String padsDeviceId = samplePadsFeatureEnabled ? audioProcessor.getSamplePadsMidiInputDeviceId()
+                                                               : juce::String();
+    const bool forPads = samplePadsFeatureEnabled && padsDeviceId.isNotEmpty() && sourceId == padsDeviceId;
     const bool forLearn = (learnDeviceId.isNotEmpty() && sourceId == learnDeviceId)
         || (forPads && midiLearnArmedTargetId.startsWith("samplepad.trigger."));
     const bool forRelay = relayDeviceId.isNotEmpty() && sourceId == relayDeviceId;

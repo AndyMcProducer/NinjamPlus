@@ -83,6 +83,7 @@ public:
     void timerCallback() override;
 
     NJClient& getClient() { return ninjamClient; }
+    bool isNinjamZapServerSupported() const;
 
     // NINJAM actions
     void connectToServer(juce::String host, juce::String user, juce::String pass);
@@ -270,6 +271,8 @@ public:
         const int userIndex = remoteUserIndexForLooperInput(inputIndex);
         return inputIndex <= looperInputRemoteUserBase && userIndex >= 0 && userIndex < maxRemoteChordUsers;
     }
+    void setSamplePadsFeatureEnabled(bool shouldEnable);
+    bool isSamplePadsFeatureEnabled() const;
     bool loadSamplePad(int padIndex, const juce::File& file);
     void loadSamplePadAsync(int padIndex,
                             const juce::File& file,
@@ -770,6 +773,7 @@ private:
     std::atomic<int> samplePadsDuckShape { (int)SamplePadDuckShape::smoothPump };
     std::atomic<int> samplePadsDuckLength { (int)SamplePadDuckLength::quarter };
     std::atomic<bool> samplePadsUseDefaultFx { true };
+    std::atomic<bool> samplePadsFeatureEnabled { true };
     std::atomic<float> samplePadsPeak { 0.0f };
     std::atomic<int> samplePadLooperInput { looperInputLocalChannel };
     static constexpr int remoteAudioTapBufferSamples = 32768;
@@ -779,10 +783,15 @@ private:
     std::array<int, maxRemoteChordUsers> remoteAudioTapAvailableSamples {};
     bool samplePadTransportInitialised = false;
     int samplePadLastTransportPosition = 0;
+    int samplePadLastTransportLength = 0;
+    int samplePadLastTransportBpi = 0;
     long long samplePadTransportInterval = 0;
     double lastSamplePadBpmSyncBpm = 0.0;
     std::atomic<int> cachedNinjamTransportPos { 0 };
     std::atomic<int> cachedNinjamTransportLen { 0 };
+    std::atomic<long long> cachedNinjamTransportSampleCounter { 0 };
+    std::atomic<int> cachedNinjamBpi { 16 };
+    std::atomic<float> cachedNinjamBpm { 120.0f };
 
     std::atomic<bool> spreadOutputsEnabled { false };
     std::atomic<bool> softLimiterEnabled { true };
@@ -938,6 +947,7 @@ private:
     std::atomic<bool> videoHelperRunning { false };
     std::atomic<int> advancedVideoHelperPort { 0 };
     std::atomic<bool> videoLaunchInProgress { false };
+    std::atomic<bool> ninjamZapServerVideoSupported { false };
     std::atomic<bool> ninjamZapVideoEnabled { false };
     std::atomic<bool> ninjamZapVideoReceivedNotice { false };
     juce::CriticalSection ninjamZapVideoChunkLock;
@@ -945,7 +955,6 @@ private:
     std::map<juce::String, juce::String> ninjamZapVideoAudioGuidByReassemblyKey;
     std::map<juce::String, int> ninjamZapVideoMarkerIntervalByReassemblyKey;
     std::map<juce::String, bool> ninjamZapVideoMarkerSeenByReassemblyKey;
-    std::map<juce::String, int> ninjamZapH264DebugLogCountByStream;
     // Per-user reassembly + decode state (used by helper HTTP server)
     std::map<juce::String, ninjamplus::zap::ChunkReassembler> remoteVideoChunkReassemblersByUser;
 #if defined(NINJAMPLUS_HAS_PROVIDEO) && NINJAMPLUS_HAS_PROVIDEO
@@ -965,13 +974,11 @@ private:
     std::array<unsigned char, 16> ninjamZapVideoStreamGuid {};
     std::atomic<juce::uint64> ninjamZapBrowserKeyframeRequestCounter { 0 };
     std::atomic<bool> ninjamZapBrowserAwaitingIntervalKeyframe { false };
-    juce::SpinLock pendingNinjamZapIntervalLock;
     std::atomic<bool> pendingNinjamZapIntervalRotate { false };
-    std::array<unsigned char, 16> pendingNinjamZapAudioGuid {};
-    int pendingNinjamZapIntervalCounter = 0;
     juce::SpinLock ninjamZapCameraChunkQueueLock;
     std::vector<PendingNinjamZapCameraChunk> pendingNinjamZapCameraChunks;
     juce::MemoryBlock ninjamZapCameraH264ConfigChunk;
+    std::atomic<bool> ninjamZapVideoPlaybackWorkPending { false };
     std::atomic<bool> pendingNinjamZapVideoPlaybackSwap { false };
     std::atomic<double> pendingNinjamZapVideoPlaybackBoundaryMs { 0.0 };
     mutable juce::CriticalSection zapVideoFrameLock;
@@ -1123,7 +1130,7 @@ private:
     void requestNinjamZapVideoIntervalRotateFromAudioThread();
     void processPendingNinjamZapVideoIntervalRotate();
     void rotateNinjamZapVideoIntervalStream(const unsigned char audioGuid[16], int intervalCounter);
-    void flushPendingNinjamZapCameraVideo();
+    void flushPendingNinjamZapCameraVideo(int maxChunksToFlush = 2);
     void enqueueNinjamZapCameraFrameChunk(juce::MemoryBlock chunk);
     juce::String enableNinjamZapBrowserCameraSendForHelper(const juce::String& codecName);
     juce::String buildNinjamZapBrowserCameraStateJson() const;
@@ -1156,6 +1163,7 @@ private:
     void flushOutboundOscRelayEvents();
     void injectInboundMidiRelayEvents(juce::MidiBuffer& midiMessages);
     void clearRemoteAudioTapBuffers();
+    void stopAllSamplePadRuntimeActivity();
     bool copyRemoteUserAudioForLooper(int userIndex, int numSamples);
     void updateSamplePadTransport(int transportPosition, int transportLength, int bpi);
     double getSamplePadBlockStartBeat(int transportPosition, int transportLength, int bpi, double& samplesPerBeat);
@@ -1189,6 +1197,8 @@ inline bool NinjamVst3AudioProcessor::isSamplePadPlaying(int padIndex) const
 {
     if (padIndex < 0 || padIndex >= numSamplePads)
         return false;
+    if (!isSamplePadsFeatureEnabled())
+        return false;
 
     const auto& pad = samplePads[(size_t)padIndex];
     return pad.playing.load(std::memory_order_relaxed)
@@ -1198,6 +1208,8 @@ inline bool NinjamVst3AudioProcessor::isSamplePadPlaying(int padIndex) const
 inline bool NinjamVst3AudioProcessor::isSamplePadWaitingForBpiLoop(int padIndex) const
 {
     if (padIndex < 0 || padIndex >= numSamplePads)
+        return false;
+    if (!isSamplePadsFeatureEnabled())
         return false;
 
     const auto& pad = samplePads[(size_t)padIndex];

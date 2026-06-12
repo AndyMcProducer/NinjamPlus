@@ -1347,6 +1347,7 @@ private:
     void updateSyncButtonColor();
     void updateSyncButtonTooltip();
     void updateFxButtonLabel();
+    void updateSamplePadsFeatureVisibility();
     void showFxMenu();
     void showOptionsMenu();
     void showSettingsCallout(std::unique_ptr<juce::Component> content, juce::Component& anchorComponent);
