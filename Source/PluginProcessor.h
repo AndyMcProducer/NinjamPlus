@@ -394,7 +394,7 @@ public:
     float getLocalPeakRight() const;
 
     void sendSideSignal(const juce::String& target, const juce::String& type, const juce::String& payload);
-    void sendIntervalSignal(const juce::String& type, const juce::String& payload);
+    void sendIntervalSignal(const juce::String& type, const juce::String& payload, const juce::String& target = "*");
     void processSyncSignal(const juce::String& sender, const juce::String& type, const juce::String& payload);
     void launchVideoSession();
     void launchVideoSessionAsync();
@@ -948,6 +948,8 @@ private:
     std::atomic<int> advancedVideoHelperPort { 0 };
     std::atomic<bool> videoLaunchInProgress { false };
     std::atomic<bool> ninjamZapServerVideoSupported { false };
+    std::atomic<bool> ninjamSideSignalServerSupported { false };
+    std::atomic<bool> ninjamSideSignalVideoCapSent { false };
     std::atomic<bool> ninjamZapVideoEnabled { false };
     std::atomic<bool> ninjamZapVideoReceivedNotice { false };
     juce::CriticalSection ninjamZapVideoChunkLock;
@@ -1033,6 +1035,7 @@ private:
     std::future<void> serverLatencyProbeFuture;
     double lastServerLatencyProbeAttemptMs = 0.0;
     double lastRemoteSyncUserPruneMs = 0.0;
+    double lastIntervalSyncFallbackSubscriptionMs = 0.0;
     struct RemoteLatencyAverageState
     {
         int sampleCount = 0;
@@ -1158,6 +1161,7 @@ private:
     void syncLocalIntervalChannelConfig();
     bool isNinjamRemoteChannelVideoOnly(int userIndex, int channelIndex);
     int syncNinjamZapVideoSubscriptions(bool subscribe);
+    int ensureRawIntervalSyncFallbackSubscriptions();
     void addSystemChatLine(const juce::String& message);
     void flushOutboundMidiRelayEvents();
     void flushOutboundOscRelayEvents();
