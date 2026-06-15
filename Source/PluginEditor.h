@@ -5,6 +5,7 @@
 #include "PluginProcessor.h"
 
 class NinjamVst3AudioProcessorEditor;  // forward declaration for LAF classes
+class ChatTtsEngine;
 
 #if JUCE_WINDOWS
 struct WinVideoReader;  // Windows Media Foundation frame reader (defined in PluginEditor.cpp)
@@ -1373,6 +1374,9 @@ private:
     juce::String buildPersistentSettingsFingerprint(bool includeProcessorState) const;
     void setChatWindowColourKey(const juce::String& key, bool markDirty);
     void applyChatWindowColourToDisplays();
+    void setChatTtsEnabled(bool enabled, bool markDirty);
+    void setChatTtsVoiceId(const juce::String& voiceId, bool markDirty);
+    void enqueueChatTtsForNewLines(const juce::StringArray& history, const juce::StringArray& senders);
     void setAbletonChatWindowSizePreset(int presetIndex);
     void setAbletonSamplerWindowSizePreset(int presetIndex);
     void rememberSamplePadsWindowBounds(juce::Rectangle<int> bounds, bool saveNow);
@@ -1421,8 +1425,16 @@ private:
         float normalized = 0.0f;
         bool binaryOn = false;
     };
+
+    struct PendingChatTtsLine
+    {
+        int historyIndex = -1;
+        double dueMs = 0.0;
+    };
     
     int lastChatRevision = 0;
+    int lastChatTtsHistorySize = 0;
+    std::vector<PendingChatTtsLine> pendingChatTtsLines;
 
     std::unique_ptr<juce::DocumentWindow> serverListWindow;
     std::unique_ptr<juce::DocumentWindow> chatWindow;
@@ -1447,6 +1459,11 @@ private:
     int currentEditorTimerIntervalMs = 0;
     int heavyUiTickCounter = 0;
     float voiceChatGlowPhase = 0.0f;
+    bool chatTtsEnabled = false;
+    juce::String chatTtsVoiceId;
+    juce::StringArray chatTtsVoiceIds;
+    juce::StringArray chatTtsVoiceNames;
+    std::unique_ptr<ChatTtsEngine> chatTtsEngine;
     float storedMetronomeVolume = 0.5f;
     std::map<int, float> autoLevelCurrentGains;
     std::map<int, float> autoLevelLastAppliedGains;

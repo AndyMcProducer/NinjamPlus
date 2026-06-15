@@ -509,6 +509,7 @@ private:
         double lastDecodeMs = 0.0;
         double lastReceiveToPublishMs = 0.0;
         double lastPlaybackOffsetMs = 0.0;
+        double lastPlaybackCompensationMs = 0.0;
         double lastSenderCaptureQueueMs = 0.0;
         double lastSenderEncodeMs = 0.0;
         int frameCount = 0;
@@ -529,6 +530,8 @@ private:
         double queuedMs = 0.0;
         double decodeStartedMs = 0.0;
         double decodeFinishedMs = 0.0;
+        double senderCaptureQueueMs = 0.0;
+        double senderEncodeMs = 0.0;
     };
 
     struct ZapVideoIntervalFrameBuffer
@@ -542,6 +545,8 @@ private:
         double lastDecodeQueueMs = 0.0;
         double lastDecodeMs = 0.0;
         double lastReceiveToPublishMs = 0.0;
+        double lastSenderCaptureQueueMs = 0.0;
+        double lastSenderEncodeMs = 0.0;
         int decodedFrameCount = 0;
         ninjamplus::zap::VideoCodec codec = ninjamplus::zap::VideoCodec::unknown;
         juce::uint64 codecConfigId = 0;
@@ -563,6 +568,13 @@ private:
     {
         std::array<unsigned char, 16> videoGuid {};
         juce::MemoryBlock chunk;
+    };
+
+    struct ZapVideoSenderTiming
+    {
+        double captureQueueMs = 0.0;
+        double encodeMs = 0.0;
+        double updatedMs = 0.0;
     };
 
     struct LinkTimingState;
@@ -944,6 +956,7 @@ private:
     double lastIntervalHelperPayloadWriteMs = 0.0;
     std::atomic<bool> intervalHelperPayloadForceWrite { false };
     std::atomic<juce::uint64> vdoRosterRevision { 0 };
+    std::atomic<bool> vdoVideoSyncEnabled { false };
     std::atomic<bool> videoHelperRunning { false };
     std::atomic<int> advancedVideoHelperPort { 0 };
     std::atomic<bool> videoLaunchInProgress { false };
@@ -983,10 +996,12 @@ private:
     std::atomic<bool> ninjamZapVideoPlaybackWorkPending { false };
     std::atomic<bool> pendingNinjamZapVideoPlaybackSwap { false };
     std::atomic<double> pendingNinjamZapVideoPlaybackBoundaryMs { 0.0 };
+    std::atomic<double> lastNinjamZapVideoTimingBroadcastMs { 0.0 };
     mutable juce::CriticalSection zapVideoFrameLock;
     std::map<juce::String, int> remoteLatencyFirmDelayMsByUser;
     std::map<juce::String, juce::uint64> remoteVideoBufferRefreshIdByUser;
     std::map<juce::String, ZapVideoFrameInfo> remoteVideoFrameInfoByUser;
+    std::map<juce::String, ZapVideoSenderTiming> zapVideoSenderTimingByStream;
     std::map<juce::String, juce::MemoryBlock> remoteVideoLatestJpegByUser;
     std::map<juce::String, juce::Image> remoteVideoLatestFrameByUser;
     std::map<juce::String, std::map<juce::String, ZapVideoIntervalFrameBuffer>> zapVideoDecodedIntervalsByStream;
@@ -1121,6 +1136,7 @@ private:
     bool isAdvancedVideoClientAvailable(int port) const;
     bool ensureAdvancedVideoClientStarted();
     bool ensureZapVideoClientStarted();
+    bool stopVdoVideoSync();
     void stopAdvancedVideoClient();
     void writeIntervalHelperJson(int pos, int length);
     void startZapVideoDecodeWorker();
@@ -1135,6 +1151,7 @@ private:
     void rotateNinjamZapVideoIntervalStream(const unsigned char audioGuid[16], int intervalCounter);
     void flushPendingNinjamZapCameraVideo(int maxChunksToFlush = 2);
     void enqueueNinjamZapCameraFrameChunk(juce::MemoryBlock chunk);
+    void broadcastNinjamZapVideoTiming(double captureQueueMs, double encodeMs);
     juce::String enableNinjamZapBrowserCameraSendForHelper(const juce::String& codecName);
     juce::String buildNinjamZapBrowserCameraStateJson() const;
     bool handleBrowserNinjamZapCameraFrame(const juce::MemoryBlock& encodedFrame,

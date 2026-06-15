@@ -5,17 +5,263 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <thread>
-
 static juce::String normaliseColourPresetName(const juce::String& name);
 static juce::Colour colourFromPresetName(const juce::String& preset, const juce::Colour& fallback);
-
 #if JUCE_WINDOWS
 #include <windows.h>
 #include <shellapi.h>
+#include <sapi.h>
+#include <sphelper.h>
+#pragma comment(lib, "sapi.lib")
+#pragma comment(lib, "ole32.lib")
 #else
 #include <dlfcn.h>
 #endif
+class ChatTtsEngine final : private juce::Thread
+{
+public:
+    ChatTtsEngine()
+        : juce::Thread("NINJAMChatTTS")
+    {
+        startThread(juce::Thread::Priority::background);
+    }
+
+    ~ChatTtsEngine() override
+    {
+        signalThreadShouldExit();
+        workAvailable.signal();
+        stopThread(1000);
+    }
+
+    static void getAvailableVoices(juce::StringArray& voiceIds, juce::StringArray& voiceNames)
+    {
+        voiceIds.clear();
+        voiceNames.clear();
+#if JUCE_WINDOWS
+        const HRESULT coResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool shouldUninitialise = SUCCEEDED(coResult);
+
+        IEnumSpObjectTokens* enumTokens = nullptr;
+        if (SUCCEEDED(SpEnumTokens(SPCAT_VOICES, nullptr, nullptr, &enumTokens)) && enumTokens != nullptr)
+        {
+            ISpObjectToken* token = nullptr;
+            ULONG fetched = 0;
+            while (enumTokens->Next(1, &token, &fetched) == S_OK && token != nullptr)
+            {
+                LPWSTR id = nullptr;
+                LPWSTR description = nullptr;
+                if (SUCCEEDED(token->GetId(&id)) && id != nullptr)
+                    voiceIds.add(juce::String(id));
+                else
+                    voiceIds.add({});
+
+                if (SUCCEEDED(SpGetDescription(token, &description)) && description != nullptr)
+                    voiceNames.add(juce::String(description));
+                else
+                    voiceNames.add("Voice " + juce::String(voiceNames.size() + 1));
+
+                if (id != nullptr)
+                    CoTaskMemFree(id);
+                if (description != nullptr)
+                    CoTaskMemFree(description);
+                token->Release();
+                token = nullptr;
+            }
+            enumTokens->Release();
+        }
+
+        if (shouldUninitialise)
+            CoUninitialize();
+#elif JUCE_MAC
+        juce::ChildProcess say;
+        if (say.start(juce::StringArray { "/usr/bin/say", "-v", "?" },
+                      juce::ChildProcess::wantStdOut | juce::ChildProcess::wantStdErr))
+        {
+            const juce::String output = say.readAllProcessOutput();
+            juce::StringArray lines;
+            lines.addLines(output);
+            for (auto line : lines)
+            {
+                line = line.trim();
+                if (line.isEmpty())
+                    continue;
+
+                const int firstSpace = line.indexOfAnyOf(" \t");
+                if (firstSpace <= 0)
+                    continue;
+
+                const juce::String voice = line.substring(0, firstSpace).trim();
+                if (voice.isNotEmpty())
+                {
+                    voiceIds.add(voice);
+                    voiceNames.add(voice);
+                }
+            }
+        }
+#elif JUCE_LINUX || JUCE_BSD
+        static constexpr const char* voiceTypes[] = {
+            "male1", "male2", "male3", "female1", "female2", "female3", "child_male", "child_female"
+        };
+        for (auto* voiceType : voiceTypes)
+        {
+            voiceIds.add(voiceType);
+            voiceNames.add(juce::String(voiceType).replace("_", " "));
+        }
+#endif
+    }
+
+    void enqueue(juce::String text, juce::String voiceId)
+    {
+        text = text.trim();
+        if (text.isEmpty())
+            return;
+
+        const juce::ScopedLock lock(queueLock);
+        while (queue.size() >= 6)
+            queue.pop_front();
+        queue.push_back({ text, voiceId.trim() });
+        workAvailable.signal();
+    }
+
+private:
+    struct SpeechJob
+    {
+        juce::String text;
+        juce::String voiceId;
+    };
+
+    void run() override
+    {
+#if JUCE_WINDOWS
+        const HRESULT coResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool shouldUninitialise = SUCCEEDED(coResult);
+
+        ISpVoice* voice = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_SpVoice, nullptr, CLSCTX_ALL, IID_ISpVoice, (void**)&voice)) && voice != nullptr)
+        {
+            while (!threadShouldExit())
+            {
+                SpeechJob job;
+                {
+                    const juce::ScopedLock lock(queueLock);
+                    if (!queue.empty())
+                    {
+                        job = queue.front();
+                        queue.pop_front();
+                    }
+                }
+
+                if (job.text.isEmpty())
+                {
+                    workAvailable.wait(200);
+                    continue;
+                }
+
+                ISpObjectToken* token = nullptr;
+                if (job.voiceId.isNotEmpty()
+                    && SUCCEEDED(SpGetTokenFromId((LPCWSTR) job.voiceId.toWideCharPointer(), &token, FALSE))
+                    && token != nullptr)
+                {
+                    voice->SetVoice(token);
+                    token->Release();
+                }
+
+                voice->Speak((LPCWSTR) job.text.toWideCharPointer(), SPF_DEFAULT, nullptr);
+            }
+            voice->Release();
+        }
+
+        if (shouldUninitialise)
+            CoUninitialize();
+#else
+        while (!threadShouldExit())
+        {
+            SpeechJob job;
+            {
+                const juce::ScopedLock lock(queueLock);
+                if (!queue.empty())
+                {
+                    job = queue.front();
+                    queue.pop_front();
+                }
+            }
+
+            if (job.text.isEmpty())
+            {
+                workAvailable.wait(200);
+                continue;
+            }
+
+            juce::StringArray args;
+           #if JUCE_MAC
+            args.add("/usr/bin/say");
+            if (job.voiceId.isNotEmpty())
+            {
+                args.add("-v");
+                args.add(job.voiceId);
+            }
+            args.add(job.text);
+           #elif JUCE_LINUX || JUCE_BSD
+            args.add("spd-say");
+            if (job.voiceId.isNotEmpty())
+            {
+                args.add("-t");
+                args.add(job.voiceId);
+            }
+            args.add(job.text);
+           #endif
+
+            if (args.isEmpty())
+                continue;
+
+            juce::ChildProcess process;
+            if (!process.start(args))
+                continue;
+
+            while (!threadShouldExit() && process.isRunning())
+                wait(25);
+
+            if (threadShouldExit() && process.isRunning())
+                process.kill();
+        }
+#endif
+    }
+
+    juce::CriticalSection queueLock;
+    juce::WaitableEvent workAvailable;
+    std::deque<SpeechJob> queue;
+};
+
+static juce::String makeChatTtsSpeechText(const juce::String& line, const juce::String& sender)
+{
+    const juce::String cleanSender = sender.trim();
+    if (cleanSender.isEmpty() || cleanSender.equalsIgnoreCase("me"))
+        return {};
+
+    if (line.contains(" shared a "))
+        return {};
+
+    const int colon = line.indexOfChar(':');
+    if (colon < 0)
+        return {};
+
+    juce::String body = line.substring(colon + 1).trim();
+    if (body.isEmpty() || body.startsWithChar('!') || body.startsWithChar('/'))
+        return {};
+
+    if (body.startsWithIgnoreCase("http://") || body.startsWithIgnoreCase("https://"))
+        return {};
+
+    body = body.replace("\r", " ").replace("\n", " ").trim();
+    while (body.contains("  "))
+        body = body.replace("  ", " ");
+    if (body.length() > 240)
+        body = body.substring(0, 240).trim() + "...";
+
+    return cleanSender + " says " + body;
+}
 
 static juce::File getThisModuleFile()
 {
@@ -2421,11 +2667,18 @@ void showChatAttachmentMenu(NinjamVst3AudioProcessor& processor,
                             std::function<void()> showGifPicker,
                             std::function<void(const juce::String&)> onChatColourSelected,
                             std::function<void(const juce::String&)> onChatWindowColourSelected,
-                            const juce::String& selectedChatWindowColourKey)
+                            const juce::String& selectedChatWindowColourKey,
+                            bool chatTtsEnabled,
+                            const juce::String& selectedTtsVoiceId,
+                            const juce::StringArray& chatTtsVoiceIds,
+                            const juce::StringArray& chatTtsVoiceNames,
+                            std::function<void(bool)> onChatTtsEnabledChanged,
+                            std::function<void(const juce::String&)> onChatTtsVoiceSelected)
 {
     constexpr int emojiBaseId = 100;
     constexpr int colourBaseId = 9000;
     constexpr int windowColourBaseId = 9200;
+    constexpr int ttsVoiceBaseId = 9400;
     const juce::String draft = targetEditor.getText().trim();
     const bool draftIsUrl = isHttpOrHttpsChatInputUrl(draft);
 
@@ -2451,6 +2704,17 @@ void showChatAttachmentMenu(NinjamVst3AudioProcessor& processor,
         windowColourMenu.addItem(id, chatWindowColourChoices[i].label, true, key == selectedWindowColour);
     }
 
+    auto idToTtsVoice = std::make_shared<std::map<int, juce::String>>();
+    juce::PopupMenu ttsVoiceMenu;
+    const int voiceCount = juce::jmin(chatTtsVoiceIds.size(), chatTtsVoiceNames.size());
+    for (int i = 0; i < voiceCount; ++i)
+    {
+        const int id = ttsVoiceBaseId + i;
+        const juce::String voiceId = chatTtsVoiceIds[i];
+        (*idToTtsVoice)[id] = voiceId;
+        ttsVoiceMenu.addItem(id, chatTtsVoiceNames[i], true, voiceId == selectedTtsVoiceId);
+    }
+
     juce::PopupMenu menu;
     menu.addSectionHeader("GIFs");
     menu.addItem(1, "GIF");
@@ -2468,6 +2732,13 @@ void showChatAttachmentMenu(NinjamVst3AudioProcessor& processor,
     menu.addSubMenu("My Chat Colour", colourMenu);
     menu.addSubMenu("Chat Window Colour", windowColourMenu);
     menu.addSeparator();
+    menu.addSectionHeader("Text to Speech");
+    menu.addItem(8, "Speak User Chat", true, chatTtsEnabled);
+    if (voiceCount > 0)
+        menu.addSubMenu("Voice", ttsVoiceMenu, chatTtsEnabled);
+    else
+        menu.addItem(9, "No voices available", false, false);
+    menu.addSeparator();
     auto idToEmoji = std::make_shared<EmojiMenuMap>();
     menu.addCustomItem(7, std::make_unique<EmojiGridComponent>(targetEditor), nullptr, "Emoji");
     juce::PopupMenu emojiMenu;
@@ -2477,11 +2748,29 @@ void showChatAttachmentMenu(NinjamVst3AudioProcessor& processor,
     juce::Component::SafePointer<juce::TextEditor> safeEditor(&targetEditor);
     auto* processorPtr = &processor;
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&anchorComponent),
-                       [safeEditor, processorPtr, idToEmoji, idToColour, idToWindowColour,
+                       [safeEditor, processorPtr, idToEmoji, idToColour, idToWindowColour, idToTtsVoice,
                         showGifPicker = std::move(showGifPicker),
                         onChatColourSelected = std::move(onChatColourSelected),
-                        onChatWindowColourSelected = std::move(onChatWindowColourSelected)](int result) mutable
+                        onChatWindowColourSelected = std::move(onChatWindowColourSelected),
+                        onChatTtsEnabledChanged = std::move(onChatTtsEnabledChanged),
+                        onChatTtsVoiceSelected = std::move(onChatTtsVoiceSelected),
+                        chatTtsEnabled](int result) mutable
                        {
+                           if (result == 8)
+                           {
+                               if (onChatTtsEnabledChanged)
+                                   onChatTtsEnabledChanged(!chatTtsEnabled);
+                               return;
+                           }
+
+                           auto voiceIt = idToTtsVoice->find(result);
+                           if (voiceIt != idToTtsVoice->end())
+                           {
+                               if (onChatTtsVoiceSelected)
+                                   onChatTtsVoiceSelected(voiceIt->second);
+                               return;
+                           }
+
                            auto colourIt = idToColour->find(result);
                            if (colourIt != idToColour->end())
                            {
@@ -3152,10 +3441,22 @@ public:
     ChatPopupComponent(NinjamVst3AudioProcessor& p,
                        juce::String initialChatWindowColourKey,
                        std::function<void(const juce::String&)> onChatColourSelectedCallback,
-                       std::function<void(const juce::String&)> onWindowColourSelectedCallback)
+                       std::function<void(const juce::String&)> onWindowColourSelectedCallback,
+                       std::function<bool()> isChatTtsEnabledCallback,
+                       std::function<juce::String()> getChatTtsVoiceIdCallback,
+                       std::function<juce::StringArray()> getChatTtsVoiceIdsCallback,
+                       std::function<juce::StringArray()> getChatTtsVoiceNamesCallback,
+                       std::function<void(bool)> onChatTtsEnabledChangedCallback,
+                       std::function<void(const juce::String&)> onChatTtsVoiceSelectedCallback)
         : processor(p),
           onChatColourSelected(std::move(onChatColourSelectedCallback)),
           onWindowColourSelected(std::move(onWindowColourSelectedCallback)),
+          isChatTtsEnabled(std::move(isChatTtsEnabledCallback)),
+          getChatTtsVoiceId(std::move(getChatTtsVoiceIdCallback)),
+          getChatTtsVoiceIds(std::move(getChatTtsVoiceIdsCallback)),
+          getChatTtsVoiceNames(std::move(getChatTtsVoiceNamesCallback)),
+          onChatTtsEnabledChanged(std::move(onChatTtsEnabledChangedCallback)),
+          onChatTtsVoiceSelected(std::move(onChatTtsVoiceSelectedCallback)),
           gifPickerPanel([this](const juce::String& url)
           {
               processor.sendChatAttachment("gif", url);
@@ -3195,7 +3496,13 @@ public:
                 if (onWindowColourSelected)
                     onWindowColourSelected(key);
             },
-            chatWindowColourKey);
+            chatWindowColourKey,
+            isChatTtsEnabled ? isChatTtsEnabled() : false,
+            getChatTtsVoiceId ? getChatTtsVoiceId() : juce::String(),
+            getChatTtsVoiceIds ? getChatTtsVoiceIds() : juce::StringArray(),
+            getChatTtsVoiceNames ? getChatTtsVoiceNames() : juce::StringArray(),
+            onChatTtsEnabledChanged,
+            onChatTtsVoiceSelected);
         };
 
         addAndMakeVisible(sendButton);
@@ -3298,6 +3605,12 @@ private:
     NinjamVst3AudioProcessor& processor;
     std::function<void(const juce::String&)> onChatColourSelected;
     std::function<void(const juce::String&)> onWindowColourSelected;
+    std::function<bool()> isChatTtsEnabled;
+    std::function<juce::String()> getChatTtsVoiceId;
+    std::function<juce::StringArray()> getChatTtsVoiceIds;
+    std::function<juce::StringArray()> getChatTtsVoiceNames;
+    std::function<void(bool)> onChatTtsEnabledChanged;
+    std::function<void(const juce::String&)> onChatTtsVoiceSelected;
     juce::String chatWindowColourKey { "default" };
     juce::Colour chatWindowColour { 0xff101417 };
     GifPickerPanel gifPickerPanel;
@@ -3374,6 +3687,12 @@ public:
                const juce::String& chatWindowColourKey,
                std::function<void(const juce::String&)> onChatColourSelected,
                std::function<void(const juce::String&)> onWindowColourSelected,
+               std::function<bool()> isChatTtsEnabled,
+               std::function<juce::String()> getChatTtsVoiceId,
+               std::function<juce::StringArray()> getChatTtsVoiceIds,
+               std::function<juce::StringArray()> getChatTtsVoiceNames,
+               std::function<void(bool)> onChatTtsEnabledChanged,
+               std::function<void(const juce::String&)> onChatTtsVoiceSelected,
                std::function<void()> onClosedCallback,
                bool abletonHostedWindow,
                int abletonChatWindowSizePreset)
@@ -3401,7 +3720,13 @@ public:
         setContentOwned(new ChatPopupComponent(p,
                                                chatWindowColourKey,
                                                std::move(onChatColourSelected),
-                                               std::move(onWindowColourSelected)), true);
+                                               std::move(onWindowColourSelected),
+                                               std::move(isChatTtsEnabled),
+                                               std::move(getChatTtsVoiceId),
+                                               std::move(getChatTtsVoiceIds),
+                                               std::move(getChatTtsVoiceNames),
+                                               std::move(onChatTtsEnabledChanged),
+                                               std::move(onChatTtsVoiceSelected)), true);
         centreWithSize(initialSize.getWidth(), initialSize.getHeight());
         setVisible(true);
     }
@@ -7650,7 +7975,19 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         {
             setChatWindowColourKey(key, true);
         },
-        chatWindowColourKey);
+        chatWindowColourKey,
+        chatTtsEnabled,
+        chatTtsVoiceId,
+        chatTtsVoiceIds,
+        chatTtsVoiceNames,
+        [this](bool enabled)
+        {
+            setChatTtsEnabled(enabled, true);
+        },
+        [this](const juce::String& voiceId)
+        {
+            setChatTtsVoiceId(voiceId, true);
+        });
     };
 
     addAndMakeVisible(sendButton);
@@ -7666,6 +8003,23 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     });
     addChildComponent(*gifPickerPanel);
     addMouseListener(this, true);
+    chatTtsEngine = std::make_unique<ChatTtsEngine>();
+    chatTtsVoiceIds.add({});
+    chatTtsVoiceNames.add("System Default");
+    {
+        juce::StringArray platformVoiceIds;
+        juce::StringArray platformVoiceNames;
+        ChatTtsEngine::getAvailableVoices(platformVoiceIds, platformVoiceNames);
+        const int voiceCount = juce::jmin(platformVoiceIds.size(), platformVoiceNames.size());
+        for (int i = 0; i < voiceCount; ++i)
+        {
+            if (platformVoiceIds[i].isNotEmpty() && !chatTtsVoiceIds.contains(platformVoiceIds[i]))
+            {
+                chatTtsVoiceIds.add(platformVoiceIds[i]);
+                chatTtsVoiceNames.add(platformVoiceNames[i]);
+            }
+        }
+    }
 
     addAndMakeVisible(atButton);
     atButton.setClickingTogglesState(true);
@@ -7833,6 +8187,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         const juce::ScopedLock lock(audioProcessor.chatLock);
         applyColoredChat(chatDisplay, audioProcessor.chatHistory, audioProcessor.chatSenders, audioProcessor);
         lastChatRevision = audioProcessor.chatRevision.load();
+        lastChatTtsHistorySize = audioProcessor.chatHistory.size();
     }
 
     // Initialize metronome UI from processor state so mute/volume persist across GUI reopen
@@ -7890,6 +8245,7 @@ NinjamVst3AudioProcessorEditor::~NinjamVst3AudioProcessorEditor()
 
     // Stop periodic UI ticks first so timerCallback won't touch UI-owned resources
     stopTimer();
+    chatTtsEngine.reset();
 
 #if JUCE_WINDOWS
     if (videoFrameReader != nullptr)
@@ -8505,6 +8861,7 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         if (revision != lastChatRevision)
         {
             applyColoredChat(chatDisplay, history, senders, audioProcessor);
+            enqueueChatTtsForNewLines(history, senders);
             lastChatRevision = revision;
 
             if (chatWindow)
@@ -8512,6 +8869,10 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                 if (auto* popup = dynamic_cast<ChatPopupComponent*>(chatWindow->getContentComponent()))
                     popup->setChatText(history, senders);
             }
+        }
+        else if (chatTtsEnabled && !pendingChatTtsLines.empty())
+        {
+            enqueueChatTtsForNewLines(history, senders);
         }
     }
 
@@ -9302,6 +9663,77 @@ void NinjamVst3AudioProcessorEditor::applyChatWindowColourToDisplays()
             popup->setChatWindowColourKey(chatWindowColourKey);
 }
 
+void NinjamVst3AudioProcessorEditor::setChatTtsEnabled(bool enabled, bool markDirty)
+{
+    chatTtsEnabled = enabled;
+    {
+        const juce::ScopedLock lock(audioProcessor.chatLock);
+        lastChatTtsHistorySize = audioProcessor.chatHistory.size();
+    }
+
+    if (markDirty)
+        markPersistentSettingsDirty();
+}
+
+void NinjamVst3AudioProcessorEditor::setChatTtsVoiceId(const juce::String& voiceId, bool markDirty)
+{
+    const juce::String trimmed = voiceId.trim();
+    chatTtsVoiceId = chatTtsVoiceIds.contains(trimmed) ? trimmed : juce::String();
+
+    if (markDirty)
+        markPersistentSettingsDirty();
+}
+
+void NinjamVst3AudioProcessorEditor::enqueueChatTtsForNewLines(const juce::StringArray& history,
+                                                               const juce::StringArray& senders)
+{
+    if (!chatTtsEnabled || chatTtsEngine == nullptr)
+    {
+        lastChatTtsHistorySize = history.size();
+        pendingChatTtsLines.clear();
+        return;
+    }
+
+    if (lastChatTtsHistorySize > history.size())
+    {
+        lastChatTtsHistorySize = 0;
+        pendingChatTtsLines.clear();
+    }
+
+    const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    const int startIndex = juce::jlimit(0, history.size(), lastChatTtsHistorySize);
+    for (int i = startIndex; i < history.size(); ++i)
+    {
+        const juce::String sender = i < senders.size() ? senders[i] : juce::String();
+        if (makeChatTtsSpeechText(history[i], sender).isNotEmpty())
+            pendingChatTtsLines.push_back({ i, nowMs + 1800.0 });
+    }
+
+    lastChatTtsHistorySize = history.size();
+
+    for (auto it = pendingChatTtsLines.begin(); it != pendingChatTtsLines.end();)
+    {
+        if (it->historyIndex < 0 || it->historyIndex >= history.size())
+        {
+            it = pendingChatTtsLines.erase(it);
+            continue;
+        }
+
+        if (nowMs < it->dueMs)
+        {
+            ++it;
+            continue;
+        }
+
+        const juce::String sender = it->historyIndex < senders.size() ? senders[it->historyIndex] : juce::String();
+        const juce::String speechText = makeChatTtsSpeechText(history[it->historyIndex], sender);
+        if (speechText.isNotEmpty())
+            chatTtsEngine->enqueue(speechText, chatTtsVoiceId);
+
+        it = pendingChatTtsLines.erase(it);
+    }
+}
+
 juce::String NinjamVst3AudioProcessorEditor::buildPersistentSettingsFingerprint(bool includeProcessorState) const
 {
     juce::StringArray parts;
@@ -9320,6 +9752,8 @@ juce::String NinjamVst3AudioProcessorEditor::buildPersistentSettingsFingerprint(
     parts.add(samplePadsWindowBoundsValid ? samplePadsWindowBounds.toString() : juce::String());
     parts.add(audioProcessor.getLocalChatColourKey());
     parts.add(chatWindowColourKey);
+    parts.add(chatTtsEnabled ? "1" : "0");
+    parts.add(chatTtsVoiceId);
 
     const int textureIdx = backgroundSelector.getSelectedItemIndex();
     parts.add((textureIdx >= 0 && textureIdx < textureFiles.size()) ? textureFiles[textureIdx].getFileName() : juce::String());
@@ -9370,6 +9804,8 @@ void NinjamVst3AudioProcessorEditor::savePersistentSettingsToDisk(bool includePr
     }
     props.setValue("chatColourKey", audioProcessor.getLocalChatColourKey());
     props.setValue("chatWindowColourKey", chatWindowColourKey);
+    props.setValue("chatTtsEnabled", chatTtsEnabled);
+    props.setValue("chatTtsVoiceId", chatTtsVoiceId);
 
     const int textureIdx = backgroundSelector.getSelectedItemIndex();
     if (textureIdx >= 0 && textureIdx < textureFiles.size())
@@ -9442,6 +9878,8 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
 
     audioProcessor.setLocalChatColourKey(props.getValue("chatColourKey", audioProcessor.getLocalChatColourKey()));
     setChatWindowColourKey(props.getValue("chatWindowColourKey", chatWindowColourKey), false);
+    setChatTtsVoiceId(props.getValue("chatTtsVoiceId", chatTtsVoiceId), false);
+    setChatTtsEnabled(props.getBoolValue("chatTtsEnabled", chatTtsEnabled), false);
 
     abletonWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonWindowSizePreset", abletonWindowSizePreset));
     abletonChatWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonChatWindowSizePreset", abletonChatWindowSizePreset));
@@ -9638,6 +10076,32 @@ void NinjamVst3AudioProcessorEditor::openChatPopoutWindow(const juce::StringArra
                                         {
                                             if (safeThis != nullptr)
                                                 safeThis->setChatWindowColourKey(key, true);
+                                        },
+                                        [safeThis]() -> bool
+                                        {
+                                            return safeThis != nullptr && safeThis->chatTtsEnabled;
+                                        },
+                                        [safeThis]() -> juce::String
+                                        {
+                                            return safeThis != nullptr ? safeThis->chatTtsVoiceId : juce::String();
+                                        },
+                                        [safeThis]() -> juce::StringArray
+                                        {
+                                            return safeThis != nullptr ? safeThis->chatTtsVoiceIds : juce::StringArray();
+                                        },
+                                        [safeThis]() -> juce::StringArray
+                                        {
+                                            return safeThis != nullptr ? safeThis->chatTtsVoiceNames : juce::StringArray();
+                                        },
+                                        [safeThis](bool enabled)
+                                        {
+                                            if (safeThis != nullptr)
+                                                safeThis->setChatTtsEnabled(enabled, true);
+                                        },
+                                        [safeThis](const juce::String& voiceId)
+                                        {
+                                            if (safeThis != nullptr)
+                                                safeThis->setChatTtsVoiceId(voiceId, true);
                                         },
                                         [safeThis]()
                                         {
