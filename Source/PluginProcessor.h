@@ -962,7 +962,7 @@ private:
     std::atomic<bool> videoLaunchInProgress { false };
     std::atomic<bool> ninjamZapServerVideoSupported { false };
     std::atomic<bool> ninjamSideSignalServerSupported { false };
-    std::atomic<bool> ninjamSideSignalVideoCapSent { false };
+    double lastNinjamVideoCapSendMs = 0.0;
     std::atomic<bool> ninjamZapVideoEnabled { false };
     std::atomic<bool> ninjamZapVideoReceivedNotice { false };
     juce::CriticalSection ninjamZapVideoChunkLock;
@@ -1038,16 +1038,14 @@ private:
     std::map<juce::String, PendingRemoteIntervalStart> pendingRemoteIntervalStartsByUser;
     std::map<juce::String, int> lastRemoteServerLatencyMsByUser;
     std::map<juce::String, int> remoteServerRouteLatencyMsByUser;
+    std::map<juce::String, double> lastRemoteIntervalSignalSeenMsByUser;
+    std::map<juce::String, double> lastRemoteRouteProbeSeenMsByUser;
     std::map<juce::String, double> pendingTransportProbeSentMsById;
     std::map<juce::String, long long> remoteLatencyLastAppliedIntervalByUser;
     std::deque<juce::String> recentVideoTimingChangeEventIds;
     int lastLatencyTimingBpi = -1;
     int lastLatencyTimingLength = -1;
     double lastLatencyTimingBpm = -1.0;
-    std::atomic<int> localServerLatencyMs { -1 };
-    std::atomic<int> lastServerLatencyProbeInterval { -1 };
-    std::atomic<bool> serverLatencyProbeInProgress { false };
-    std::future<void> serverLatencyProbeFuture;
     double lastServerLatencyProbeAttemptMs = 0.0;
     double lastRemoteSyncUserPruneMs = 0.0;
     double lastIntervalSyncFallbackSubscriptionMs = 0.0;
@@ -1124,7 +1122,6 @@ private:
     void setIntervalSyncStatusText(const juce::String& text);
     void broadcastIntervalSyncTag(const juce::String& target = "*", int markerBeatIndex = -1);
     void broadcastTransportProbe(const juce::String& target = "*");
-    void measureServerLatencyAsync();
     juce::String buildIntervalSyncTag(int interval, int length) const;
     void invalidateIntervalSyncLatencyState(bool keepRemoteServerLatency);
     void pruneDisconnectedRemoteSyncState();

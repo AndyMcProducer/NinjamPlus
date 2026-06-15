@@ -315,8 +315,8 @@ img,canvas{display:block;width:100%;height:100%;object-fit:contain}
 <section class="camera-panel">
   <label>Camera <select id="camSelect"><option value="">Default camera</option></select></label>
   <label>Codec <select id="camCodec"><option value="h264">H.264</option><option value="mjpeg">MJPEG</option><option value="vp8">VP8</option><option value="vp9">VP9</option></select></label>
-  <label>Size <select id="camSize"><option value="320x180">320x180</option><option value="640x360" selected>640x360</option><option value="800x450">800x450</option><option value="1280x720">1280x720</option></select></label>
-  <label>FPS <select id="camFps"><option value="10">10</option><option value="15">15</option><option value="24">24</option><option value="30" selected>30</option></select></label>
+  <label>Size <select id="camSize"><option value="320x180">320x180</option><option value="640x360" selected>640x360</option><option value="800x450">800x450</option><option value="1280x720">1280x720</option><option value="1920x1080" data-vpx-only="1">1920x1080 VP8/VP9</option></select></label>
+  <label>FPS <select id="camFps"><option value="10">10</option><option value="15">15</option><option value="24">24</option><option value="30" selected>30</option><option value="60">60</option></select></label>
   <label>Quality <select id="camQuality"><option value="balanced">Balanced</option><option value="high" selected>High</option><option value="low">Low</option></select></label>
   <label>View <select id="camLayout"><option value="tiles" selected>Tiles</option><option value="rows">Rows</option><option value="columns">Columns</option></select></label>
   <label>Mask <select id="camMask"><option value="none" selected>None</option><option value="cloud">Cloud</option><option value="circle">Circle</option><option value="rounded">Rounded</option><option value="square">Square</option><option value="tree">Xmas tree</option><option value="pumpkin">Pumpkin</option><option value="star">Star</option><option value="heart">Heart</option></select></label>
@@ -494,16 +494,31 @@ async function copyObsLink(slot){
 }
 function selectedTransportSize(){
   const parts=String(camSize.value||'640x360').split('x');
-  const width=Math.max(160,Math.min(1280,parseInt(parts[0]||'640',10)||640));
-  const height=Math.max(90,Math.min(720,parseInt(parts[1]||'360',10)||360));
+  const codec=String(camCodec.value||'h264').toLowerCase();
+  const maxWidth=(codec==='vp8'||codec==='vp9')?1920:1280;
+  const maxHeight=(codec==='vp8'||codec==='vp9')?1080:720;
+  const width=Math.max(160,Math.min(maxWidth,parseInt(parts[0]||'640',10)||640));
+  const height=Math.max(90,Math.min(maxHeight,parseInt(parts[1]||'360',10)||360));
   return {width,height};
 }
 function selectedTransportFps(){
-  return Math.max(1,Math.min(30,parseInt(camFps.value||'30',10)||30));
+  return Math.max(1,Math.min(60,parseInt(camFps.value||'30',10)||30));
 }
 function selectedTransportQuality(){
   const value=String(camQuality.value||'high').toLowerCase();
   return value==='low'||value==='balanced'||value==='high'?value:'high';
+}
+function updateTransportControls(){
+  const codec=String(camCodec.value||'h264').toLowerCase();
+  const allowVpx1080=codec==='vp8'||codec==='vp9';
+  for(const option of camSize.options){
+    if(option.dataset&&option.dataset.vpxOnly==='1'){
+      option.disabled=!allowVpx1080;
+    }
+  }
+  if(!allowVpx1080&&camSize.value==='1920x1080'){
+    camSize.value='1280x720';
+  }
 }
 function selectedCameraFx(){
   const value=String(camFx.value||'off').toLowerCase();
@@ -848,7 +863,7 @@ async function postBrowserJpeg(blob,captureStartedMs,encodeMs,width,height){
     +'&seq='+encodeURIComponent(String(++browserFrameCounter));
   const res=await fetch(url,{method:'POST',headers:{'Content-Type':'image/jpeg'},body:blob,cache:'no-store'});
   if(!res.ok&&res.status!==204) throw new Error('helper rejected frame '+String(res.status));
-  setCamStatus('Browser camera sending MJPEG '+String(width)+'x'+String(height)+' @ '+camFps.value+'fps');
+  setCamStatus('Browser camera sending MJPEG '+String(width)+'x'+String(height)+' @ '+String(selectedTransportFps())+'fps');
 }
 async function postBrowserEncodedBytes(bytes,codec,captureStartedMs,encodeMs,width,height,keyFrame,configBase64){
   const ageMs=Math.max(0,performance.now()-captureStartedMs);
@@ -868,7 +883,7 @@ async function postBrowserEncodedBytes(bytes,codec,captureStartedMs,encodeMs,wid
   const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:bytes,cache:'no-store'});
   if(!res.ok&&res.status!==204) throw new Error('helper rejected frame '+String(res.status));
     const payloadLabel=bytes&&bytes.length?'frame':'config';
-    setCamStatus('Browser camera sending '+codec.toUpperCase()+' '+payloadLabel+' '+String(width)+'x'+String(height)+' @ '+camFps.value+'fps');
+    setCamStatus('Browser camera sending '+codec.toUpperCase()+' '+payloadLabel+' '+String(width)+'x'+String(height)+' @ '+String(selectedTransportFps())+'fps');
 }
 async function handleEncodedBrowserChunk(chunk,metadata){
   const fallbackSize=selectedTransportSize();
@@ -1057,6 +1072,7 @@ async function startBrowserCamera(){
 camRefresh.addEventListener('click',refreshCameras);
 camStart.addEventListener('click',startBrowserCamera);
 camStop.addEventListener('click',stopBrowserCamera);
+camCodec.addEventListener('change',updateTransportControls);
 camLayout.addEventListener('change',applyGridLayout);
 camMask.addEventListener('change',refreshDisplayMasks);
 camFx.addEventListener('change',()=>{
@@ -1066,6 +1082,7 @@ camFx.addEventListener('change',()=>{
 });
 camObs.addEventListener('click',()=>window.open('/zap-wall?layout='+encodeURIComponent(camLayout.value||'tiles'),'_blank'));
 applyGridLayout();
+updateTransportControls();
 updateFxControls();
 refreshCameras();
 function tileFor(stream){
@@ -4866,7 +4883,7 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
     stopAdvancedVideoClient();
     ninjamZapServerVideoSupported.store(false, std::memory_order_relaxed);
     ninjamSideSignalServerSupported.store(false, std::memory_order_relaxed);
-    ninjamSideSignalVideoCapSent.store(false, std::memory_order_relaxed);
+    lastNinjamVideoCapSendMs = 0.0;
 
     host = host.trim();
     user = user.trim();
@@ -4907,6 +4924,8 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
         pendingRemoteIntervalStartsByUser.clear();
         lastRemoteServerLatencyMsByUser.clear();
         remoteServerRouteLatencyMsByUser.clear();
+        lastRemoteIntervalSignalSeenMsByUser.clear();
+        lastRemoteRouteProbeSeenMsByUser.clear();
         pendingTransportProbeSentMsById.clear();
         remoteLatencyLastAppliedIntervalByUser.clear();
         remoteLatencyAverageByUser.clear();
@@ -4921,11 +4940,6 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
     opusSyncHasLegacyClients.store(false);
     lastOpusSupportBroadcastMs = 0.0;
     lastServerLatencyProbeAttemptMs = 0.0;
-    localServerLatencyMs.store(-1);
-    lastServerLatencyProbeInterval.store(-1);
-    if (serverLatencyProbeFuture.valid())
-        serverLatencyProbeFuture.wait();
-    serverLatencyProbeInProgress.store(false);
 
     {
         const juce::SpinLock::ScopedLockType endpointLock(linkAudioEndpointLock);
@@ -4953,7 +4967,7 @@ void NinjamVst3AudioProcessor::disconnectFromServer()
     pendingConnectNameAttempt = 0;
     ninjamZapServerVideoSupported.store(false, std::memory_order_relaxed);
     ninjamSideSignalServerSupported.store(false, std::memory_order_relaxed);
-    ninjamSideSignalVideoCapSent.store(false, std::memory_order_relaxed);
+    lastNinjamVideoCapSendMs = 0.0;
     {
         const juce::ScopedLock clientLock(ninjamClientLock);
         stopNinjamZapVideoTransportForDisconnect();
@@ -4975,6 +4989,8 @@ void NinjamVst3AudioProcessor::disconnectFromServer()
         pendingRemoteIntervalStartsByUser.clear();
         lastRemoteServerLatencyMsByUser.clear();
         remoteServerRouteLatencyMsByUser.clear();
+        lastRemoteIntervalSignalSeenMsByUser.clear();
+        lastRemoteRouteProbeSeenMsByUser.clear();
         pendingTransportProbeSentMsById.clear();
         remoteLatencyLastAppliedIntervalByUser.clear();
         remoteLatencyAverageByUser.clear();
@@ -4993,11 +5009,6 @@ void NinjamVst3AudioProcessor::disconnectFromServer()
     opusSyncAvailable.store(false);
     opusSyncHasLegacyClients.store(false);
     lastServerLatencyProbeAttemptMs = 0.0;
-    localServerLatencyMs.store(-1);
-    lastServerLatencyProbeInterval.store(-1);
-    if (serverLatencyProbeFuture.valid())
-        serverLatencyProbeFuture.wait();
-    serverLatencyProbeInProgress.store(false);
     applyCodecPreference();
 }
 
@@ -5146,8 +5157,6 @@ void NinjamVst3AudioProcessor::broadcastIntervalSyncTag(const juce::String& targ
     obj->setProperty("bpi", bpi);
     obj->setProperty("beatIndex", beatIndex);
     obj->setProperty("intervalProgress", intervalProgress);
-    if (const int serverLatencyMs = localServerLatencyMs.load(); serverLatencyMs >= 0)
-        obj->setProperty("serverLatencyMs", serverLatencyMs);
     obj->setProperty("eventId", "intervalTag:" + (userId.isNotEmpty() ? userId : currentUser) + ":" + juce::String(++sideSignalEventCounter));
     const juce::String payload = juce::JSON::toString(juce::var(obj.get()));
     const juce::String safeTarget = target.isNotEmpty() ? target : "*";
@@ -5185,17 +5194,6 @@ void NinjamVst3AudioProcessor::broadcastTransportProbe(const juce::String& targe
     const juce::String payload = juce::JSON::toString(juce::var(obj.get()));
     const juce::String safeTarget = target.isNotEmpty() ? target : "*";
     sendIntervalSignal("intervalTransportProbe", payload, safeTarget);
-}
-
-void NinjamVst3AudioProcessor::measureServerLatencyAsync()
-{
-    // Do not open a throwaway TCP socket to estimate RTT here. NINJAM servers
-    // log that unauthenticated probe as "Incoming connection" followed by an
-    // empty-user disconnect, and Zap/local servers can get spammed every few
-    // seconds. Sync continues to use the authenticated interval markers and
-    // treats this optional local route estimate as unavailable.
-    serverLatencyProbeInProgress.store(false);
-    localServerLatencyMs.store(-1);
 }
 
 void NinjamVst3AudioProcessor::broadcastOpusSyncSupport(const juce::String& target)
@@ -5299,7 +5297,10 @@ void NinjamVst3AudioProcessor::syncLocalIntervalChannelConfig()
     const bool multiChanAuto = numCh > 1 && opusSyncAvailable.load() && shouldTransmit;
     const bool singleStereoLocal = numCh == 1 && getLocalChannelInput(0) < 0;
     const bool cameraVideoEnabled = ninjamZapCameraSendEnabled.load(std::memory_order_relaxed);
-    const int videoChannel = cameraVideoEnabled ? getNinjamZapVideoChannelIndex() : -1;
+    const bool vdoZapCarrierEnabled = vdoVideoSyncEnabled.load(std::memory_order_relaxed)
+                                   && ninjamSideSignalServerSupported.load(std::memory_order_relaxed)
+                                   && !ninjamZapVideoEnabled.load(std::memory_order_relaxed);
+    const int videoChannel = (cameraVideoEnabled || vdoZapCarrierEnabled) ? getNinjamZapVideoChannelIndex() : -1;
 
     if (multiChanAuto)
     {
@@ -5421,6 +5422,8 @@ void NinjamVst3AudioProcessor::resetIntervalSyncTimingCache()
     videoBufferRefreshCounter = 0;
     lastRemoteServerLatencyMsByUser.clear();
     remoteServerRouteLatencyMsByUser.clear();
+    lastRemoteIntervalSignalSeenMsByUser.clear();
+    lastRemoteRouteProbeSeenMsByUser.clear();
     recentVideoTimingChangeEventIds.clear();
 }
 
@@ -5442,6 +5445,8 @@ void NinjamVst3AudioProcessor::invalidateIntervalSyncLatencyState(bool keepRemot
         videoBufferRefreshCounter = 0;
         lastRemoteServerLatencyMsByUser.clear();
         remoteServerRouteLatencyMsByUser.clear();
+        lastRemoteIntervalSignalSeenMsByUser.clear();
+        lastRemoteRouteProbeSeenMsByUser.clear();
     }
 }
 
@@ -5533,6 +5538,22 @@ void NinjamVst3AudioProcessor::pruneDisconnectedRemoteSyncState()
     {
         if (!isActiveUserKey(it->first))
             it = remoteServerRouteLatencyMsByUser.erase(it);
+        else
+            ++it;
+    }
+
+    for (auto it = lastRemoteIntervalSignalSeenMsByUser.begin(); it != lastRemoteIntervalSignalSeenMsByUser.end();)
+    {
+        if (!isActiveUserKey(it->first))
+            it = lastRemoteIntervalSignalSeenMsByUser.erase(it);
+        else
+            ++it;
+    }
+
+    for (auto it = lastRemoteRouteProbeSeenMsByUser.begin(); it != lastRemoteRouteProbeSeenMsByUser.end();)
+    {
+        if (!isActiveUserKey(it->first))
+            it = lastRemoteRouteProbeSeenMsByUser.erase(it);
         else
             ++it;
     }
@@ -5998,7 +6019,11 @@ int NinjamVst3AudioProcessor::getNinjamZapVideoChannelIndex() const
 
 void NinjamVst3AudioProcessor::configureNinjamZapVideoLocalChannel()
 {
-    if (!ninjamZapCameraSendEnabled.load(std::memory_order_relaxed))
+    const bool cameraVideoEnabled = ninjamZapCameraSendEnabled.load(std::memory_order_relaxed);
+    const bool vdoZapCarrierEnabled = vdoVideoSyncEnabled.load(std::memory_order_relaxed)
+                                   && ninjamSideSignalServerSupported.load(std::memory_order_relaxed)
+                                   && !ninjamZapVideoEnabled.load(std::memory_order_relaxed);
+    if (!cameraVideoEnabled && !vdoZapCarrierEnabled)
         return;
 
     const int videoChannel = getNinjamZapVideoChannelIndex();
@@ -7422,6 +7447,8 @@ bool NinjamVst3AudioProcessor::stopVdoVideoSync()
         remoteVideoBufferRefreshIdByUser.clear();
         recentVideoTimingChangeEventIds.clear();
     }
+    if (wasEnabled)
+        syncLocalIntervalChannelConfig();
     return wasEnabled;
 }
 
@@ -7481,13 +7508,11 @@ void NinjamVst3AudioProcessor::launchVideoSession()
         {
             ninjamZapServerVideoSupported.store(true, std::memory_order_relaxed);
             ninjamSideSignalServerSupported.store(true, std::memory_order_relaxed);
-            if (!ninjamSideSignalVideoCapSent.load(std::memory_order_relaxed))
-            {
-                ninjamClient.ChatMessage_Send("VIDEO_CAP", "1", nullptr, nullptr, nullptr);
-                ninjamSideSignalVideoCapSent.store(true, std::memory_order_relaxed);
-            }
+            ninjamClient.ChatMessage_Send("VIDEO_CAP", "1", nullptr, nullptr, nullptr);
+            lastNinjamVideoCapSendMs = juce::Time::getMillisecondCounterHiRes();
         }
     }
+    syncLocalIntervalChannelConfig();
 
     juce::String roomSource = currentServer.trim();
     const int schemePos = roomSource.indexOf("://");
@@ -7679,8 +7704,6 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
         const juce::String rosterKey = canonicalUserKey.isNotEmpty() ? canonicalUserKey : senderKey;
         if (rosterKey.isNotEmpty())
             activeRoster.add(rosterKey);
-        const int localServerLatencyRawMs = localServerLatencyMs.load();
-        const int localServerRouteLatencyMs = juce::jmax(0, localServerLatencyRawMs);
         bool remoteSub = false;
         float remoteChVol = 1.0f, remoteChPan = 0.0f;
         bool remoteChMute = false, remoteChSolo = false;
@@ -7706,6 +7729,8 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
         int averageIntervalMeasurementMs = -1;
         int firmIntervalMeasurementMs = -1;
         bool intervalMeasurementSeen = false;
+        double lastIntervalSignalAgeMs = -1.0;
+        double serverRouteAgeMs = -1.0;
         juce::uint64 bufferRefreshId = 0;
         {
             const juce::ScopedLock lock(intervalSyncAnnouncementLock);
@@ -7736,8 +7761,25 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
                 if (canonicalRouteIt != remoteServerRouteLatencyMsByUser.end())
                     serverRouteLatencyMs = juce::jmax(0, canonicalRouteIt->second);
             }
-            const int fallbackRouteLatencyMs = juce::jmax(0, remoteServerLatencyMs) + localServerRouteLatencyMs;
-            const int routeLatencyForBufferMs = serverRouteLatencyMs >= 0 ? serverRouteLatencyMs : fallbackRouteLatencyMs;
+            auto intervalSeenIt = lastRemoteIntervalSignalSeenMsByUser.find(senderKey);
+            if (intervalSeenIt != lastRemoteIntervalSignalSeenMsByUser.end())
+                lastIntervalSignalAgeMs = juce::jmax(0.0, nowMs - intervalSeenIt->second);
+            if (lastIntervalSignalAgeMs < 0.0 && canonicalUserKey.isNotEmpty())
+            {
+                auto canonicalIntervalSeenIt = lastRemoteIntervalSignalSeenMsByUser.find(canonicalUserKey);
+                if (canonicalIntervalSeenIt != lastRemoteIntervalSignalSeenMsByUser.end())
+                    lastIntervalSignalAgeMs = juce::jmax(0.0, nowMs - canonicalIntervalSeenIt->second);
+            }
+            auto routeSeenIt = lastRemoteRouteProbeSeenMsByUser.find(senderKey);
+            if (routeSeenIt != lastRemoteRouteProbeSeenMsByUser.end())
+                serverRouteAgeMs = juce::jmax(0.0, nowMs - routeSeenIt->second);
+            if (serverRouteAgeMs < 0.0 && canonicalUserKey.isNotEmpty())
+            {
+                auto canonicalRouteSeenIt = lastRemoteRouteProbeSeenMsByUser.find(canonicalUserKey);
+                if (canonicalRouteSeenIt != lastRemoteRouteProbeSeenMsByUser.end())
+                    serverRouteAgeMs = juce::jmax(0.0, nowMs - canonicalRouteSeenIt->second);
+            }
+            const int routeLatencyForBufferMs = serverRouteLatencyMs >= 0 ? serverRouteLatencyMs : 0;
             auto refreshIt = remoteVideoBufferRefreshIdByUser.find(senderKey);
             if (refreshIt != remoteVideoBufferRefreshIdByUser.end())
                 bufferRefreshId = refreshIt->second;
@@ -7857,10 +7899,12 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
         if (firmIntervalMeasurementMs >= 0)
             userObj->setProperty("firmIntervalMeasurementMs", firmIntervalMeasurementMs);
         userObj->setProperty("bufferCalculated", bufferMs >= 0);
-        userObj->setProperty("ourServerLatencyReady", localServerLatencyRawMs >= 0);
-        userObj->setProperty("ourServerLatencyProbeEnabled", false);
-        userObj->setProperty("theirServerLatencyReady", remoteServerLatencyMs >= 0);
+        userObj->setProperty("sideSignalMode", ninjamSideSignalServerSupported.load(std::memory_order_relaxed));
         userObj->setProperty("serverRouteLatencyReady", serverRouteLatencyMs >= 0);
+        if (lastIntervalSignalAgeMs >= 0.0)
+            userObj->setProperty("intervalSignalAgeMs", lastIntervalSignalAgeMs);
+        if (serverRouteAgeMs >= 0.0)
+            userObj->setProperty("serverRouteAgeMs", serverRouteAgeMs);
         if (bufferMs >= 0)
         {
             userObj->setProperty("bufferTotalMs", (double)bufferMs);
@@ -7871,8 +7915,6 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
                 userObj->setProperty("senderServerLatencyMs", (double)remoteServerLatencyMs);
             if (serverRouteLatencyMs >= 0)
                 userObj->setProperty("serverRouteLatencyMs", (double)serverRouteLatencyMs);
-            if (localServerLatencyRawMs >= 0)
-                userObj->setProperty("receiverServerLatencyMs", (double)localServerRouteLatencyMs);
             if (bufferRefreshId != 0)
             {
                 userObj->setProperty("refreshBuffer", true);
@@ -9333,8 +9375,20 @@ void NinjamVst3AudioProcessor::sendIntervalSignal(const juce::String& type, cons
     if (useSideSignal)
     {
         ninjamSideSignalServerSupported.store(true, std::memory_order_relaxed);
-        const char* tgt = target.isNotEmpty() ? target.toRawUTF8() : "*";
-        ninjamClient.ChatMessage_Send("SIDE_SIGNAL", tgt, type.toRawUTF8(), payload.toRawUTF8());
+        const int videoChannel = getNinjamZapVideoChannelIndex();
+        if (videoChannel < 0 || videoChannel >= ninjamClient.GetMaxLocalChannels())
+            return;
+
+        juce::DynamicObject::Ptr wrapper = new juce::DynamicObject();
+        wrapper->setProperty("sig", type);
+        wrapper->setProperty("data", payload);
+        const juce::String msg = juce::JSON::toString(juce::var(wrapper.get()));
+        const int result = ninjamClient.SendRawIntervalItem(videoChannel,
+                                                            kSyncSignalFourcc,
+                                                            msg.toRawUTF8(),
+                                                            (int)msg.getNumBytesAsUTF8());
+        if (result != 0)
+            logIntervalPerf("zap video-carrier sync send failed type=" + type + " result=" + juce::String(result));
         return;
     }
 
@@ -9794,8 +9848,6 @@ NinjamVst3AudioProcessor::~NinjamVst3AudioProcessor()
             videoLaunchFuture.wait();
     }
     abletonLink.reset();
-    if (serverLatencyProbeFuture.valid())
-        serverLatencyProbeFuture.wait();
     JNL::close_socketlib();
 }
 
@@ -13250,9 +13302,13 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
             : measuredRouteMs;
 
         remoteServerRouteLatencyMsByUser[senderKey] = smoothedRouteMs;
+        lastRemoteRouteProbeSeenMsByUser[senderKey] = nowMs;
         const juce::String canonicalSenderKey = canonicalDelayUserKey(senderKey);
         if (canonicalSenderKey.isNotEmpty())
+        {
             remoteServerRouteLatencyMsByUser[canonicalSenderKey] = smoothedRouteMs;
+            lastRemoteRouteProbeSeenMsByUser[canonicalSenderKey] = nowMs;
+        }
         return;
     }
     if (type == "midiRelay")
@@ -13443,6 +13499,14 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
             const juce::String senderKey = normaliseOpusPeerId(payloadUserId.isNotEmpty() ? payloadUserId : sender);
             if (senderKey.isNotEmpty() && senderKey != localUserKey)
             {
+                const double signalSeenMs = juce::Time::getMillisecondCounterHiRes();
+                {
+                    const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+                    lastRemoteIntervalSignalSeenMsByUser[senderKey] = signalSeenMs;
+                    const juce::String canonicalSenderKey = canonicalDelayUserKey(senderKey);
+                    if (canonicalSenderKey.isNotEmpty())
+                        lastRemoteIntervalSignalSeenMsByUser[canonicalSenderKey] = signalSeenMs;
+                }
                 const bool bpiMatches = (remoteBpi <= 0 || remoteBpi == localBpi);
                 if (!bpiMatches)
                     return;
@@ -13452,7 +13516,7 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                 bool shouldStorePending = false;
                 const juce::String displaySender = sender.isNotEmpty() ? sender : (payloadUserId.isNotEmpty() ? payloadUserId : senderKey);
                 const long long receivedSampleCount = intervalSyncSampleCounter.load(std::memory_order_relaxed);
-                const double receivedAtMs = juce::Time::getMillisecondCounterHiRes();
+                const double receivedAtMs = signalSeenMs;
                 {
                     const juce::ScopedLock lock(intervalSyncAnnouncementLock);
                     const int clampedRemoteServerLatencyMs = remoteServerLatencyMs >= 0 ? juce::jlimit(0, 3000, remoteServerLatencyMs) : -1;
@@ -16300,10 +16364,9 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
         int firmAverageMs = -1;
         int correctedDelayMs = -1;
         const int senderServerLatencyMs = pending.remoteServerLatencyMs >= 0 ? juce::jmax(0, pending.remoteServerLatencyMs) : 0;
-        const int receiverServerLatencyMs = juce::jmax(0, localServerLatencyMs.load());
         const int serverRouteLatencyMs = pending.serverRouteLatencyMs >= 0
             ? juce::jmax(0, pending.serverRouteLatencyMs)
-            : senderServerLatencyMs + receiverServerLatencyMs;
+            : 0;
         {
             const juce::ScopedLock lock(intervalSyncAnnouncementLock);
             auto& avgState = remoteLatencyAverageByUser[senderKey];
@@ -16424,18 +16487,24 @@ void NinjamVst3AudioProcessor::timerCallback()
         && (serverSupportsZapVideo || ninjamSideSignalServerSupported.load(std::memory_order_relaxed));
     if (serverSupportsSideSignal)
         ninjamSideSignalServerSupported.store(true, std::memory_order_relaxed);
-    if (serverSupportsSideSignal && !ninjamSideSignalVideoCapSent.load(std::memory_order_relaxed))
+    const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    const bool vdoSyncActive = vdoVideoSyncEnabled.load(std::memory_order_relaxed)
+        && !ninjamZapVideoEnabled.load(std::memory_order_relaxed);
+    const bool wantsSideSignalVideoCap = vdoSyncActive
+        || ninjamZapVideoEnabled.load(std::memory_order_relaxed)
+        || ninjamZapCameraSendEnabled.load(std::memory_order_relaxed)
+        || ninjamZapBrowserCameraSendEnabled.load(std::memory_order_relaxed);
+    if (serverSupportsSideSignal
+        && wantsSideSignalVideoCap
+        && (lastNinjamVideoCapSendMs <= 0.0 || (nowMs - lastNinjamVideoCapSendMs) >= 10000.0))
     {
         const juce::ScopedLock clientLock(ninjamClientLock);
         if (ninjamClient.GetStatus() == NJClient::NJC_STATUS_OK)
         {
             ninjamClient.ChatMessage_Send("VIDEO_CAP", "1", nullptr, nullptr, nullptr);
-            ninjamSideSignalVideoCapSent.store(true, std::memory_order_relaxed);
+            lastNinjamVideoCapSendMs = nowMs;
         }
     }
-    const double nowMs = juce::Time::getMillisecondCounterHiRes();
-    const bool vdoSyncActive = vdoVideoSyncEnabled.load(std::memory_order_relaxed)
-        && !ninjamZapVideoEnabled.load(std::memory_order_relaxed);
     if (status == NJClient::NJC_STATUS_OK && (nowMs - lastRemoteSyncUserPruneMs) >= 350.0)
     {
         pruneDisconnectedRemoteSyncState();
@@ -16522,8 +16591,6 @@ void NinjamVst3AudioProcessor::timerCallback()
             }
             lastNinjamZapVideoSubscriptionSyncMs = 0.0;
             lastIntervalSyncFallbackSubscriptionMs = 0.0;
-            localServerLatencyMs.store(-1);
-            lastServerLatencyProbeInterval.store(-1);
             resetIntervalSyncTimingCache();
             if (!isTransportSyncEnabled())
             {
@@ -16544,7 +16611,7 @@ void NinjamVst3AudioProcessor::timerCallback()
             stopNinjamZapVideoTransportForDisconnect();
             ninjamZapServerVideoSupported.store(false, std::memory_order_relaxed);
             ninjamSideSignalServerSupported.store(false, std::memory_order_relaxed);
-            ninjamSideSignalVideoCapSent.store(false, std::memory_order_relaxed);
+            lastNinjamVideoCapSendMs = 0.0;
             opusSyncServerSupported.store(false);
             {
                 const juce::ScopedLock lock(opusSyncPeerLock);
@@ -16555,8 +16622,6 @@ void NinjamVst3AudioProcessor::timerCallback()
             }
             opusSyncAvailable.store(false);
             opusSyncHasLegacyClients.store(false);
-            localServerLatencyMs.store(-1);
-            lastServerLatencyProbeInterval.store(-1);
             lastIntervalSyncFallbackSubscriptionMs = 0.0;
             setIntervalSyncStatusText({});
             lastBroadcastIntervalTag.store(-1);
@@ -16640,7 +16705,20 @@ void NinjamVst3AudioProcessor::timerCallback()
         }
         else if (serverSupportsSideSignal)
         {
-            lastIntervalSyncFallbackSubscriptionMs = nowMs;
+            if (vdoSyncActive && (nowMs - lastIntervalSyncFallbackSubscriptionMs) >= 1000.0)
+            {
+                stepStartMs = juce::Time::getMillisecondCounterHiRes();
+                syncLocalIntervalChannelConfig();
+                const int changedZapCarrierSubs = syncNinjamZapVideoSubscriptions(true);
+                if (changedZapCarrierSubs > 0)
+                    intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
+                noteSlowIntervalStep("zapVdoCarrierSub", juce::Time::getMillisecondCounterHiRes() - stepStartMs);
+                lastIntervalSyncFallbackSubscriptionMs = nowMs;
+            }
+            else if (!vdoSyncActive)
+            {
+                lastIntervalSyncFallbackSubscriptionMs = nowMs;
+            }
         }
         if (serverSupportsZapVideo && ninjamZapVideoEnabled.load(std::memory_order_relaxed))
         {
@@ -16760,8 +16838,6 @@ void NinjamVst3AudioProcessor::timerCallback()
             noteSlowIntervalStep("timingChanged", juce::Time::getMillisecondCounterHiRes() - stepStartMs);
         }
 
-        if (status == NJClient::NJC_STATUS_OK)
-            lastServerLatencyProbeInterval.store(getDisplayIntervalIndex());
         int last = lastIntervalPos.load();
         if (pos < last)
         {

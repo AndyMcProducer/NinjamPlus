@@ -213,7 +213,10 @@
             bufferRefreshTimersByUser: {},
             bufferRefreshPendingUntilByUser: {},
             latencyMsByUser: {},
+            latencyTargetMsByUser: {},
             latencyUpdatedAtByUser: {},
+            chunkEventsByStreamId: {},
+            chunkStatsByUser: {},
             lastRosterRevision: '',
             rosterTimerId: 0
         };
@@ -221,6 +224,7 @@
         const manualOffsetsMs = {};
         const remoteUserStaleMs = 12000;
         const vdoLatencyStaleMs = 8000;
+        const vdoLatencyMaxStepMs = 50;
 
         if (!appState.intervalSource) {
             appState.intervalSource = window.location.origin + '/intervals';
@@ -308,10 +312,9 @@
                 String(data.voiceChatMode ? 1 : 0),
                 String(data.intervalMeasurementSeen ? 1 : 0),
                 String(data.bufferCalculated ? 1 : 0),
-                String(data.ourServerLatencyReady ? 1 : 0),
-                String(data.ourServerLatencyProbeEnabled === false ? 0 : 1),
-                String(data.theirServerLatencyReady ? 1 : 0),
                 String(data.serverRouteLatencyReady ? 1 : 0),
+                String(Math.round(Number(data.intervalSignalAgeMs ?? -1) / 1000)),
+                String(Math.round(Number(data.serverRouteAgeMs ?? -1) / 1000)),
                 (typeof bufferMs === 'number' && isFinite(bufferMs)) ? String(Math.round(bufferMs)) : ''
             ].join('|');
         }
@@ -393,6 +396,10 @@
             return '';
         }
 
+        function formatMaybeMs(value) {
+            return (typeof value === 'number' && isFinite(value)) ? (Math.round(value) + 'ms') : '?';
+        }
+
         function registerPeerTarget(streamId, label, explicitTargetId) {
             const cleanStreamId = String(streamId || '').trim();
             if (!cleanStreamId) {
@@ -429,10 +436,12 @@
                 if (vdoState.streamIdByUser[userKey] === cleanStreamId) {
                     delete vdoState.streamIdByUser[userKey];
                     delete vdoState.targetIdByUser[userKey];
+                    delete vdoState.chunkStatsByUser[userKey];
                     resetBufferApplicationState(userKey);
                     changed = true;
                 }
             }
+            delete vdoState.chunkEventsByStreamId[cleanStreamId];
             return changed;
         }
 
@@ -482,7 +491,35 @@
             if (typeof value !== 'number' || !isFinite(value) || value < 0) {
                 return NaN;
             }
-            return Math.max(0, Math.min(6000, value));
+            return Math.max(0, Math.min(1200, value));
+        }
+
+        function getAverageCounterMs(objectValue, totalKeys, countKeys, maxMs) {
+            const totalSeconds = getNumericProperty(objectValue, totalKeys);
+            let count = NaN;
+            if (objectValue && typeof objectValue === 'object') {
+                const entries = Object.entries(objectValue);
+                for (let i = 0; i < countKeys.length; i++) {
+                    const wanted = String(countKeys[i]).toLowerCase();
+                    for (let j = 0; j < entries.length; j++) {
+                        if (String(entries[j][0]).toLowerCase() !== wanted) {
+                            continue;
+                        }
+                        if (typeof entries[j][1] === 'number' && isFinite(entries[j][1]) && entries[j][1] > 0) {
+                            count = entries[j][1];
+                            break;
+                        }
+                    }
+                    if (isFinite(count) && count > 0) {
+                        break;
+                    }
+                }
+            }
+            if (!isFinite(totalSeconds) || !isFinite(count) || totalSeconds <= 0 || count <= 0) {
+                return NaN;
+            }
+            const ms = (totalSeconds / count) * 1000.0;
+            return Math.max(0, Math.min(maxMs, ms));
         }
 
         function getMessageNumber(data, keyNames) {
@@ -508,24 +545,19 @@
         }
 
         function buildSyncDiagnostics(data, bufferMs) {
-            const senderServerLatencyMs = getNonNegativeMessageMs(data, ['senderServerLatencyMs', 'remoteServerLatencyMs']);
-            const receiverServerLatencyMs = getNonNegativeMessageMs(data, ['receiverServerLatencyMs', 'localServerLatencyMs']);
             const serverRouteLatencyMs = getNonNegativeMessageMs(data, ['serverRouteLatencyMs']);
+            const intervalSignalAgeMs = getNonNegativeMessageMs(data, ['intervalSignalAgeMs']);
+            const serverRouteAgeMs = getNonNegativeMessageMs(data, ['serverRouteAgeMs']);
             const hasBuffer = (typeof bufferMs === 'number' && isFinite(bufferMs) && bufferMs >= 0)
                 || boolProp(data, 'bufferCalculated') === true;
             const hasInterval = boolProp(data, 'intervalMeasurementSeen') === true
                 || isFinite(getMessageNumber(data, ['lastIntervalMeasurementMs', 'averageIntervalMeasurementMs', 'firmIntervalMeasurementMs']))
                 || hasBuffer;
-            const explicitTheirServer = boolProp(data, 'theirServerLatencyReady');
-            const explicitOurServer = boolProp(data, 'ourServerLatencyReady');
             const explicitServerRoute = boolProp(data, 'serverRouteLatencyReady');
-            const ourServerProbeEnabled = boolProp(data, 'ourServerLatencyProbeEnabled') !== false;
-            const hasTheirServer = explicitTheirServer !== null ? explicitTheirServer : isFinite(senderServerLatencyMs);
-            const hasOurServer = explicitOurServer !== null ? explicitOurServer : isFinite(receiverServerLatencyMs);
             const hasServerRoute = explicitServerRoute !== null ? explicitServerRoute : isFinite(serverRouteLatencyMs);
             const parts = [];
             if (!hasInterval) {
-                parts.push('interval missing');
+                parts.push(isFinite(intervalSignalAgeMs) ? 'waiting local marker' : 'interval missing');
             } else if (!hasBuffer) {
                 parts.push('buffer pending');
             } else {
@@ -534,12 +566,7 @@
             if (hasServerRoute) {
                 parts.push('route ok');
             } else {
-                if (!hasTheirServer) {
-                    parts.push('their srv ?');
-                }
-                if (!hasOurServer) {
-                    parts.push(ourServerProbeEnabled ? 'our srv ?' : 'srv probe off');
-                }
+                parts.push(isFinite(serverRouteAgeMs) ? 'route aging' : 'route pending');
             }
             return {
                 ok: hasInterval && hasBuffer,
@@ -579,7 +606,9 @@
                 'cameraSendLatencyMs', 'vdoCameraLatencyMs', 'vdoSendLatencyMs',
                 'cameraLatencyMs', 'videoSendLatencyMs', 'senderVideoLatencyMs',
                 'sendLatencyMs', 'senderLatencyMs', 'captureLatencyMs', 'captureDelayMs',
-                'encodeLatencyMs', 'encoderLatencyMs', 'encodeDelayMs', 'encoderDelayMs'
+                'encodeLatencyMs', 'encoderLatencyMs', 'encodeDelayMs', 'encoderDelayMs',
+                'decodeLatencyMs', 'decoderLatencyMs', 'decodeDelayMs', 'decoderDelayMs',
+                'jitterBufferDelayMs', 'playoutDelayMs', 'renderDelayMs', 'videoPipelineLatencyMs'
             ]);
             return isFinite(latencyMs) ? clampLatencyMs(latencyMs) : NaN;
         }
@@ -615,7 +644,9 @@
                 'cameraSendLatencyMs', 'vdoCameraLatencyMs', 'vdoSendLatencyMs',
                 'cameraLatencyMs', 'videoSendLatencyMs', 'senderVideoLatencyMs',
                 'sendLatencyMs', 'senderLatencyMs', 'captureLatencyMs', 'captureDelayMs',
-                'encodeLatencyMs', 'encoderLatencyMs', 'encodeDelayMs', 'encoderDelayMs'
+                'encodeLatencyMs', 'encoderLatencyMs', 'encodeDelayMs', 'encoderDelayMs',
+                'decodeLatencyMs', 'decoderLatencyMs', 'decodeDelayMs', 'decoderDelayMs',
+                'jitterBufferDelayMs', 'playoutDelayMs', 'renderDelayMs', 'videoPipelineLatencyMs'
             ]);
             if (isFinite(directMs)) {
                 return clampLatencyMs(directMs);
@@ -625,10 +656,54 @@
                 'cameraSendLatency', 'vdoCameraLatency', 'vdoSendLatency',
                 'cameraLatency', 'videoSendLatency', 'senderVideoLatency',
                 'sendLatency', 'senderLatency', 'captureLatency', 'captureDelay',
-                'encodeLatency', 'encoderLatency', 'encodeDelay', 'encoderDelay'
+                'encodeLatency', 'encoderLatency', 'encodeDelay', 'encoderDelay',
+                'decodeLatency', 'decoderLatency', 'decodeDelay', 'decoderDelay',
+                'jitterBufferDelay', 'playoutDelay', 'renderDelay', 'videoPipelineLatency'
             ]);
             if (isFinite(directSeconds)) {
                 return clampLatencyMs(directSeconds * 1000.0);
+            }
+
+            const encodeMs = getAverageCounterMs(objectValue,
+                ['totalEncodeTime'],
+                ['framesEncoded'],
+                300);
+            const decodeMs = getAverageCounterMs(objectValue,
+                ['totalDecodeTime'],
+                ['framesDecoded'],
+                300);
+            const processingMs = getAverageCounterMs(objectValue,
+                ['totalProcessingDelay'],
+                ['framesDecoded', 'framesReceived'],
+                500);
+            const jitterMs = getAverageCounterMs(objectValue,
+                ['jitterBufferDelay'],
+                ['jitterBufferEmittedCount', 'framesDecoded', 'framesReceived'],
+                800);
+            const targetJitterMs = getAverageCounterMs(objectValue,
+                ['jitterBufferTargetDelay'],
+                ['jitterBufferEmittedCount', 'framesDecoded', 'framesReceived'],
+                800);
+            let derivedMs = 0;
+            let hasDerived = false;
+            if (isFinite(encodeMs)) {
+                derivedMs += encodeMs;
+                hasDerived = true;
+            }
+            if (isFinite(decodeMs)) {
+                derivedMs += decodeMs;
+                hasDerived = true;
+            }
+            if (isFinite(processingMs)) {
+                derivedMs += processingMs;
+                hasDerived = true;
+            }
+            if (isFinite(jitterMs) || isFinite(targetJitterMs)) {
+                derivedMs += Math.max(isFinite(jitterMs) ? jitterMs : 0, isFinite(targetJitterMs) ? targetJitterMs : 0);
+                hasDerived = true;
+            }
+            if (hasDerived) {
+                return clampLatencyMs(derivedMs);
             }
 
             return NaN;
@@ -682,11 +757,94 @@
             if (!userKey || !isFinite(latencyMs) || latencyMs < 0) {
                 return false;
             }
-            const nextValue = Math.max(0, Math.round(latencyMs));
-            const previousValue = vdoState.latencyMsByUser[userKey];
-            vdoState.latencyMsByUser[userKey] = nextValue;
+            const observedValue = Math.round(clampLatencyMs(latencyMs));
+            const previousTarget = vdoState.latencyTargetMsByUser[userKey];
+            const targetValue = (typeof previousTarget === 'number' && isFinite(previousTarget))
+                ? Math.round(previousTarget * 0.65 + observedValue * 0.35)
+                : observedValue;
+            const previousApplied = vdoState.latencyMsByUser[userKey];
+            let appliedValue = targetValue;
+            if (typeof previousApplied === 'number' && isFinite(previousApplied)) {
+                const delta = targetValue - previousApplied;
+                const limitedDelta = Math.max(-vdoLatencyMaxStepMs, Math.min(vdoLatencyMaxStepMs, delta));
+                appliedValue = Math.round(previousApplied + limitedDelta);
+            }
+            vdoState.latencyTargetMsByUser[userKey] = targetValue;
+            vdoState.latencyMsByUser[userKey] = appliedValue;
             vdoState.latencyUpdatedAtByUser[userKey] = Date.now();
-            return previousValue !== nextValue;
+            return previousApplied !== appliedValue;
+        }
+
+        function handleVdoChunkEvent(data) {
+            if (!data || typeof data !== 'object' || (data.action !== 'chunked-inbound' && data.action !== 'chunked-outbound')) {
+                return false;
+            }
+            const value = data.value && typeof data.value === 'object' ? data.value : {};
+            const streamId = String(data.streamID || value.streamID || '').trim();
+            if (!streamId) {
+                return false;
+            }
+            const prior = vdoState.chunkEventsByStreamId[streamId] || {};
+            const now = Date.now();
+            const chunkTs = typeof value.ts === 'number' && isFinite(value.ts) ? value.ts : Number(value.ts);
+            const direction = data.action === 'chunked-inbound' ? 'in' : 'out';
+            const type = value.type || 'unknown';
+            const shouldRefresh = !prior.updatedAt
+                || (now - prior.updatedAt) >= 1000
+                || prior.direction !== direction
+                || prior.type !== type;
+            vdoState.chunkEventsByStreamId[streamId] = {
+                direction: direction,
+                type: type,
+                ts: isFinite(chunkTs) ? chunkTs : NaN,
+                updatedAt: now
+            };
+            return shouldRefresh;
+        }
+
+        function updateVdoChunkStats(root) {
+            if (!root || typeof root !== 'object') {
+                return false;
+            }
+            const statsRoot = root.stats && typeof root.stats === 'object' ? root.stats : root;
+            const inbound = statsRoot.inbound && typeof statsRoot.inbound === 'object' ? statsRoot.inbound : null;
+            if (!inbound) {
+                return false;
+            }
+            let changed = false;
+            const entries = Object.entries(inbound);
+            for (let i = 0; i < entries.length; i++) {
+                const streamId = String(entries[i][0] || '').trim();
+                const stats = entries[i][1];
+                if (!streamId || !stats || typeof stats !== 'object') {
+                    continue;
+                }
+                const chunkStats = stats.chunked_mode_video && typeof stats.chunked_mode_video === 'object'
+                    ? stats.chunked_mode_video
+                    : null;
+                if (!chunkStats) {
+                    continue;
+                }
+                const userKey = resolveUserKeyFromPeerIds(streamId, '', vdoState.labelByStreamId[streamId] || '');
+                if (!userKey) {
+                    continue;
+                }
+                const targetMs = getNumericProperty(chunkStats, ['buffer_buffer']);
+                const levelMs = getNumericProperty(chunkStats, ['buffer_level']);
+                const nextStats = {
+                    targetMs: isFinite(targetMs) ? targetMs : NaN,
+                    levelMs: isFinite(levelMs) ? levelMs : NaN,
+                    rebuffering: chunkStats.rebuffering === true,
+                    updatedAt: Date.now()
+                };
+                const prior = vdoState.chunkStatsByUser[userKey] || {};
+                changed = changed
+                    || Math.round(prior.targetMs || -1) !== Math.round(nextStats.targetMs || -1)
+                    || Math.round(prior.levelMs || -1) !== Math.round(nextStats.levelMs || -1)
+                    || prior.rebuffering !== nextStats.rebuffering;
+                vdoState.chunkStatsByUser[userKey] = nextStats;
+            }
+            return changed;
         }
 
         function getEstimatedVdoLatencyMs(userId) {
@@ -846,6 +1004,7 @@
             }
             postToVdo({ getStreamIDs: true });
             postToVdo({ getDetailedState: true });
+            postToVdo({ getStats: true });
         }
 
         function applyPeerBuffers(force) {
@@ -925,7 +1084,26 @@
                 const light = document.createElement('button');
                 light.type = 'button';
                 light.className = diagnostics.ok ? 'peer-light ok' : 'peer-light';
-                const detailText = userKey + ': ' + diagnostics.text;
+                const vdoLatencyMs = getEstimatedVdoLatencyMs(userKey);
+                const targetLatencyMs = vdoState.latencyTargetMsByUser[userKey];
+                const targetText = (typeof targetLatencyMs === 'number'
+                    && isFinite(targetLatencyMs)
+                    && Math.abs(targetLatencyMs - vdoLatencyMs) >= 5)
+                        ? (' -> ' + Math.round(targetLatencyMs) + 'ms')
+                        : '';
+                const vdoText = vdoLatencyMs > 0 ? (' | vdo comp ' + vdoLatencyMs + 'ms' + targetText) : '';
+                const chunkStats = vdoState.chunkStatsByUser[userKey] || {};
+                const chunkText = (typeof chunkStats.updatedAt === 'number' && (Date.now() - chunkStats.updatedAt) < 8000)
+                    ? (' | chunk target ' + formatMaybeMs(chunkStats.targetMs)
+                        + ' level ' + formatMaybeMs(chunkStats.levelMs)
+                        + (chunkStats.rebuffering ? ' rebuffering' : ''))
+                    : '';
+                const streamId = vdoState.streamIdByUser[userKey];
+                const chunkEvent = streamId ? vdoState.chunkEventsByStreamId[streamId] : null;
+                const chunkEventText = (chunkEvent && (Date.now() - chunkEvent.updatedAt) < 8000)
+                    ? (' | last chunk ' + chunkEvent.direction + ' ' + chunkEvent.type + ' ts ' + formatMaybeMs(chunkEvent.ts))
+                    : '';
+                const detailText = userKey + ': ' + diagnostics.text + vdoText + chunkText + chunkEventText;
                 light.title = detailText + '\nClick to copy';
                 light.setAttribute('aria-label', detailText);
                 light.addEventListener('click', function () {
@@ -968,7 +1146,9 @@
                 delete vdoState.bufferRefreshTimersByUser[userKey];
                 delete vdoState.bufferRefreshPendingUntilByUser[userKey];
                 delete vdoState.latencyMsByUser[userKey];
+                delete vdoState.latencyTargetMsByUser[userKey];
                 delete vdoState.latencyUpdatedAtByUser[userKey];
+                delete vdoState.chunkStatsByUser[userKey];
                 changed = true;
             }
             if (changed) {
@@ -1017,7 +1197,9 @@
                 delete vdoState.bufferRefreshTimersByUser[userKey];
                 delete vdoState.bufferRefreshPendingUntilByUser[userKey];
                 delete vdoState.latencyMsByUser[userKey];
+                delete vdoState.latencyTargetMsByUser[userKey];
                 delete vdoState.latencyUpdatedAtByUser[userKey];
+                delete vdoState.chunkStatsByUser[userKey];
                 changed = true;
             }
 
@@ -1184,6 +1366,8 @@
             }
 
             let changed = false;
+            changed = handleVdoChunkEvent(data) || changed;
+            changed = updateVdoChunkStats(data) || changed;
 
             if (data.streamIDs && typeof data.streamIDs === 'object') {
                 const entries = Object.entries(data.streamIDs);

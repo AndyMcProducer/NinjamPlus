@@ -582,22 +582,19 @@
             return msg && Object.prototype.hasOwnProperty.call(msg, key) ? msg[key] === true : null;
         }
 
-        function buildSyncDiagnostics(msg, bufferVal, senderServerLatencyMs, receiverServerLatencyMs) {
+        function buildSyncDiagnostics(msg, bufferVal) {
             const serverRouteLatencyMs = getNonNegativeMessageMs(msg, ['serverRouteLatencyMs']);
+            const intervalSignalAgeMs = getNonNegativeMessageMs(msg, ['intervalSignalAgeMs']);
+            const serverRouteAgeMs = getNonNegativeMessageMs(msg, ['serverRouteAgeMs']);
             const hasBuffer = (isFinite(bufferVal) && bufferVal >= 0) || boolProp(msg, 'bufferCalculated') === true;
             const hasInterval = boolProp(msg, 'intervalMeasurementSeen') === true
                 || isFinite(getMessageNumber(msg, ['lastIntervalMeasurementMs', 'averageIntervalMeasurementMs', 'firmIntervalMeasurementMs']))
                 || hasBuffer;
-            const explicitTheirServer = boolProp(msg, 'theirServerLatencyReady');
-            const explicitOurServer = boolProp(msg, 'ourServerLatencyReady');
             const explicitServerRoute = boolProp(msg, 'serverRouteLatencyReady');
-            const ourServerProbeEnabled = boolProp(msg, 'ourServerLatencyProbeEnabled') !== false;
-            const hasTheirServer = explicitTheirServer !== null ? explicitTheirServer : isFinite(senderServerLatencyMs);
-            const hasOurServer = explicitOurServer !== null ? explicitOurServer : isFinite(receiverServerLatencyMs);
             const hasServerRoute = explicitServerRoute !== null ? explicitServerRoute : isFinite(serverRouteLatencyMs);
             const parts = [];
             if (!hasInterval) {
-                parts.push('interval missing');
+                parts.push(isFinite(intervalSignalAgeMs) ? 'waiting local marker' : 'interval missing');
             } else if (!hasBuffer) {
                 parts.push('buffer pending');
             } else {
@@ -606,12 +603,7 @@
             if (hasServerRoute) {
                 parts.push('route ok');
             } else {
-                if (!hasTheirServer) {
-                    parts.push('their srv ?');
-                }
-                if (!hasOurServer) {
-                    parts.push(ourServerProbeEnabled ? 'our srv ?' : 'srv probe off');
-                }
+                parts.push(isFinite(serverRouteAgeMs) ? 'route aging' : 'route pending');
             }
             return {
                 ok: hasInterval && hasBuffer,
@@ -858,12 +850,16 @@
                 const receiverServerLatencyMs = getNonNegativeMessageMs(msg, ['receiverServerLatencyMs', 'localServerLatencyMs']);
                 const serverRouteLatencyMs = getNonNegativeMessageMs(msg, ['serverRouteLatencyMs']);
                 const vdoLatencyMs = getIncomingVdoLatencyMs(msg);
-                const syncDiagnostics = buildSyncDiagnostics(msg, bufferVal, senderServerLatencyMs, receiverServerLatencyMs);
+                const intervalSignalAgeMs = getNonNegativeMessageMs(msg, ['intervalSignalAgeMs']);
+                const serverRouteAgeMs = getNonNegativeMessageMs(msg, ['serverRouteAgeMs']);
+                const syncDiagnostics = buildSyncDiagnostics(msg, bufferVal);
                 const sampleKey = buildUserSampleKey(msg, bufferVal)
                     + '|' + (isFinite(senderServerLatencyMs) ? String(Math.round(senderServerLatencyMs)) : '')
                     + '|' + (isFinite(receiverServerLatencyMs) ? String(Math.round(receiverServerLatencyMs)) : '')
                     + '|' + (isFinite(serverRouteLatencyMs) ? String(Math.round(serverRouteLatencyMs)) : '')
                     + '|' + (isFinite(vdoLatencyMs) ? String(Math.round(vdoLatencyMs)) : '')
+                    + '|' + (isFinite(intervalSignalAgeMs) ? String(Math.round(intervalSignalAgeMs / 1000)) : '')
+                    + '|' + (isFinite(serverRouteAgeMs) ? String(Math.round(serverRouteAgeMs / 1000)) : '')
                     + '|' + syncDiagnostics.text;
                 if (userLastSampleKey[normalizedUserId] === sampleKey) {
                     continue;

@@ -168,7 +168,17 @@ private:
                     token->Release();
                 }
 
-                voice->Speak((LPCWSTR) job.text.toWideCharPointer(), SPF_DEFAULT, nullptr);
+                voice->Speak((LPCWSTR) job.text.toWideCharPointer(), SPF_ASYNC | SPF_PURGEBEFORESPEAK, nullptr);
+                while (!threadShouldExit())
+                {
+                    SPVOICESTATUS status {};
+                    if (FAILED(voice->GetStatus(&status, nullptr)) || status.dwRunningState == SPRS_DONE)
+                        break;
+                    wait(25);
+                }
+
+                if (threadShouldExit())
+                    voice->Speak(nullptr, SPF_PURGEBEFORESPEAK, nullptr);
             }
             voice->Release();
         }
@@ -8007,18 +8017,30 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     chatTtsVoiceIds.add({});
     chatTtsVoiceNames.add("System Default");
     {
-        juce::StringArray platformVoiceIds;
-        juce::StringArray platformVoiceNames;
-        ChatTtsEngine::getAvailableVoices(platformVoiceIds, platformVoiceNames);
-        const int voiceCount = juce::jmin(platformVoiceIds.size(), platformVoiceNames.size());
-        for (int i = 0; i < voiceCount; ++i)
+        juce::Component::SafePointer<NinjamVst3AudioProcessorEditor> safeThis(this);
+        std::thread([safeThis]
         {
-            if (platformVoiceIds[i].isNotEmpty() && !chatTtsVoiceIds.contains(platformVoiceIds[i]))
+            juce::StringArray platformVoiceIds;
+            juce::StringArray platformVoiceNames;
+            ChatTtsEngine::getAvailableVoices(platformVoiceIds, platformVoiceNames);
+            juce::MessageManager::callAsync([safeThis,
+                                             platformVoiceIds = std::move(platformVoiceIds),
+                                             platformVoiceNames = std::move(platformVoiceNames)]() mutable
             {
-                chatTtsVoiceIds.add(platformVoiceIds[i]);
-                chatTtsVoiceNames.add(platformVoiceNames[i]);
-            }
-        }
+                if (safeThis == nullptr)
+                    return;
+
+                const int voiceCount = juce::jmin(platformVoiceIds.size(), platformVoiceNames.size());
+                for (int i = 0; i < voiceCount; ++i)
+                {
+                    if (platformVoiceIds[i].isNotEmpty() && !safeThis->chatTtsVoiceIds.contains(platformVoiceIds[i]))
+                    {
+                        safeThis->chatTtsVoiceIds.add(platformVoiceIds[i]);
+                        safeThis->chatTtsVoiceNames.add(platformVoiceNames[i]);
+                    }
+                }
+            });
+        }).detach();
     }
 
     addAndMakeVisible(atButton);
@@ -9678,7 +9700,7 @@ void NinjamVst3AudioProcessorEditor::setChatTtsEnabled(bool enabled, bool markDi
 void NinjamVst3AudioProcessorEditor::setChatTtsVoiceId(const juce::String& voiceId, bool markDirty)
 {
     const juce::String trimmed = voiceId.trim();
-    chatTtsVoiceId = chatTtsVoiceIds.contains(trimmed) ? trimmed : juce::String();
+    chatTtsVoiceId = trimmed;
 
     if (markDirty)
         markPersistentSettingsDirty();
