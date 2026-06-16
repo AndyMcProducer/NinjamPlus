@@ -135,6 +135,66 @@
             return 'remote';
         }
 
+        function normalizeCameraFx(value) {
+            const fx = String(value || 'off').trim().toLowerCase();
+            if (fx === 'blur' || fx === '3' || fx === '3a') return 'blur';
+            if (fx === 'remove' || fx === 'transparent' || fx === 'background-remove' || fx === 'backgroundremove' || fx === '16') return 'remove';
+            if (fx === 'green' || fx === 'greenscreen' || fx === 'green-screen' || fx === '4') return 'green';
+            if (fx === 'image' || fx === 'virtual' || fx === 'virtual-background' || fx === 'background' || fx === '5') return 'image';
+            return 'off';
+        }
+
+        function normalizeCameraFxStrength(value) {
+            const strength = parseInt(value || '4', 10);
+            return isFinite(strength) ? Math.max(1, Math.min(20, strength)) : 4;
+        }
+
+        function normalizeVdoQualityPreset(value) {
+            const preset = String(value || 'default').trim().toLowerCase();
+            if (preset === '1080p60' || preset === 'high' || preset === 'fullhd60') return '1080p60';
+            if (preset === '1080p30' || preset === 'fullhd30') return '1080p30';
+            if (preset === '720p60' || preset === 'hd60') return '720p60';
+            if (preset === '720p30' || preset === 'hd30') return '720p30';
+            if (preset === '360p30' || preset === 'low') return '360p30';
+            return 'default';
+        }
+
+        function normalizeVdoCodec(value) {
+            const codec = String(value || 'default').trim().toLowerCase();
+            if (codec === 'vp8') return 'vp8';
+            if (codec === 'vp9') return 'vp9';
+            if (codec === 'h264' || codec === '264' || codec === 'avc') return 'h264';
+            if (codec === 'av1') return 'av1';
+            return 'default';
+        }
+
+        function queryFpsValue() {
+            return parseInt(query.get('fps') || query.get('fr') || query.get('frameRate') || '', 10) || 0;
+        }
+
+        function initialVdoQualityPreset() {
+            const directQuality = query.get('cameraQuality') || query.get('vdoQuality');
+            if (directQuality) return normalizeVdoQualityPreset(directQuality);
+            const quality = String(query.get('quality') || query.get('q') || '').trim().toLowerCase();
+            const fps = queryFpsValue();
+            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60) return '1080p60';
+            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps > 0 && fps <= 30) return '1080p30';
+            if ((quality === '1' || quality === '720' || quality === '720p' || quality === 'hd') && fps >= 60) return '720p60';
+            if ((quality === '1' || quality === '720' || quality === '720p' || quality === 'hd') && fps > 0 && fps <= 30) return '720p30';
+            if ((quality === '2' || quality === '360' || quality === '360p' || quality === 'low') && fps > 0 && fps <= 30) return '360p30';
+            return 'default';
+        }
+
+        function initialVdoCodec() {
+            return normalizeVdoCodec(query.get('cameraCodec') || query.get('vdoCodec') || query.get('codec') || query.get('videocodec') || 'default');
+        }
+
+        function initialCameraFx() {
+            const directFx = query.get('cameraFx') || query.get('vdoFx') || query.get('videoFx');
+            if (directFx) return normalizeCameraFx(directFx);
+            return normalizeCameraFx(query.get('effects') || query.get('effect') || 'off');
+        }
+
         const appState = {
             room: resolvedRoom,
             label: query.get('label') || 'NINJAM',
@@ -146,6 +206,11 @@
             chunkedMs: parseInt(query.get('chunked') || '', 10) || 120,
             ninjamServer: ninjamServer,
             initialBufferMode: normalizeBufferMode(query.get('bufferMode')),
+            cameraCodec: initialVdoCodec(),
+            cameraQuality: initialVdoQualityPreset(),
+            cameraFx: initialCameraFx(),
+            cameraFxStrength: normalizeCameraFxStrength(query.get('cameraFxStrength') || query.get('effectvalue') || query.get('ev') || '4'),
+            cameraBgImage: query.get('cameraBgImage') || query.get('backgroundImage') || query.get('bgImage') || '',
             intervalMessages: 0
         };
 
@@ -1345,6 +1410,133 @@
             tick();
         }
 
+        function applyVdoCodecParams(params) {
+            if (appState.cameraCodec !== 'default') {
+                params.set('codec', appState.cameraCodec);
+            }
+        }
+
+        function vdoQualityPresetConfig(preset) {
+            const quality = normalizeVdoQualityPreset(preset);
+            if (quality === '1080p60') return { quality: '0', width: 1920, height: 1080, fps: 60, bitrate: 6000 };
+            if (quality === '1080p30') return { quality: '0', width: 1920, height: 1080, fps: 30, bitrate: 4500 };
+            if (quality === '720p60') return { quality: '1', width: 1280, height: 720, fps: 60, bitrate: 3500 };
+            if (quality === '720p30') return { quality: '1', width: 1280, height: 720, fps: 30, bitrate: 2500 };
+            if (quality === '360p30') return { quality: '2', width: 640, height: 360, fps: 30, bitrate: 1200 };
+            return null;
+        }
+
+        function applyVdoQualityParams(params) {
+            const config = vdoQualityPresetConfig(appState.cameraQuality);
+            if (!config) {
+                return;
+            }
+            params.set('quality', config.quality);
+            params.set('fps', String(config.fps));
+            params.set('bitrate', String(config.bitrate));
+        }
+
+        function applyCameraFxParams(params) {
+            if (appState.cameraFx === 'blur') {
+                params.set('effects', '3');
+                params.set('effectvalue', String(appState.cameraFxStrength));
+            } else if (appState.cameraFx === 'remove') {
+                params.set('effects', '16');
+            } else if (appState.cameraFx === 'green') {
+                params.set('effects', '4');
+            } else if (appState.cameraFx === 'image') {
+                params.set('effects', '5');
+                if (appState.cameraBgImage) {
+                    params.set('imagelist', encodeURIComponent(JSON.stringify([appState.cameraBgImage])));
+                }
+            }
+        }
+
+        function postEvalToVdo(source) {
+            return postToVdo({ function: 'eval', value: source });
+        }
+
+        function vdoEffectIdForFx(fx) {
+            const value = normalizeCameraFx(fx);
+            if (value === 'blur') return '3';
+            if (value === 'remove') return '16';
+            if (value === 'green') return '4';
+            if (value === 'image') return '5';
+            return '0';
+        }
+
+        function applyLiveVdoQuality() {
+            const config = vdoQualityPresetConfig(appState.cameraQuality);
+            if (!config) {
+                return false;
+            }
+            const script = '(function(){' +
+                'var cfg=' + JSON.stringify(config) + ';' +
+                'try{' +
+                'session.quality=' + JSON.stringify(config.quality) + ';' +
+                'session.frameRate=cfg.fps;' +
+                'session.maxframeRate=cfg.fps;' +
+                'session.bitrate=cfg.bitrate;' +
+                'var stream=session.streamSrc||null;' +
+                'var track=stream&&stream.getVideoTracks?stream.getVideoTracks()[0]:null;' +
+                'if(track&&track.readyState==="live"&&track.applyConstraints){' +
+                'track.applyConstraints({width:{ideal:cfg.width},height:{ideal:cfg.height},frameRate:{ideal:cfg.fps,max:cfg.fps}})' +
+                '.then(function(){try{session.currentCameraConstraints=track.getSettings();}catch(e){}})' +
+                '.catch(function(e){try{errorlog(e&&e.message?e.message:e);}catch(_){}});' +
+                '}' +
+                '}catch(e){try{errorlog(e&&e.message?e.message:e);}catch(_){}}' +
+                '})();';
+            return postEvalToVdo(script);
+        }
+
+        function applyLiveVdoEffects() {
+            const effectId = vdoEffectIdForFx(appState.cameraFx);
+            const payload = {
+                effect: effectId,
+                effectValue: normalizeCameraFxStrength(appState.cameraFxStrength),
+                image: String(appState.cameraBgImage || '').trim()
+            };
+            const script = '(function(){' +
+                'var cfg=' + JSON.stringify(payload) + ';' +
+                'try{' +
+                'var effect=String(cfg.effect||"0");' +
+                'var amount=parseInt(cfg.effectValue||4,10)||4;' +
+                'if(effect==="5"&&cfg.image){' +
+                'session.defaultBackgroundImages=[cfg.image];' +
+                'session.effectsImage=document.createElement("img");' +
+                'session.effectsImage.crossOrigin="Anonymous";' +
+                'session.effectsImage.src=cfg.image;' +
+                '}' +
+                'if(effect==="3"){session.effectValue_default=amount;session.effectValue=amount;}else{session.effectValue_default=false;}' +
+                'var select=document.getElementById("effectSelector3")||document.getElementById("effectSelector");' +
+                'if(select){' +
+                'var found=false;' +
+                'for(var i=0;i<select.options.length;i++){if(String(select.options[i].value)===effect){found=true;break;}}' +
+                'if(found){select.value=effect;effectsDynamicallyUpdate(null,select);}else{session.effect=effect==="0"?false:effect;updateRenderOutpipe();}' +
+                '}else{session.effect=effect==="0"?false:effect;updateRenderOutpipe();}' +
+                'if(effect==="3"){session.effectValue=amount;session.effectValue_default=amount;["selectEffectAmountInput","selectEffectAmountInput3"].forEach(function(id){var input=document.getElementById(id);if(input)input.value=amount;});updateRenderOutpipe();}' +
+                '}catch(e){try{errorlog(e&&e.message?e.message:e);}catch(_){}}' +
+                '})();';
+            return postEvalToVdo(script);
+        }
+
+        function applyLiveCameraSettings(settings, changed) {
+            if (!settings || typeof settings !== 'object') {
+                return;
+            }
+            appState.cameraCodec = normalizeVdoCodec(settings.cameraCodec || appState.cameraCodec);
+            appState.cameraQuality = normalizeVdoQualityPreset(settings.cameraQuality || appState.cameraQuality);
+            appState.cameraFx = normalizeCameraFx(settings.cameraFx || appState.cameraFx);
+            appState.cameraFxStrength = normalizeCameraFxStrength(settings.cameraFxStrength || appState.cameraFxStrength);
+            appState.cameraBgImage = String(settings.cameraBgImage || '');
+            if (!changed || changed === 'quality') {
+                applyLiveVdoQuality();
+            }
+            if (!changed || changed === 'fx') {
+                applyLiveVdoEffects();
+            }
+        }
+
         function buildIframeUrl() {
             const iframeParams = new URLSearchParams();
             iframeParams.set('room', appState.room);
@@ -1357,6 +1549,9 @@
             // Keep the initial room join buffer minimal; the sync layer applies the
             // measured delay after load, and sending both can double the result.
             iframeParams.set('buffer', String(minimumBufferMs));
+            applyVdoCodecParams(iframeParams);
+            applyVdoQualityParams(iframeParams);
+            applyCameraFxParams(iframeParams);
             return 'https://vdo.ninja/?' + iframeParams.toString();
         }
 
@@ -1408,6 +1603,10 @@
                 return;
             }
             if (event.origin !== window.location.origin) {
+                return;
+            }
+            if (event.data && typeof event.data === 'object' && event.data.type === 'ninjam-vdo-camera-settings') {
+                applyLiveCameraSettings(event.data.settings || {}, event.data.changed || '');
                 return;
             }
             if (!event.data || typeof event.data !== 'object' || event.data.type !== 'ninjamOffsetUpdate') {

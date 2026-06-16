@@ -56,11 +56,15 @@
             background: #293655;
         }
         .obs-tools,
-        .display-tools {
+        .camera-tools {
             display: flex;
             flex-wrap: wrap;
             gap: 6px;
             align-items: center;
+        }
+        .camera-bg-input {
+            width: min(260px, 34vw);
+            min-width: 160px;
         }
         .obs-control {
             display: flex;
@@ -149,16 +153,32 @@
         .peer-latency.ok {
             color: #91d98e;
         }
-        .status {
+        .header-meta {
             margin-left: auto;
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 8px;
+            flex: 0 0 auto;
+        }
+        .status {
             font-size: 12px;
             color: #afbbd3;
+        }
+        .vdo-credit {
+            display: block;
+            width: auto;
+            height: 24px;
+            max-width: 128px;
+            object-fit: contain;
+            flex: 0 0 auto;
         }
         .frame-wrap {
             border: 1px solid #2a3450;
             border-radius: 6px;
             overflow: hidden;
             background: #000;
+            position: relative;
         }
         iframe {
             width: 100%;
@@ -199,37 +219,47 @@
             </label>
             <button id="obsBtn">Copy OBS Link</button>
         </div>
-        <div class="display-tools">
-            <label class="obs-control" for="vdoDisplayFx">Display FX
-                <select id="vdoDisplayFx">
+        <div class="camera-tools">
+            <label class="obs-control" for="vdoCameraCodec">Codec
+                <select id="vdoCameraCodec">
+                    <option value="default">Auto</option>
+                    <option value="vp8">VP8</option>
+                    <option value="vp9">VP9</option>
+                    <option value="h264">H.264</option>
+                    <option value="av1">AV1</option>
+                </select>
+            </label>
+            <label class="obs-control" for="vdoCameraQuality">Quality
+                <select id="vdoCameraQuality">
+                    <option value="default">Default</option>
+                    <option value="1080p60">1080p60 high</option>
+                    <option value="1080p30">1080p30</option>
+                    <option value="720p60">720p60</option>
+                    <option value="720p30">720p30</option>
+                    <option value="360p30">360p30</option>
+                </select>
+            </label>
+            <label class="obs-control" for="vdoCameraFx">Camera FX
+                <select id="vdoCameraFx">
                     <option value="off">Off</option>
-                    <option value="blur">Blur</option>
-                    <option value="grayscale">Grayscale</option>
-                    <option value="sepia">Sepia</option>
+                    <option value="blur">Blur background</option>
+                    <option value="remove">Remove background</option>
+                    <option value="green">Green screen</option>
+                    <option value="image">Image background</option>
                 </select>
             </label>
-            <label class="obs-control" for="vdoDisplayFxStrength">Strength
-                <input id="vdoDisplayFxStrength" type="range" min="0" max="24" value="8">
+            <label class="obs-control" for="vdoCameraFxStrength">Amount
+                <input id="vdoCameraFxStrength" type="range" min="1" max="20" value="4">
             </label>
-            <label class="obs-control" for="vdoDisplayMask">Mask
-                <select id="vdoDisplayMask">
-                    <option value="none">None</option>
-                    <option value="cloud">Cloud</option>
-                    <option value="circle">Circle</option>
-                    <option value="rounded">Rounded</option>
-                    <option value="square">Square</option>
-                    <option value="tree">Xmas tree</option>
-                    <option value="pumpkin">Pumpkin</option>
-                    <option value="star">Star</option>
-                    <option value="heart">Heart</option>
-                </select>
-            </label>
-            <label class="obs-control" for="vdoDisplayMirror">Mirror
-                <input id="vdoDisplayMirror" type="checkbox">
+            <label class="obs-control" for="vdoCameraBgImage">Image URL
+                <input id="vdoCameraBgImage" class="camera-bg-input" type="url" placeholder="https://...">
             </label>
         </div>
         <div class="peer-offsets" id="peerOffsets"></div>
-        <span class="status" id="statusText"></span>
+        <div class="header-meta">
+            <span class="status" id="statusText"></span>
+            <img class="vdo-credit" src="/PoweredByVDONinja.png" alt="Powered by VDO.Ninja">
+        </div>
     </div>
     <div class="frame-wrap">
         <iframe id="appFrame" allow="camera; microphone; fullscreen"></iframe>
@@ -240,10 +270,11 @@
         const obsBtn = document.getElementById('obsBtn');
         const obsLayout = document.getElementById('obsLayout');
         const obsSource = document.getElementById('obsSource');
-        const vdoDisplayFx = document.getElementById('vdoDisplayFx');
-        const vdoDisplayFxStrength = document.getElementById('vdoDisplayFxStrength');
-        const vdoDisplayMask = document.getElementById('vdoDisplayMask');
-        const vdoDisplayMirror = document.getElementById('vdoDisplayMirror');
+        const vdoCameraCodec = document.getElementById('vdoCameraCodec');
+        const vdoCameraQuality = document.getElementById('vdoCameraQuality');
+        const vdoCameraFx = document.getElementById('vdoCameraFx');
+        const vdoCameraFxStrength = document.getElementById('vdoCameraFxStrength');
+        const vdoCameraBgImage = document.getElementById('vdoCameraBgImage');
         const peerOffsets = document.getElementById('peerOffsets');
         const statusText = document.getElementById('statusText');
         const appFrame = document.getElementById('appFrame');
@@ -272,104 +303,148 @@
             obsSource.value = String(normalizeObsSlot(query.get('obsSlot') || query.get('slot') || '0'));
         }
 
-        function normalizeDisplayFx(value) {
-            const fx = String(value || 'off').toLowerCase();
-            return fx === 'blur' || fx === 'grayscale' || fx === 'sepia' ? fx : 'off';
+        function normalizeCameraFx(value) {
+            const fx = String(value || 'off').trim().toLowerCase();
+            if (fx === 'blur' || fx === '3' || fx === '3a') return 'blur';
+            if (fx === 'remove' || fx === 'transparent' || fx === 'background-remove' || fx === 'backgroundremove' || fx === '16') return 'remove';
+            if (fx === 'green' || fx === 'greenscreen' || fx === 'green-screen' || fx === '4') return 'green';
+            if (fx === 'image' || fx === 'virtual' || fx === 'virtual-background' || fx === 'background' || fx === '5') return 'image';
+            return 'off';
         }
 
-        function normalizeDisplayMask(value) {
-            const mask = String(value || 'none').toLowerCase();
-            return ['none', 'cloud', 'circle', 'rounded', 'square', 'tree', 'pumpkin', 'star', 'heart'].includes(mask) ? mask : 'none';
+        function normalizeCameraFxStrength(value) {
+            const strength = parseInt(value || '4', 10);
+            return isFinite(strength) ? Math.max(1, Math.min(20, strength)) : 4;
         }
 
-        function displaySvgMaskUrl(shape) {
-            let inner = '';
-            if (shape === 'tree') {
-                inner = '<path fill="white" d="M50 4 L74 36 H62 L82 63 H66 L91 94 H58 V100 H42 V94 H9 L34 63 H18 L38 36 H26 Z"/>';
-            } else if (shape === 'pumpkin') {
-                inner = '<path fill="white" d="M47 7 H57 V23 H47 Z M50 18 C34 7 12 20 12 53 C12 82 31 98 50 88 C69 98 88 82 88 53 C88 20 66 7 50 18 Z"/>';
-            } else if (shape === 'star') {
-                inner = '<polygon fill="white" points="50,4 61,37 96,37 68,57 79,92 50,71 21,92 32,57 4,37 39,37"/>';
-            } else if (shape === 'heart') {
-                inner = '<path fill="white" d="M50 91 C23 68 8 54 8 33 C8 18 19 8 34 8 C42 8 48 12 50 19 C52 12 58 8 66 8 C81 8 92 18 92 33 C92 54 77 68 50 91 Z"/>';
+        function normalizeVdoQualityPreset(value) {
+            const preset = String(value || 'default').trim().toLowerCase();
+            if (preset === '1080p60' || preset === 'high' || preset === 'fullhd60') return '1080p60';
+            if (preset === '1080p30' || preset === 'fullhd30') return '1080p30';
+            if (preset === '720p60' || preset === 'hd60') return '720p60';
+            if (preset === '720p30' || preset === 'hd30') return '720p30';
+            if (preset === '360p30' || preset === 'low') return '360p30';
+            return 'default';
+        }
+
+        function normalizeVdoCodec(value) {
+            const codec = String(value || 'default').trim().toLowerCase();
+            if (codec === 'vp8') return 'vp8';
+            if (codec === 'vp9') return 'vp9';
+            if (codec === 'h264' || codec === '264' || codec === 'avc') return 'h264';
+            if (codec === 'av1') return 'av1';
+            return 'default';
+        }
+
+        function queryFpsValue() {
+            return parseInt(query.get('fps') || query.get('fr') || query.get('frameRate') || '', 10) || 0;
+        }
+
+        function initialVdoQualityPreset() {
+            const directQuality = query.get('cameraQuality') || query.get('vdoQuality');
+            if (directQuality) return normalizeVdoQualityPreset(directQuality);
+            const quality = String(query.get('quality') || query.get('q') || '').trim().toLowerCase();
+            const fps = queryFpsValue();
+            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60) return '1080p60';
+            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps > 0 && fps <= 30) return '1080p30';
+            if ((quality === '1' || quality === '720' || quality === '720p' || quality === 'hd') && fps >= 60) return '720p60';
+            if ((quality === '1' || quality === '720' || quality === '720p' || quality === 'hd') && fps > 0 && fps <= 30) return '720p30';
+            if ((quality === '2' || quality === '360' || quality === '360p' || quality === 'low') && fps > 0 && fps <= 30) return '360p30';
+            return 'default';
+        }
+
+        function initialVdoCodec() {
+            return normalizeVdoCodec(query.get('cameraCodec') || query.get('vdoCodec') || query.get('codec') || query.get('videocodec') || 'default');
+        }
+
+        function initialCameraFx() {
+            const directFx = query.get('cameraFx') || query.get('vdoFx') || query.get('videoFx');
+            if (directFx) return normalizeCameraFx(directFx);
+            return normalizeCameraFx(query.get('effects') || query.get('effect') || 'off');
+        }
+
+        function updateCameraFxControls() {
+            const fx = normalizeCameraFx(vdoCameraFx ? vdoCameraFx.value : 'off');
+            if (vdoCameraFxStrength) {
+                vdoCameraFxStrength.disabled = fx !== 'blur';
             }
-            if (!inner) return '';
-            return 'url("data:image/svg+xml;utf8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" preserveAspectRatio="none">' + inner + '</svg>') + '")';
+            if (vdoCameraBgImage) {
+                vdoCameraBgImage.disabled = fx !== 'image';
+            }
         }
 
-        function clearDisplayMask(el) {
-            if (!el) return;
-            el.style.clipPath = '';
-            el.style.webkitClipPath = '';
-            el.style.maskImage = 'none';
-            el.style.webkitMaskImage = 'none';
-            el.style.maskSize = '';
-            el.style.webkitMaskSize = '';
-            el.style.maskRepeat = '';
-            el.style.webkitMaskRepeat = '';
-            el.style.maskPosition = '';
-            el.style.webkitMaskPosition = '';
+        function applyCameraFxToMainParams(params) {
+            params.delete('effects');
+            params.delete('effect');
+            params.delete('effectvalue');
+            params.delete('ev');
+            params.delete('imagelist');
+            params.delete('cameraQuality');
+            params.delete('vdoQuality');
+            params.delete('quality');
+            params.delete('q');
+            params.delete('fps');
+            params.delete('fr');
+            params.delete('frameRate');
+            params.delete('bitrate');
+            params.delete('videobitrate');
+            params.delete('vb');
+            params.delete('cameraCodec');
+            params.delete('vdoCodec');
+            params.delete('codec');
+            params.delete('codecs');
+            params.delete('videocodec');
+
+            const codec = normalizeVdoCodec(vdoCameraCodec ? vdoCameraCodec.value : 'default');
+            const quality = normalizeVdoQualityPreset(vdoCameraQuality ? vdoCameraQuality.value : 'default');
+            const fx = normalizeCameraFx(vdoCameraFx ? vdoCameraFx.value : 'off');
+            const strength = normalizeCameraFxStrength(vdoCameraFxStrength ? vdoCameraFxStrength.value : '4');
+            const bgImage = String(vdoCameraBgImage ? vdoCameraBgImage.value : '').trim();
+
+            if (codec !== 'default') {
+                params.set('cameraCodec', codec);
+            }
+            if (quality !== 'default') {
+                params.set('cameraQuality', quality);
+            }
+            if (fx !== 'off') {
+                params.set('cameraFx', fx);
+            } else {
+                params.delete('cameraFx');
+            }
+            if (fx === 'blur') {
+                params.set('cameraFxStrength', String(strength));
+            } else {
+                params.delete('cameraFxStrength');
+            }
+            if (fx === 'image' && bgImage) {
+                params.set('cameraBgImage', bgImage);
+            } else {
+                params.delete('cameraBgImage');
+            }
         }
 
-        function applyDisplayMask(el, shape) {
-            clearDisplayMask(el);
-            if (!el || shape === 'none') return;
-            if (shape === 'circle') {
-                el.style.clipPath = 'circle(47% at 50% 50%)';
-                el.style.webkitClipPath = 'circle(47% at 50% 50%)';
-                return;
-            }
-            if (shape === 'rounded') {
-                el.style.clipPath = 'inset(0 round 10%)';
-                el.style.webkitClipPath = 'inset(0 round 10%)';
-                return;
-            }
-            if (shape === 'square') {
-                el.style.clipPath = 'inset(0)';
-                el.style.webkitClipPath = 'inset(0)';
-                return;
-            }
-            const maskUrl = shape === 'cloud' ? 'url("/zap-mask/cloud.png")' : displaySvgMaskUrl(shape);
-            if (!maskUrl) return;
-            el.style.maskImage = maskUrl;
-            el.style.webkitMaskImage = maskUrl;
-            el.style.maskSize = '100% 100%';
-            el.style.webkitMaskSize = '100% 100%';
-            el.style.maskRepeat = 'no-repeat';
-            el.style.webkitMaskRepeat = 'no-repeat';
-            el.style.maskPosition = 'center';
-            el.style.webkitMaskPosition = 'center';
+        if (vdoCameraCodec) {
+            vdoCameraCodec.value = initialVdoCodec();
         }
-
-        function applyVdoDisplayEffects() {
-            const fx = normalizeDisplayFx(vdoDisplayFx ? vdoDisplayFx.value : 'off');
-            const mask = normalizeDisplayMask(vdoDisplayMask ? vdoDisplayMask.value : 'none');
-            const strength = Math.max(0, Math.min(24, parseInt(vdoDisplayFxStrength ? vdoDisplayFxStrength.value : '8', 10) || 0));
-            if (vdoDisplayFxStrength) {
-                vdoDisplayFxStrength.disabled = fx !== 'blur';
-            }
-            if (!appFrame) return;
-            appFrame.style.filter = fx === 'blur'
-                ? 'blur(' + String(strength) + 'px)'
-                : (fx === 'grayscale' ? 'grayscale(1)' : (fx === 'sepia' ? 'sepia(1)' : 'none'));
-            appFrame.style.transformOrigin = 'center center';
-            appFrame.style.transform = vdoDisplayMirror && vdoDisplayMirror.checked ? 'scaleX(-1)' : '';
-            applyDisplayMask(appFrame, mask);
+        if (vdoCameraQuality) {
+            vdoCameraQuality.value = initialVdoQualityPreset();
         }
-
-        if (vdoDisplayFx) {
-            vdoDisplayFx.value = normalizeDisplayFx(query.get('displayFx') || 'off');
+        if (vdoCameraFx) {
+            vdoCameraFx.value = initialCameraFx();
         }
-        if (vdoDisplayMask) {
-            vdoDisplayMask.value = normalizeDisplayMask(query.get('displayMask') || query.get('mask') || 'none');
+        if (vdoCameraFxStrength) {
+            vdoCameraFxStrength.value = String(normalizeCameraFxStrength(query.get('cameraFxStrength') || query.get('effectvalue') || query.get('ev') || '4'));
         }
-        if (vdoDisplayMirror) {
-            vdoDisplayMirror.checked = query.get('displayMirror') === '1';
+        if (vdoCameraBgImage) {
+            vdoCameraBgImage.value = query.get('cameraBgImage') || query.get('backgroundImage') || query.get('bgImage') || '';
         }
+        updateCameraFxControls();
 
         function buildMainUrl() {
             const p = new URLSearchParams(window.location.search);
             p.delete('view');
+            applyCameraFxToMainParams(p);
             p.set('helperLoad', String(Date.now()));
             const q = p.toString();
             return q ? ('/app?' + q) : '/app';
@@ -949,23 +1024,58 @@
                 .catch(function () { statusText.textContent = 'Could not copy OBS link'; });
         });
 
-        if (vdoDisplayFx) {
-            vdoDisplayFx.addEventListener('change', applyVdoDisplayEffects);
+        function currentCameraSettings() {
+            return {
+                cameraCodec: normalizeVdoCodec(vdoCameraCodec ? vdoCameraCodec.value : 'default'),
+                cameraQuality: normalizeVdoQualityPreset(vdoCameraQuality ? vdoCameraQuality.value : 'default'),
+                cameraFx: normalizeCameraFx(vdoCameraFx ? vdoCameraFx.value : 'off'),
+                cameraFxStrength: normalizeCameraFxStrength(vdoCameraFxStrength ? vdoCameraFxStrength.value : '4'),
+                cameraBgImage: String(vdoCameraBgImage ? vdoCameraBgImage.value : '').trim()
+            };
         }
-        if (vdoDisplayFxStrength) {
-            vdoDisplayFxStrength.addEventListener('input', applyVdoDisplayEffects);
+
+        function replaceUrlWithCurrentCameraSettings() {
+            const p = new URLSearchParams(window.location.search);
+            applyCameraFxToMainParams(p);
+            const next = window.location.pathname + (p.toString() ? ('?' + p.toString()) : '') + window.location.hash;
+            window.history.replaceState(null, '', next);
         }
-        if (vdoDisplayMask) {
-            vdoDisplayMask.addEventListener('change', applyVdoDisplayEffects);
+
+        function sendVdoCameraSettingsLive(changed) {
+            updateCameraFxControls();
+            replaceUrlWithCurrentCameraSettings();
+            if (appFrame && appFrame.contentWindow) {
+                appFrame.contentWindow.postMessage({
+                    type: 'ninjam-vdo-camera-settings',
+                    settings: currentCameraSettings(),
+                    changed: changed || ''
+                }, window.location.origin);
+            }
+            statusText.textContent = changed === 'codec'
+                ? 'Codec saved for next VDO reconnect'
+                : 'Camera settings sent to VDO live';
         }
-        if (vdoDisplayMirror) {
-            vdoDisplayMirror.addEventListener('change', applyVdoDisplayEffects);
+
+        if (vdoCameraCodec) {
+            vdoCameraCodec.addEventListener('change', function () { sendVdoCameraSettingsLive('codec'); });
+        }
+        if (vdoCameraQuality) {
+            vdoCameraQuality.addEventListener('change', function () { sendVdoCameraSettingsLive('quality'); });
+        }
+        if (vdoCameraFx) {
+            vdoCameraFx.addEventListener('change', function () { sendVdoCameraSettingsLive('fx'); });
+        }
+        if (vdoCameraFxStrength) {
+            vdoCameraFxStrength.addEventListener('input', function () { sendVdoCameraSettingsLive('fx'); });
+            vdoCameraFxStrength.addEventListener('change', function () { sendVdoCameraSettingsLive('fx'); });
+        }
+        if (vdoCameraBgImage) {
+            vdoCameraBgImage.addEventListener('change', function () { sendVdoCameraSettingsLive('fx'); });
         }
 
         renderUsers();
         appFrame.addEventListener('load', pushAllOffsetsToFrame);
         appFrame.src = buildMainUrl();
-        applyVdoDisplayEffects();
         startUserDiscovery();
         setInterval(pruneInactiveUsers, 1500);
     </script>

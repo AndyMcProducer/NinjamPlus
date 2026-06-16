@@ -285,6 +285,7 @@ h1{font-size:15px;margin:0;font-weight:700}
 .camera-panel input[type="range"]{width:96px;padding:0}
 .camera-panel input[type="color"]{width:34px;padding:2px}
 .camera-panel input[type="checkbox"]{width:16px;height:16px}
+.camera-panel input[type="url"]{width:min(220px,32vw);min-width:150px;padding:0 8px}
 .camera-panel button{padding:0 10px;cursor:pointer}
 .camera-panel button:hover{background:#22343a}
 .camera-panel button:disabled{opacity:.45;cursor:default}
@@ -320,9 +321,10 @@ img,canvas{display:block;width:100%;height:100%;object-fit:contain}
   <label>Quality <select id="camQuality"><option value="balanced">Balanced</option><option value="high" selected>High</option><option value="low">Low</option></select></label>
   <label>View <select id="camLayout"><option value="tiles" selected>Tiles</option><option value="rows">Rows</option><option value="columns">Columns</option></select></label>
   <label>Mask <select id="camMask"><option value="none" selected>None</option><option value="cloud">Cloud</option><option value="circle">Circle</option><option value="rounded">Rounded</option><option value="square">Square</option><option value="tree">Xmas tree</option><option value="pumpkin">Pumpkin</option><option value="star">Star</option><option value="heart">Heart</option></select></label>
-  <label>FX <select id="camFx"><option value="off" selected>Off</option><option value="blur">Blur</option><option value="bg-blur">Blur background</option><option value="green-bg">Green background</option><option value="black-bg">Black background</option><option value="custom-bg">Custom background</option><option value="grayscale">Grayscale</option><option value="sepia">Sepia</option></select></label>
+  <label>FX <select id="camFx"><option value="off" selected>Off</option><option value="blur">Blur</option><option value="bg-blur">Blur background</option><option value="green-bg">Green background</option><option value="black-bg">Black background</option><option value="custom-bg">Custom background</option><option value="video-bg">Video background</option><option value="grayscale">Grayscale</option><option value="sepia">Sepia</option></select></label>
   <label>Strength <input id="camFxStrength" type="range" min="0" max="24" value="10"></label>
   <label>BG <input id="camBgColor" type="color" value="#00ff00"></label>
+  <label>Video BG <input id="camVideoBg" type="url" placeholder="https://..."></label>
   <label>Mirror <input id="camMirror" type="checkbox"></label>
   <button id="camRefresh" type="button">Refresh</button>
   <button id="camStart" type="button">Start browser camera</button>
@@ -347,6 +349,7 @@ const camMask=document.getElementById('camMask');
 const camFx=document.getElementById('camFx');
 const camFxStrength=document.getElementById('camFxStrength');
 const camBgColor=document.getElementById('camBgColor');
+const camVideoBg=document.getElementById('camVideoBg');
 const camMirror=document.getElementById('camMirror');
 const camRefresh=document.getElementById('camRefresh');
 const camStart=document.getElementById('camStart');
@@ -377,6 +380,10 @@ let browserLastKeyframeMs=0;
 let browserForceNextKeyframe=false;
 let browserLastKeyframeRequestId='';
 let browserCameraStateTimer=0;
+let browserSettingsApplying=false;
+let browserPendingSettingsApply=false;
+let browserApplySettingsTimer=0;
+let browserActiveCodec='mjpeg';
 let refreshInFlight=false;
 let browserFxSegmenter=null;
 let browserFxSegmenterLoading=null;
@@ -384,6 +391,8 @@ let browserFxSegmenterFailed=false;
 let browserFxSegmentationInFlight=false;
 let browserFxLastSegmentationMs=0;
 let browserFxMaskReady=false;
+let browserBgVideo=null;
+let browserBgVideoUrl='';
 const showStreamDebug=false;
 const urlParams=new URLSearchParams(location.search);
 const obsMode=location.pathname==='/zap-wall'||urlParams.get('obs')==='1';
@@ -397,11 +406,21 @@ function ms(value){
   return Number.isFinite(n)&&n>0?String(Math.round(n)):'0';
 }
 function setCamStatus(text){ camStatus.textContent=text; }
+function normalizedGridLayout(value){
+  const layout=String(value||'tiles').toLowerCase();
+  return layout==='rows'||layout==='columns'?layout:'tiles';
+}
 function applyGridLayout(){
-  const value=String(camLayout.value||'tiles').toLowerCase();
-  const layout=value==='rows'||value==='columns'?value:'tiles';
+  const layout=normalizedGridLayout(camLayout.value);
+  camLayout.value=layout;
   grid.classList.remove('layout-tiles','layout-rows','layout-columns');
   grid.classList.add('layout-'+layout);
+  if(!obsMode&&history&&history.replaceState){
+    const url=new URL(location.href);
+    url.searchParams.set('layout',layout);
+    history.replaceState(null,'',url.toString());
+  }
+  return layout;
 }
 function selectedDisplayMask(){
   const value=String(camMask.value||'none').toLowerCase();
@@ -479,7 +498,7 @@ function refreshDisplayMasks(){
 }
 function obsUrlForSlot(slot){
   const url=new URL('/zap-wall',location.href);
-  url.searchParams.set('layout',camLayout.value||'tiles');
+  url.searchParams.set('layout',normalizedGridLayout(camLayout.value));
   if(slot>0) url.searchParams.set('slot',String(slot));
   return url.toString();
 }
@@ -494,12 +513,16 @@ async function copyObsLink(slot){
 }
 function selectedTransportSize(){
   const parts=String(camSize.value||'640x360').split('x');
-  const codec=String(camCodec.value||'h264').toLowerCase();
+  const codec=selectedTransportCodec();
   const maxWidth=(codec==='vp8'||codec==='vp9')?1920:1280;
   const maxHeight=(codec==='vp8'||codec==='vp9')?1080:720;
   const width=Math.max(160,Math.min(maxWidth,parseInt(parts[0]||'640',10)||640));
   const height=Math.max(90,Math.min(maxHeight,parseInt(parts[1]||'360',10)||360));
   return {width,height};
+}
+function selectedTransportCodec(){
+  const codec=String(camCodec.value||'h264').toLowerCase();
+  return codec==='mjpeg'||codec==='vp8'||codec==='vp9'||codec==='h264'?codec:'h264';
 }
 function selectedTransportFps(){
   return Math.max(1,Math.min(60,parseInt(camFps.value||'30',10)||30));
@@ -509,7 +532,7 @@ function selectedTransportQuality(){
   return value==='low'||value==='balanced'||value==='high'?value:'high';
 }
 function updateTransportControls(){
-  const codec=String(camCodec.value||'h264').toLowerCase();
+  const codec=selectedTransportCodec();
   const allowVpx1080=codec==='vp8'||codec==='vp9';
   for(const option of camSize.options){
     if(option.dataset&&option.dataset.vpxOnly==='1'){
@@ -520,9 +543,20 @@ function updateTransportControls(){
     camSize.value='1280x720';
   }
 }
+function selectedJpegQuality(){
+  const quality=selectedTransportQuality();
+  return quality==='low'?0.56:(quality==='balanced'?0.68:0.8);
+}
+function selectedVideoConstraints(){
+  const fps=selectedTransportFps();
+  const {width,height}=selectedTransportSize();
+  const video={width:{ideal:width,max:width},height:{ideal:height,max:height},frameRate:{ideal:fps,max:fps}};
+  if(camSelect.value) video.deviceId={exact:camSelect.value};
+  return video;
+}
 function selectedCameraFx(){
   const value=String(camFx.value||'off').toLowerCase();
-  return ['off','blur','bg-blur','green-bg','black-bg','custom-bg','grayscale','sepia'].includes(value)?value:'off';
+  return ['off','blur','bg-blur','green-bg','black-bg','custom-bg','video-bg','grayscale','sepia'].includes(value)?value:'off';
 }
 function selectedFxStrength(){
   const value=parseInt(camFxStrength.value||'10',10);
@@ -532,14 +566,20 @@ function selectedFxBgColor(){
   const value=String(camBgColor.value||'#00ff00');
   return /^#[0-9a-f]{6}$/i.test(value)?value:'#00ff00';
 }
+function selectedFxVideoUrl(){
+  return String(camVideoBg.value||'').trim();
+}
 function isSegmentationFx(value){
   const fx=value||selectedCameraFx();
-  return fx==='bg-blur'||fx==='green-bg'||fx==='black-bg'||fx==='custom-bg';
+  return fx==='bg-blur'||fx==='green-bg'||fx==='black-bg'||fx==='custom-bg'||fx==='video-bg';
 }
 function updateFxControls(){
   const fx=selectedCameraFx();
   camFxStrength.disabled=!(fx==='blur'||fx==='bg-blur');
   camBgColor.disabled=fx!=='custom-bg';
+  camVideoBg.disabled=fx!=='video-bg';
+  if(fx==='video-bg') syncBrowserBgVideo();
+  else stopBrowserBgVideo();
   if(!isSegmentationFx(fx)) browserFxMaskReady=false;
 }
 function ensureCanvasSize(canvas,width,height){
@@ -569,6 +609,63 @@ function drawBrowserVideoTo(ctx,width,height,filter,mirror,scale){
   ctx.drawImage(browserPreview,drawX,drawY,drawWidth,drawHeight);
   ctx.restore();
   return true;
+}
+function drawCoverSourceTo(ctx,source,width,height){
+  const sourceWidth=source.videoWidth||source.naturalWidth||source.width||width;
+  const sourceHeight=source.videoHeight||source.naturalHeight||source.height||height;
+  if(!sourceWidth||!sourceHeight) return false;
+  const scale=Math.max(width/sourceWidth,height/sourceHeight);
+  const drawWidth=sourceWidth*scale;
+  const drawHeight=sourceHeight*scale;
+  const drawX=(width-drawWidth)/2;
+  const drawY=(height-drawHeight)/2;
+  ctx.drawImage(source,drawX,drawY,drawWidth,drawHeight);
+  return true;
+}
+function ensureBrowserBgVideoElement(){
+  if(browserBgVideo) return browserBgVideo;
+  browserBgVideo=document.createElement('video');
+  browserBgVideo.muted=true;
+  browserBgVideo.loop=true;
+  browserBgVideo.playsInline=true;
+  browserBgVideo.crossOrigin='anonymous';
+  browserBgVideo.preload='auto';
+  browserBgVideo.addEventListener('error',()=>setCamStatus('Video background could not load'));
+  return browserBgVideo;
+}
+function stopBrowserBgVideo(){
+  if(!browserBgVideo) return;
+  browserBgVideo.pause();
+  browserBgVideo.removeAttribute('src');
+  browserBgVideo.load();
+  browserBgVideoUrl='';
+}
+function syncBrowserBgVideo(){
+  const url=selectedFxVideoUrl();
+  if(selectedCameraFx()!=='video-bg'||!url){
+    stopBrowserBgVideo();
+    return false;
+  }
+  const video=ensureBrowserBgVideoElement();
+  if(browserBgVideoUrl!==url){
+    browserBgVideoUrl=url;
+    video.src=url;
+    video.load();
+  }
+  if(video.paused){
+    const playPromise=video.play();
+    if(playPromise&&playPromise.catch) playPromise.catch(()=>{});
+  }
+  return video.readyState>=2;
+}
+function drawBrowserVideoBackground(ctx,width,height){
+  if(!syncBrowserBgVideo()) return false;
+  try{
+    return drawCoverSourceTo(ctx,browserBgVideo,width,height);
+  }catch(e){
+    setCamStatus('Video background cannot be drawn');
+    return false;
+  }
 }
 function drawBrowserMaskTo(ctx,width,height,mirror){
   ctx.save();
@@ -651,6 +748,11 @@ function drawBrowserFxFrame(ctx,width,height){
   if(isSegmentationFx(fx)&&browserFxMaskReady){
     if(fx==='bg-blur'){
       drawBrowserVideoTo(ctx,width,height,'blur('+String(selectedFxStrength())+'px)',mirror,1.08);
+    }else if(fx==='video-bg'){
+      if(!drawBrowserVideoBackground(ctx,width,height)){
+        ctx.fillStyle='#050808';
+        ctx.fillRect(0,0,width,height);
+      }
     }else{
       ctx.fillStyle=fx==='black-bg'?'#000000':(fx==='custom-bg'?selectedFxBgColor():'#00ff00');
       ctx.fillRect(0,0,width,height);
@@ -800,6 +902,8 @@ async function armBrowserZapSend(codec){
   const payload=await res.json().catch(()=>({ok:false,error:'helper did not return JSON'}));
   if(!res.ok||!payload.ok) throw new Error(payload.error||'Zap camera send could not start');
   browserSendArmed=true;
+  browserActiveCodec=String(payload.codec||codec||'mjpeg').toLowerCase();
+  return browserActiveCodec;
 }
 async function disarmBrowserZapSend(){
   browserSendArmed=false;
@@ -825,13 +929,14 @@ function startBrowserCameraStatePolling(){
 }
 function stopBrowserCamera(disarm=true){
   if(browserTimer){ clearTimeout(browserTimer); browserTimer=0; }
+  if(browserApplySettingsTimer){ clearTimeout(browserApplySettingsTimer); browserApplySettingsTimer=0; }
   if(browserCameraStateTimer){ clearInterval(browserCameraStateTimer); browserCameraStateTimer=0; }
-  if(browserEncoder){ try{browserEncoder.close();}catch(e){} browserEncoder=null; }
-  browserEncodeStarts.clear();
-  browserLastCodecConfig='';
-  browserLastKeyframeMs=0;
+  closeBrowserVideoEncoder();
   browserForceNextKeyframe=false;
   browserLastKeyframeRequestId='';
+  browserSettingsApplying=false;
+  browserPendingSettingsApply=false;
+  stopBrowserBgVideo();
   resetBrowserFxMask();
 )HTML";
         html << R"HTML(
@@ -840,7 +945,7 @@ function stopBrowserCamera(disarm=true){
   browserFxPreviewCtx.fillStyle='#050808';
   browserFxPreviewCtx.fillRect(0,0,browserFxPreview.width,browserFxPreview.height);
   browserPosting=false;
-  browserEncoderH264Format='avc';
+  browserActiveCodec='mjpeg';
   camStart.disabled=false;
   camStop.disabled=true;
   if(disarm) disarmBrowserZapSend();
@@ -885,7 +990,8 @@ async function postBrowserEncodedBytes(bytes,codec,captureStartedMs,encodeMs,wid
     const payloadLabel=bytes&&bytes.length?'frame':'config';
     setCamStatus('Browser camera sending '+codec.toUpperCase()+' '+payloadLabel+' '+String(width)+'x'+String(height)+' @ '+String(selectedTransportFps())+'fps');
 }
-async function handleEncodedBrowserChunk(chunk,metadata){
+async function handleEncodedBrowserChunk(chunk,metadata,codecOverride){
+  const chunkCodec=codecOverride||browserEncoderCodec;
   const fallbackSize=selectedTransportSize();
   const info=browserEncodeStarts.get(chunk.timestamp)||{captureStartedMs:performance.now(),width:fallbackSize.width,height:fallbackSize.height};
   browserEncodeStarts.delete(chunk.timestamp);
@@ -895,30 +1001,30 @@ async function handleEncodedBrowserChunk(chunk,metadata){
   let configBase64='';
   let frameBytes=bytes;
   let keyFrame=chunk.type==='key';
-  if(browserEncoderCodec==='h264'&&browserEncoderH264Format==='annexb'){
+  if(chunkCodec==='h264'&&browserEncoderH264Format==='annexb'){
     const nals=splitAnnexBNals(bytes);
     const annexConfig=h264ConfigFromNalsBase64(nals);
     if(annexConfig) configBase64=annexConfig;
     keyFrame=keyFrame||nals.some(nal=>nal.length&&((nal[0]&31)===5));
     frameBytes=h264NalsToAvcc(nals);
         if(!frameBytes.length&&configBase64)
-            return await postBrowserEncodedBytes(new Uint8Array(),browserEncoderCodec,info.captureStartedMs,encodeMs,info.width,info.height,keyFrame,configBase64);
+            return await postBrowserEncodedBytes(new Uint8Array(),chunkCodec,info.captureStartedMs,encodeMs,info.width,info.height,keyFrame,configBase64);
         if(!frameBytes.length) return;
   }
-  if(browserEncoderCodec==='h264'&&metadata&&metadata.decoderConfig&&metadata.decoderConfig.description){
+  if(chunkCodec==='h264'&&metadata&&metadata.decoderConfig&&metadata.decoderConfig.description){
     const avcConfig=avccToZapConfigBase64(new Uint8Array(metadata.decoderConfig.description));
     if(avcConfig) configBase64=avcConfig;
   }
-    if(browserEncoderCodec==='h264'&&!configBase64){
+    if(chunkCodec==='h264'&&!configBase64){
         const avccConfig=h264ConfigFromAvccFrameBase64(frameBytes);
         if(avccConfig) configBase64=avccConfig;
     }
-    const configChanged=browserEncoderCodec==='h264'&&configBase64&&configBase64!==browserLastCodecConfig;
+    const configChanged=chunkCodec==='h264'&&configBase64&&configBase64!==browserLastCodecConfig;
     if(configBase64) browserLastCodecConfig=configBase64;
-  else if(browserEncoderCodec==='h264'&&keyFrame&&browserLastCodecConfig) configBase64=browserLastCodecConfig;
+  else if(chunkCodec==='h264'&&keyFrame&&browserLastCodecConfig) configBase64=browserLastCodecConfig;
     if(configChanged)
-        await postBrowserEncodedBytes(new Uint8Array(),browserEncoderCodec,info.captureStartedMs,encodeMs,info.width,info.height,false,configBase64);
-  await postBrowserEncodedBytes(frameBytes,browserEncoderCodec,info.captureStartedMs,encodeMs,info.width,info.height,keyFrame,configBase64);
+        await postBrowserEncodedBytes(new Uint8Array(),chunkCodec,info.captureStartedMs,encodeMs,info.width,info.height,false,configBase64);
+  await postBrowserEncodedBytes(frameBytes,chunkCodec,info.captureStartedMs,encodeMs,info.width,info.height,keyFrame,configBase64);
 }
 async function getSupportedEncoderConfig(codec,width,height,fps){
   if(codec==='mjpeg') return null;
@@ -952,6 +1058,17 @@ async function getSupportedEncoderConfig(codec,width,height,fps){
   }
   return null;
 }
+function closeBrowserVideoEncoder(){
+  if(browserEncoder){
+    try{ browserEncoder.close(); }catch(e){}
+    browserEncoder=null;
+  }
+  browserEncodeStarts.clear();
+  browserLastCodecConfig='';
+  browserLastKeyframeMs=0;
+  browserForceNextKeyframe=true;
+  browserEncoderH264Format='avc';
+}
 async function startBrowserVideoEncoder(codec,width,height,fps){
   if(codec==='mjpeg') return;
   if(!('VideoEncoder' in window)||!('VideoFrame' in window)) throw new Error('Browser WebCodecs encoder unavailable');
@@ -959,10 +1076,90 @@ async function startBrowserVideoEncoder(codec,width,height,fps){
   const config=await getSupportedEncoderConfig(codec,width,height,fps);
   if(!config) throw new Error(codec.toUpperCase()+' browser encoder unsupported');
   browserEncoder=new VideoEncoder({
-    output(chunk,metadata){ handleEncodedBrowserChunk(chunk,metadata).catch(e=>setCamStatus(String(e.message||e))); },
+    output(chunk,metadata){ handleEncodedBrowserChunk(chunk,metadata,codec).catch(e=>setCamStatus(String(e.message||e))); },
     error(err){ setCamStatus('Browser encoder error: '+String(err&&err.message?err.message:err)); }
   });
   browserEncoder.configure(config);
+}
+async function configureBrowserEncoderForSelectedSettings(){
+  const desiredCodec=selectedTransportCodec();
+  const {width,height}=selectedTransportSize();
+  const fps=selectedTransportFps();
+  closeBrowserVideoEncoder();
+  browserEncoderCodec='mjpeg';
+  let activeCodec=desiredCodec;
+  if(desiredCodec!=='mjpeg'){
+    try{
+      await startBrowserVideoEncoder(desiredCodec,width,height,fps);
+    }catch(encoderError){
+      activeCodec='mjpeg';
+      browserEncoderCodec='mjpeg';
+      closeBrowserVideoEncoder();
+      setCamStatus(desiredCodec.toUpperCase()+' encoder unavailable, using MJPEG');
+    }
+  }
+  activeCodec=await armBrowserZapSend(activeCodec);
+  browserActiveCodec=activeCodec;
+  browserForceNextKeyframe=true;
+  return activeCodec;
+}
+async function applyLiveVideoConstraints(){
+  if(!browserStream) return false;
+  const tracks=browserStream.getVideoTracks();
+  const track=tracks&&tracks.length?tracks[0]:null;
+  if(!track||!track.applyConstraints) return false;
+  await track.applyConstraints(selectedVideoConstraints());
+  resetBrowserFxMask();
+  return true;
+}
+async function replaceBrowserCameraStream(){
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia) throw new Error('Browser camera API unavailable');
+  const nextStream=await navigator.mediaDevices.getUserMedia({audio:false,video:selectedVideoConstraints()});
+  const previousStream=browserStream;
+  browserStream=nextStream;
+  browserPreview.srcObject=browserStream;
+  await browserPreview.play();
+  if(previousStream) previousStream.getTracks().forEach(track=>track.stop());
+  resetBrowserFxMask();
+  browserFxSegmenterFailed=false;
+  await refreshCameras();
+}
+async function applyBrowserCameraSettings(){
+  if(!browserStream) return;
+  if(browserSettingsApplying){
+    browserPendingSettingsApply=true;
+    return;
+  }
+  browserSettingsApplying=true;
+  try{
+    updateTransportControls();
+    let trackUpdated=false;
+    try{
+      trackUpdated=await applyLiveVideoConstraints();
+    }catch(trackError){
+      trackUpdated=false;
+    }
+    if(!trackUpdated) await replaceBrowserCameraStream();
+    const activeCodec=await configureBrowserEncoderForSelectedSettings();
+    setCamStatus('Browser camera updated '+activeCodec.toUpperCase()+' '+String(selectedTransportSize().width)+'x'+String(selectedTransportSize().height)+' @ '+String(selectedTransportFps())+'fps');
+  }catch(e){
+    setCamStatus('Could not apply camera settings live: '+String(e&&e.message?e.message:e));
+  }finally{
+    browserSettingsApplying=false;
+    if(browserPendingSettingsApply){
+      browserPendingSettingsApply=false;
+      scheduleBrowserCameraSettingsApply();
+    }
+  }
+}
+function scheduleBrowserCameraSettingsApply(){
+  updateTransportControls();
+  if(!browserStream) return;
+  if(browserApplySettingsTimer) clearTimeout(browserApplySettingsTimer);
+  browserApplySettingsTimer=setTimeout(()=>{
+    browserApplySettingsTimer=0;
+    applyBrowserCameraSettings();
+  },120);
 }
 function captureBrowserFrame(){
   if(!browserStream||browserPosting){
@@ -1016,7 +1213,7 @@ function captureBrowserFrame(){
         browserPosting=false;
         if(browserStream) scheduleBrowserFrame();
       }
-    },'image/jpeg',0.72);
+    },'image/jpeg',selectedJpegQuality());
   }catch(e){
     browserPosting=false;
     setCamStatus('Browser capture failed');
@@ -1030,30 +1227,14 @@ async function startBrowserCamera(){
     setCamStatus('Browser camera API unavailable');
     return;
   }
-  const fps=selectedTransportFps();
-  const codec=String(camCodec.value||'h264').toLowerCase();
-  const {width,height}=selectedTransportSize();
-  const video={width:{ideal:width,max:width},height:{ideal:height,max:height},frameRate:{ideal:fps,max:fps}};
-  if(camSelect.value) video.deviceId={exact:camSelect.value};
+  const codec=selectedTransportCodec();
   try{
-    browserStream=await navigator.mediaDevices.getUserMedia({audio:false,video});
+    browserStream=await navigator.mediaDevices.getUserMedia({audio:false,video:selectedVideoConstraints()});
     browserPreview.srcObject=browserStream;
     await browserPreview.play();
     resetBrowserFxMask();
     browserFxSegmenterFailed=false;
-    let activeCodec=codec;
-    browserEncoderCodec='mjpeg';
-    if(codec!=='mjpeg'){
-      try{
-        await startBrowserVideoEncoder(codec,width,height,fps);
-      }catch(encoderError){
-        activeCodec='mjpeg';
-        browserEncoderCodec='mjpeg';
-        if(browserEncoder){ try{browserEncoder.close();}catch(e){} browserEncoder=null; }
-        setCamStatus(codec.toUpperCase()+' encoder unavailable, using MJPEG');
-      }
-    }
-    await armBrowserZapSend(activeCodec);
+    const activeCodec=await configureBrowserEncoderForSelectedSettings();
   camStart.disabled=true;
   camStop.disabled=false;
   await refreshCameras();
@@ -1072,7 +1253,14 @@ async function startBrowserCamera(){
 camRefresh.addEventListener('click',refreshCameras);
 camStart.addEventListener('click',startBrowserCamera);
 camStop.addEventListener('click',stopBrowserCamera);
-camCodec.addEventListener('change',updateTransportControls);
+camSelect.addEventListener('change',scheduleBrowserCameraSettingsApply);
+camCodec.addEventListener('change',()=>{
+  updateTransportControls();
+  scheduleBrowserCameraSettingsApply();
+});
+camSize.addEventListener('change',scheduleBrowserCameraSettingsApply);
+camFps.addEventListener('change',scheduleBrowserCameraSettingsApply);
+camQuality.addEventListener('change',scheduleBrowserCameraSettingsApply);
 camLayout.addEventListener('change',applyGridLayout);
 camMask.addEventListener('change',refreshDisplayMasks);
 camFx.addEventListener('change',()=>{
@@ -1080,7 +1268,11 @@ camFx.addEventListener('change',()=>{
   browserFxSegmenterFailed=false;
   updateFxControls();
 });
-camObs.addEventListener('click',()=>window.open('/zap-wall?layout='+encodeURIComponent(camLayout.value||'tiles'),'_blank'));
+camVideoBg.addEventListener('change',()=>{
+  browserBgVideoUrl='';
+  syncBrowserBgVideo();
+});
+camObs.addEventListener('click',()=>window.open('/zap-wall?layout='+encodeURIComponent(normalizedGridLayout(camLayout.value)),'_blank'));
 applyGridLayout();
 updateTransportControls();
 updateFxControls();

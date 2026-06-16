@@ -366,6 +366,9 @@ if (TARGET NINJAM_VST3_Standalone)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/icon.png"
             "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/icon.png"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/PoweredByVDONinja.png"
+            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/PoweredByVDONinja.png"
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/masks"
             "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/masks"
@@ -388,6 +391,9 @@ if (TARGET NINJAM_VST3_VST3)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/icon.png"
             "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/icon.png"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/PoweredByVDONinja.png"
+            "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/PoweredByVDONinja.png"
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/masks"
             "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/masks"
@@ -409,6 +415,9 @@ if (TARGET NINJAM_VST3_LV2)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/icon.png"
             "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client/icon.png"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/PoweredByVDONinja.png"
+            "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client/PoweredByVDONinja.png"
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/masks"
             "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client/masks"
