@@ -7400,16 +7400,18 @@ void NinjamVst3AudioProcessor::processPendingNinjamZapVideoPlaybackSwap()
             ++it;
         }
 
-        if (prevMatchIt != intervalsByGuid.end())
+        // currentGuid is the decode stream currently mixed into audio; prefer it so
+        // the Zap video does not trail by one NINJAM interval.
+        if (currentMatchIt != intervalsByGuid.end())
+        {
+            promote(std::move(currentMatchIt->second));
+            intervalsByGuid.erase(currentMatchIt);
+            zapVideoPlaybackByStream[streamKey].holdCount = 0;
+        }
+        else if (prevMatchIt != intervalsByGuid.end())
         {
             promote(std::move(prevMatchIt->second));
             intervalsByGuid.erase(prevMatchIt);
-            zapVideoPlaybackByStream[streamKey].holdCount = 0;
-        }
-        else if (currentMatchIt != intervalsByGuid.end())
-        {
-            zapVideoDeferredPlaybackByStream[streamKey] = std::move(currentMatchIt->second);
-            intervalsByGuid.erase(currentMatchIt);
             zapVideoPlaybackByStream[streamKey].holdCount = 0;
         }
 
