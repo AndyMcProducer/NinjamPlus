@@ -588,7 +588,9 @@ private:
     juce::String getLinkPeerName() const;
     NJClient ninjamClient;
     juce::CriticalSection ninjamClientLock;
-    juce::CriticalSection processLock;
+    // Serialises destructive NJClient lifecycle operations with AudioProc without
+    // making the real-time thread contend with the periodic network Run() call.
+    juce::CriticalSection ninjamAudioLifecycleLock;
     mutable juce::CriticalSection serverListLock;
     std::vector<PublicServerInfo> publicServers;
     juce::String pendingConnectHost;
@@ -957,6 +959,7 @@ private:
     std::atomic<bool> intervalHelperPayloadForceWrite { false };
     std::atomic<juce::uint64> vdoRosterRevision { 0 };
     std::atomic<bool> vdoVideoSyncEnabled { false };
+    std::atomic<bool> vdoCarrierChannelConfigured { false };
     std::atomic<bool> videoHelperRunning { false };
     std::atomic<int> advancedVideoHelperPort { 0 };
     std::atomic<bool> videoLaunchInProgress { false };

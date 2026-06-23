@@ -55,6 +55,9 @@ static void logIntervalPerf(const juce::String& msg)
 
 static constexpr double intervalPerfStepThresholdMs = 3.0;
 static constexpr double intervalPerfTotalThresholdMs = 8.0;
+static constexpr int ninjamRunDefaultMaxIterationsPerTimer = 50;
+static constexpr int ninjamRunMaxIterationsPerTimer = 4;
+static constexpr double ninjamRunBudgetMs = 2.0;
 
 static constexpr int advancedVideoHelperBasePort = 8000;
 static constexpr int advancedVideoHelperMaxPort = 8199;
@@ -3865,7 +3868,7 @@ namespace
     constexpr const char* sideSignalChatPrefix = "__NINJAM_VST3_SIDESIGNAL__ ";
     constexpr int remoteLatencyUpdateCadenceIntervals = 1;
     constexpr int kSyncSignalChannelIndex = 0;
-    constexpr double intervalHelperPayloadMinWriteMs = 100.0;
+    constexpr double intervalHelperPayloadMinWriteMs = 500.0;
     constexpr long long intervalSyncMarkerKeyBeatStride = 1024;
     constexpr int kLocalInputLinkAudioSentinel = -2000000000;
     constexpr double linkAudioQuantumBeats = 4.0;
@@ -5140,6 +5143,7 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
     }
 
     {
+        const juce::ScopedLock lifecycleLock(ninjamAudioLifecycleLock);
         const juce::ScopedLock clientLock(ninjamClientLock);
         applyCodecPreference();
         ninjamClient.Connect(host.toRawUTF8(), user.toRawUTF8(), pass.toRawUTF8());
@@ -5161,6 +5165,7 @@ void NinjamVst3AudioProcessor::disconnectFromServer()
     ninjamSideSignalServerSupported.store(false, std::memory_order_relaxed);
     lastNinjamVideoCapSendMs = 0.0;
     {
+        const juce::ScopedLock lifecycleLock(ninjamAudioLifecycleLock);
         const juce::ScopedLock clientLock(ninjamClientLock);
         stopNinjamZapVideoTransportForDisconnect();
         ninjamClient.Disconnect();
@@ -7400,19 +7405,26 @@ void NinjamVst3AudioProcessor::processPendingNinjamZapVideoPlaybackSwap()
             ++it;
         }
 
-        // currentGuid is the decode stream currently mixed into audio; prefer it so
-        // the Zap video does not trail by one NINJAM interval.
-        if (currentMatchIt != intervalsByGuid.end())
-        {
-            promote(std::move(currentMatchIt->second));
-            intervalsByGuid.erase(currentMatchIt);
-            zapVideoPlaybackByStream[streamKey].holdCount = 0;
-        }
-        else if (prevMatchIt != intervalsByGuid.end())
+        // PREV is the decode stream that has reached the audible interval, so play
+        // that video immediately. DS/current will not reach the speaker until the
+        // next NINJAM swap, so defer that video by one swap to keep audio/video aligned.
+        if (prevMatchIt != intervalsByGuid.end())
         {
             promote(std::move(prevMatchIt->second));
             intervalsByGuid.erase(prevMatchIt);
             zapVideoPlaybackByStream[streamKey].holdCount = 0;
+        }
+        else if (currentMatchIt != intervalsByGuid.end())
+        {
+            ZapVideoIntervalFrameBuffer buffer = std::move(currentMatchIt->second);
+            intervalsByGuid.erase(currentMatchIt);
+
+            if (!buffer.frames.empty() && buffer.streamKey.isNotEmpty())
+                zapVideoDeferredPlaybackByStream[buffer.streamKey] = std::move(buffer);
+
+            auto playbackIt = zapVideoPlaybackByStream.find(streamKey);
+            if (playbackIt != zapVideoPlaybackByStream.end())
+                playbackIt->second.holdCount = 0;
         }
 
         if (intervalsByGuid.empty())
@@ -7630,6 +7642,7 @@ void NinjamVst3AudioProcessor::stopNinjamZapVideoTransportForDisconnect()
 bool NinjamVst3AudioProcessor::stopVdoVideoSync()
 {
     const bool wasEnabled = vdoVideoSyncEnabled.exchange(false, std::memory_order_relaxed);
+    vdoCarrierChannelConfigured.store(false, std::memory_order_release);
     intervalHelperPayloadForceWrite.store(false, std::memory_order_release);
     lastIntervalHelperPayloadWriteMs = 0.0;
     {
@@ -7706,7 +7719,10 @@ void NinjamVst3AudioProcessor::launchVideoSession()
             lastNinjamVideoCapSendMs = juce::Time::getMillisecondCounterHiRes();
         }
     }
+    const bool carrierConfigured = ninjamSideSignalServerSupported.load(std::memory_order_acquire);
     syncLocalIntervalChannelConfig();
+    vdoCarrierChannelConfigured.store(carrierConfigured, std::memory_order_release);
+
 
     juce::String roomSource = currentServer.trim();
     const int schemePos = roomSource.indexOf("://");
@@ -10052,6 +10068,7 @@ void NinjamVst3AudioProcessor::beginStandaloneShutdown()
         samplePadBackgroundAlive->store(false, std::memory_order_release);
     samplePadBackgroundPool.removeAllJobs(true, 4000);
     {
+        const juce::ScopedLock lifecycleLock(ninjamAudioLifecycleLock);
         const juce::ScopedLock clientLock(ninjamClientLock);
         stopNinjamZapVideoTransportForDisconnect();
         ninjamClient.LicenseAgreementCallback = nullptr;
@@ -14909,40 +14926,46 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     const bool allowEngineLocalInput = transmitEnabled;
     float** engineInputs = allowEngineLocalInput ? inputs : nullptr;
     int engineInputChannels = allowEngineLocalInput ? actualInputChannels : 0;
-    if (syncModeAtBlock == SyncMode::host
-        && gotHostPosition
-        && hostInfoAtBlock.isPlaying
-        && hostWasPlaying.load()
-        && !gateForSync)
     {
-        int currentPosition = 0;
-        int intervalLength = 0;
-        ninjamClient.GetPosition(&currentPosition, &intervalLength);
-        const int hostPhasePosition = computeHostIntervalPhasePositionSamples(hostInfoAtBlock,
-                                                                              getSampleRate(),
-                                                                              ninjamClient.GetBPI(),
-                                                                              intervalLength);
-        if (hostPhasePosition >= 0)
+        const juce::ScopedTryLock lifecycleLock(ninjamAudioLifecycleLock);
+        if (lifecycleLock.isLocked())
         {
-            const int targetPosition = normaliseSignedIntervalPosition(
-                hostPhasePosition + syncHostPhaseOffsetSamples.load(),
-                intervalLength);
-            const int phaseError = shortestIntervalPhaseError(targetPosition, currentPosition, intervalLength);
-            const int correctionThreshold = juce::jmax(64, (int)std::llround(getSampleRate() * 0.0015));
-            const int maxCorrectionPerBlock = juce::jmax(correctionThreshold * 2,
-                                                         (int)std::llround(getSampleRate() * 0.025));
-            const int maxTrustedError = juce::jmax(maxCorrectionPerBlock,
-                                                   (int)std::llround(getSampleRate() * 0.5));
-
-            if (std::abs(phaseError) >= correctionThreshold
-                && std::abs(phaseError) <= maxTrustedError)
+            if (syncModeAtBlock == SyncMode::host
+                && gotHostPosition
+                && hostInfoAtBlock.isPlaying
+                && hostWasPlaying.load()
+                && !gateForSync)
             {
-                const int correction = juce::jlimit(-maxCorrectionPerBlock, maxCorrectionPerBlock, phaseError);
-                ninjamClient.SetTransportPosition(currentPosition + correction);
+                int currentPosition = 0;
+                int intervalLength = 0;
+                ninjamClient.GetPosition(&currentPosition, &intervalLength);
+                const int hostPhasePosition = computeHostIntervalPhasePositionSamples(hostInfoAtBlock,
+                                                                                      getSampleRate(),
+                                                                                      ninjamClient.GetBPI(),
+                                                                                      intervalLength);
+                if (hostPhasePosition >= 0)
+                {
+                    const int targetPosition = normaliseSignedIntervalPosition(
+                        hostPhasePosition + syncHostPhaseOffsetSamples.load(),
+                        intervalLength);
+                    const int phaseError = shortestIntervalPhaseError(targetPosition, currentPosition, intervalLength);
+                    const int correctionThreshold = juce::jmax(64, (int)std::llround(getSampleRate() * 0.0015));
+                    const int maxCorrectionPerBlock = juce::jmax(correctionThreshold * 2,
+                                                                 (int)std::llround(getSampleRate() * 0.025));
+                    const int maxTrustedError = juce::jmax(maxCorrectionPerBlock,
+                                                           (int)std::llround(getSampleRate() * 0.5));
+
+                    if (std::abs(phaseError) >= correctionThreshold
+                        && std::abs(phaseError) <= maxTrustedError)
+                    {
+                        const int correction = juce::jlimit(-maxCorrectionPerBlock, maxCorrectionPerBlock, phaseError);
+                        ninjamClient.SetTransportPosition(currentPosition + correction);
+                    }
+                }
             }
+            ninjamClient.AudioProc(engineInputs, engineInputChannels, outputs, actualOutputChannels, numSamples, (int)getSampleRate(), runMonitorOnly);
         }
     }
-    ninjamClient.AudioProc(engineInputs, engineInputChannels, outputs, actualOutputChannels, numSamples, (int)getSampleRate(), runMonitorOnly);
 
     int numOutputBusesOut = getBusCount(false);
     if (gateForSync)
@@ -16652,11 +16675,23 @@ void NinjamVst3AudioProcessor::timerCallback()
     int perfDisplayInterval = -1;
 
     int loopCount = 0;
+    const bool budgetNinjamRun = vdoVideoSyncEnabled.load(std::memory_order_relaxed);
+    const int maxRunIterations = budgetNinjamRun ? ninjamRunMaxIterationsPerTimer
+                                                  : ninjamRunDefaultMaxIterationsPerTimer;
     double stepStartMs = juce::Time::getMillisecondCounterHiRes();
     {
         const juce::ScopedLock clientLock(ninjamClientLock);
-        while (!ninjamClient.Run() && loopCount < 50)
-            loopCount++;
+        bool wantsSleep = false;
+        do
+        {
+            wantsSleep = ninjamClient.Run() != 0;
+            ++loopCount;
+        }
+        while (!wantsSleep
+               && loopCount < maxRunIterations
+               && (!budgetNinjamRun
+                   || (juce::Time::getMillisecondCounterHiRes() - stepStartMs) < ninjamRunBudgetMs));
+
         int cachePos = 0, cacheLen = 0;
         ninjamClient.GetPosition(&cachePos, &cacheLen);
         cachedNinjamTransportPos.store(cachePos, std::memory_order_relaxed);
@@ -16722,6 +16757,7 @@ void NinjamVst3AudioProcessor::timerCallback()
                     const juce::String nextUser = buildNumberedUserName(pendingConnectOriginalUser, nextAttempt);
                     addSystemChatLine("Username is already in use; retrying as " + stripAnonymousPrefix(nextUser) + ".");
                     {
+                        const juce::ScopedLock lifecycleLock(ninjamAudioLifecycleLock);
                         const juce::ScopedLock clientLock(ninjamClientLock);
                         applyCodecPreference();
                         ninjamClient.Connect(pendingConnectHost.toRawUTF8(),
@@ -16739,6 +16775,7 @@ void NinjamVst3AudioProcessor::timerCallback()
                 pendingConnectNameAttempt = 0;
                 addSystemChatLine("Username retry failed after 3 attempts; disconnected.");
                 {
+                    const juce::ScopedLock lifecycleLock(ninjamAudioLifecycleLock);
                     const juce::ScopedLock clientLock(ninjamClientLock);
                     ninjamClient.Disconnect();
                 }
@@ -16902,7 +16939,8 @@ void NinjamVst3AudioProcessor::timerCallback()
             if (vdoSyncActive && (nowMs - lastIntervalSyncFallbackSubscriptionMs) >= 1000.0)
             {
                 stepStartMs = juce::Time::getMillisecondCounterHiRes();
-                syncLocalIntervalChannelConfig();
+                if (!vdoCarrierChannelConfigured.exchange(true, std::memory_order_acq_rel))
+                    syncLocalIntervalChannelConfig();
                 const int changedZapCarrierSubs = syncNinjamZapVideoSubscriptions(true);
                 if (changedZapCarrierSubs > 0)
                     intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
