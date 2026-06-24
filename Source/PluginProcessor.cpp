@@ -13943,8 +13943,8 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
             payloadUserId = obj->getProperty("userId").toString();
             appFamily = obj->getProperty("appFamily").toString();
             channelIndex = (int)obj->getProperty("channelIndex");
-            captureQueueMs = obj->getProperty("captureQueueMs").toString().getDoubleValue();
-            encodeMs = obj->getProperty("encodeMs").toString().getDoubleValue();
+            captureQueueMs = (double)obj->getProperty("captureQueueMs");
+            encodeMs = (double)obj->getProperty("encodeMs");
         }
 
         if (appFamily.isNotEmpty() && appFamily != opusSyncAppFamily)
@@ -14146,8 +14146,8 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
             payloadUserId = obj->getProperty("userId").toString();
             appFamily = obj->getProperty("appFamily").toString();
             eventId = obj->getProperty("eventId").toString();
-            previousBpm = obj->getProperty("previousBpm").toString().getDoubleValue();
-            newBpm = obj->getProperty("bpm").toString().getDoubleValue();
+            previousBpm = (double)obj->getProperty("previousBpm");
+            newBpm = (double)obj->getProperty("bpm");
             bpi = (int)obj->getProperty("bpi");
             timingDelayDeltaMs = (int)obj->getProperty("timingDelayDeltaMs");
         }
