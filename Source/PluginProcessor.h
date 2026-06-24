@@ -98,6 +98,16 @@ public:
     bool isMetronomeMuted() const;
     void setStoredMetronomeVolume(float vol);
     float getStoredMetronomeVolume() const;
+    static juce::String getClassicMetronomeSoundKey();
+    static juce::String getSoftBeepMetronomeSoundKey();
+    static juce::String getSoftTickMetronomeSoundKey();
+    static juce::String getWoodTickMetronomeSoundKey();
+    static juce::String makeCustomMetronomeSoundKey(const juce::File& file);
+    static juce::String getMetronomeSoundDisplayNameForKey(const juce::String& key);
+    juce::String getMetronomeSoundKey() const;
+    bool setMetronomeSoundKey(const juce::String& key);
+    juce::Array<juce::File> findCustomMetronomeSoundFiles() const;
+    juce::File getUserMetronomeSoundsDirectory() const;
 
     // Local Channel
     void setTransmitLocal(bool shouldTransmit);
@@ -623,7 +633,34 @@ private:
     int lastStatus = 0;
     std::atomic<bool> metronomeMuted { false };
     std::atomic<float> storedMetronomeVolume { 1.0f };
-    
+    enum class MetronomeSoundMode : int
+    {
+        classic = 0,
+        softBeep = 1,
+        softTick = 2,
+        woodTick = 3,
+        customFile = 100
+    };
+    struct MetronomeClickVoice
+    {
+        bool active = false;
+        int mode = (int)MetronomeSoundMode::classic;
+        bool accent = false;
+        int ageSamples = 0;
+        int durationSamples = 0;
+        double phase = 0.0;
+        double phaseDelta = 0.0;
+        double phase2 = 0.0;
+        double phaseDelta2 = 0.0;
+        double samplePosition = 0.0;
+        double sampleIncrement = 1.0;
+        float gain = 1.0f;
+    };
+    static constexpr int maxMetronomeClickVoices = 24;
+    std::atomic<int> metronomeSoundMode { (int)MetronomeSoundMode::classic };
+    mutable juce::CriticalSection metronomeSoundKeyLock;
+    juce::String metronomeSoundKey { "classic" };
+
     juce::AudioBuffer<float> tempInputBuffer;
     juce::AudioBuffer<float> localChannelBuffer;
     juce::AudioBuffer<float> localMixBuffer;   // 1-ch mix used by multiChanAuto Vorbis slot
@@ -755,6 +792,14 @@ private:
         int recordWritePosition = 0;
         double recordStartBeat = 0.0;
     };
+
+    juce::AudioFormatManager metronomeFormatManager;
+    juce::SpinLock metronomeCustomSampleLock;
+    juce::AudioBuffer<float> metronomeCustomSample;
+    double metronomeCustomSampleRate = 44100.0;
+    juce::File metronomeCustomSampleFile;
+    std::array<MetronomeClickVoice, maxMetronomeClickVoices> metronomeClickVoices;
+    int nextMetronomeClickVoice = 0;
 
     juce::AudioFormatManager samplePadFormatManager;
     juce::ThreadPool samplePadBackgroundPool { 1 };
@@ -1119,6 +1164,15 @@ private:
     bool isStandaloneWrapper() const;
     int getDisplayIntervalIndex() const;
     void emitMidiTimecode(juce::MidiBuffer& midiMessages, int numSamples, int pos, int length);
+    void updateMetronomeEngineVolume();
+    bool loadCustomMetronomeSoundFile(const juce::File& file);
+    void clearCustomMetronomeSoundFile();
+    void resetMetronomeClickVoices();
+    void startMetronomeClick(int mode, bool accent, double sampleRate);
+    void mixSelectedMetronomeIntoOutputs(float** outputs, int outnch, int numSamples,
+                                         double sampleRate, int transportStartPosition,
+                                         int transportLength, int bpi,
+                                         bool justMonitor);
     void broadcastOpusSyncSupport(const juce::String& target = "*");
     void refreshOpusSyncAvailabilityFromUsers();
     void applyCodecPreference();

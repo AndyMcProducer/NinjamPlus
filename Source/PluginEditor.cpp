@@ -112,7 +112,49 @@ public:
 #endif
     }
 
-    void enqueue(juce::String text, juce::String voiceId)
+    static void getAvailableOutputs(juce::StringArray& outputIds, juce::StringArray& outputNames)
+    {
+        outputIds.clear();
+        outputNames.clear();
+#if JUCE_WINDOWS
+        const HRESULT coResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool shouldUninitialise = SUCCEEDED(coResult);
+
+        IEnumSpObjectTokens* enumTokens = nullptr;
+        if (SUCCEEDED(SpEnumTokens(SPCAT_AUDIOOUT, nullptr, nullptr, &enumTokens)) && enumTokens != nullptr)
+        {
+            ISpObjectToken* token = nullptr;
+            ULONG fetched = 0;
+            while (enumTokens->Next(1, &token, &fetched) == S_OK && token != nullptr)
+            {
+                LPWSTR id = nullptr;
+                LPWSTR description = nullptr;
+                if (SUCCEEDED(token->GetId(&id)) && id != nullptr)
+                    outputIds.add(juce::String(id));
+                else
+                    outputIds.add({});
+
+                if (SUCCEEDED(SpGetDescription(token, &description)) && description != nullptr)
+                    outputNames.add(juce::String(description));
+                else
+                    outputNames.add("Output " + juce::String(outputNames.size() + 1));
+
+                if (id != nullptr)
+                    CoTaskMemFree(id);
+                if (description != nullptr)
+                    CoTaskMemFree(description);
+                token->Release();
+                token = nullptr;
+            }
+            enumTokens->Release();
+        }
+
+        if (shouldUninitialise)
+            CoUninitialize();
+#endif
+    }
+
+    void enqueue(juce::String text, juce::String voiceId, float volume, juce::String outputId)
     {
         text = text.trim();
         if (text.isEmpty())
@@ -121,7 +163,7 @@ public:
         const juce::ScopedLock lock(queueLock);
         while (queue.size() >= 6)
             queue.pop_front();
-        queue.push_back({ text, voiceId.trim() });
+        queue.push_back({ text, voiceId.trim(), juce::jlimit(0.0f, 1.0f, volume), outputId.trim() });
         workAvailable.signal();
     }
 
@@ -130,6 +172,8 @@ private:
     {
         juce::String text;
         juce::String voiceId;
+        float volume = 1.0f;
+        juce::String outputId;
     };
 
     void run() override
@@ -159,6 +203,8 @@ private:
                     continue;
                 }
 
+                voice->SetVolume((USHORT) juce::jlimit(0, 100, (int) std::round(job.volume * 100.0f)));
+
                 ISpObjectToken* token = nullptr;
                 if (job.voiceId.isNotEmpty()
                     && SUCCEEDED(SpGetTokenFromId((LPCWSTR) job.voiceId.toWideCharPointer(), &token, FALSE))
@@ -166,6 +212,18 @@ private:
                 {
                     voice->SetVoice(token);
                     token->Release();
+                }
+
+                if (job.outputId.isNotEmpty()
+                    && SUCCEEDED(SpGetTokenFromId((LPCWSTR) job.outputId.toWideCharPointer(), &token, FALSE))
+                    && token != nullptr)
+                {
+                    voice->SetOutput(token, TRUE);
+                    token->Release();
+                }
+                else
+                {
+                    voice->SetOutput(nullptr, TRUE);
                 }
 
                 voice->Speak((LPCWSTR) job.text.toWideCharPointer(), SPF_ASYNC | SPF_PURGEBEFORESPEAK, nullptr);
@@ -215,6 +273,9 @@ private:
             args.add(job.text);
            #elif JUCE_LINUX || JUCE_BSD
             args.add("spd-say");
+            args.add("-i");
+            args.add(juce::String(juce::jlimit(-100, 100,
+                                               (int) std::round(job.volume * 200.0f - 100.0f))));
             if (job.voiceId.isNotEmpty())
             {
                 args.add("-t");
@@ -2671,6 +2732,51 @@ void showChatVoteDialog(NinjamVst3AudioProcessor& processor, const juce::String&
                            false);
 }
 
+class ChatTtsVolumeMenuComponent : public juce::PopupMenu::CustomComponent
+{
+public:
+    ChatTtsVolumeMenuComponent(float initialVolume, std::function<void(float)> onVolumeChangedCallback)
+        : juce::PopupMenu::CustomComponent(false),
+          onVolumeChanged(std::move(onVolumeChangedCallback))
+    {
+        titleLabel.setText("Volume", juce::dontSendNotification);
+        titleLabel.setJustificationType(juce::Justification::centredLeft);
+        addAndMakeVisible(titleLabel);
+
+        volumeSlider.setRange(0.0, 100.0, 1.0);
+        volumeSlider.setValue((double) juce::jlimit(0.0f, 1.0f, initialVolume) * 100.0, juce::dontSendNotification);
+        volumeSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+        volumeSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 54, 20);
+        volumeSlider.setTextValueSuffix("%");
+        volumeSlider.onValueChange = [this]
+        {
+            if (onVolumeChanged)
+                onVolumeChanged((float) volumeSlider.getValue() / 100.0f);
+        };
+        addAndMakeVisible(volumeSlider);
+
+        setSize(250, 48);
+    }
+
+    void getIdealSize(int& idealWidth, int& idealHeight) override
+    {
+        idealWidth = 250;
+        idealHeight = 48;
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced(8, 5);
+        titleLabel.setBounds(area.removeFromTop(18));
+        volumeSlider.setBounds(area);
+    }
+
+private:
+    juce::Label titleLabel;
+    juce::Slider volumeSlider;
+    std::function<void(float)> onVolumeChanged;
+};
+
 void showChatAttachmentMenu(NinjamVst3AudioProcessor& processor,
                             juce::TextEditor& targetEditor,
                             juce::Component& anchorComponent,
@@ -2682,13 +2788,20 @@ void showChatAttachmentMenu(NinjamVst3AudioProcessor& processor,
                             const juce::String& selectedTtsVoiceId,
                             const juce::StringArray& chatTtsVoiceIds,
                             const juce::StringArray& chatTtsVoiceNames,
+                            float chatTtsVolume,
+                            const juce::String& selectedTtsOutputId,
+                            const juce::StringArray& chatTtsOutputIds,
+                            const juce::StringArray& chatTtsOutputNames,
                             std::function<void(bool)> onChatTtsEnabledChanged,
-                            std::function<void(const juce::String&)> onChatTtsVoiceSelected)
+                            std::function<void(const juce::String&)> onChatTtsVoiceSelected,
+                            std::function<void(float)> onChatTtsVolumeChanged,
+                            std::function<void(const juce::String&)> onChatTtsOutputSelected)
 {
     constexpr int emojiBaseId = 100;
     constexpr int colourBaseId = 9000;
     constexpr int windowColourBaseId = 9200;
     constexpr int ttsVoiceBaseId = 9400;
+    constexpr int ttsOutputBaseId = 9600;
     const juce::String draft = targetEditor.getText().trim();
     const bool draftIsUrl = isHttpOrHttpsChatInputUrl(draft);
 
@@ -2725,6 +2838,17 @@ void showChatAttachmentMenu(NinjamVst3AudioProcessor& processor,
         ttsVoiceMenu.addItem(id, chatTtsVoiceNames[i], true, voiceId == selectedTtsVoiceId);
     }
 
+    auto idToTtsOutput = std::make_shared<std::map<int, juce::String>>();
+    juce::PopupMenu ttsOutputMenu;
+    const int outputCount = juce::jmin(chatTtsOutputIds.size(), chatTtsOutputNames.size());
+    for (int i = 0; i < outputCount; ++i)
+    {
+        const int id = ttsOutputBaseId + i;
+        const juce::String outputId = chatTtsOutputIds[i];
+        (*idToTtsOutput)[id] = outputId;
+        ttsOutputMenu.addItem(id, chatTtsOutputNames[i], true, outputId == selectedTtsOutputId);
+    }
+
     juce::PopupMenu menu;
     menu.addSectionHeader("GIFs");
     menu.addItem(1, "GIF");
@@ -2744,10 +2868,18 @@ void showChatAttachmentMenu(NinjamVst3AudioProcessor& processor,
     menu.addSeparator();
     menu.addSectionHeader("Text to Speech");
     menu.addItem(8, "Speak User Chat", true, chatTtsEnabled);
+    menu.addCustomItem(10,
+                       std::make_unique<ChatTtsVolumeMenuComponent>(chatTtsVolume, std::move(onChatTtsVolumeChanged)),
+                       nullptr,
+                       "Volume");
     if (voiceCount > 0)
         menu.addSubMenu("Voice", ttsVoiceMenu, chatTtsEnabled);
     else
         menu.addItem(9, "No voices available", false, false);
+    if (outputCount > 0)
+        menu.addSubMenu("Output", ttsOutputMenu, chatTtsEnabled);
+    else
+        menu.addItem(11, "No outputs available", false, false);
     menu.addSeparator();
     auto idToEmoji = std::make_shared<EmojiMenuMap>();
     menu.addCustomItem(7, std::make_unique<EmojiGridComponent>(targetEditor), nullptr, "Emoji");
@@ -2758,12 +2890,13 @@ void showChatAttachmentMenu(NinjamVst3AudioProcessor& processor,
     juce::Component::SafePointer<juce::TextEditor> safeEditor(&targetEditor);
     auto* processorPtr = &processor;
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&anchorComponent),
-                       [safeEditor, processorPtr, idToEmoji, idToColour, idToWindowColour, idToTtsVoice,
+                       [safeEditor, processorPtr, idToEmoji, idToColour, idToWindowColour, idToTtsVoice, idToTtsOutput,
                         showGifPicker = std::move(showGifPicker),
                         onChatColourSelected = std::move(onChatColourSelected),
                         onChatWindowColourSelected = std::move(onChatWindowColourSelected),
                         onChatTtsEnabledChanged = std::move(onChatTtsEnabledChanged),
                         onChatTtsVoiceSelected = std::move(onChatTtsVoiceSelected),
+                        onChatTtsOutputSelected = std::move(onChatTtsOutputSelected),
                         chatTtsEnabled](int result) mutable
                        {
                            if (result == 8)
@@ -2778,6 +2911,14 @@ void showChatAttachmentMenu(NinjamVst3AudioProcessor& processor,
                            {
                                if (onChatTtsVoiceSelected)
                                    onChatTtsVoiceSelected(voiceIt->second);
+                               return;
+                           }
+
+                           auto outputIt = idToTtsOutput->find(result);
+                           if (outputIt != idToTtsOutput->end())
+                           {
+                               if (onChatTtsOutputSelected)
+                                   onChatTtsOutputSelected(outputIt->second);
                                return;
                            }
 
@@ -3456,8 +3597,14 @@ public:
                        std::function<juce::String()> getChatTtsVoiceIdCallback,
                        std::function<juce::StringArray()> getChatTtsVoiceIdsCallback,
                        std::function<juce::StringArray()> getChatTtsVoiceNamesCallback,
+                       std::function<float()> getChatTtsVolumeCallback,
+                       std::function<juce::String()> getChatTtsOutputIdCallback,
+                       std::function<juce::StringArray()> getChatTtsOutputIdsCallback,
+                       std::function<juce::StringArray()> getChatTtsOutputNamesCallback,
                        std::function<void(bool)> onChatTtsEnabledChangedCallback,
-                       std::function<void(const juce::String&)> onChatTtsVoiceSelectedCallback)
+                       std::function<void(const juce::String&)> onChatTtsVoiceSelectedCallback,
+                       std::function<void(float)> onChatTtsVolumeChangedCallback,
+                       std::function<void(const juce::String&)> onChatTtsOutputSelectedCallback)
         : processor(p),
           onChatColourSelected(std::move(onChatColourSelectedCallback)),
           onWindowColourSelected(std::move(onWindowColourSelectedCallback)),
@@ -3465,8 +3612,14 @@ public:
           getChatTtsVoiceId(std::move(getChatTtsVoiceIdCallback)),
           getChatTtsVoiceIds(std::move(getChatTtsVoiceIdsCallback)),
           getChatTtsVoiceNames(std::move(getChatTtsVoiceNamesCallback)),
+          getChatTtsVolume(std::move(getChatTtsVolumeCallback)),
+          getChatTtsOutputId(std::move(getChatTtsOutputIdCallback)),
+          getChatTtsOutputIds(std::move(getChatTtsOutputIdsCallback)),
+          getChatTtsOutputNames(std::move(getChatTtsOutputNamesCallback)),
           onChatTtsEnabledChanged(std::move(onChatTtsEnabledChangedCallback)),
           onChatTtsVoiceSelected(std::move(onChatTtsVoiceSelectedCallback)),
+          onChatTtsVolumeChanged(std::move(onChatTtsVolumeChangedCallback)),
+          onChatTtsOutputSelected(std::move(onChatTtsOutputSelectedCallback)),
           gifPickerPanel([this](const juce::String& url)
           {
               processor.sendChatAttachment("gif", url);
@@ -3511,8 +3664,14 @@ public:
             getChatTtsVoiceId ? getChatTtsVoiceId() : juce::String(),
             getChatTtsVoiceIds ? getChatTtsVoiceIds() : juce::StringArray(),
             getChatTtsVoiceNames ? getChatTtsVoiceNames() : juce::StringArray(),
+            getChatTtsVolume ? getChatTtsVolume() : 1.0f,
+            getChatTtsOutputId ? getChatTtsOutputId() : juce::String(),
+            getChatTtsOutputIds ? getChatTtsOutputIds() : juce::StringArray(),
+            getChatTtsOutputNames ? getChatTtsOutputNames() : juce::StringArray(),
             onChatTtsEnabledChanged,
-            onChatTtsVoiceSelected);
+            onChatTtsVoiceSelected,
+            onChatTtsVolumeChanged,
+            onChatTtsOutputSelected);
         };
 
         addAndMakeVisible(sendButton);
@@ -3619,8 +3778,14 @@ private:
     std::function<juce::String()> getChatTtsVoiceId;
     std::function<juce::StringArray()> getChatTtsVoiceIds;
     std::function<juce::StringArray()> getChatTtsVoiceNames;
+    std::function<float()> getChatTtsVolume;
+    std::function<juce::String()> getChatTtsOutputId;
+    std::function<juce::StringArray()> getChatTtsOutputIds;
+    std::function<juce::StringArray()> getChatTtsOutputNames;
     std::function<void(bool)> onChatTtsEnabledChanged;
     std::function<void(const juce::String&)> onChatTtsVoiceSelected;
+    std::function<void(float)> onChatTtsVolumeChanged;
+    std::function<void(const juce::String&)> onChatTtsOutputSelected;
     juce::String chatWindowColourKey { "default" };
     juce::Colour chatWindowColour { 0xff101417 };
     GifPickerPanel gifPickerPanel;
@@ -3701,8 +3866,14 @@ public:
                std::function<juce::String()> getChatTtsVoiceId,
                std::function<juce::StringArray()> getChatTtsVoiceIds,
                std::function<juce::StringArray()> getChatTtsVoiceNames,
+               std::function<float()> getChatTtsVolume,
+               std::function<juce::String()> getChatTtsOutputId,
+               std::function<juce::StringArray()> getChatTtsOutputIds,
+               std::function<juce::StringArray()> getChatTtsOutputNames,
                std::function<void(bool)> onChatTtsEnabledChanged,
                std::function<void(const juce::String&)> onChatTtsVoiceSelected,
+               std::function<void(float)> onChatTtsVolumeChanged,
+               std::function<void(const juce::String&)> onChatTtsOutputSelected,
                std::function<void()> onClosedCallback,
                bool abletonHostedWindow,
                int abletonChatWindowSizePreset)
@@ -3735,8 +3906,14 @@ public:
                                                std::move(getChatTtsVoiceId),
                                                std::move(getChatTtsVoiceIds),
                                                std::move(getChatTtsVoiceNames),
+                                               std::move(getChatTtsVolume),
+                                               std::move(getChatTtsOutputId),
+                                               std::move(getChatTtsOutputIds),
+                                               std::move(getChatTtsOutputNames),
                                                std::move(onChatTtsEnabledChanged),
-                                               std::move(onChatTtsVoiceSelected)), true);
+                                               std::move(onChatTtsVoiceSelected),
+                                               std::move(onChatTtsVolumeChanged),
+                                               std::move(onChatTtsOutputSelected)), true);
         centreWithSize(initialSize.getWidth(), initialSize.getHeight());
         setVisible(true);
     }
@@ -7990,6 +8167,10 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         chatTtsVoiceId,
         chatTtsVoiceIds,
         chatTtsVoiceNames,
+        chatTtsVolume,
+        chatTtsOutputId,
+        chatTtsOutputIds,
+        chatTtsOutputNames,
         [this](bool enabled)
         {
             setChatTtsEnabled(enabled, true);
@@ -7997,6 +8178,14 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         [this](const juce::String& voiceId)
         {
             setChatTtsVoiceId(voiceId, true);
+        },
+        [this](float volume)
+        {
+            setChatTtsVolume(volume, true);
+        },
+        [this](const juce::String& outputId)
+        {
+            setChatTtsOutputId(outputId, true);
         });
     };
 
@@ -8016,16 +8205,23 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     chatTtsEngine = std::make_unique<ChatTtsEngine>();
     chatTtsVoiceIds.add({});
     chatTtsVoiceNames.add("System Default");
+    chatTtsOutputIds.add({});
+    chatTtsOutputNames.add("System Default");
     {
         juce::Component::SafePointer<NinjamVst3AudioProcessorEditor> safeThis(this);
         std::thread([safeThis]
         {
             juce::StringArray platformVoiceIds;
             juce::StringArray platformVoiceNames;
+            juce::StringArray platformOutputIds;
+            juce::StringArray platformOutputNames;
             ChatTtsEngine::getAvailableVoices(platformVoiceIds, platformVoiceNames);
+            ChatTtsEngine::getAvailableOutputs(platformOutputIds, platformOutputNames);
             juce::MessageManager::callAsync([safeThis,
                                              platformVoiceIds = std::move(platformVoiceIds),
-                                             platformVoiceNames = std::move(platformVoiceNames)]() mutable
+                                             platformVoiceNames = std::move(platformVoiceNames),
+                                             platformOutputIds = std::move(platformOutputIds),
+                                             platformOutputNames = std::move(platformOutputNames)]() mutable
             {
                 if (safeThis == nullptr)
                     return;
@@ -8037,6 +8233,16 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
                     {
                         safeThis->chatTtsVoiceIds.add(platformVoiceIds[i]);
                         safeThis->chatTtsVoiceNames.add(platformVoiceNames[i]);
+                    }
+                }
+
+                const int outputCount = juce::jmin(platformOutputIds.size(), platformOutputNames.size());
+                for (int i = 0; i < outputCount; ++i)
+                {
+                    if (platformOutputIds[i].isNotEmpty() && !safeThis->chatTtsOutputIds.contains(platformOutputIds[i]))
+                    {
+                        safeThis->chatTtsOutputIds.add(platformOutputIds[i]);
+                        safeThis->chatTtsOutputNames.add(platformOutputNames[i]);
                     }
                 }
             });
@@ -9706,6 +9912,22 @@ void NinjamVst3AudioProcessorEditor::setChatTtsVoiceId(const juce::String& voice
         markPersistentSettingsDirty();
 }
 
+void NinjamVst3AudioProcessorEditor::setChatTtsVolume(float volume, bool markDirty)
+{
+    chatTtsVolume = juce::jlimit(0.0f, 1.0f, volume);
+
+    if (markDirty)
+        markPersistentSettingsDirty();
+}
+
+void NinjamVst3AudioProcessorEditor::setChatTtsOutputId(const juce::String& outputId, bool markDirty)
+{
+    chatTtsOutputId = outputId.trim();
+
+    if (markDirty)
+        markPersistentSettingsDirty();
+}
+
 void NinjamVst3AudioProcessorEditor::enqueueChatTtsForNewLines(const juce::StringArray& history,
                                                                const juce::StringArray& senders)
 {
@@ -9750,7 +9972,7 @@ void NinjamVst3AudioProcessorEditor::enqueueChatTtsForNewLines(const juce::Strin
         const juce::String sender = it->historyIndex < senders.size() ? senders[it->historyIndex] : juce::String();
         const juce::String speechText = makeChatTtsSpeechText(history[it->historyIndex], sender);
         if (speechText.isNotEmpty())
-            chatTtsEngine->enqueue(speechText, chatTtsVoiceId);
+            chatTtsEngine->enqueue(speechText, chatTtsVoiceId, chatTtsVolume, chatTtsOutputId);
 
         it = pendingChatTtsLines.erase(it);
     }
@@ -9776,6 +9998,8 @@ juce::String NinjamVst3AudioProcessorEditor::buildPersistentSettingsFingerprint(
     parts.add(chatWindowColourKey);
     parts.add(chatTtsEnabled ? "1" : "0");
     parts.add(chatTtsVoiceId);
+    parts.add(juce::String(chatTtsVolume, 3));
+    parts.add(chatTtsOutputId);
 
     const int textureIdx = backgroundSelector.getSelectedItemIndex();
     parts.add((textureIdx >= 0 && textureIdx < textureFiles.size()) ? textureFiles[textureIdx].getFileName() : juce::String());
@@ -9828,6 +10052,8 @@ void NinjamVst3AudioProcessorEditor::savePersistentSettingsToDisk(bool includePr
     props.setValue("chatWindowColourKey", chatWindowColourKey);
     props.setValue("chatTtsEnabled", chatTtsEnabled);
     props.setValue("chatTtsVoiceId", chatTtsVoiceId);
+    props.setValue("chatTtsVolume", (double)chatTtsVolume);
+    props.setValue("chatTtsOutputId", chatTtsOutputId);
 
     const int textureIdx = backgroundSelector.getSelectedItemIndex();
     if (textureIdx >= 0 && textureIdx < textureFiles.size())
@@ -9901,6 +10127,8 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
     audioProcessor.setLocalChatColourKey(props.getValue("chatColourKey", audioProcessor.getLocalChatColourKey()));
     setChatWindowColourKey(props.getValue("chatWindowColourKey", chatWindowColourKey), false);
     setChatTtsVoiceId(props.getValue("chatTtsVoiceId", chatTtsVoiceId), false);
+    setChatTtsVolume((float)props.getDoubleValue("chatTtsVolume", chatTtsVolume), false);
+    setChatTtsOutputId(props.getValue("chatTtsOutputId", chatTtsOutputId), false);
     setChatTtsEnabled(props.getBoolValue("chatTtsEnabled", chatTtsEnabled), false);
 
     abletonWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonWindowSizePreset", abletonWindowSizePreset));
@@ -10115,6 +10343,22 @@ void NinjamVst3AudioProcessorEditor::openChatPopoutWindow(const juce::StringArra
                                         {
                                             return safeThis != nullptr ? safeThis->chatTtsVoiceNames : juce::StringArray();
                                         },
+                                        [safeThis]() -> float
+                                        {
+                                            return safeThis != nullptr ? safeThis->chatTtsVolume : 1.0f;
+                                        },
+                                        [safeThis]() -> juce::String
+                                        {
+                                            return safeThis != nullptr ? safeThis->chatTtsOutputId : juce::String();
+                                        },
+                                        [safeThis]() -> juce::StringArray
+                                        {
+                                            return safeThis != nullptr ? safeThis->chatTtsOutputIds : juce::StringArray();
+                                        },
+                                        [safeThis]() -> juce::StringArray
+                                        {
+                                            return safeThis != nullptr ? safeThis->chatTtsOutputNames : juce::StringArray();
+                                        },
                                         [safeThis](bool enabled)
                                         {
                                             if (safeThis != nullptr)
@@ -10124,6 +10368,16 @@ void NinjamVst3AudioProcessorEditor::openChatPopoutWindow(const juce::StringArra
                                         {
                                             if (safeThis != nullptr)
                                                 safeThis->setChatTtsVoiceId(voiceId, true);
+                                        },
+                                        [safeThis](float volume)
+                                        {
+                                            if (safeThis != nullptr)
+                                                safeThis->setChatTtsVolume(volume, true);
+                                        },
+                                        [safeThis](const juce::String& outputId)
+                                        {
+                                            if (safeThis != nullptr)
+                                                safeThis->setChatTtsOutputId(outputId, true);
                                         },
                                         [safeThis]()
                                         {
@@ -11367,6 +11621,15 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
     const auto activeMode = audioProcessor.getSyncMode();
     const auto selectedMode = activeMode != NinjamVst3AudioProcessor::SyncMode::off ? activeMode : preferredSyncMode;
 
+    constexpr int metronomeClassicMenuId = 70;
+    constexpr int metronomeSoftBeepMenuId = 71;
+    constexpr int metronomeSoftTickMenuId = 72;
+    constexpr int metronomeWoodTickMenuId = 73;
+    constexpr int metronomeOpenFolderMenuId = 74;
+    constexpr int metronomeCustomMenuIdBase = 9000;
+    const juce::String selectedMetronomeSoundKey = audioProcessor.getMetronomeSoundKey();
+    const juce::Array<juce::File> customMetronomeFiles = audioProcessor.findCustomMetronomeSoundFiles();
+
     juce::PopupMenu syncSourceMenu;
     syncSourceMenu.addItem(44,
                            "VST Host",
@@ -11376,6 +11639,28 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
                            "Ableton Link",
                            true,
                            selectedMode == NinjamVst3AudioProcessor::SyncMode::abletonLink);
+
+    juce::PopupMenu metronomeSoundMenu;
+    metronomeSoundMenu.addItem(metronomeClassicMenuId, "Classic", true,
+                               selectedMetronomeSoundKey == NinjamVst3AudioProcessor::getClassicMetronomeSoundKey());
+    metronomeSoundMenu.addItem(metronomeSoftBeepMenuId, "Soft Beep", true,
+                               selectedMetronomeSoundKey == NinjamVst3AudioProcessor::getSoftBeepMetronomeSoundKey());
+    metronomeSoundMenu.addItem(metronomeSoftTickMenuId, "Soft Tick", true,
+                               selectedMetronomeSoundKey == NinjamVst3AudioProcessor::getSoftTickMetronomeSoundKey());
+    metronomeSoundMenu.addItem(metronomeWoodTickMenuId, "Wood Tick", true,
+                               selectedMetronomeSoundKey == NinjamVst3AudioProcessor::getWoodTickMetronomeSoundKey());
+    metronomeSoundMenu.addSeparator();
+    const int customFileCount = juce::jmin(customMetronomeFiles.size(), 64);
+    for (int i = 0; i < customFileCount; ++i)
+    {
+        const juce::String key = NinjamVst3AudioProcessor::makeCustomMetronomeSoundKey(customMetronomeFiles[i]);
+        metronomeSoundMenu.addItem(metronomeCustomMenuIdBase + i,
+                                   customMetronomeFiles[i].getFileNameWithoutExtension(),
+                                   true,
+                                   selectedMetronomeSoundKey == key);
+    }
+    metronomeSoundMenu.addSeparator();
+    metronomeSoundMenu.addItem(metronomeOpenFolderMenuId, "Open User Sounds Folder...");
 
     if (standaloneOptionsMenuHandler)
     {
@@ -11387,6 +11672,7 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
     menu.addItem(42, "Enable Chord Detection", true, audioProcessor.isChordDetectionEnabled());
     menu.addItem(46, "Enable Sample Pads / Looper", true, audioProcessor.isSamplePadsFeatureEnabled());
     menu.addItem(43, "Ableton Link Audio");
+    menu.addSubMenu("Metronome Sound", metronomeSoundMenu);
     menu.addSubMenu("Transport Sync Source", syncSourceMenu);
     if (isAbletonLiveHost() && !audioProcessor.isStandaloneWrapper())
     {
@@ -11404,7 +11690,7 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
     }
 
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&optionsButton),
-        [this](int result)
+        [this, customMetronomeFiles](int result)
         {
             if (result == 0)
                 return;
@@ -11428,6 +11714,48 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
                 resized();
                 repaint();
                 markPersistentSettingsDirty();
+            }
+            if (result >= 70 && result <= 73)
+            {
+                juce::String key = NinjamVst3AudioProcessor::getClassicMetronomeSoundKey();
+                if (result == 71)
+                    key = NinjamVst3AudioProcessor::getSoftBeepMetronomeSoundKey();
+                else if (result == 72)
+                    key = NinjamVst3AudioProcessor::getSoftTickMetronomeSoundKey();
+                else if (result == 73)
+                    key = NinjamVst3AudioProcessor::getWoodTickMetronomeSoundKey();
+
+                if (!audioProcessor.setMetronomeSoundKey(key))
+                    juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                           "Metronome sound",
+                                                           "That metronome sound could not be loaded.",
+                                                           "OK",
+                                                           this);
+                markPersistentSettingsDirty();
+            }
+            if (result == 74)
+            {
+                const juce::File dir = audioProcessor.getUserMetronomeSoundsDirectory();
+                if (!dir.isDirectory())
+                    dir.createDirectory();
+                dir.revealToUser();
+                return;
+            }
+            if (result >= 9000)
+            {
+                const int index = result - 9000;
+                if (index >= 0 && index < customMetronomeFiles.size())
+                {
+                    if (!audioProcessor.setMetronomeSoundKey(NinjamVst3AudioProcessor::makeCustomMetronomeSoundKey(customMetronomeFiles[index])))
+                    {
+                        juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                               "Metronome sound",
+                                                               "That metronome sound file could not be loaded.",
+                                                               "OK",
+                                                               this);
+                    }
+                    markPersistentSettingsDirty();
+                }
             }
             if (result == 44 || result == 45)
             {

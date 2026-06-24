@@ -37,6 +37,8 @@
 #include <set>
 #include <vector>
 
+static juce::File getThisModuleFile();
+
 static void writeDiagnosticLogLine(const char* fileName, const juce::String& msg)
 {
     static juce::CriticalSection logLock;
@@ -4996,6 +4998,7 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
                      .withOutput ("Output 16", juce::AudioChannelSet::stereo(), false)
                        )
 {
+    metronomeFormatManager.registerBasicFormats();
     samplePadFormatManager.registerBasicFormats();
 
     for (int i = 0; i < maxLocalChannels; ++i)
@@ -5268,51 +5271,560 @@ void NinjamVst3AudioProcessor::sendChatAttachment(const juce::String& kindIn, co
 
 }
 
+namespace
+{
+    constexpr const char* metronomeSoundClassicKey = "classic";
+    constexpr const char* metronomeSoundSoftBeepKey = "soft_beep";
+    constexpr const char* metronomeSoundSoftTickKey = "soft_tick";
+    constexpr const char* metronomeSoundWoodTickKey = "wood_tick";
+    constexpr const char* metronomeSoundFilePrefix = "file:";
+
+    constexpr int metronomeModeClassic = 0;
+    constexpr int metronomeModeSoftBeep = 1;
+    constexpr int metronomeModeSoftTick = 2;
+    constexpr int metronomeModeWoodTick = 3;
+    constexpr int metronomeModeCustomFile = 100;
+
+    bool isSupportedMetronomeSoundFile(const juce::File& file)
+    {
+        const juce::String ext = file.getFileExtension().toLowerCase();
+        return ext == ".wav"
+            || ext == ".aif"
+            || ext == ".aiff"
+            || ext == ".flac"
+            || ext == ".ogg"
+            || ext == ".mp3";
+    }
+
+    juce::String normaliseMetronomeSoundKey(const juce::String& key)
+    {
+        const juce::String trimmed = key.trim();
+        if (trimmed.isEmpty() || trimmed.equalsIgnoreCase(metronomeSoundClassicKey))
+            return metronomeSoundClassicKey;
+        if (trimmed.equalsIgnoreCase(metronomeSoundSoftBeepKey))
+            return metronomeSoundSoftBeepKey;
+        if (trimmed.equalsIgnoreCase(metronomeSoundSoftTickKey))
+            return metronomeSoundSoftTickKey;
+        if (trimmed.equalsIgnoreCase(metronomeSoundWoodTickKey))
+            return metronomeSoundWoodTickKey;
+        if (trimmed.startsWithIgnoreCase(metronomeSoundFilePrefix))
+            return metronomeSoundFilePrefix + trimmed.substring((int)std::strlen(metronomeSoundFilePrefix));
+        return metronomeSoundClassicKey;
+    }
+
+    juce::File fileFromMetronomeSoundKey(const juce::String& key)
+    {
+        if (!key.startsWithIgnoreCase(metronomeSoundFilePrefix))
+            return {};
+        return juce::File(key.substring((int)std::strlen(metronomeSoundFilePrefix)));
+    }
+
+    int modeForMetronomeSoundKey(const juce::String& key)
+    {
+        if (key.equalsIgnoreCase(metronomeSoundSoftBeepKey))
+            return metronomeModeSoftBeep;
+        if (key.equalsIgnoreCase(metronomeSoundSoftTickKey))
+            return metronomeModeSoftTick;
+        if (key.equalsIgnoreCase(metronomeSoundWoodTickKey))
+            return metronomeModeWoodTick;
+        if (key.startsWithIgnoreCase(metronomeSoundFilePrefix))
+            return metronomeModeCustomFile;
+        return metronomeModeClassic;
+    }
+
+    void addMetronomeSoundDirectoryIfUnique(juce::Array<juce::File>& dirs, const juce::File& dir)
+    {
+        if (dir.getFullPathName().isNotEmpty())
+            dirs.addIfNotAlreadyThere(dir);
+    }
+
+    void addMetronomeSoundDirectoryCandidates(juce::Array<juce::File>& dirs, const juce::File& root)
+    {
+        if (root.getFullPathName().isEmpty())
+            return;
+
+        juce::File probe = root;
+        for (int i = 0; i < 8; ++i)
+        {
+            addMetronomeSoundDirectoryIfUnique(dirs, probe.getChildFile("Metronome Sounds"));
+            addMetronomeSoundDirectoryIfUnique(dirs, probe.getChildFile("metronome-sounds"));
+            addMetronomeSoundDirectoryIfUnique(dirs, probe.getChildFile("metronome_sounds"));
+            addMetronomeSoundDirectoryIfUnique(dirs, probe.getChildFile("Resources").getChildFile("Metronome Sounds"));
+            addMetronomeSoundDirectoryIfUnique(dirs, probe.getChildFile("Resources").getChildFile("metronome-sounds"));
+            addMetronomeSoundDirectoryIfUnique(dirs, probe.getParentDirectory().getChildFile("Resources").getChildFile("Metronome Sounds"));
+            addMetronomeSoundDirectoryIfUnique(dirs, probe.getParentDirectory().getChildFile("Resources").getChildFile("metronome-sounds"));
+            probe = probe.getParentDirectory();
+        }
+    }
+}
+
+juce::String NinjamVst3AudioProcessor::getClassicMetronomeSoundKey()
+{
+    return metronomeSoundClassicKey;
+}
+
+juce::String NinjamVst3AudioProcessor::getSoftBeepMetronomeSoundKey()
+{
+    return metronomeSoundSoftBeepKey;
+}
+
+juce::String NinjamVst3AudioProcessor::getSoftTickMetronomeSoundKey()
+{
+    return metronomeSoundSoftTickKey;
+}
+
+juce::String NinjamVst3AudioProcessor::getWoodTickMetronomeSoundKey()
+{
+    return metronomeSoundWoodTickKey;
+}
+
+juce::String NinjamVst3AudioProcessor::makeCustomMetronomeSoundKey(const juce::File& file)
+{
+    return juce::String(metronomeSoundFilePrefix) + file.getFullPathName();
+}
+
+juce::String NinjamVst3AudioProcessor::getMetronomeSoundDisplayNameForKey(const juce::String& key)
+{
+    const juce::String normalised = normaliseMetronomeSoundKey(key);
+    if (normalised.equalsIgnoreCase(metronomeSoundSoftBeepKey))
+        return "Soft Beep";
+    if (normalised.equalsIgnoreCase(metronomeSoundSoftTickKey))
+        return "Soft Tick";
+    if (normalised.equalsIgnoreCase(metronomeSoundWoodTickKey))
+        return "Wood Tick";
+    if (normalised.startsWithIgnoreCase(metronomeSoundFilePrefix))
+    {
+        const juce::File file = fileFromMetronomeSoundKey(normalised);
+        return file.getFileNameWithoutExtension().isNotEmpty() ? file.getFileNameWithoutExtension() : "Custom File";
+    }
+    return "Classic";
+}
+
+juce::String NinjamVst3AudioProcessor::getMetronomeSoundKey() const
+{
+    const juce::ScopedLock lock(metronomeSoundKeyLock);
+    return metronomeSoundKey;
+}
+
+bool NinjamVst3AudioProcessor::setMetronomeSoundKey(const juce::String& key)
+{
+    const juce::String normalised = normaliseMetronomeSoundKey(key);
+    const int mode = modeForMetronomeSoundKey(normalised);
+
+    if (mode == (int)MetronomeSoundMode::customFile)
+    {
+        const juce::File file = fileFromMetronomeSoundKey(normalised);
+        if (!isSupportedMetronomeSoundFile(file) || !loadCustomMetronomeSoundFile(file))
+        {
+            clearCustomMetronomeSoundFile();
+            {
+                const juce::ScopedLock lock(metronomeSoundKeyLock);
+                metronomeSoundKey = metronomeSoundClassicKey;
+            }
+            metronomeSoundMode.store((int)MetronomeSoundMode::classic, std::memory_order_release);
+            updateMetronomeEngineVolume();
+            return false;
+        }
+    }
+    else
+    {
+        clearCustomMetronomeSoundFile();
+    }
+
+    {
+        const juce::ScopedLock lock(metronomeSoundKeyLock);
+        metronomeSoundKey = normalised;
+    }
+    metronomeSoundMode.store(mode, std::memory_order_release);
+    updateMetronomeEngineVolume();
+    return true;
+}
+
+juce::File NinjamVst3AudioProcessor::getUserMetronomeSoundsDirectory() const
+{
+    return juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+        .getChildFile("NINJAMplus")
+        .getChildFile("Metronome Sounds");
+}
+
+juce::Array<juce::File> NinjamVst3AudioProcessor::findCustomMetronomeSoundFiles() const
+{
+    juce::Array<juce::File> dirs;
+    addMetronomeSoundDirectoryIfUnique(dirs, getUserMetronomeSoundsDirectory());
+    addMetronomeSoundDirectoryCandidates(dirs, juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory());
+
+    const juce::File moduleFile = getThisModuleFile();
+    if (moduleFile.existsAsFile())
+        addMetronomeSoundDirectoryCandidates(dirs, moduleFile.getParentDirectory());
+
+    juce::Array<juce::File> files;
+    const juce::StringArray patterns { "*.wav", "*.aif", "*.aiff", "*.flac", "*.ogg", "*.mp3" };
+    for (const auto& dir : dirs)
+    {
+        if (!dir.isDirectory())
+            continue;
+
+        for (const auto& pattern : patterns)
+        {
+            auto matches = dir.findChildFiles(juce::File::findFiles, false, pattern);
+            for (const auto& file : matches)
+                files.addIfNotAlreadyThere(file);
+        }
+    }
+
+    files.sort();
+    return files;
+}
+
+bool NinjamVst3AudioProcessor::loadCustomMetronomeSoundFile(const juce::File& file)
+{
+    if (!file.existsAsFile())
+        return false;
+
+    std::unique_ptr<juce::AudioFormatReader> reader(metronomeFormatManager.createReaderFor(file));
+    if (reader == nullptr || reader->lengthInSamples <= 0 || reader->numChannels <= 0)
+        return false;
+
+    const double sourceRate = reader->sampleRate > 1.0 ? reader->sampleRate : 44100.0;
+    constexpr double maxMetronomeSoundSeconds = 3.0;
+    const juce::int64 maxSamplesFromLength = (juce::int64)std::ceil(sourceRate * maxMetronomeSoundSeconds);
+    const juce::int64 samplesToRead64 = juce::jmin(reader->lengthInSamples, maxSamplesFromLength);
+    if (samplesToRead64 <= 0 || samplesToRead64 > (juce::int64)std::numeric_limits<int>::max())
+        return false;
+
+    const int samplesToRead = (int)samplesToRead64;
+    juce::AudioBuffer<float> loaded(2, samplesToRead);
+    loaded.clear();
+    const bool readRightChannel = reader->numChannels > 1;
+    if (!reader->read(&loaded, 0, samplesToRead, 0, true, readRightChannel))
+        return false;
+    if (!readRightChannel)
+        loaded.copyFrom(1, 0, loaded, 0, 0, samplesToRead);
+
+    float peak = 0.0f;
+    for (int ch = 0; ch < loaded.getNumChannels(); ++ch)
+        peak = juce::jmax(peak, loaded.getMagnitude(ch, 0, loaded.getNumSamples()));
+    if (peak <= 0.000001f)
+        return false;
+    if (peak > 1.0f)
+        loaded.applyGain(1.0f / peak);
+
+    {
+        const juce::SpinLock::ScopedLockType lock(metronomeCustomSampleLock);
+        metronomeCustomSample = std::move(loaded);
+        metronomeCustomSampleRate = sourceRate;
+        metronomeCustomSampleFile = file;
+    }
+    return true;
+}
+
+void NinjamVst3AudioProcessor::clearCustomMetronomeSoundFile()
+{
+    const juce::SpinLock::ScopedLockType lock(metronomeCustomSampleLock);
+    metronomeCustomSample.setSize(0, 0);
+    metronomeCustomSampleRate = 44100.0;
+    metronomeCustomSampleFile = {};
+}
+
+void NinjamVst3AudioProcessor::updateMetronomeEngineVolume()
+{
+    const float vol = metronomeMuted.load(std::memory_order_relaxed)
+        ? 0.0f
+        : juce::jlimit(0.0f, 1.0f, storedMetronomeVolume.load(std::memory_order_relaxed));
+    ninjamClient.config_metronome = metronomeSoundMode.load(std::memory_order_acquire) == (int)MetronomeSoundMode::classic
+        ? vol
+        : 0.0f;
+}
+
 void NinjamVst3AudioProcessor::setMetronomeVolume(float vol)
 {
     vol = juce::jlimit(0.0f, 1.0f, vol);
+    storedMetronomeVolume.store(vol, std::memory_order_relaxed);
     if (vol > 0.0f)
-    {
-        storedMetronomeVolume.store(vol);
-        metronomeMuted.store(false);
-    }
-    ninjamClient.config_metronome = metronomeMuted.load() ? 0.0f : vol;
+        metronomeMuted.store(false, std::memory_order_relaxed);
+    updateMetronomeEngineVolume();
 }
 
 float NinjamVst3AudioProcessor::getMetronomeVolume() const
 {
-    return ninjamClient.config_metronome;
+    return metronomeMuted.load(std::memory_order_relaxed)
+        ? 0.0f
+        : juce::jlimit(0.0f, 1.0f, storedMetronomeVolume.load(std::memory_order_relaxed));
 }
 
 void NinjamVst3AudioProcessor::setMetronomeMuted(bool shouldMute)
 {
-    metronomeMuted.store(shouldMute);
+    const float current = getMetronomeVolume();
+    metronomeMuted.store(shouldMute, std::memory_order_relaxed);
     if (shouldMute)
     {
-        const float current = ninjamClient.config_metronome;
         if (current > 0.0f)
-            storedMetronomeVolume.store(current);
-        ninjamClient.config_metronome = 0.0f;
+            storedMetronomeVolume.store(current, std::memory_order_relaxed);
     }
-    else
-    {
-        ninjamClient.config_metronome = juce::jlimit(0.0f, 1.0f, storedMetronomeVolume.load());
-    }
+    updateMetronomeEngineVolume();
 }
 
 bool NinjamVst3AudioProcessor::isMetronomeMuted() const
 {
-    return metronomeMuted.load();
+    return metronomeMuted.load(std::memory_order_relaxed);
 }
 
 void NinjamVst3AudioProcessor::setStoredMetronomeVolume(float vol)
 {
-    storedMetronomeVolume.store(juce::jlimit(0.0f, 1.0f, vol));
+    storedMetronomeVolume.store(juce::jlimit(0.0f, 1.0f, vol), std::memory_order_relaxed);
+    updateMetronomeEngineVolume();
 }
 
 float NinjamVst3AudioProcessor::getStoredMetronomeVolume() const
 {
-    return juce::jlimit(0.0f, 1.0f, storedMetronomeVolume.load());
+    return juce::jlimit(0.0f, 1.0f, storedMetronomeVolume.load(std::memory_order_relaxed));
+}
+
+void NinjamVst3AudioProcessor::resetMetronomeClickVoices()
+{
+    for (auto& voice : metronomeClickVoices)
+        voice = {};
+    nextMetronomeClickVoice = 0;
+}
+
+void NinjamVst3AudioProcessor::startMetronomeClick(int mode, bool accent, double sampleRate)
+{
+    if (sampleRate <= 1.0)
+        return;
+
+    auto& voice = metronomeClickVoices[(size_t)nextMetronomeClickVoice];
+    nextMetronomeClickVoice = (nextMetronomeClickVoice + 1) % maxMetronomeClickVoices;
+    voice = {};
+    voice.active = true;
+    voice.mode = mode;
+    voice.accent = accent;
+    voice.gain = accent ? 1.0f : 0.76f;
+
+    const double twoPi = juce::MathConstants<double>::twoPi;
+    if (mode == (int)MetronomeSoundMode::customFile)
+    {
+        const double pitchRatio = accent ? 1.122462048309373 : 1.0; // two semitones up on beat 1
+        const double sourceRate = juce::jmax(1.0, metronomeCustomSampleRate);
+        voice.sampleIncrement = (sourceRate / sampleRate) * pitchRatio;
+        voice.durationSamples = metronomeCustomSample.getNumSamples() > 0
+            ? (int)std::ceil((double)metronomeCustomSample.getNumSamples() / juce::jmax(0.0001, voice.sampleIncrement))
+            : 0;
+        voice.gain = accent ? 0.92f : 0.76f;
+        if (voice.durationSamples <= 0)
+            voice.active = false;
+        return;
+    }
+
+    if (mode == (int)MetronomeSoundMode::softTick)
+    {
+        const double freq = accent ? 1760.0 : 1320.0;
+        voice.phaseDelta = twoPi * freq / sampleRate;
+        voice.phaseDelta2 = twoPi * (freq * 1.52) / sampleRate;
+        voice.durationSamples = (int)std::ceil(sampleRate * (accent ? 0.045 : 0.035));
+        voice.gain = accent ? 0.26f : 0.18f;
+        return;
+    }
+
+    if (mode == (int)MetronomeSoundMode::woodTick)
+    {
+        const double freq = accent ? 930.0 : 690.0;
+        voice.phaseDelta = twoPi * freq / sampleRate;
+        voice.phaseDelta2 = twoPi * (freq * 1.47) / sampleRate;
+        voice.durationSamples = (int)std::ceil(sampleRate * (accent ? 0.070 : 0.055));
+        voice.gain = accent ? 0.34f : 0.24f;
+        return;
+    }
+
+    const double freq = accent ? 1320.0 : 980.0;
+    voice.phaseDelta = twoPi * freq / sampleRate;
+    voice.durationSamples = (int)std::ceil(sampleRate * (accent ? 0.085 : 0.070));
+    voice.gain = accent ? 0.30f : 0.21f;
+}
+
+void NinjamVst3AudioProcessor::mixSelectedMetronomeIntoOutputs(float** outputs, int outnch, int numSamples,
+                                                               double sampleRate, int transportStartPosition,
+                                                               int transportLength, int bpi,
+                                                               bool justMonitor)
+{
+    const int mode = metronomeSoundMode.load(std::memory_order_acquire);
+    if (mode == (int)MetronomeSoundMode::classic
+        || justMonitor
+        || outputs == nullptr
+        || outnch <= 0
+        || outputs[0] == nullptr
+        || numSamples <= 0
+        || sampleRate <= 1.0
+        || transportLength <= 0
+        || bpi <= 0
+        || metronomeMuted.load(std::memory_order_relaxed))
+    {
+        return;
+    }
+
+    const float volume = juce::jlimit(0.0f, 1.0f, storedMetronomeVolume.load(std::memory_order_relaxed));
+    if (volume <= 0.0001f)
+        return;
+
+    juce::SpinLock::ScopedTryLockType customSampleLock(metronomeCustomSampleLock);
+    const bool usingCustomSample = mode == (int)MetronomeSoundMode::customFile;
+    if (usingCustomSample
+        && (!customSampleLock.isLocked()
+            || metronomeCustomSample.getNumSamples() <= 0
+            || metronomeCustomSample.getNumChannels() <= 0))
+    {
+        return;
+    }
+
+    const double samplesPerBeat = (double)transportLength / (double)juce::jmax(1, bpi);
+    if (samplesPerBeat <= 1.0)
+        return;
+
+    auto normaliseTransportPosition = [transportLength](long long value)
+    {
+        value %= (long long)transportLength;
+        if (value < 0)
+            value += transportLength;
+        return (int)value;
+    };
+
+    auto beatIndexForPosition = [samplesPerBeat, bpi](int position)
+    {
+        return juce::jlimit(0, bpi - 1, (int)std::floor((double)position / samplesPerBeat));
+    };
+
+    auto samplesUntilNextBeatBoundary = [transportLength, &beatIndexForPosition](int position)
+    {
+        const int beat = beatIndexForPosition(position);
+        int low = position + 1;
+        int high = transportLength;
+        while (low < high)
+        {
+            const int mid = low + (high - low) / 2;
+            if (beatIndexForPosition(mid) == beat)
+                low = mid + 1;
+            else
+                high = mid;
+        }
+
+        if (low < transportLength)
+            return low - position;
+        return transportLength - position;
+    };
+
+    int transportPosition = normaliseTransportPosition(transportStartPosition);
+    const int previousPosition = transportPosition > 0 ? transportPosition - 1 : transportLength - 1;
+    const int currentBeat = beatIndexForPosition(transportPosition);
+    const int previousBeat = beatIndexForPosition(previousPosition);
+    int samplesToNextBeat = (transportPosition < previousPosition || currentBeat != previousBeat)
+        ? 0
+        : samplesUntilNextBeatBoundary(transportPosition);
+    float* left = outputs[0];
+    float* right = (outnch > 1 && outputs[1] != nullptr) ? outputs[1] : nullptr;
+    const int customSampleChannels = usingCustomSample ? metronomeCustomSample.getNumChannels() : 0;
+    const int customSampleLength = usingCustomSample ? metronomeCustomSample.getNumSamples() : 0;
+
+    for (int sample = 0; sample < numSamples; ++sample)
+    {
+        if (samplesToNextBeat <= 0)
+        {
+            const int beat = beatIndexForPosition(transportPosition);
+            startMetronomeClick(mode, beat == 0, sampleRate);
+            samplesToNextBeat = samplesUntilNextBeatBoundary(transportPosition);
+            if (samplesToNextBeat <= 0)
+                samplesToNextBeat = transportLength;
+        }
+
+        float mixedLeft = 0.0f;
+        float mixedRight = 0.0f;
+        for (auto& voice : metronomeClickVoices)
+        {
+            if (!voice.active)
+                continue;
+
+            float voiceLeft = 0.0f;
+            float voiceRight = 0.0f;
+            if (voice.mode == (int)MetronomeSoundMode::customFile)
+            {
+                if (!usingCustomSample || customSampleLength <= 0)
+                {
+                    voice.active = false;
+                    continue;
+                }
+
+                const int sourceIndex = (int)voice.samplePosition;
+                if (sourceIndex >= customSampleLength - 1)
+                {
+                    voice.active = false;
+                    continue;
+                }
+
+                const float frac = (float)(voice.samplePosition - (double)sourceIndex);
+                const float l0 = metronomeCustomSample.getSample(0, sourceIndex);
+                const float l1 = metronomeCustomSample.getSample(0, sourceIndex + 1);
+                voiceLeft = l0 + (l1 - l0) * frac;
+                if (customSampleChannels > 1)
+                {
+                    const float r0 = metronomeCustomSample.getSample(1, sourceIndex);
+                    const float r1 = metronomeCustomSample.getSample(1, sourceIndex + 1);
+                    voiceRight = r0 + (r1 - r0) * frac;
+                }
+                else
+                {
+                    voiceRight = voiceLeft;
+                }
+                voice.samplePosition += voice.sampleIncrement;
+            }
+            else
+            {
+                const double t = (double)voice.ageSamples / sampleRate;
+                const double attackSamples = juce::jmax(1.0, sampleRate * 0.003);
+                const double attack = juce::jlimit(0.0, 1.0, (double)(voice.ageSamples + 1) / attackSamples);
+                double env = 0.0;
+                double value = 0.0;
+
+                if (voice.mode == (int)MetronomeSoundMode::softTick)
+                {
+                    env = attack * std::exp(-t * 92.0);
+                    value = (std::sin(voice.phase) * 0.78 + std::sin(voice.phase2) * 0.22) * env;
+                    voice.phase2 += voice.phaseDelta2;
+                }
+                else if (voice.mode == (int)MetronomeSoundMode::woodTick)
+                {
+                    env = attack * std::exp(-t * 58.0);
+                    value = (std::sin(voice.phase) * 0.68 + std::sin(voice.phase2) * 0.32) * env;
+                    voice.phase2 += voice.phaseDelta2;
+                }
+                else
+                {
+                    env = attack * std::exp(-t * 36.0);
+                    value = std::sin(voice.phase) * env;
+                }
+
+                voice.phase += voice.phaseDelta;
+                voiceLeft = (float)value;
+                voiceRight = voiceLeft;
+            }
+
+            mixedLeft += voiceLeft * voice.gain;
+            mixedRight += voiceRight * voice.gain;
+
+            if (++voice.ageSamples >= voice.durationSamples)
+                voice.active = false;
+        }
+
+        if (mixedLeft != 0.0f || mixedRight != 0.0f)
+        {
+            left[sample] += mixedLeft * volume;
+            if (right != nullptr)
+                right[sample] += mixedRight * volume;
+            else
+                left[sample] += mixedRight * volume;
+        }
+
+        if (++transportPosition >= transportLength)
+            transportPosition = 0;
+        --samplesToNextBeat;
+    }
 }
 
 bool NinjamVst3AudioProcessor::isOpusSyncAvailable() const
@@ -10167,6 +10679,7 @@ void NinjamVst3AudioProcessor::prepareToPlay (double sampleRate, int samplesPerB
     samplePadLastTransportBpi = 0;
     samplePadTransportInterval = 0;
     processingSampleRate = sampleRate > 1.0 ? sampleRate : 44100.0;
+    resetMetronomeClickVoices();
     if (linkTimingState != nullptr)
         linkTimingState->reset();
     if (localChordAnalyzer)
@@ -14926,6 +15439,10 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     const bool allowEngineLocalInput = transmitEnabled;
     float** engineInputs = allowEngineLocalInput ? inputs : nullptr;
     int engineInputChannels = allowEngineLocalInput ? actualInputChannels : 0;
+    bool ninjamAudioProcessed = false;
+    int metronomeTransportStartPosition = 0;
+    int metronomeTransportLength = 0;
+    int metronomeTransportBpi = 0;
     {
         const juce::ScopedTryLock lifecycleLock(ninjamAudioLifecycleLock);
         if (lifecycleLock.isLocked())
@@ -14963,9 +15480,22 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
                     }
                 }
             }
+            ninjamClient.GetPosition(&metronomeTransportStartPosition, &metronomeTransportLength);
+            metronomeTransportBpi = juce::jmax(1, ninjamClient.GetBPI());
             ninjamClient.AudioProc(engineInputs, engineInputChannels, outputs, actualOutputChannels, numSamples, (int)getSampleRate(), runMonitorOnly);
+            if (metronomeTransportLength <= 0)
+            {
+                int metronomeTransportEndPosition = 0;
+                ninjamClient.GetPosition(&metronomeTransportEndPosition, &metronomeTransportLength);
+                metronomeTransportStartPosition = metronomeTransportLength > 0
+                    ? (metronomeTransportEndPosition - numSamples + metronomeTransportLength) % metronomeTransportLength
+                    : 0;
+            }
+            ninjamAudioProcessed = true;
         }
     }
+    if (ninjamAudioProcessed)
+        mixSelectedMetronomeIntoOutputs(outputs, actualOutputChannels, numSamples, getSampleRate(), metronomeTransportStartPosition, metronomeTransportLength, metronomeTransportBpi, runMonitorOnly);
 
     int numOutputBusesOut = getBusCount(false);
     if (gateForSync)
@@ -16372,6 +16902,7 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     state.setProperty("linkAudioReceiveSelection", getLinkAudioReceiveSelection(), nullptr);
     state.setProperty("metronomeMuted", isMetronomeMuted(), nullptr);
     state.setProperty("metronomeVolume", (double)getStoredMetronomeVolume(), nullptr);
+    state.setProperty("metronomeSoundKey", getMetronomeSoundKey(), nullptr);
     state.setProperty("transmitLocal", isTransmittingLocal(), nullptr);
     state.setProperty("chordDetectionEnabled", isChordDetectionEnabled(), nullptr);
     state.setProperty("samplePadsVolume", (double)getSamplePadVolume(), nullptr);
@@ -16461,6 +16992,7 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setLinkAudioReceiveSelection(state.getProperty("linkAudioReceiveSelection", "").toString());
     storedMetronomeVolume.store(juce::jlimit(0.0f, 1.0f, (float)(double)state.getProperty("metronomeVolume", 1.0)));
     setMetronomeMuted((bool)state.getProperty("metronomeMuted", false));
+    setMetronomeSoundKey(state.getProperty("metronomeSoundKey", getClassicMetronomeSoundKey()).toString());
     setTransmitLocal((bool)state.getProperty("transmitLocal", false));
     setChordDetectionEnabled((bool)state.getProperty("chordDetectionEnabled", true));
     setSamplePadVolume(juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("samplePadsVolume", 1.0)));

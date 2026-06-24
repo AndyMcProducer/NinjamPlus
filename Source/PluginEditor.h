@@ -1376,6 +1376,8 @@ private:
     void applyChatWindowColourToDisplays();
     void setChatTtsEnabled(bool enabled, bool markDirty);
     void setChatTtsVoiceId(const juce::String& voiceId, bool markDirty);
+    void setChatTtsVolume(float volume, bool markDirty);
+    void setChatTtsOutputId(const juce::String& outputId, bool markDirty);
     void enqueueChatTtsForNewLines(const juce::StringArray& history, const juce::StringArray& senders);
     void setAbletonChatWindowSizePreset(int presetIndex);
     void setAbletonSamplerWindowSizePreset(int presetIndex);
@@ -1461,8 +1463,12 @@ private:
     float voiceChatGlowPhase = 0.0f;
     bool chatTtsEnabled = false;
     juce::String chatTtsVoiceId;
+    float chatTtsVolume = 1.0f;
+    juce::String chatTtsOutputId;
     juce::StringArray chatTtsVoiceIds;
     juce::StringArray chatTtsVoiceNames;
+    juce::StringArray chatTtsOutputIds;
+    juce::StringArray chatTtsOutputNames;
     std::unique_ptr<ChatTtsEngine> chatTtsEngine;
     float storedMetronomeVolume = 0.5f;
     std::map<int, float> autoLevelCurrentGains;
