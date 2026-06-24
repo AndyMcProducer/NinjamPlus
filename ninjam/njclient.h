@@ -324,11 +324,13 @@ protected:
   int m_metro_chidx, m_remote_chanoffs, m_local_chanoffs;
 
   DecodeState *start_decode(unsigned char *guid, int chanflags, int chidx, unsigned int fourcc, DecodeMediaBuffer *decbuf);
+  void defer_delete_decode_state(DecodeState *state);
+  void drain_pending_decode_deletes(int maxToDelete=-1);
 
   bool ShouldEncodeVorbis(int chidx) const;
   bool ShouldEncodeOpus(int chidx) const;
 
-  I_NJEncoder *createEncoderForChannel(int chidx, int srate, int nch, int bitrate, int serno);
+  I_NJEncoder *createEncoderForChannel(int chidx, int srate, int nch, int bitrate, int serno, unsigned int *actualFourcc);
   I_NJDecoder *createDecoderForChannel(int chidx, unsigned int fourcc, DecodeMediaBuffer *decbuf);
 
   BufferQueue *m_wavebq;
@@ -340,8 +342,10 @@ protected:
                     int len, int srate, int outnch, int offs, double vudecay, bool isPlaying, bool isSeek, double playPos);
 
   WDL_Mutex m_users_cs, m_locchan_cs, m_log_cs, m_misc_cs;
+  WDL_Mutex m_pending_decode_delete_cs;
   Net_Connection *m_netcon;
   WDL_PtrList<RemoteUser> m_remoteusers;
+  WDL_PtrList<DecodeState> m_pending_decode_deletes;
   WDL_PtrList<RemoteDownload> m_downloads;
   WDL_PtrList<CustomIntervalDownload> m_customIntervalDownloads;
 
