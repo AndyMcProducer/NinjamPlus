@@ -853,9 +853,9 @@ public:
 
     static juce::Colour colourForDb(float db)
     {
-        if (db >= -6.0f)
+        if (db >= 0.0f)
             return juce::Colour(0xffff1f1f);
-        if (db >= -18.0f)
+        if (db > -6.0f)
             return juce::Colour(0xffffff26);
         return juce::Colour(0xff20ff37);
     }
@@ -1025,6 +1025,12 @@ private:
                             : base.withMultipliedBrightness(0.36f).withAlpha(0.20f));
             g.fillRoundedRectangle(segment.toFloat(), 1.2f);
         }
+
+        const bool clipLit = peakToDb(peak) >= 0.0f;
+        const int capHeight = juce::jlimit(1, 4, juce::jmax(1, barBounds.getHeight() / 18));
+        const auto clipCap = barBounds.withHeight(capHeight);
+        g.setColour(juce::Colour(0xffff1f1f).withAlpha(clipLit ? 0.98f : 0.18f));
+        g.fillRoundedRectangle(clipCap.toFloat(), 1.0f);
     }
 
     static void drawHorizontalBar(juce::Graphics& g, juce::Rectangle<int> barBounds, float peak)
@@ -1057,6 +1063,15 @@ private:
                             : base.withMultipliedBrightness(0.36f).withAlpha(0.20f));
             g.fillRoundedRectangle(segment.toFloat(), 1.0f);
         }
+
+        const bool clipLit = peakToDb(peak) >= 0.0f;
+        const int capWidth = juce::jlimit(1, 4, juce::jmax(1, barBounds.getWidth() / 18));
+        const auto clipCap = juce::Rectangle<int>(barBounds.getRight() - capWidth,
+                                                  barBounds.getY(),
+                                                  capWidth,
+                                                  barBounds.getHeight());
+        g.setColour(juce::Colour(0xffff1f1f).withAlpha(clipLit ? 0.98f : 0.18f));
+        g.fillRoundedRectangle(clipCap.toFloat(), 1.0f);
     }
 
     static void drawDbTicks(juce::Graphics& g, juce::Rectangle<int> meterBounds)

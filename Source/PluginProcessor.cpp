@@ -15875,10 +15875,12 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
                 }
                 else
                 {
+                    constexpr float monoToStereoSplitGain = 0.70710678118f;
+                    const float outputGain = outChans > 1 ? gain * monoToStereoSplitGain : gain;
                     if (outLeft < outChans)
-                        mainBus.addFrom(outLeft, 0, tempInputBuffer, sourceLeft, 0, numSamples, gain);
+                        mainBus.addFrom(outLeft, 0, tempInputBuffer, sourceLeft, 0, numSamples, outputGain);
                     if (outRight < outChans)
-                        mainBus.addFrom(outRight, 0, tempInputBuffer, sourceLeft, 0, numSamples, gain);
+                        mainBus.addFrom(outRight, 0, tempInputBuffer, sourceLeft, 0, numSamples, outputGain);
                     else if (outLeft == 0 && outChans == 1)
                         mainBus.addFrom(0, 0, tempInputBuffer, sourceLeft, 0, numSamples, gain);
                 }
@@ -15929,8 +15931,10 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
             const int linkRight = linkInputChannels > 1 ? totalInputChannels + 1 : linkLeft;
             if (outputChannels > 1)
             {
-                mainBus.addFrom(0, 0, tempInputBuffer, linkLeft, 0, numSamples);
-                mainBus.addFrom(1, 0, tempInputBuffer, linkRight, 0, numSamples);
+                constexpr float monoToStereoSplitGain = 0.70710678118f;
+                const float linkGain = linkInputChannels > 1 ? 1.0f : monoToStereoSplitGain;
+                mainBus.addFrom(0, 0, tempInputBuffer, linkLeft, 0, numSamples, linkGain);
+                mainBus.addFrom(1, 0, tempInputBuffer, linkRight, 0, numSamples, linkGain);
             }
             else if (outputChannels == 1)
             {

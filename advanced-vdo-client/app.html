@@ -1010,30 +1010,14 @@
 
         function sendTargetedRemove(userKey) {
             const key = normalizeUserId(userKey);
-            const targetId = vdoState.targetIdByUser[key];
-            const streamId = vdoState.streamIdByUser[key];
-            let sent = false;
-            function sendRemove(targetKey, targetValue) {
-                if (!targetValue) {
-                    return;
-                }
-                const hangupMsg = { action: 'hangup' };
-                hangupMsg[targetKey] = targetValue;
-                sent = postToVdo(hangupMsg) || sent;
-                const removeMsg = { action: 'remove' };
-                removeMsg[targetKey] = targetValue;
-                sent = postToVdo(removeMsg) || sent;
-                const hideMsg = { action: 'hide' };
-                hideMsg[targetKey] = targetValue;
-                sent = postToVdo(hideMsg) || sent;
+            if (!key) {
+                return false;
             }
-            sendRemove('UUID', targetId);
-            sendRemove('target', targetId);
-            sendRemove('streamID', streamId);
-            if (!targetId) {
-                sendRemove('target', streamId);
-            }
-            return sent;
+
+            // Do not post hangup/remove/hide commands into VDO from roster cleanup.
+            // Some VDO builds treat those as a local page/session exit and show the
+            // "file transfer in progress" unload confirmation when peers leave.
+            return false;
         }
 
         function scheduleBufferRefresh(userKey, refreshEventId) {
