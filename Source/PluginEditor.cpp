@@ -1431,6 +1431,19 @@ private:
 };
 }
 
+static bool isDbThresholdFader(const juce::Slider& slider)
+{
+    return slider.getMinimum() < 0.0 && slider.getMaximum() <= 0.0;
+}
+
+static juce::String formatDbTickLabel(double db)
+{
+    const int dbInt = (int)std::round(db);
+    if (dbInt > 0)
+        return "+" + juce::String(dbInt) + " dB";
+    return juce::String(dbInt) + " dB";
+}
+
 void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int y, int width, int height,
                                                   float sliderPos, float minSliderPos, float maxSliderPos,
                                                   const juce::Slider::SliderStyle style, juce::Slider& slider)
@@ -1453,6 +1466,31 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
         g.drawRect(track);
 
         int tickX = track.getRight() + 6;
+
+        if (isDbThresholdFader(slider))
+        {
+            const double minDb = slider.getMinimum();
+            const double maxDb = slider.getMaximum();
+            const double ticks[] { maxDb, (minDb + maxDb) * 0.5, minDb };
+
+            for (double db : ticks)
+            {
+                const double value = juce::jlimit(minDb, maxDb, db);
+                const float prop = juce::jlimit(0.0f, 1.0f, (float)slider.valueToProportionOfLength(value));
+                const int yPos = track.getY() + (int)((1.0f - prop) * (float)track.getHeight());
+                const bool major = db == maxDb || db == minDb;
+                const int labelY = juce::jlimit(bounds.getY(), bounds.getBottom() - 14, yPos - 7);
+
+                g.setColour(juce::Colours::lightgrey.withAlpha(major ? 0.92f : 0.68f));
+                g.drawLine((float)(track.getX() - 6), (float)yPos,
+                           (float)(tickX + 4), (float)yPos);
+
+                g.setFont(9.0f);
+                g.drawText(formatDbTickLabel(db), tickX + 4, labelY, 40, 14,
+                           juce::Justification::centredLeft, false);
+            }
+            return;
+        }
 
         const int numTicksBelowZero = 3;
         float zeroProp = slider.valueToProportionOfLength(1.0);
@@ -1504,6 +1542,35 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
 
         g.setColour(juce::Colours::black);
         g.drawRect(track);
+
+        if (isDbThresholdFader(slider))
+        {
+            const double minDb = slider.getMinimum();
+            const double maxDb = slider.getMaximum();
+            const double ticks[] { minDb, (minDb + maxDb) * 0.5, maxDb };
+
+            for (double db : ticks)
+            {
+                const double value = juce::jlimit(minDb, maxDb, db);
+                const float prop = juce::jlimit(0.0f, 1.0f, (float)slider.valueToProportionOfLength(value));
+                const int xPos = track.getX() + (int)(prop * (float)track.getWidth());
+                const bool major = db == maxDb || db == minDb;
+
+                g.setColour(juce::Colours::lightgrey.withAlpha(major ? 0.92f : 0.68f));
+                g.drawLine((float)xPos, (float)(track.getY() - 6),
+                           (float)xPos, (float)(track.getBottom() + 6));
+
+                g.setFont(10.0f);
+                g.drawText(formatDbTickLabel(db),
+                           xPos - 20,
+                           track.getBottom() + 8,
+                           40,
+                           14,
+                           juce::Justification::centred,
+                           false);
+            }
+            return;
+        }
 
         const int numTicksBelowZero = 3;
         float zeroProp = slider.valueToProportionOfLength(1.0);
@@ -1637,7 +1704,9 @@ void FaderLookAndFeel::drawLinearSlider(juce::Graphics& g, int x, int y, int wid
         g.setColour(juce::Colours::white.withAlpha(0.9f));
 
         juce::String text;
-        if (v <= 1.0e-6)
+        if (isDbThresholdFader(slider))
+            text = formatDbTickLabel(v);
+        else if (v <= 1.0e-6)
             text = "-inf";
         else if (dbInt > 0)
             text = "+" + juce::String(dbInt) + " dB";
@@ -1696,7 +1765,9 @@ void FaderLookAndFeel::drawLinearSlider(juce::Graphics& g, int x, int y, int wid
         g.setColour(juce::Colours::white.withAlpha(0.9f));
 
         juce::String text;
-        if (v <= 1.0e-6)
+        if (isDbThresholdFader(slider))
+            text = formatDbTickLabel(v);
+        else if (v <= 1.0e-6)
             text = "-inf";
         else if (dbInt > 0)
             text = "+" + juce::String(dbInt) + " dB";
@@ -4322,6 +4393,15 @@ public:
         duckRouteButton.setLookAndFeel(nullptr);
     }
 
+    void setResizeLightweightMode(bool shouldUse)
+    {
+        if (resizeLightweightMode == shouldUse)
+            return;
+
+        resizeLightweightMode = shouldUse;
+        repaint();
+    }
+
     void paint(juce::Graphics& g) override
     {
         auto bounds = getLocalBounds().toFloat().reduced(1.0f);
@@ -4382,6 +4462,14 @@ public:
         rubber.addColour(0.78, juce::Colour(0xff30353a));
         g.setGradientFill(rubber);
         g.fillRoundedRectangle(bounds, 8.0f);
+
+        if (resizeLightweightMode)
+        {
+            const auto outline = activeTint ? activeGlow : (loaded ? juce::Colour(0xff82d9ff) : juce::Colours::black);
+            g.setColour(outline.withAlpha(activeTint ? 0.78f : (loaded ? 0.62f : 0.80f)));
+            g.drawRoundedRectangle(bounds, 8.0f, loaded ? 1.7f : 1.2f);
+            return;
+        }
 
         g.setColour(juce::Colours::white.withAlpha(0.06f));
         for (int y = 4; y < getHeight(); y += 7)
@@ -4454,10 +4542,13 @@ public:
         }
 
         const int loopBeats = cachedLoopBeats;
-        if (loopBeats > 0)
+        const bool showRecordCountdown = waitingForBpiLoop && cachedRecordStartCountdownBeats > 0;
+        if (loopBeats > 0 || showRecordCountdown)
         {
-            const float progress = cachedLoopProgress;
-            const float remaining = playing ? juce::jlimit(0.0f, 1.0f, 1.0f - progress) : 1.0f;
+            const float progress = showRecordCountdown ? cachedRecordStartCountdownProgress : cachedLoopProgress;
+            const float remaining = showRecordCountdown
+                ? juce::jlimit(0.0f, 1.0f, 1.0f - progress)
+                : (playing ? juce::jlimit(0.0f, 1.0f, 1.0f - progress) : 1.0f);
             auto indicator = juce::Rectangle<float>(bounds.getRight() - 58.0f,
                                                     bounds.getBottom() - 30.0f,
                                                     23.0f,
@@ -4474,12 +4565,15 @@ public:
             const float startAngle = -juce::MathConstants<float>::halfPi;
             const float endAngle = startAngle + juce::MathConstants<float>::twoPi * remaining;
             remainingArc.addCentredArc(centre.x, centre.y, radius, radius, 0.0f, startAngle, endAngle, true);
-            g.setColour((activeTint ? activeGlow : juce::Colour(0xff82d9ff)).withAlpha(playing ? 0.92f : 0.55f));
+            const auto ringColour = showRecordCountdown ? juce::Colour(0xffff9f2f)
+                                                         : (activeTint ? activeGlow : juce::Colour(0xff82d9ff));
+            g.setColour(ringColour.withAlpha((playing || showRecordCountdown) ? 0.92f : 0.55f));
             g.strokePath(remainingArc, juce::PathStrokeType(2.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
 
+            const int displayBeats = showRecordCountdown ? cachedRecordStartCountdownBeats : loopBeats;
             g.setColour(juce::Colours::white.withAlpha(0.92f));
-            g.setFont(juce::Font(loopBeats >= 100 ? 7.0f : 8.5f, juce::Font::bold));
-            g.drawFittedText(juce::String(loopBeats), indicator.toNearestInt().reduced(3), juce::Justification::centred, 1);
+            g.setFont(juce::Font(displayBeats >= 100 ? 7.0f : 8.5f, juce::Font::bold));
+            g.drawFittedText(juce::String(displayBeats), indicator.toNearestInt().reduced(3), juce::Justification::centred, 1);
         }
     }
 
@@ -4612,11 +4706,9 @@ public:
             return;
         }
 
-        const double bpm = juce::jmax(1.0, (double)processor.getBPM());
-        const double twoBeatHoldMs = 2.0 * 60000.0 / bpm;
-        if (heldMs >= twoBeatHoldMs)
+        if (heldMs >= holdToScheduleRecordMs)
         {
-            processor.armSamplePadLooper(padIndex, false);
+            processor.scheduleSamplePadBpiRecordStartAtNextInterval(padIndex);
             refreshFromProcessor();
         }
         else
@@ -4656,9 +4748,7 @@ public:
 
         if (mouseDownActive && !mouseHoldActionTriggered)
         {
-            const double bpm = juce::jmax(1.0, (double)processor.getBPM());
-            const double fourBeatHoldMs = 4.0 * 60000.0 / bpm;
-            if (juce::Time::getMillisecondCounterHiRes() - mouseDownAtMs >= fourBeatHoldMs)
+            if (juce::Time::getMillisecondCounterHiRes() - mouseDownAtMs >= holdToScheduleRecordMs)
             {
                 processor.scheduleSamplePadBpiRecordStartAtNextInterval(padIndex);
                 mouseHoldActionTriggered = true;
@@ -4676,6 +4766,8 @@ public:
         const bool waitingForBpiLoop = processor.isSamplePadWaitingForBpiLoop(padIndex);
         const int loopBeats = processor.getSamplePadLoopLengthBeats(padIndex);
         const float loopProgress = loopBeats > 0 ? processor.getSamplePadLoopProgress(padIndex) : 0.0f;
+        const int recordStartCountdownBeats = waitingForBpiLoop ? processor.getSamplePadRecordStartCountdownBeats(padIndex) : 0;
+        const float recordStartCountdownProgress = waitingForBpiLoop ? processor.getSamplePadRecordStartCountdownProgress(padIndex) : 0.0f;
 
         const bool shouldShowRecordToggle = recordArmed || recording;
         if (recordButton.getToggleState() != shouldShowRecordToggle)
@@ -4693,8 +4785,10 @@ public:
             || recording != cachedRecording
             || playing != cachedPlaying
             || waitingForBpiLoop != cachedWaitingForBpiLoop
-            || loopBeats != cachedLoopBeats;
-        if (std::abs(loopProgress - cachedLoopProgress) >= 0.01f)
+            || loopBeats != cachedLoopBeats
+            || recordStartCountdownBeats != cachedRecordStartCountdownBeats;
+        if (std::abs(loopProgress - cachedLoopProgress) >= 0.01f
+            || std::abs(recordStartCountdownProgress - cachedRecordStartCountdownProgress) >= 0.01f)
             visualStateChanged = true;
 
         cachedLoaded = loaded;
@@ -4703,6 +4797,8 @@ public:
         cachedWaitingForBpiLoop = waitingForBpiLoop;
         cachedLoopBeats = loopBeats;
         cachedLoopProgress = loopProgress;
+        cachedRecordStartCountdownBeats = recordStartCountdownBeats;
+        cachedRecordStartCountdownProgress = recordStartCountdownProgress;
 
         const int triggerFlashCounter = processor.getSamplePadTriggerFlashCounter(padIndex);
         if (triggerFlashCounter != lastTriggerFlashCounter)
@@ -4916,6 +5012,7 @@ private:
     SamplePadToggleLookAndFeel toggleLookAndFeel;
     std::unique_ptr<juce::FileChooser> chooser;
     static constexpr double hitGlowDurationMs = 240.0;
+    static constexpr double holdToScheduleRecordMs = 2000.0;
     double hitGlowUntilMs = 0.0;
     int lastTriggerFlashCounter = 0;
     bool cachedLoaded = false;
@@ -4924,11 +5021,14 @@ private:
     bool cachedWaitingForBpiLoop = false;
     int cachedLoopBeats = 0;
     float cachedLoopProgress = 0.0f;
+    int cachedRecordStartCountdownBeats = 0;
+    float cachedRecordStartCountdownProgress = 0.0f;
     // Hold-to-arm state
     double mouseDownAtMs = 0.0;
     bool mouseDownActive = false;
     bool mouseHoldActionTriggered = false;
     bool fxRouteDragActive = false;
+    bool resizeLightweightMode = false;
 };
 
 class SamplePadsComponent : public juce::Component,
@@ -4946,8 +5046,7 @@ public:
           abletonHosted(abletonHostedWindow),
           currentSamplerSizePreset(juce::jlimit(0, 2, samplerWindowSizePreset)),
           onPadsMidiChanged(std::move(onPadsMidiChangedCallback)),
-          onSamplerSizePresetChanged(std::move(onSamplerSizePresetChangedCallback)),
-          bpiCounter(p)
+          onSamplerSizePresetChanged(std::move(onSamplerSizePresetChangedCallback))
     {
         padCurrentAlpha.fill(1.0f);
         padTargetAlpha.fill(1.0f);
@@ -5198,14 +5297,19 @@ public:
         };
         addAndMakeVisible(defaultFxButton);
         updateDefaultFxButtonColour();
+        monitorButton.setClickingTogglesState(true);
+        monitorButton.setButtonText("Monitor");
+        monitorButton.setToggleState(processor.isSamplePadMonitorModeEnabled(), juce::dontSendNotification);
+        monitorButton.setTooltip("Private monitor for newly triggered pads");
+        monitorButton.onClick = [this]
+        {
+            processor.setSamplePadMonitorModeEnabled(monitorButton.getToggleState());
+            updateMonitorButtonColour();
+            refreshSampleFxControls();
+        };
+        addAndMakeVisible(monitorButton);
+        updateMonitorButtonColour();
 
-        bpiLabel.setJustificationType(juce::Justification::centredLeft);
-        bpiLabel.setFont(juce::Font(12.0f, juce::Font::bold));
-        bpiLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
-        bpiLabel.setColour(juce::Label::backgroundColourId, juce::Colours::transparentBlack);
-        bpiLabel.setColour(juce::Label::outlineColourId, juce::Colours::transparentBlack);
-        addAndMakeVisible(bpiLabel);
-        addAndMakeVisible(bpiCounter);
 
         startTimerHz(24);
     }
@@ -5230,7 +5334,8 @@ public:
         g.setGradientFill(bg);
         g.fillAll();
 
-        drawFxRouteLines(g);
+        if (!isResizeRefreshSuppressed(juce::Time::getMillisecondCounterHiRes()))
+            drawFxRouteLines(g);
 
         auto frame = getLocalBounds().toFloat().reduced(6.0f);
         g.setColour(juce::Colours::white.withAlpha(0.08f));
@@ -5240,6 +5345,7 @@ public:
     void resized() override
     {
         samplerResizeSuppressUntilMs = juce::Time::getMillisecondCounterHiRes() + samplerResizeRefreshSuppressMs;
+        setPadsResizeLightweightMode(true);
 
         auto area = getLocalBounds().reduced(14);
         auto controls = area.removeFromRight(104);
@@ -5251,6 +5357,9 @@ public:
         controls.removeFromBottom(4);
         auto defaultFxArea = controls.removeFromBottom(30);
         defaultFxButton.setBounds(defaultFxArea.reduced(0, 2));
+        controls.removeFromBottom(4);
+        auto monitorArea = controls.removeFromBottom(30);
+        monitorButton.setBounds(monitorArea.reduced(0, 2));
         controls.removeFromBottom(4);
         auto limiterArea = controls.removeFromBottom(30);
         limiterButton.setBounds(limiterArea.reduced(0, 2));
@@ -5287,10 +5396,6 @@ public:
         const int bankSelectorWidth = juce::jmin(bankRow.getWidth(), abletonHosted ? 104 : 124);
         bankSelector.setBounds(bankRow.removeFromLeft(bankSelectorWidth).reduced(2, 1));
 
-        auto bpiArea = area.removeFromBottom(28);
-        area.removeFromBottom(8);
-        bpiLabel.setBounds(bpiArea.removeFromLeft(72));
-        bpiCounter.setBounds(bpiArea.reduced(2, 5));
 
         auto fxArea = area.removeFromLeft(250);
         area.removeFromLeft(12);
@@ -5315,18 +5420,37 @@ public:
     }
 
 private:
+    bool isResizeRefreshSuppressed(double nowMs) const
+    {
+        return nowMs < samplerResizeSuppressUntilMs;
+    }
+
+    void setPadsResizeLightweightMode(bool shouldUse)
+    {
+        if (padsResizeLightweightMode == shouldUse)
+            return;
+
+        padsResizeLightweightMode = shouldUse;
+        for (auto& pad : pads)
+            if (pad != nullptr)
+                pad->setResizeLightweightMode(shouldUse);
+    }
+
     void timerCallback() override
     {
         const double now = juce::Time::getMillisecondCounterHiRes();
-        const bool canDoHeavyRefresh = !samplerPopupActive && now >= samplerResizeSuppressUntilMs;
+        if (isResizeRefreshSuppressed(now))
+            return;
+
+        if (padsResizeLightweightMode)
+        {
+            setPadsResizeLightweightMode(false);
+            repaint();
+        }
+
+        const bool canDoHeavyRefresh = !samplerPopupActive;
 
         peakMeter.setPeak(processor.getSamplePadPeak());
-        const int bpi = juce::jmax(1, processor.getBPI());
-        const int beat = juce::jlimit(1, bpi, 1 + (int)std::floor(juce::jlimit(0.0f, 0.9999f, processor.getIntervalProgress()) * (float)bpi));
-        const juce::String bpiText = "BPI " + juce::String(beat) + "/" + juce::String(bpi);
-        if (bpiLabel.getText() != bpiText)
-            bpiLabel.setText(bpiText, juce::dontSendNotification);
-        bpiCounter.repaint();
         if (canDoHeavyRefresh && (now - lastQuickSelectorRefreshMs) >= quickSelectorRefreshIntervalMs)
         {
             refreshQuickSelectors(false);
@@ -5822,12 +5946,24 @@ private:
             const int targetId = samplePadFxMenuIdForType(processor.getSamplePadFxSlotType(slot));
             if (!samplerPopupActive && selector.getSelectedId() != targetId)
                 selector.setSelectedId(targetId, juce::dontSendNotification);
+
+            const bool lockActiveSlot = processor.isSamplePadMonitorModeEnabled()
+                && processor.isSamplePadFxSlotInUseForLocalRoute(slot);
+            knob.setEnabled(!lockActiveSlot);
+            selector.setEnabled(!lockActiveSlot);
+            const auto slotTooltip = lockActiveSlot
+                ? juce::String("In use by a playing normal pad")
+                : juce::String();
+            knob.setTooltip(slotTooltip);
+            selector.setTooltip(slotTooltip);
         }
 
         duckButton.setToggleState(processor.isSamplePadDuckEnabled(), juce::dontSendNotification);
         updateDuckButtonColour();
         defaultFxButton.setToggleState(processor.getSamplePadsUseDefaultFx(), juce::dontSendNotification);
         updateDefaultFxButtonColour();
+        monitorButton.setToggleState(processor.isSamplePadMonitorModeEnabled(), juce::dontSendNotification);
+        updateMonitorButtonColour();
     }
 
     void layoutSampleFxRack(juce::Rectangle<int> fxArea)
@@ -6147,6 +6283,15 @@ private:
         defaultFxButton.setColour(juce::TextButton::textColourOnId, juce::Colours::black);
         defaultFxButton.setColour(juce::TextButton::textColourOffId, juce::Colours::lightgrey);
     }
+    void updateMonitorButtonColour()
+    {
+        const bool on = monitorButton.getToggleState();
+        const auto colour = on ? juce::Colour(0xffffd24a) : juce::Colour(0xff3a3214);
+        monitorButton.setColour(juce::TextButton::buttonColourId, colour);
+        monitorButton.setColour(juce::TextButton::buttonOnColourId, colour);
+        monitorButton.setColour(juce::TextButton::textColourOnId, juce::Colours::black);
+        monitorButton.setColour(juce::TextButton::textColourOffId, juce::Colours::lightgrey);
+    }
 
     void updateSamplerSizeButtons()
     {
@@ -6318,6 +6463,7 @@ private:
     double lastPadAlphaUpdateMs = 0.0;
     double suppressRouteFocusUntilMs = 0.0;
     double samplerResizeSuppressUntilMs = 0.0;
+    bool padsResizeLightweightMode = false;
     bool samplerPopupActive = false;
     static constexpr double routeFocusSuppressAfterEditMs = 800.0;
     static constexpr double padAlphaFadeMs = 320.0;
@@ -6330,8 +6476,7 @@ private:
     LeftClickOnlyTextButton limiterButton{ "Limiter" };
     PopupTextButton duckButton{ "Duck" };
     LeftClickOnlyTextButton defaultFxButton{ "NJ FX" };
-    juce::Label bpiLabel;
-    IntervalDisplayComponent bpiCounter;
+    LeftClickOnlyTextButton monitorButton{ "Monitor" };
     double lastQuickSelectorRefreshMs = 0.0;
 };
 
@@ -8851,7 +8996,7 @@ void NinjamVst3AudioProcessorEditor::resized()
     localFaderLabel.setBounds(localHeader);
     auto localInner = localArea.reduced(4);
 
-    int meterWidth = 10;
+    int meterWidth = 18;
     int totalWidth = localInner.getWidth();
     int columnWidth = totalWidth / numLocal;
 
@@ -8909,7 +9054,7 @@ void NinjamVst3AudioProcessorEditor::resized()
 
     masterFaderLabel.setBounds(masterArea.removeFromTop(20));
     auto masterInner = masterArea.reduced(4);
-    auto masterMeterWidth = 10;
+    auto masterMeterWidth = 18;
     auto masterMeterArea = masterInner.removeFromRight(masterMeterWidth);
     auto controlColumn = masterInner.removeFromLeft(70);
     auto fxColumn = masterInner;
@@ -11626,6 +11771,9 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
     constexpr int metronomeSoftTickMenuId = 72;
     constexpr int metronomeWoodTickMenuId = 73;
     constexpr int metronomeOpenFolderMenuId = 74;
+    constexpr int metronomeOutputMonoMenuIdBase = 8000;
+    constexpr int metronomeOutputStereoMenuIdBase = 8200;
+    constexpr int metronomeOutputMonoFlag = 1024;
     constexpr int metronomeCustomMenuIdBase = 9000;
     const juce::String selectedMetronomeSoundKey = audioProcessor.getMetronomeSoundKey();
     const juce::Array<juce::File> customMetronomeFiles = audioProcessor.findCustomMetronomeSoundFiles();
@@ -11661,6 +11809,33 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
     }
     metronomeSoundMenu.addSeparator();
     metronomeSoundMenu.addItem(metronomeOpenFolderMenuId, "Open User Sounds Folder...");
+    juce::PopupMenu metronomeOutputMenu;
+    const int selectedMetronomeOutput = audioProcessor.getMetronomeOutputChannel();
+    const bool selectedMetronomeOutputMono = (selectedMetronomeOutput & metronomeOutputMonoFlag) != 0;
+    const int selectedMetronomeOutputChannel = selectedMetronomeOutput & ~metronomeOutputMonoFlag;
+    const int totalMetronomeOutputs = juce::jmax(1, audioProcessor.getTotalNumOutputChannels());
+    const int stereoPairCount = juce::jmax(1, (totalMetronomeOutputs + 1) / 2);
+    for (int pair = 0; pair < stereoPairCount; ++pair)
+    {
+        const int leftChannel = pair * 2;
+        const int rightChannel = juce::jmin(leftChannel + 1, totalMetronomeOutputs - 1);
+        const auto label = pair == 0
+            ? juce::String("Main Out 1/2")
+            : juce::String("Out ") + juce::String(leftChannel + 1) + "/" + juce::String(rightChannel + 1);
+        metronomeOutputMenu.addItem(metronomeOutputStereoMenuIdBase + pair,
+                                    label,
+                                    true,
+                                    !selectedMetronomeOutputMono && selectedMetronomeOutputChannel == leftChannel);
+    }
+
+    metronomeOutputMenu.addSeparator();
+    for (int channel = 0; channel < totalMetronomeOutputs; ++channel)
+    {
+        metronomeOutputMenu.addItem(metronomeOutputMonoMenuIdBase + channel,
+                                    juce::String("Out ") + juce::String(channel + 1) + " (mono)",
+                                    true,
+                                    selectedMetronomeOutputMono && selectedMetronomeOutputChannel == channel);
+    }
 
     if (standaloneOptionsMenuHandler)
     {
@@ -11673,6 +11848,7 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
     menu.addItem(46, "Enable Sample Pads / Looper", true, audioProcessor.isSamplePadsFeatureEnabled());
     menu.addItem(43, "Ableton Link Audio");
     menu.addSubMenu("Metronome Sound", metronomeSoundMenu);
+    menu.addSubMenu("Metronome Output", metronomeOutputMenu);
     menu.addSubMenu("Transport Sync Source", syncSourceMenu);
     if (isAbletonLiveHost() && !audioProcessor.isStandaloneWrapper())
     {
@@ -11714,6 +11890,24 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
                 resized();
                 repaint();
                 markPersistentSettingsDirty();
+            }
+            constexpr int callbackMetronomeOutputMonoMenuIdBase = 8000;
+            constexpr int callbackMetronomeOutputStereoMenuIdBase = 8200;
+            constexpr int callbackMetronomeOutputCustomSoundMenuIdBase = 9000;
+            constexpr int callbackMetronomeOutputMonoFlag = 1024;
+            if (result >= callbackMetronomeOutputMonoMenuIdBase && result < callbackMetronomeOutputStereoMenuIdBase)
+            {
+                const int channel = result - callbackMetronomeOutputMonoMenuIdBase;
+                audioProcessor.setMetronomeOutputChannel(channel | callbackMetronomeOutputMonoFlag);
+                markPersistentSettingsDirty();
+                return;
+            }
+            if (result >= callbackMetronomeOutputStereoMenuIdBase && result < callbackMetronomeOutputCustomSoundMenuIdBase)
+            {
+                const int pair = result - callbackMetronomeOutputStereoMenuIdBase;
+                audioProcessor.setMetronomeOutputChannel(pair * 2);
+                markPersistentSettingsDirty();
+                return;
             }
             if (result >= 70 && result <= 73)
             {
@@ -12161,108 +12355,61 @@ void UserChannelStrip::paintOverChildren(juce::Graphics& g)
 
 void UserChannelStrip::paint(juce::Graphics& g)
 {
-    auto dbFromPeak = [](float peak)
-    {
-        float p = juce::jlimit(1.0e-6f, 1.0f, peak);
-        return 20.0f * std::log10(p);
-    };
-    auto colourForPeak = [&](float peak)
-    {
-        float db = dbFromPeak(peak);
-        if (peak >= 0.999f) return juce::Colours::red;
-        if (db > -3.0f)     return juce::Colours::orange;
-        return juce::Colours::green;
-    };
-
     g.fillAll(juce::Colours::black.withAlpha(0.45f));
     g.setColour(juce::Colours::black.withAlpha(0.60f));
     g.drawRect(getLocalBounds(), 1);
 
-    const bool multiChan = isMultiChanPeer && numRemoteChannels > 1;
-    // Only show wide per-channel meter bars when collapsed; when expanded the sub-faders show peaks
+    const int remotePeakCount = juce::jlimit(0, kMaxRemoteCh, numRemoteChannels);
+    const bool multiChan = isMultiChanPeer && remotePeakCount > 1;
     const bool showMultiMeter = multiChan && !isExpanded;
 
     if (isHorizontalLayout)
     {
         auto sliderBounds = volumeSlider.getBounds();
-        int meterWidth = 10; // Fixed width to prevent growing/shrinking
-        juce::Rectangle<int> meterBounds(sliderBounds.getRight(), sliderBounds.getY(),
+        constexpr int meterWidth = 18;
+        constexpr int meterGap = 4;
+        juce::Rectangle<int> meterBounds(sliderBounds.getRight() + meterGap, sliderBounds.getY(),
                                          meterWidth, sliderBounds.getHeight());
 
-        g.setColour(juce::Colours::black);
-        g.fillRect(meterBounds);
-
         if (showMultiMeter)
-        {
-            int n   = numRemoteChannels;
-            int bw  = juce::jmax(1, meterBounds.getWidth() / n);
-            int totalH = meterBounds.getHeight();
-            for (int ch = 0; ch < n; ++ch)
-            {
-                float peak = channelPeaks[ch];
-                int h = (int)(totalH * juce::jmin(peak, 1.0f));
-                if (h > 0)
-                {
-                    juce::Rectangle<int> bar(meterBounds.getX() + ch * bw,
-                                             meterBounds.getBottom() - h,
-                                             bw - 1, h);
-                    g.setColour(colourForPeak(peak));
-                    g.fillRect(bar);
-                }
-            }
-        }
+            MasterPeakMeter::drawVerticalMultiMeter(g, meterBounds, channelPeaks, remotePeakCount);
         else
-        {
-            auto meterL = meterBounds.removeFromLeft(meterBounds.getWidth() / 2);
-            auto meterR = meterBounds;
-
-            int hL = (int)(meterL.getHeight() * juce::jmin(currentPeakL, 1.0f));
-            int hR = (int)(meterR.getHeight() * juce::jmin(currentPeakR, 1.0f));
-
-            if (hL > 0) { auto bar = meterL.removeFromBottom(hL); g.setColour(colourForPeak(currentPeakL)); g.fillRect(bar); }
-            if (hR > 0) { auto bar = meterR.removeFromBottom(hR); g.setColour(colourForPeak(currentPeakR)); g.fillRect(bar); }
-        }
+            MasterPeakMeter::drawVerticalStereoMeter(g, meterBounds, currentPeakL, currentPeakR);
     }
     else
     {
         auto sliderBounds = volumeSlider.getBounds();
-        int meterHeight = 6; // Fixed height to prevent growing/shrinking
+        constexpr int meterHeight = 8;
         juce::Rectangle<int> meterBounds(sliderBounds.getX(), sliderBounds.getBottom(),
                                          sliderBounds.getWidth(), meterHeight);
 
-        g.setColour(juce::Colours::black);
-        g.fillRect(meterBounds);
-
         if (showMultiMeter)
-        {
-            int n   = numRemoteChannels;
-            int bh  = juce::jmax(1, meterBounds.getHeight() / n);
-            int totalW = meterBounds.getWidth();
-            for (int ch = 0; ch < n; ++ch)
-            {
-                float peak = channelPeaks[ch];
-                int w = (int)(totalW * juce::jmin(peak, 1.0f));
-                if (w > 0)
-                {
-                    juce::Rectangle<int> bar(meterBounds.getX(),
-                                             meterBounds.getY() + ch * bh,
-                                             w, bh - 1);
-                    g.setColour(colourForPeak(peak));
-                    g.fillRect(bar);
-                }
-            }
-        }
+            MasterPeakMeter::drawHorizontalMultiMeter(g, meterBounds, channelPeaks, remotePeakCount);
         else
-        {
-            int w = meterBounds.getWidth();
-            float maxP = juce::jmax(currentPeakL, currentPeakR);
-            int wP = (int)(w * juce::jmin(maxP, 1.0f));
+            MasterPeakMeter::drawHorizontalStereoMeter(g, meterBounds, currentPeakL, currentPeakR);
+    }
 
-            if (wP > 0)
+    if (isExpanded && multiChan)
+    {
+        for (int ch = 0; ch < remotePeakCount; ++ch)
+        {
+            if (!channelSliders[ch].isVisible())
+                continue;
+
+            auto sliderBounds = channelSliders[ch].getBounds();
+            if (isHorizontalLayout)
             {
-                auto bar = meterBounds.removeFromLeft(wP);
-                g.setColour(colourForPeak(maxP));
-                g.fillRect(bar);
+                constexpr int meterWidth = 8;
+                juce::Rectangle<int> meterBounds(sliderBounds.getRight() + 1, sliderBounds.getY(),
+                                                 meterWidth, sliderBounds.getHeight());
+                MasterPeakMeter::drawVerticalMonoMeter(g, meterBounds, channelPeaks[ch]);
+            }
+            else
+            {
+                constexpr int meterHeight = 8;
+                juce::Rectangle<int> meterBounds(sliderBounds.getX(), sliderBounds.getBottom() + 1,
+                                                 sliderBounds.getWidth(), meterHeight);
+                MasterPeakMeter::drawHorizontalMonoMeter(g, meterBounds, channelPeaks[ch]);
             }
         }
     }
@@ -12271,11 +12418,12 @@ void UserChannelStrip::paint(juce::Graphics& g)
 void UserChannelStrip::resized()
 {
     auto area = getLocalBounds().reduced(2);
+    const int remoteChannelCount = juce::jlimit(0, kMaxRemoteCh, numRemoteChannels);
 
     if (isHorizontalLayout)
     {
         // When multichan is expanded, restrict main strip to the left column
-        if (isExpanded && isMultiChanPeer && numRemoteChannels > 1)
+        if (isExpanded && isMultiChanPeer && remoteChannelCount > 1)
             area.setWidth(56); // 60px column minus 2px margin each side
 
         nameLabel.setBounds(area.removeFromTop(18));
@@ -12288,9 +12436,13 @@ void UserChannelStrip::resized()
         panSlider.setBounds(area.removeFromTop(20).reduced(4, 2));
 
         int sliderWidth  = juce::jmin(20, area.getWidth());
+        constexpr int meterWidth = 18;
+        constexpr int meterGap = 4;
         int sliderHeight = (int)(area.getHeight() * 0.85f);
         int sliderY      = area.getY() + (area.getHeight() - sliderHeight) / 2;
-        volumeSlider.setBounds(area.getCentreX() - sliderWidth / 2, sliderY, sliderWidth, sliderHeight);
+        int groupWidth   = sliderWidth + meterGap + meterWidth;
+        int sliderX      = area.getX() + juce::jmax(0, (area.getWidth() - groupWidth) / 2);
+        volumeSlider.setBounds(sliderX, sliderY, sliderWidth, sliderHeight);
         volumeSlider.setSliderStyle(juce::Slider::LinearVertical);
         dbLabel.setBounds(dbArea);
         dbLabel.setVisible(true);
@@ -12308,23 +12460,25 @@ void UserChannelStrip::resized()
         }
 
         // Per-channel faders as side columns to the right of main strip when expanded
-        if (isExpanded && isMultiChanPeer && numRemoteChannels > 1)
+        if (isExpanded && isMultiChanPeer && remoteChannelCount > 1)
         {
             auto subArea = getLocalBounds().reduced(2);
             subArea.removeFromLeft(60); // skip the narrower main column when expanded
             int colW = 36;
-            for (int i = 0; i < numRemoteChannels; ++i)
+            for (int i = 0; i < remoteChannelCount; ++i)
             {
                 auto col = subArea.removeFromLeft(colW);
                 // Name label at top (18px), slider fills rest
                 channelNameLabels[i].setBounds(col.removeFromTop(18).reduced(1, 0));
                 channelNameLabels[i].setVisible(true);
                 col.reduce(2, 4);
-                channelSliders[i].setBounds(col);
+                auto sliderCol = col;
+                sliderCol.removeFromRight(9);
+                channelSliders[i].setBounds(sliderCol);
                 channelSliders[i].setSliderStyle(juce::Slider::LinearVertical);
                 channelSliders[i].setVisible(true);
             }
-            for (int i = numRemoteChannels; i < kMaxRemoteCh; ++i)
+            for (int i = remoteChannelCount; i < kMaxRemoteCh; ++i)
             {
                 channelSliders[i].setVisible(false);
                 channelNameLabels[i].setVisible(false);
@@ -12343,7 +12497,7 @@ void UserChannelStrip::resized()
     {
         // List layout (strip is horizontal)
         // When multichan is expanded, restrict main strip to the top row
-        if (isExpanded && isMultiChanPeer && numRemoteChannels > 1)
+        if (isExpanded && isMultiChanPeer && remoteChannelCount > 1)
             area.setHeight(36); // 40px base minus 2px padding top/bottom
         // Reserve 18px at right for expand button if this is a multichan peer
         if (isMultiChanPeer)
@@ -12365,7 +12519,7 @@ void UserChannelStrip::resized()
         panSlider.setBounds(area.removeFromRight(40));
 
         // Leave a fixed room for the meter rows at the bottom of the main strip
-        int meterH = 6;
+        int meterH = 8;
         area.removeFromBottom(meterH);
         int sliderHeight = juce::jmin(18, area.getHeight());
         volumeSlider.setBounds(area.getX(), area.getCentreY() - sliderHeight / 2, area.getWidth(), sliderHeight);
@@ -12373,23 +12527,25 @@ void UserChannelStrip::resized()
         dbLabel.setVisible(false);
 
         // Per-channel rows below the main strip when expanded
-        if (isExpanded && isMultiChanPeer && numRemoteChannels > 1)
+        if (isExpanded && isMultiChanPeer && remoteChannelCount > 1)
         {
             auto expandArea = getLocalBounds().reduced(2);
             expandArea.removeFromTop(40); // skip the main strip row
             int rowH = 36;
-            for (int i = 0; i < numRemoteChannels; ++i)
+            for (int i = 0; i < remoteChannelCount; ++i)
             {
                 auto row = expandArea.removeFromTop(rowH);
                 row.removeFromLeft(6);
                 // Left 80px: channel name; rest: slider
                 channelNameLabels[i].setBounds(row.removeFromLeft(80));
                 channelNameLabels[i].setVisible(true);
-                channelSliders[i].setBounds(row.reduced(0, 2));
+                auto sliderRow = row.reduced(0, 2);
+                sliderRow.removeFromBottom(9);
+                channelSliders[i].setBounds(sliderRow);
                 channelSliders[i].setSliderStyle(juce::Slider::LinearHorizontal);
                 channelSliders[i].setVisible(true);
             }
-            for (int i = numRemoteChannels; i < kMaxRemoteCh; ++i)
+            for (int i = remoteChannelCount; i < kMaxRemoteCh; ++i)
             {
                 channelSliders[i].setVisible(false);
                 channelNameLabels[i].setVisible(false);
@@ -12409,15 +12565,17 @@ void UserChannelStrip::resized()
 int UserChannelStrip::getPreferredHeight() const
 {
     int base = 40;
-    if (!isHorizontalLayout && isExpanded && isMultiChanPeer && numRemoteChannels > 1)
-        return base + numRemoteChannels * 36;
+    const int remoteChannelCount = juce::jlimit(0, kMaxRemoteCh, numRemoteChannels);
+    if (!isHorizontalLayout && isExpanded && isMultiChanPeer && remoteChannelCount > 1)
+        return base + remoteChannelCount * 36;
     return base;
 }
 
 int UserChannelStrip::getPreferredWidth() const
 {
-    if (isHorizontalLayout && isExpanded && isMultiChanPeer && numRemoteChannels > 1)
-        return 60 + numRemoteChannels * 36; // narrower main + wider sub-channels
+    const int remoteChannelCount = juce::jlimit(0, kMaxRemoteCh, numRemoteChannels);
+    if (isHorizontalLayout && isExpanded && isMultiChanPeer && remoteChannelCount > 1)
+        return 60 + remoteChannelCount * 36; // narrower main + wider sub-channels
     return 80;
 }
 
@@ -12604,9 +12762,10 @@ void UserChannelStrip::timerCallback()
     }
 
     // Update per-NINJAM-channel peaks for multichan peers (used by collapsed multi-meter + expanded rows)
-    if (isMultiChanPeer && numRemoteChannels > 1)
+    const int remoteChannelCount = juce::jlimit(0, kMaxRemoteCh, numRemoteChannels);
+    if (isMultiChanPeer && remoteChannelCount > 1)
     {
-        for (int ch = 0; ch < numRemoteChannels; ++ch)
+        for (int ch = 0; ch < remoteChannelCount; ++ch)
         {
             // NINJAM ch0 = Vorbis mixdown; individual channels start at ch1
             float chPeak = processor.getUserChannelPeak(userIndex, ch + 1, -1); // -1 = both/max
@@ -12752,9 +12911,10 @@ void UserChannelStrip::applyVolumesToProcessor()
     bool solo  = soloButton.getToggleState();
     processor.setUserLevel(userIndex, mv, pan, mute, solo);
     // Re-apply per-channel gain overrides for multichan peers
-    if (isMultiChanPeer && numRemoteChannels > 1)
+    const int remoteChannelCount = juce::jlimit(0, kMaxRemoteCh, numRemoteChannels);
+    if (isMultiChanPeer && remoteChannelCount > 1)
     {
-        for (int ch = 0; ch < numRemoteChannels; ++ch)
+        for (int ch = 0; ch < remoteChannelCount; ++ch)
             // NINJAM ch0 = Vorbis mixdown; individual channels start at ch1
             processor.setUserNjChannelVolume(userIndex, ch + 1, mv * perChannelGain[ch]);
     }

@@ -825,39 +825,276 @@ public:
 
     void paint(juce::Graphics& g) override
     {
-        auto bounds = getLocalBounds();
-        g.fillAll(juce::Colours::black);
+        drawVerticalStereoMeter(g, getLocalBounds(), peakL, peakR);
+    }
 
-        auto gap = 1;
-        auto barWidth = juce::jmax(1, (bounds.getWidth() - gap) / 2);
-        auto leftBar = bounds.removeFromLeft(barWidth);
-        bounds.removeFromLeft(gap);
-        auto rightBar = bounds;
+    static constexpr float meterMinDb = -60.0f;
+    static constexpr float meterMaxDb = 0.0f;
+    static constexpr int numSegments = 22;
 
-        auto drawBar = [&g] (juce::Rectangle<int> barBounds, float peak)
+    static float peakToDb(float peak)
+    {
+        return 20.0f * std::log10(juce::jlimit(1.0e-6f, 1.0f, peak));
+    }
+
+    static float dbToMeterProportion(float db)
+    {
+        return juce::jmap(juce::jlimit(meterMinDb, meterMaxDb, db),
+                          meterMinDb, meterMaxDb,
+                          0.0f, 1.0f);
+    }
+
+    static float meterProportionToDb(float proportion)
+    {
+        return juce::jmap(juce::jlimit(0.0f, 1.0f, proportion),
+                          0.0f, 1.0f,
+                          meterMinDb, meterMaxDb);
+    }
+
+    static juce::Colour colourForDb(float db)
+    {
+        if (db >= -6.0f)
+            return juce::Colour(0xffff1f1f);
+        if (db >= -18.0f)
+            return juce::Colour(0xffffff26);
+        return juce::Colour(0xff20ff37);
+    }
+
+    static int yForDb(juce::Rectangle<int> bounds, float db)
+    {
+        const int y = bounds.getBottom() - juce::roundToInt((float)bounds.getHeight() * dbToMeterProportion(db));
+        return juce::jlimit(bounds.getY(), bounds.getBottom() - 1, y);
+    }
+
+    static int xForDb(juce::Rectangle<int> bounds, float db)
+    {
+        const int x = bounds.getX() + juce::roundToInt((float)bounds.getWidth() * dbToMeterProportion(db));
+        return juce::jlimit(bounds.getX(), bounds.getRight() - 1, x);
+    }
+
+    static void drawVerticalMonoMeter(juce::Graphics& g, juce::Rectangle<int> bounds, float peak)
+    {
+        if (bounds.isEmpty())
+            return;
+
+        g.setColour(juce::Colours::black);
+        g.fillRect(bounds);
+
+        auto meterBounds = bounds.reduced(1, 1);
+        drawBar(g, meterBounds, peak);
+        drawDbTicks(g, meterBounds);
+    }
+
+    static void drawVerticalStereoMeter(juce::Graphics& g, juce::Rectangle<int> bounds, float leftPeak, float rightPeak)
+    {
+        if (bounds.isEmpty())
+            return;
+
+        g.setColour(juce::Colours::black);
+        g.fillRect(bounds);
+
+        auto meterBounds = bounds.reduced(1, 1);
+        const int gap = meterBounds.getWidth() >= 8 ? 2 : 1;
+        const int barWidth = juce::jmax(1, (meterBounds.getWidth() - gap) / 2);
+        auto leftBar = meterBounds.removeFromLeft(barWidth);
+        meterBounds.removeFromLeft(juce::jmin(gap, meterBounds.getWidth()));
+        auto rightBar = meterBounds;
+        if (rightBar.isEmpty())
+            rightBar = leftBar;
+
+        const auto fullMeterBounds = leftBar.getUnion(rightBar);
+        drawBar(g, leftBar, leftPeak);
+        drawBar(g, rightBar, rightPeak);
+        drawDbTicks(g, fullMeterBounds);
+    }
+
+    static void drawVerticalMultiMeter(juce::Graphics& g, juce::Rectangle<int> bounds, const float* peaks, int numPeaks)
+    {
+        if (bounds.isEmpty() || peaks == nullptr || numPeaks <= 0)
+            return;
+
+        g.setColour(juce::Colours::black);
+        g.fillRect(bounds);
+
+        auto meterBounds = bounds.reduced(1, 1);
+        const int count = juce::jmax(1, numPeaks);
+        const int gap = meterBounds.getWidth() >= count * 3 ? 1 : 0;
+        const int barWidth = juce::jmax(1, (meterBounds.getWidth() - gap * (count - 1)) / count);
+        int x = meterBounds.getX();
+        for (int i = 0; i < count; ++i)
         {
-            float safePeak = juce::jlimit(1.0e-6f, 1.0f, peak);
-            float db = 20.0f * std::log10(safePeak);
+            juce::Rectangle<int> barBounds(x, meterBounds.getY(), barWidth, meterBounds.getHeight());
+            drawBar(g, barBounds, peaks[i]);
+            x += barWidth + gap;
+            if (x >= meterBounds.getRight())
+                break;
+        }
 
-            juce::Colour colour;
-            if (db >= 0.0f) colour = juce::Colours::red;
-            else if (db > -6.0f) colour = juce::Colours::yellow;
-            else colour = juce::Colours::green;
+        drawDbTicks(g, meterBounds);
+    }
 
-            int filled = (int)(barBounds.getHeight() * safePeak);
-            if (filled <= 0)
-                return;
+    static void drawHorizontalMonoMeter(juce::Graphics& g, juce::Rectangle<int> bounds, float peak)
+    {
+        if (bounds.isEmpty())
+            return;
 
-            juce::Rectangle<int> fill(barBounds.getX(), barBounds.getBottom() - filled, barBounds.getWidth(), filled);
-            g.setColour(colour);
-            g.fillRect(fill);
-        };
+        g.setColour(juce::Colours::black);
+        g.fillRect(bounds);
 
-        drawBar(leftBar, peakL);
-        drawBar(rightBar, peakR);
+        auto meterBounds = bounds.reduced(1, 1);
+        drawHorizontalBar(g, meterBounds, peak);
+        drawHorizontalDbTicks(g, meterBounds);
+    }
+
+    static void drawHorizontalStereoMeter(juce::Graphics& g, juce::Rectangle<int> bounds, float leftPeak, float rightPeak)
+    {
+        if (bounds.isEmpty())
+            return;
+
+        g.setColour(juce::Colours::black);
+        g.fillRect(bounds);
+
+        auto meterBounds = bounds.reduced(1, 1);
+        const int gap = meterBounds.getHeight() >= 6 ? 1 : 0;
+        const int barHeight = juce::jmax(1, (meterBounds.getHeight() - gap) / 2);
+        auto topBar = meterBounds.removeFromTop(barHeight);
+        meterBounds.removeFromTop(juce::jmin(gap, meterBounds.getHeight()));
+        auto bottomBar = meterBounds;
+        if (bottomBar.isEmpty())
+            bottomBar = topBar;
+
+        const auto fullMeterBounds = topBar.getUnion(bottomBar);
+        drawHorizontalBar(g, topBar, leftPeak);
+        drawHorizontalBar(g, bottomBar, rightPeak);
+        drawHorizontalDbTicks(g, fullMeterBounds);
+    }
+
+    static void drawHorizontalMultiMeter(juce::Graphics& g, juce::Rectangle<int> bounds, const float* peaks, int numPeaks)
+    {
+        if (bounds.isEmpty() || peaks == nullptr || numPeaks <= 0)
+            return;
+
+        g.setColour(juce::Colours::black);
+        g.fillRect(bounds);
+
+        auto meterBounds = bounds.reduced(1, 1);
+        const int count = juce::jmax(1, numPeaks);
+        const int gap = meterBounds.getHeight() >= count * 3 ? 1 : 0;
+        const int barHeight = juce::jmax(1, (meterBounds.getHeight() - gap * (count - 1)) / count);
+        int y = meterBounds.getY();
+        for (int i = 0; i < count; ++i)
+        {
+            juce::Rectangle<int> barBounds(meterBounds.getX(), y, meterBounds.getWidth(), barHeight);
+            drawHorizontalBar(g, barBounds, peaks[i]);
+            y += barHeight + gap;
+            if (y >= meterBounds.getBottom())
+                break;
+        }
+
+        drawHorizontalDbTicks(g, meterBounds);
     }
 
 private:
+    static void drawBar(juce::Graphics& g, juce::Rectangle<int> barBounds, float peak)
+    {
+        if (barBounds.isEmpty())
+            return;
+
+        const float fillProportion = dbToMeterProportion(peakToDb(peak));
+        const float slotHeight = (float)barBounds.getHeight() / (float)numSegments;
+
+        for (int i = 0; i < numSegments; ++i)
+        {
+            const float segmentBottom = (float)barBounds.getBottom() - (float)i * slotHeight;
+            const float segmentTop = (float)barBounds.getBottom() - (float)(i + 1) * slotHeight;
+            const int y = juce::roundToInt(segmentTop + 1.0f);
+            const int h = juce::jmax(1, juce::roundToInt(segmentBottom - segmentTop - 1.0f));
+            const auto segment = juce::Rectangle<int>(barBounds.getX(), y, barBounds.getWidth(), h);
+
+            const float segmentProportion = ((float)i + 0.5f) / (float)numSegments;
+            const juce::Colour base = colourForDb(meterProportionToDb(segmentProportion));
+            const bool lit = segmentProportion <= fillProportion;
+
+            if (lit && h > 2)
+            {
+                g.setColour(base.withAlpha(0.16f));
+                g.fillRoundedRectangle(segment.toFloat().expanded(1.0f, 0.5f), 1.6f);
+            }
+
+            g.setColour(lit ? base.withAlpha(0.96f)
+                            : base.withMultipliedBrightness(0.36f).withAlpha(0.20f));
+            g.fillRoundedRectangle(segment.toFloat(), 1.2f);
+        }
+    }
+
+    static void drawHorizontalBar(juce::Graphics& g, juce::Rectangle<int> barBounds, float peak)
+    {
+        if (barBounds.isEmpty())
+            return;
+
+        const float fillProportion = dbToMeterProportion(peakToDb(peak));
+        const float slotWidth = (float)barBounds.getWidth() / (float)numSegments;
+
+        for (int i = 0; i < numSegments; ++i)
+        {
+            const float segmentLeft = (float)barBounds.getX() + (float)i * slotWidth;
+            const float segmentRight = (float)barBounds.getX() + (float)(i + 1) * slotWidth;
+            const int x = juce::roundToInt(segmentLeft + 1.0f);
+            const int w = juce::jmax(1, juce::roundToInt(segmentRight - segmentLeft - 1.0f));
+            const auto segment = juce::Rectangle<int>(x, barBounds.getY(), w, barBounds.getHeight());
+
+            const float segmentProportion = ((float)i + 0.5f) / (float)numSegments;
+            const juce::Colour base = colourForDb(meterProportionToDb(segmentProportion));
+            const bool lit = segmentProportion <= fillProportion;
+
+            if (lit && w > 2)
+            {
+                g.setColour(base.withAlpha(0.16f));
+                g.fillRoundedRectangle(segment.toFloat().expanded(0.5f, 1.0f), 1.4f);
+            }
+
+            g.setColour(lit ? base.withAlpha(0.96f)
+                            : base.withMultipliedBrightness(0.36f).withAlpha(0.20f));
+            g.fillRoundedRectangle(segment.toFloat(), 1.0f);
+        }
+    }
+
+    static void drawDbTicks(juce::Graphics& g, juce::Rectangle<int> meterBounds)
+    {
+        static constexpr float ticks[] { 0.0f, -3.0f, -6.0f, -12.0f, -18.0f, -24.0f, -36.0f, -48.0f, -60.0f };
+
+        for (float db : ticks)
+        {
+            const int y = yForDb(meterBounds, db);
+            const bool major = db == 0.0f || db == -6.0f || db == -12.0f || db == -24.0f || db == -60.0f;
+            const int tickLength = major ? juce::jmax(3, meterBounds.getWidth() / 3)
+                                         : juce::jmax(2, meterBounds.getWidth() / 5);
+            const float fy = (float)y + 0.5f;
+
+            g.setColour((db >= -3.0f ? juce::Colours::red : juce::Colours::white).withAlpha(major ? 0.38f : 0.24f));
+            g.drawLine((float)meterBounds.getX(), fy, (float)(meterBounds.getX() + tickLength), fy, 1.0f);
+            g.drawLine((float)(meterBounds.getRight() - tickLength), fy, (float)meterBounds.getRight(), fy, 1.0f);
+        }
+    }
+
+    static void drawHorizontalDbTicks(juce::Graphics& g, juce::Rectangle<int> meterBounds)
+    {
+        static constexpr float ticks[] { 0.0f, -3.0f, -6.0f, -12.0f, -18.0f, -24.0f, -36.0f, -48.0f, -60.0f };
+
+        for (float db : ticks)
+        {
+            const int x = xForDb(meterBounds, db);
+            const bool major = db == 0.0f || db == -6.0f || db == -12.0f || db == -24.0f || db == -60.0f;
+            const int tickLength = major ? juce::jmax(2, meterBounds.getHeight() / 2)
+                                         : juce::jmax(1, meterBounds.getHeight() / 3);
+            const float fx = (float)x + 0.5f;
+
+            g.setColour((db >= -3.0f ? juce::Colours::red : juce::Colours::white).withAlpha(major ? 0.38f : 0.24f));
+            g.drawLine(fx, (float)meterBounds.getY(), fx, (float)(meterBounds.getY() + tickLength), 1.0f);
+            g.drawLine(fx, (float)(meterBounds.getBottom() - tickLength), fx, (float)meterBounds.getBottom(), 1.0f);
+        }
+    }
+
     float peakL = 0.0f;
     float peakR = 0.0f;
 };

@@ -98,6 +98,8 @@ public:
     bool isMetronomeMuted() const;
     void setStoredMetronomeVolume(float vol);
     float getStoredMetronomeVolume() const;
+    void setMetronomeOutputChannel(int outputChannel);
+    int getMetronomeOutputChannel() const;
     static juce::String getClassicMetronomeSoundKey();
     static juce::String getSoftBeepMetronomeSoundKey();
     static juce::String getSoftTickMetronomeSoundKey();
@@ -328,6 +330,8 @@ public:
     void setSamplePadName(int padIndex, const juce::String& name);
     int getSamplePadLoopLengthBeats(int padIndex) const;
     float getSamplePadLoopProgress(int padIndex) const;
+    float getSamplePadRecordStartCountdownProgress(int padIndex) const;
+    int getSamplePadRecordStartCountdownBeats(int padIndex) const;
     int getSamplePadTriggerFlashCounter(int padIndex) const;
     bool triggerSamplePadForMidiNote(int noteNumber);
     bool handleSamplePadMidiNote(int noteNumber, bool isNoteOn);
@@ -359,6 +363,9 @@ public:
     SamplePadDuckLength getSamplePadDuckLength() const;
     void setSamplePadsUseDefaultFx(bool shouldUse);
     bool getSamplePadsUseDefaultFx() const;
+    void setSamplePadMonitorModeEnabled(bool shouldEnable);
+    bool isSamplePadMonitorModeEnabled() const;
+    bool isSamplePadFxSlotInUseForLocalRoute(int slotIndex) const;
     void setSamplePadDuckRouteEnabled(int padIndex, bool shouldEnable);
     bool isSamplePadDuckRouteEnabled(int padIndex) const;
     void setSamplePadFxSlotRouteEnabled(int padIndex, int slotIndex, bool shouldEnable);
@@ -633,6 +640,7 @@ private:
     int lastStatus = 0;
     std::atomic<bool> metronomeMuted { false };
     std::atomic<float> storedMetronomeVolume { 1.0f };
+    std::atomic<int> metronomeOutputChannel { 0 };
     enum class MetronomeSoundMode : int
     {
         classic = 0,
@@ -718,6 +726,7 @@ private:
     {
         bool active = false;
         double position = 0.0;
+        bool routeToLocal = true;
     };
 
     struct SamplePadState
@@ -759,6 +768,8 @@ private:
         std::array<std::atomic<bool>, numSamplePadFxSlots> fxSlotRoutes {};
         std::atomic<bool> playing { false };
         std::atomic<bool> playbackScheduled { false };
+        std::atomic<bool> mainVoiceRouteToLocal { true };
+        bool scheduledPlaybackRouteToLocal = true;
         std::atomic<bool> recordArmed { false };
         std::atomic<bool> recordPendingStart { false };
         std::atomic<bool> recordPendingStop { false };
@@ -776,6 +787,7 @@ private:
         double lastAcceptedPressMs = -1000.0;
         double scheduledStartBeat = 0.0;
         double recordScheduledStartBeat = 0.0;
+        double recordScheduledCountdownBeats = 0.0;
         double recordScheduledStopBeat = 0.0;
         double loopAnchorBeat = 0.0;
         double undoClearLoopAnchorBeat = 0.0;
@@ -811,27 +823,41 @@ private:
     mutable juce::CriticalSection samplePadsLock;
     std::array<SamplePadState, numSamplePads> samplePads;
     juce::AudioBuffer<float> samplePadsRenderBuffer;
+    juce::AudioBuffer<float> samplePadsMonitorRenderBuffer;
     juce::AudioBuffer<float> samplePadsOneShotRenderBuffer;
     juce::AudioBuffer<float> samplePadRemoteLooperInputBuffer;
+    using SamplePadFilterBank = std::array<std::array<juce::dsp::StateVariableTPTFilter<float>, numSamplePadFxSlots>, numSamplePads>;
+    using SamplePadPhaserBank = std::array<std::array<juce::dsp::Phaser<float>, numSamplePadFxSlots>, numSamplePads>;
+    using SamplePadReverbBank = std::array<std::array<juce::Reverb, numSamplePadFxSlots>, numSamplePads>;
+    using SamplePadFxBufferBank = std::array<std::array<juce::AudioBuffer<float>, numSamplePadFxSlots>, numSamplePads>;
+    using SamplePadDelayWritePositionBank = std::array<std::array<int, numSamplePadFxSlots>, numSamplePads>;
     std::array<std::atomic<int>, numSamplePadFxSlots> samplePadFxSlotTypes;
     std::array<std::atomic<float>, numSamplePadFxSlots> samplePadFxSlotAmounts;
     std::array<std::array<std::atomic<bool>, numSamplePadFxSlots>, numSamplePadFxSlots> samplePadFxSlotChainRoutes;
-    std::array<std::array<juce::dsp::StateVariableTPTFilter<float>, numSamplePadFxSlots>, numSamplePads> samplePadPerPadDjFilters;
-    std::array<std::array<juce::dsp::StateVariableTPTFilter<float>, numSamplePadFxSlots>, numSamplePads> samplePadPerPadDjBpFilters;
-    std::array<std::array<juce::dsp::Phaser<float>, numSamplePadFxSlots>, numSamplePads> samplePadPerPadPhasers;
-    std::array<std::array<juce::Reverb, numSamplePadFxSlots>, numSamplePads> samplePadPerPadReverbs;
-    std::array<std::array<juce::AudioBuffer<float>, numSamplePadFxSlots>, numSamplePads> samplePadPerPadDelayBuffers;
-    std::array<std::array<juce::AudioBuffer<float>, numSamplePadFxSlots>, numSamplePads> samplePadPerPadFxSlotInputBuffers;
+    SamplePadFilterBank samplePadPerPadDjFilters;
+    SamplePadFilterBank samplePadMonitorPerPadDjFilters;
+    SamplePadFilterBank samplePadPerPadDjBpFilters;
+    SamplePadFilterBank samplePadMonitorPerPadDjBpFilters;
+    SamplePadPhaserBank samplePadPerPadPhasers;
+    SamplePadPhaserBank samplePadMonitorPerPadPhasers;
+    SamplePadReverbBank samplePadPerPadReverbs;
+    SamplePadReverbBank samplePadMonitorPerPadReverbs;
+    SamplePadFxBufferBank samplePadPerPadDelayBuffers;
+    SamplePadFxBufferBank samplePadMonitorPerPadDelayBuffers;
+    SamplePadFxBufferBank samplePadPerPadFxSlotInputBuffers;
+    SamplePadFxBufferBank samplePadMonitorPerPadFxSlotInputBuffers;
     juce::AudioBuffer<float> samplePadFxScratchBuffer;
     juce::dsp::Oscillator<float> samplePadDuckOscillator;
     std::vector<float> samplePadDuckGainBuffer;
-    std::array<std::array<int, numSamplePadFxSlots>, numSamplePads> samplePadPerPadDelayWritePositions {};
+    SamplePadDelayWritePositionBank samplePadPerPadDelayWritePositions {};
+    SamplePadDelayWritePositionBank samplePadMonitorPerPadDelayWritePositions {};
     std::atomic<float> samplePadsVolume { 1.0f };
     std::atomic<bool> samplePadsLimiterEnabled { false };
     std::atomic<bool> samplePadsDuckEnabled { false };
     std::atomic<int> samplePadsDuckShape { (int)SamplePadDuckShape::smoothPump };
     std::atomic<int> samplePadsDuckLength { (int)SamplePadDuckLength::quarter };
     std::atomic<bool> samplePadsUseDefaultFx { true };
+    std::atomic<bool> samplePadMonitorModeEnabled { false };
     std::atomic<bool> samplePadsFeatureEnabled { true };
     std::atomic<float> samplePadsPeak { 0.0f };
     std::atomic<int> samplePadLooperInput { looperInputLocalChannel };
@@ -1252,6 +1278,18 @@ private:
                                          int localRightIndex = -1);
     bool renderSamplePads(int numSamples, double blockStartBeat, double samplesPerBeat, int bpi);
     void applySamplePadInsertFx(int numSamples, double blockStartBeat, double samplesPerBeat, int bpi);
+    void processSamplePadInsertFxRoute(int numSamples,
+                                       juce::AudioBuffer<float>& renderBuffer,
+                                       SamplePadFxBufferBank& slotInputBuffers,
+                                       SamplePadFilterBank& djFilters,
+                                       SamplePadFilterBank& djBpFilters,
+                                       SamplePadPhaserBank& phasers,
+                                       SamplePadReverbBank& reverbs,
+                                       SamplePadFxBufferBank& delayBuffers,
+                                       SamplePadDelayWritePositionBank& delayWritePositions,
+                                       double blockStartBeat,
+                                       double samplesPerBeat,
+                                       int bpi);
     float getSamplePadFxSendAmount(SamplePadFxType type) const;
     void resyncLoopedSamplePadsToBpm(double targetBpm);
     void resyncSamplePadToBpm(int padIndex, double targetBpm, bool force);
@@ -1288,6 +1326,5 @@ inline bool NinjamVst3AudioProcessor::isSamplePadWaitingForBpiLoop(int padIndex)
         return false;
 
     const auto& pad = samplePads[(size_t)padIndex];
-    return pad.recordStartScheduled.load(std::memory_order_relaxed)
-        && pad.matchBpi.load(std::memory_order_relaxed);
+    return pad.recordStartScheduled.load(std::memory_order_relaxed);
 }
