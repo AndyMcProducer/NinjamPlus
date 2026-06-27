@@ -5562,7 +5562,7 @@ void NinjamVst3AudioProcessor::clearCustomMetronomeSoundFile()
     const juce::SpinLock::ScopedLockType lock(metronomeCustomSampleLock);
     metronomeCustomSample.setSize(0, 0);
     metronomeCustomSampleRate = 44100.0;
-    metronomeCustomSampleFile = {};
+    metronomeCustomSampleFile = juce::File();
 }
 
 void NinjamVst3AudioProcessor::updateMetronomeEngineVolume()
