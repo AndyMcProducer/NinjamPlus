@@ -12707,8 +12707,33 @@ void NinjamVst3AudioProcessor::requestLoopedSamplePadsResync(double targetBpm)
     if (!isSamplePadsFeatureEnabled() || targetBpm <= 1.0 || !std::isfinite(targetBpm))
         return;
 
+    std::array<bool, numSamplePads> padsToResync {};
+    {
+        const juce::ScopedLock lock(samplePadsLock);
+        for (int padIndex = 0; padIndex < numSamplePads; ++padIndex)
+        {
+            const auto& pad = samplePads[(size_t)padIndex];
+            if (pad.sample.getNumSamples() <= 0
+                || !pad.bpmSyncEnabled.load(std::memory_order_relaxed)
+                || pad.recording.load(std::memory_order_relaxed))
+            {
+                continue;
+            }
+
+            const auto playbackSpeed = sanitizeSamplePadPlaybackSpeed(pad.playbackSpeed.load(std::memory_order_relaxed));
+            const double effectiveTargetBpm = targetBpm * samplePadPlaybackSpeedMultiplier(playbackSpeed);
+            if (effectiveTargetBpm <= 1.0 || !std::isfinite(effectiveTargetBpm))
+                continue;
+            if (pad.bpmSyncApplied && std::abs(pad.lastSyncedTargetBpm - effectiveTargetBpm) < 0.05)
+                continue;
+
+            padsToResync[(size_t)padIndex] = true;
+        }
+    }
+
     for (int pad = 0; pad < numSamplePads; ++pad)
-        enqueueSamplePadResyncJob(pad, targetBpm, false);
+        if (padsToResync[(size_t)pad])
+            enqueueSamplePadResyncJob(pad, targetBpm, false);
 }
 
 void NinjamVst3AudioProcessor::enqueueSamplePadResyncJob(int padIndex, double targetBpm, bool force)
@@ -13055,6 +13080,24 @@ void NinjamVst3AudioProcessor::processSamplePadLooperRecording(int numSamples,
     if (!isSamplePadsFeatureEnabled() || numSamples <= 0)
         return;
 
+    bool hasRecordingWork = false;
+    {
+        const juce::ScopedLock lock(samplePadsLock);
+        for (const auto& pad : samplePads)
+        {
+            if (pad.recording.load(std::memory_order_relaxed)
+                || pad.recordPendingStart.load(std::memory_order_relaxed)
+                || pad.recordPendingStop.load(std::memory_order_relaxed)
+                || pad.recordStartScheduled.load(std::memory_order_relaxed))
+            {
+                hasRecordingWork = true;
+                break;
+            }
+        }
+    }
+    if (!hasRecordingWork)
+        return;
+
     const float* srcL = nullptr;
     const float* srcR = nullptr;
     const int input = samplePadLooperInput.load(std::memory_order_relaxed);
@@ -13385,6 +13428,49 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
 {
     if (!isSamplePadsFeatureEnabled() || numSamples <= 0)
     {
+        samplePadsPeak.store(0.0f, std::memory_order_relaxed);
+        return false;
+    }
+
+    bool hasRenderWork = false;
+    {
+        const juce::ScopedLock lock(samplePadsLock);
+        for (const auto& pad : samplePads)
+        {
+            bool hasActiveOneShot = pad.activeOneShotVoices.load(std::memory_order_relaxed) > 0;
+            if (!hasActiveOneShot)
+            {
+                for (const auto& voice : pad.oneShotVoices)
+                {
+                    if (voice.active)
+                    {
+                        hasActiveOneShot = true;
+                        break;
+                    }
+                }
+            }
+
+            if (pad.playing.load(std::memory_order_relaxed)
+                || pad.playbackScheduled.load(std::memory_order_relaxed)
+                || hasActiveOneShot)
+            {
+                hasRenderWork = true;
+                break;
+            }
+        }
+    }
+    if (!hasRenderWork)
+    {
+        auto clearOrResizeStereoBuffer = [numSamples](juce::AudioBuffer<float>& target)
+        {
+            if (target.getNumChannels() < 2 || target.getNumSamples() < numSamples)
+                target.setSize(2, numSamples, false, true, true);
+            target.clear(0, 0, numSamples);
+            target.clear(1, 0, numSamples);
+        };
+        clearOrResizeStereoBuffer(samplePadsRenderBuffer);
+        clearOrResizeStereoBuffer(samplePadsMonitorRenderBuffer);
+        clearOrResizeStereoBuffer(samplePadsOneShotRenderBuffer);
         samplePadsPeak.store(0.0f, std::memory_order_relaxed);
         return false;
     }
@@ -15111,12 +15197,27 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         const juce::ScopedLock lock(samplePadsLock);
         for (const auto& pad : samplePads)
         {
-            if (pad.sample.getNumSamples() > 0
-                || pad.recordArmed.load(std::memory_order_relaxed)
+            bool hasActiveOneShot = pad.activeOneShotVoices.load(std::memory_order_relaxed) > 0;
+            if (!hasActiveOneShot)
+            {
+                for (const auto& voice : pad.oneShotVoices)
+                {
+                    if (voice.active)
+                    {
+                        hasActiveOneShot = true;
+                        break;
+                    }
+                }
+            }
+
+            if (pad.recordArmed.load(std::memory_order_relaxed)
                 || pad.recording.load(std::memory_order_relaxed)
                 || pad.recordPendingStart.load(std::memory_order_relaxed)
+                || pad.recordPendingStop.load(std::memory_order_relaxed)
+                || pad.recordStartScheduled.load(std::memory_order_relaxed)
                 || pad.playbackScheduled.load(std::memory_order_relaxed)
-                || pad.playing.load(std::memory_order_relaxed))
+                || pad.playing.load(std::memory_order_relaxed)
+                || hasActiveOneShot)
             {
                 samplePadsNeedLocalSlot = true;
                 break;
@@ -15875,12 +15976,10 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
                 }
                 else
                 {
-                    constexpr float monoToStereoSplitGain = 0.70710678118f;
-                    const float outputGain = outChans > 1 ? gain * monoToStereoSplitGain : gain;
                     if (outLeft < outChans)
-                        mainBus.addFrom(outLeft, 0, tempInputBuffer, sourceLeft, 0, numSamples, outputGain);
+                        mainBus.addFrom(outLeft, 0, tempInputBuffer, sourceLeft, 0, numSamples, gain);
                     if (outRight < outChans)
-                        mainBus.addFrom(outRight, 0, tempInputBuffer, sourceLeft, 0, numSamples, outputGain);
+                        mainBus.addFrom(outRight, 0, tempInputBuffer, sourceLeft, 0, numSamples, gain);
                     else if (outLeft == 0 && outChans == 1)
                         mainBus.addFrom(0, 0, tempInputBuffer, sourceLeft, 0, numSamples, gain);
                 }
@@ -15931,10 +16030,8 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
             const int linkRight = linkInputChannels > 1 ? totalInputChannels + 1 : linkLeft;
             if (outputChannels > 1)
             {
-                constexpr float monoToStereoSplitGain = 0.70710678118f;
-                const float linkGain = linkInputChannels > 1 ? 1.0f : monoToStereoSplitGain;
-                mainBus.addFrom(0, 0, tempInputBuffer, linkLeft, 0, numSamples, linkGain);
-                mainBus.addFrom(1, 0, tempInputBuffer, linkRight, 0, numSamples, linkGain);
+                mainBus.addFrom(0, 0, tempInputBuffer, linkLeft, 0, numSamples);
+                mainBus.addFrom(1, 0, tempInputBuffer, linkRight, 0, numSamples);
             }
             else if (outputChannels == 1)
             {

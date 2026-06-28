@@ -1466,6 +1466,8 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
         g.drawRect(track);
 
         int tickX = track.getRight() + 6;
+        const float sliderTop = juce::jmin(minSliderPos, maxSliderPos);
+        const float sliderBottom = juce::jmax(minSliderPos, maxSliderPos);
 
         if (isDbThresholdFader(slider))
         {
@@ -1477,7 +1479,7 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
             {
                 const double value = juce::jlimit(minDb, maxDb, db);
                 const float prop = juce::jlimit(0.0f, 1.0f, (float)slider.valueToProportionOfLength(value));
-                const int yPos = track.getY() + (int)((1.0f - prop) * (float)track.getHeight());
+                const int yPos = juce::roundToInt(juce::jmap(prop, 0.0f, 1.0f, sliderBottom, sliderTop));
                 const bool major = db == maxDb || db == minDb;
                 const int labelY = juce::jlimit(bounds.getY(), bounds.getBottom() - 14, yPos - 7);
 
@@ -1505,7 +1507,7 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
             float clampedGain = juce::jlimit(1.0e-6f, 2.0f, gain);
             float db = 20.0f * std::log10(clampedGain);
 
-            int yPos = track.getY() + (int)((1.0f - prop) * (float)track.getHeight());
+            int yPos = juce::roundToInt(juce::jmap(prop, 0.0f, 1.0f, sliderBottom, sliderTop));
 
             float alpha = 0.7f;
             if (i == numTicksBelowZero) alpha = 0.95f;
@@ -1542,6 +1544,8 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
 
         g.setColour(juce::Colours::black);
         g.drawRect(track);
+        const float sliderLeft = juce::jmin(minSliderPos, maxSliderPos);
+        const float sliderRight = juce::jmax(minSliderPos, maxSliderPos);
 
         if (isDbThresholdFader(slider))
         {
@@ -1553,7 +1557,7 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
             {
                 const double value = juce::jlimit(minDb, maxDb, db);
                 const float prop = juce::jlimit(0.0f, 1.0f, (float)slider.valueToProportionOfLength(value));
-                const int xPos = track.getX() + (int)(prop * (float)track.getWidth());
+                const int xPos = juce::roundToInt(juce::jmap(prop, 0.0f, 1.0f, sliderLeft, sliderRight));
                 const bool major = db == maxDb || db == minDb;
 
                 g.setColour(juce::Colours::lightgrey.withAlpha(major ? 0.92f : 0.68f));
@@ -1585,7 +1589,7 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
             float clampedGain = juce::jlimit(1.0e-6f, 2.0f, gain);
             float db = 20.0f * std::log10(clampedGain);
 
-            int xPos = track.getX() + (int)(prop * (float)track.getWidth());
+            int xPos = juce::roundToInt(juce::jmap(prop, 0.0f, 1.0f, sliderLeft, sliderRight));
 
             float alpha = 0.7f;
             if (i == numTicksBelowZero) alpha = 0.95f;
@@ -1631,7 +1635,7 @@ void FaderLookAndFeel::drawLinearSlider(juce::Graphics& g, int x, int y, int wid
     {
         drawLinearSliderBackground(g, x, y, width, height, sliderPos, minSliderPos, maxSliderPos, style, slider);
         bool isVert = (style == juce::Slider::LinearVertical);
-        float thumbW = isVert ? (float)width  * 0.95f : 40.0f;
+        float thumbW = isVert ? juce::jmin(34.0f, (float)width * 0.95f) : 40.0f;
         float thumbH = isVert ? 42.0f : (float)height * 0.95f;
         float thumbX = isVert ? (float)x + (float)width  * 0.025f : sliderPos - thumbW * 0.5f;
         float thumbY = isVert ? sliderPos - thumbH * 0.5f         : (float)y + (float)height * 0.025f;
@@ -7867,9 +7871,11 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
             autoLevelChannelActiveTicks.clear();
             autoLevelMeasureTicks.clear();
             autoLevelOverTargetTicks.clear();
+            autoLevelUnderTargetTicks.clear();
             autoLevelUserNameById.clear();
             autoLevelWorkTickCounter = 0;
         }
+        audioProcessor.setSoftLimiterEnabled(autoLevelEnabled);
         updateAutoLevelButtonColor();
         markPersistentSettingsDirty();
     };
@@ -8031,6 +8037,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         fader.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
         fader.setRange(0.0, 2.0);
         fader.setSkewFactorFromMidPoint(0.25);
+        fader.setSliderSnapsToMousePosition(false);
         fader.setValue(audioProcessor.getLocalChannelGain(i), juce::dontSendNotification);
         fader.setDoubleClickReturnValue(true, 1.0);
         fader.setLookAndFeel(&mixerFaderLookAndFeel);
@@ -8182,6 +8189,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     masterFader.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
     masterFader.setRange(0.0, 2.0);
     masterFader.setSkewFactorFromMidPoint(0.25);
+    masterFader.setSliderSnapsToMousePosition(false);
     masterFader.setValue(1.0, juce::dontSendNotification);
     masterFader.setDoubleClickReturnValue(true, 1.0);
     masterFader.setLookAndFeel(&mixerFaderLookAndFeel);
@@ -8803,6 +8811,27 @@ void NinjamVst3AudioProcessorEditor::paintOverChildren(juce::Graphics& g)
     if (chatShowing)
         drawGlow(chatButton,      juce::Colour(0x5550c8ff), juce::Colours::transparentBlack); // sky blue
 
+    auto drawClipPulse = [&](juce::Rectangle<int> bounds, bool active)
+    {
+        if (!active || bounds.isEmpty())
+            return;
+
+        const double phase = juce::Time::getMillisecondCounterHiRes() * 0.001
+                           * (juce::MathConstants<double>::twoPi * 0.85);
+        const float pulse = 0.5f + 0.5f * (float)std::sin(phase);
+        const float alpha = juce::jmap(pulse, 0.32f, 0.88f);
+        auto r = bounds.toFloat().reduced(1.0f);
+
+        g.setColour(juce::Colour(0xffff2424).withAlpha(alpha));
+        g.drawRoundedRectangle(r, 5.0f, 2.0f + pulse * 1.4f);
+        g.setColour(juce::Colour(0xffff2424).withAlpha(alpha * 0.35f));
+        g.drawRoundedRectangle(r.expanded(2.0f), 7.0f, 1.0f);
+    };
+
+    for (int i = 0; i < NinjamVst3AudioProcessor::maxLocalChannels; ++i)
+        drawClipPulse(localChannelPulseBounds[(size_t)i], localClipPulsing[(size_t)i]);
+    drawClipPulse(masterChannelPulseBounds, masterClipPulsing);
+
     if (transmitButton.isVisible() && !transmitButton.getToggleState())
     {
         const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
@@ -8957,6 +8986,7 @@ void NinjamVst3AudioProcessorEditor::resized()
 
     auto localArea = area.removeFromLeft(localWidth);
     auto masterArea = area.removeFromRight(masterWidth);
+    auto masterPulseBounds = masterArea;
     auto userArea = area;
 
     auto usersHeader = userArea.removeFromTop(22);
@@ -9013,11 +9043,14 @@ void NinjamVst3AudioProcessorEditor::resized()
         localDelaySendKnobs[(size_t)i].setVisible(visible);
         localReverbSendLabels[(size_t)i].setVisible(visible);
         localDelaySendLabels[(size_t)i].setVisible(visible);
+        if (!visible)
+            localChannelPulseBounds[(size_t)i] = {};
     }
 
     for (int i = 0; i < numLocal; ++i)
     {
         juce::Rectangle<int> col = localInner.removeFromLeft(columnWidth);
+        const auto pulseBounds = col;
         auto meterArea = col.removeFromLeft(meterWidth);
         auto nameArea = col.removeFromTop(18);
         auto dbArea = col.removeFromBottom(16);
@@ -9036,6 +9069,7 @@ void NinjamVst3AudioProcessorEditor::resized()
         localChannelNameLabels[(size_t)i].setBounds(nameArea);
         localReverbSendLabels[(size_t)i].setBounds(revLabelArea);
         localDelaySendLabels[(size_t)i].setBounds(dlyLabelArea);
+        localChannelPulseBounds[(size_t)i] = pulseBounds.expanded(1);
 
         auto revKnobArea = revArea.expanded(1);
         auto dlyKnobArea = dlyArea.expanded(1);
@@ -9091,6 +9125,7 @@ void NinjamVst3AudioProcessorEditor::resized()
     masterFader.setBounds(masterInner.removeFromTop(masterInner.getHeight() - 16));
     masterDbLabel.setBounds(masterInner);
     masterPeakMeter.setBounds(masterMeterArea);
+    masterChannelPulseBounds = masterPulseBounds.expanded(1);
 
     if (showDockedChat)
     {
@@ -9271,12 +9306,38 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
     applyMidiMappings();
     applyOscMappings();
 
+    auto updateClipPulseState = [nowMs](float peak, double& startMs, bool& pulsing) -> bool
+    {
+        constexpr double holdMs = 500.0;
+        const bool clipping = peak >= 1.0f;
+        const bool wasPulsing = pulsing;
+
+        if (clipping)
+        {
+            if (startMs <= 0.0)
+                startMs = nowMs;
+            pulsing = (nowMs - startMs) >= holdMs;
+        }
+        else
+        {
+            startMs = 0.0;
+            pulsing = false;
+        }
+
+        return wasPulsing != pulsing;
+    };
+
+    bool clipPulseNeedsRepaint = false;
     int numLocal = audioProcessor.getNumLocalChannels();
     numLocal = juce::jlimit(1, NinjamVst3AudioProcessor::maxLocalChannels, numLocal);
     for (int i = 0; i < numLocal; ++i)
     {
-        float peak = audioProcessor.getLocalChannelPeak(i);
-        localPeakMeters[(size_t)i].setPeak(audioProcessor.getLocalChannelPeakLeft(i), audioProcessor.getLocalChannelPeakRight(i));
+        const float peakL = audioProcessor.getLocalChannelPeakLeft(i);
+        const float peakR = audioProcessor.getLocalChannelPeakRight(i);
+        const float peak = juce::jmax(peakL, peakR);
+        localPeakMeters[(size_t)i].setPeak(peakL, peakR);
+        clipPulseNeedsRepaint |= updateClipPulseState(peak, localClipStartMs[(size_t)i], localClipPulsing[(size_t)i]);
+
         float db = -60.0f;
         if (peak > 1.0e-6f)
             db = juce::jlimit(-60.0f, 6.0f, 20.0f * std::log10(peak));
@@ -9297,13 +9358,30 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
     if (localChordStatsLabel.getText() != compactChordStats)
         localChordStatsLabel.setText(compactChordStats, juce::dontSendNotification);
 
-    float masterPk = audioProcessor.getMasterPeak();
-    masterPeakMeter.setPeak(audioProcessor.getMasterPeakLeft(), audioProcessor.getMasterPeakRight());
+    const float masterPeakL = audioProcessor.getMasterPeakLeft();
+    const float masterPeakR = audioProcessor.getMasterPeakRight();
+    const float masterPk = juce::jmax(masterPeakL, masterPeakR);
+    masterPeakMeter.setPeak(masterPeakL, masterPeakR);
+    clipPulseNeedsRepaint |= updateClipPulseState(masterPk, masterClipStartMs, masterClipPulsing);
     {
         float db = -60.0f;
         if (masterPk > 1.0e-6f)
             db = juce::jlimit(-60.0f, 6.0f, 20.0f * std::log10(masterPk));
         masterDbLabel.setText(juce::String((int)std::round(db)) + " dB", juce::dontSendNotification);
+    }
+
+    bool anyClipPulsing = masterClipPulsing;
+    for (int i = 0; i < numLocal; ++i)
+        anyClipPulsing = anyClipPulsing || localClipPulsing[(size_t)i];
+
+    if (clipPulseNeedsRepaint || (anyClipPulsing && nowMs - lastClipPulseRepaintMs >= transmitPulseRepaintMs))
+    {
+        lastClipPulseRepaintMs = nowMs;
+        for (int i = 0; i < numLocal; ++i)
+            if (!localChannelPulseBounds[(size_t)i].isEmpty())
+                repaint(localChannelPulseBounds[(size_t)i].expanded(4));
+        if (!masterChannelPulseBounds.isEmpty())
+            repaint(masterChannelPulseBounds.expanded(4));
     }
 
     const bool runAutoLevelTick = autoLevelEnabled
@@ -9321,14 +9399,16 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
             const float perUserCeiling = 0.56f;
             const float minGain = 0.05f;
             const float maxGain = 2.0f;
-            const float peakAttackCoeff = 1.0f - std::exp(-timerIntervalMs / 220.0f);
-            const float peakReleaseCoeff = 1.0f - std::exp(-timerIntervalMs / 2400.0f);
-            const float gainUpCoeff = 1.0f - std::exp(-timerIntervalMs / 2500.0f);
-            const float gainDownCoeff = 1.0f - std::exp(-timerIntervalMs / 450.0f);
-            const float emergencyDownCoeff = 1.0f - std::exp(-timerIntervalMs / 120.0f);
-            const float maxUpStep = juce::jmax(0.012f, (timerIntervalMs / 1000.0f) * 0.30f);
-            const float maxDownStep = juce::jmax(0.08f, (timerIntervalMs / 1000.0f) * 1.50f);
-            const float maxEmergencyDownStep = juce::jmax(0.20f, (timerIntervalMs / 1000.0f) * 4.00f);
+            const float peakAttackCoeff = 1.0f - std::exp(-timerIntervalMs / 700.0f);
+            const float peakReleaseCoeff = 1.0f - std::exp(-timerIntervalMs / 3500.0f);
+            const float gainUpCoeff = 1.0f - std::exp(-timerIntervalMs / 5000.0f);
+            const float gainDownCoeff = 1.0f - std::exp(-timerIntervalMs / 1400.0f);
+            const float emergencyDownCoeff = 1.0f - std::exp(-timerIntervalMs / 450.0f);
+            const float maxUpStep = juce::jmax(0.006f, (timerIntervalMs / 1000.0f) * 0.12f);
+            const float maxDownStep = juce::jmax(0.035f, (timerIntervalMs / 1000.0f) * 0.45f);
+            const float maxEmergencyDownStep = juce::jmax(0.08f, (timerIntervalMs / 1000.0f) * 1.35f);
+            const int highPersistTicks = juce::jmax(2, juce::roundToInt(700.0f / timerIntervalMs));
+            const int lowPersistTicks = juce::jmax(5, juce::roundToInt(1800.0f / timerIntervalMs));
 
             std::map<int, float> observedLevels;
             int audibleUsers = 0;
@@ -9337,8 +9417,9 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                 const float peakL = audioProcessor.getUserPeak(u.index, 0);
                 const float peakR = audioProcessor.getUserPeak(u.index, 1);
                 const float currentLevel = juce::jmax(peakL, peakR);
+                const float sourceEstimate = juce::jlimit(0.0f, 4.0f, currentLevel / juce::jmax(minGain, u.volume));
                 observedLevels[u.index] = currentLevel;
-                if (currentLevel >= noiseFloor)
+                if (sourceEstimate >= noiseFloor)
                     ++audibleUsers;
             }
 
@@ -9369,12 +9450,19 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                     autoLevelChannelActiveTicks.erase(id);
                     autoLevelMeasureTicks.erase(id);
                     autoLevelOverTargetTicks.erase(id);
+                    autoLevelUnderTargetTicks.erase(id);
                     autoLevelUserNameById[id] = nameKey;
                 }
 
                 const float currentLevel = observedLevels[id];
                 if (!autoLevelCurrentGains.count(id))
                     autoLevelCurrentGains[id] = juce::jlimit(minGain, maxGain, u.volume);
+
+                const float currentGain = autoLevelCurrentGains[id];
+                const float sourceLevel = currentGain > 1.0e-4f
+                    ? juce::jlimit(0.0f, 4.0f, currentLevel / currentGain)
+                    : currentLevel;
+
                 if (!autoLevelPeakLevels.count(id))         autoLevelPeakLevels[id] = 0.0f;
                 if (!autoLevelChannelActiveTicks.count(id)) autoLevelChannelActiveTicks[id] = 0;
                 else                                         autoLevelChannelActiveTicks[id]++;
@@ -9385,20 +9473,20 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                 const bool firstMeasurement = measureTicks == 0;
                 ++measureTicks;
 
-                if (firstMeasurement && currentLevel >= noiseFloor)
-                    longTermPeak = currentLevel;
+                if (firstMeasurement && sourceLevel >= noiseFloor)
+                    longTermPeak = sourceLevel;
                 else
                 {
-                    const float peakCoeff = currentLevel > longTermPeak ? peakAttackCoeff : peakReleaseCoeff;
-                    longTermPeak += (currentLevel - longTermPeak) * peakCoeff;
+                    const float peakCoeff = sourceLevel > longTermPeak ? peakAttackCoeff : peakReleaseCoeff;
+                    longTermPeak += (sourceLevel - longTermPeak) * peakCoeff;
                 }
 
                 longTermPeak = juce::jlimit(0.0f, 4.0f, longTermPeak);
 
-                float targetGain = 1.0f;
+                float targetGain = currentGain;
                 if (longTermPeak >= noiseFloor)
                 {
-                    const float safePeak = juce::jmax(juce::jmax(longTermPeak, currentLevel), noiseFloor);
+                    const float safePeak = juce::jmax(longTermPeak, noiseFloor);
                     targetGain = targetPerUserLevel / safePeak;
                     targetGain = juce::jmin(targetGain, perUserCeiling / safePeak);
                     targetGain *= masterReduction;
@@ -9406,17 +9494,31 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
 
                 targetGain = juce::jlimit(minGain, maxGain, targetGain);
 
-                const float currentGain = autoLevelCurrentGains[id];
-                const float currentOutput = currentLevel * currentGain;
-                const bool emergencyReduction = targetGain < currentGain
-                    && currentLevel >= noiseFloor
-                    && currentOutput > targetMasterLevel;
-                if (currentOutput > targetMasterLevel)
+                const float currentOutput = sourceLevel * currentGain;
+                const float longTermOutput = longTermPeak * currentGain;
+                const bool tooHigh = (longTermOutput > targetPerUserLevel * 1.12f) || (currentOutput > targetMasterLevel);
+                const bool tooLow = longTermPeak >= noiseFloor && longTermOutput < targetPerUserLevel * 0.72f;
+
+                if (tooHigh)
                     ++autoLevelOverTargetTicks[id];
                 else
                     autoLevelOverTargetTicks[id] = 0;
 
+                if (tooLow)
+                    ++autoLevelUnderTargetTicks[id];
+                else
+                    autoLevelUnderTargetTicks[id] = 0;
+
+                const bool sustainedHigh = autoLevelOverTargetTicks[id] >= highPersistTicks;
+                const bool sustainedLow = autoLevelUnderTargetTicks[id] >= lowPersistTicks;
+
+                if (targetGain < currentGain && !sustainedHigh)
+                    targetGain = currentGain;
+                else if (targetGain > currentGain && !sustainedLow)
+                    targetGain = currentGain;
+
                 const bool reducing = targetGain < currentGain;
+                const bool emergencyReduction = reducing && sustainedHigh && currentOutput > targetMasterLevel;
                 float smoothingCoeff = reducing ? (emergencyReduction ? emergencyDownCoeff : gainDownCoeff)
                                                 : gainUpCoeff;
                 if (isNew && !reducing)
@@ -9449,6 +9551,7 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                     autoLevelChannelActiveTicks.erase(id);
                     autoLevelMeasureTicks.erase(id);
                     autoLevelOverTargetTicks.erase(id);
+                    autoLevelUnderTargetTicks.erase(id);
                     autoLevelUserNameById.erase(id);
                     it = autoLevelCurrentGains.erase(it);
                 }
@@ -9463,6 +9566,7 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
             autoLevelChannelActiveTicks.clear();
             autoLevelMeasureTicks.clear();
             autoLevelOverTargetTicks.clear();
+            autoLevelUnderTargetTicks.clear();
             autoLevelUserNameById.clear();
         }
     }
@@ -10263,6 +10367,7 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
 
     autoLevelEnabled = props.getBoolValue("autoLevelEnabled", autoLevelEnabled);
     autoLevelButton.setToggleState(autoLevelEnabled, juce::dontSendNotification);
+    audioProcessor.setSoftLimiterEnabled(autoLevelEnabled);
     updateAutoLevelButtonColor();
 
     const bool spreadOutputs = props.getBoolValue("spreadOutputs", spreadOutputsButton.getToggleState());
@@ -12178,6 +12283,7 @@ UserChannelStrip::UserChannelStrip(NinjamVst3AudioProcessor& p, int userIdx)
     volumeSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
     volumeSlider.setRange(0.0, 2.0);
     volumeSlider.setSkewFactorFromMidPoint(0.25);
+    volumeSlider.setSliderSnapsToMousePosition(false);
     volumeSlider.setValue(1.0, juce::dontSendNotification);
     volumeSlider.setDoubleClickReturnValue(true, 1.0);
     volumeSlider.setLookAndFeel(&faderLookAndFeel);
@@ -12235,6 +12341,7 @@ UserChannelStrip::UserChannelStrip(NinjamVst3AudioProcessor& p, int userIdx)
         channelSliders[i].setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
         channelSliders[i].setRange(0.0, 2.0);
         channelSliders[i].setSkewFactorFromMidPoint(0.25);
+        channelSliders[i].setSliderSnapsToMousePosition(false);
         channelSliders[i].setValue(1.0, juce::dontSendNotification);
         channelSliders[i].setDoubleClickReturnValue(true, 1.0);
         channelSliders[i].setLookAndFeel(&faderLookAndFeel);
@@ -12351,6 +12458,20 @@ void UserChannelStrip::paintOverChildren(juce::Graphics& g)
 
     drawGlow(muteButton, juce::Colour(0x55ff3030), juce::Colour(0x22200808));
     drawGlow(soloButton, juce::Colour(0x55ffd030), juce::Colour(0x22281e04));
+
+    if (clipPulsing)
+    {
+        const double phase = juce::Time::getMillisecondCounterHiRes() * 0.001
+                           * (juce::MathConstants<double>::twoPi * 0.85);
+        const float pulse = 0.5f + 0.5f * (float)std::sin(phase);
+        const float alpha = juce::jmap(pulse, 0.32f, 0.88f);
+        auto r = getLocalBounds().toFloat().reduced(1.0f);
+
+        g.setColour(juce::Colour(0xffff2424).withAlpha(alpha));
+        g.drawRoundedRectangle(r, 5.0f, 2.0f + pulse * 1.4f);
+        g.setColour(juce::Colour(0xffff2424).withAlpha(alpha * 0.35f));
+        g.drawRoundedRectangle(r.expanded(2.0f), 7.0f, 1.0f);
+    }
 }
 
 void UserChannelStrip::paint(juce::Graphics& g)
@@ -12607,6 +12728,8 @@ void UserChannelStrip::updateInfo(const NinjamVst3AudioProcessor::UserInfo& info
     {
         currentPeakL = 0.0f;
         currentPeakR = 0.0f;
+        clipStartMs = 0.0;
+        clipPulsing = false;
         chordToggleArmed = false;
         isExpanded = false;
         expandButton.setButtonText(isHorizontalLayout ? ">" : "v");
@@ -12736,15 +12859,14 @@ void UserChannelStrip::timerCallback()
 
     auto peakL = processor.getUserPeak(userIndex, 0);
     auto peakR = processor.getUserPeak(userIndex, 1);
-
-    const float stripGain = juce::jmax(0.0f, (float) volumeSlider.getValue());
     const float pan = juce::jlimit(-1.0f, 1.0f, (float) panSlider.getValue());
     const float leftPanGain = (pan > 0.0f) ? (1.0f - pan) : 1.0f;
     const float rightPanGain = (pan < 0.0f) ? (1.0f + pan) : 1.0f;
 
-    peakL = juce::jmax(0.0f, peakL * stripGain * leftPanGain);
-    peakR = juce::jmax(0.0f, peakR * stripGain * rightPanGain);
+    peakL = juce::jmax(0.0f, peakL * leftPanGain);
+    peakR = juce::jmax(0.0f, peakR * rightPanGain);
 
+    float displayedPeak = juce::jmax(peakL, peakR);
     bool needRepaint = false;
 
     if (std::abs(peakL - currentPeakL) > 0.001f || std::abs(peakR - currentPeakR) > 0.001f)
@@ -12769,6 +12891,7 @@ void UserChannelStrip::timerCallback()
         {
             // NINJAM ch0 = Vorbis mixdown; individual channels start at ch1
             float chPeak = processor.getUserChannelPeak(userIndex, ch + 1, -1); // -1 = both/max
+            displayedPeak = juce::jmax(displayedPeak, chPeak);
             if (std::abs(chPeak - channelPeaks[ch]) > 0.001f)
             {
                 channelPeaks[ch] = chPeak;
@@ -12776,6 +12899,23 @@ void UserChannelStrip::timerCallback()
             }
         }
     }
+
+    const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    const bool clipping = displayedPeak >= 1.0f;
+    const bool wasPulsing = clipPulsing;
+    if (clipping)
+    {
+        if (clipStartMs <= 0.0)
+            clipStartMs = nowMs;
+        clipPulsing = (nowMs - clipStartMs) >= 500.0;
+    }
+    else
+    {
+        clipStartMs = 0.0;
+        clipPulsing = false;
+    }
+    if (clipPulsing || wasPulsing != clipPulsing)
+        needRepaint = true;
 
     const auto remoteChord = processor.getUserChordLabel(userIndex);
     const auto remoteChordStats = "CPU " + juce::String(processor.getUserChordCpuPercent(userIndex), 2)

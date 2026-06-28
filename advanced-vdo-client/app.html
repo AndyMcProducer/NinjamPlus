@@ -274,6 +274,7 @@
             targetIdByUser: {},
             labelByStreamId: {},
             lastAppliedBufferByUser: {},
+            lastAppliedIntervalByUser: {},
             lastBufferRefreshIdByUser: {},
             bufferRefreshTimersByUser: {},
             bufferRefreshPendingUntilByUser: {},
@@ -409,6 +410,7 @@
                 return;
             }
             delete vdoState.lastAppliedBufferByUser[key];
+            delete vdoState.lastAppliedIntervalByUser[key];
             delete vdoState.lastBufferRefreshIdByUser[key];
             if (vdoState.bufferRefreshTimersByUser[key]) {
                 clearTimeout(vdoState.bufferRefreshTimersByUser[key]);
@@ -1300,6 +1302,12 @@
             }
             const receiverBufferMs = resolveIncomingBufferMs(data);
             const userKey = data.userId || data.userKey || '';
+            const normalizedUserKey = normalizeUserId(userKey);
+            const intervalKey = String(data.interval ?? '');
+            if (normalizedUserKey && intervalKey && vdoState.lastAppliedIntervalByUser[normalizedUserKey] !== intervalKey) {
+                vdoState.lastAppliedIntervalByUser[normalizedUserKey] = intervalKey;
+                delete vdoState.lastAppliedBufferByUser[normalizedUserKey];
+            }
             const diagnostics = buildSyncDiagnostics(data, receiverBufferMs);
             const incomingVdoLatencyMs = getIncomingVdoLatencyMs(data);
             if (isFinite(incomingVdoLatencyMs)) {

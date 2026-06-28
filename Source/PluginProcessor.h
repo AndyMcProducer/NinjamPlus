@@ -879,7 +879,7 @@ private:
     std::atomic<float> cachedNinjamBpm { 120.0f };
 
     std::atomic<bool> spreadOutputsEnabled { false };
-    std::atomic<bool> softLimiterEnabled { true };
+    std::atomic<bool> softLimiterEnabled { false };
     std::atomic<bool> dspLimiterEnabled { false };
     std::atomic<float> limiterThresholdDb { 0.0f };
     std::atomic<float> limiterReleaseMs { 100.0f };

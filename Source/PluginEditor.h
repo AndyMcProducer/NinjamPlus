@@ -711,6 +711,8 @@ private:
     
     float currentPeakL = 0.0f;
     float currentPeakR = 0.0f;
+    double clipStartMs = 0.0;
+    bool clipPulsing = false;
     bool isHorizontalLayout = false; // Default List view (strip is horizontal)
 
     // Multi-channel remote support
@@ -811,15 +813,15 @@ class MasterPeakMeter : public juce::Component
 public:
     void setPeak(float newPeak)
     {
-        peakL = juce::jlimit(0.0f, 1.0f, newPeak);
+        peakL = juce::jlimit(0.0f, 2.0f, newPeak);
         peakR = peakL;
         repaint();
     }
 
     void setPeak(float newPeakL, float newPeakR)
     {
-        peakL = juce::jlimit(0.0f, 1.0f, newPeakL);
-        peakR = juce::jlimit(0.0f, 1.0f, newPeakR);
+        peakL = juce::jlimit(0.0f, 2.0f, newPeakL);
+        peakR = juce::jlimit(0.0f, 2.0f, newPeakR);
         repaint();
     }
 
@@ -829,12 +831,12 @@ public:
     }
 
     static constexpr float meterMinDb = -60.0f;
-    static constexpr float meterMaxDb = 0.0f;
+    static constexpr float meterMaxDb = 6.0f;
     static constexpr int numSegments = 22;
 
     static float peakToDb(float peak)
     {
-        return 20.0f * std::log10(juce::jlimit(1.0e-6f, 1.0f, peak));
+        return 20.0f * std::log10(juce::jlimit(1.0e-6f, 2.0f, peak));
     }
 
     static float dbToMeterProportion(float db)
@@ -1012,8 +1014,11 @@ private:
             const auto segment = juce::Rectangle<int>(barBounds.getX(), y, barBounds.getWidth(), h);
 
             const float segmentProportion = ((float)i + 0.5f) / (float)numSegments;
-            const juce::Colour base = colourForDb(meterProportionToDb(segmentProportion));
-            const bool lit = segmentProportion <= fillProportion;
+            const bool redSegment = i >= numSegments - 2;
+            const juce::Colour base = redSegment ? juce::Colour(0xffff1f1f)
+                                                 : colourForDb(meterProportionToDb(segmentProportion));
+            const float litThreshold = redSegment ? ((float)i / (float)numSegments) : segmentProportion;
+            const bool lit = litThreshold <= fillProportion;
 
             if (lit && h > 2)
             {
@@ -1026,11 +1031,6 @@ private:
             g.fillRoundedRectangle(segment.toFloat(), 1.2f);
         }
 
-        const bool clipLit = peakToDb(peak) >= 0.0f;
-        const int capHeight = juce::jlimit(1, 4, juce::jmax(1, barBounds.getHeight() / 18));
-        const auto clipCap = barBounds.withHeight(capHeight);
-        g.setColour(juce::Colour(0xffff1f1f).withAlpha(clipLit ? 0.98f : 0.18f));
-        g.fillRoundedRectangle(clipCap.toFloat(), 1.0f);
     }
 
     static void drawHorizontalBar(juce::Graphics& g, juce::Rectangle<int> barBounds, float peak)
@@ -1050,8 +1050,11 @@ private:
             const auto segment = juce::Rectangle<int>(x, barBounds.getY(), w, barBounds.getHeight());
 
             const float segmentProportion = ((float)i + 0.5f) / (float)numSegments;
-            const juce::Colour base = colourForDb(meterProportionToDb(segmentProportion));
-            const bool lit = segmentProportion <= fillProportion;
+            const bool redSegment = i >= numSegments - 2;
+            const juce::Colour base = redSegment ? juce::Colour(0xffff1f1f)
+                                                 : colourForDb(meterProportionToDb(segmentProportion));
+            const float litThreshold = redSegment ? ((float)i / (float)numSegments) : segmentProportion;
+            const bool lit = litThreshold <= fillProportion;
 
             if (lit && w > 2)
             {
@@ -1064,24 +1067,16 @@ private:
             g.fillRoundedRectangle(segment.toFloat(), 1.0f);
         }
 
-        const bool clipLit = peakToDb(peak) >= 0.0f;
-        const int capWidth = juce::jlimit(1, 4, juce::jmax(1, barBounds.getWidth() / 18));
-        const auto clipCap = juce::Rectangle<int>(barBounds.getRight() - capWidth,
-                                                  barBounds.getY(),
-                                                  capWidth,
-                                                  barBounds.getHeight());
-        g.setColour(juce::Colour(0xffff1f1f).withAlpha(clipLit ? 0.98f : 0.18f));
-        g.fillRoundedRectangle(clipCap.toFloat(), 1.0f);
     }
 
     static void drawDbTicks(juce::Graphics& g, juce::Rectangle<int> meterBounds)
     {
-        static constexpr float ticks[] { 0.0f, -3.0f, -6.0f, -12.0f, -18.0f, -24.0f, -36.0f, -48.0f, -60.0f };
+        static constexpr float ticks[] { 6.0f, 0.0f, -3.0f, -6.0f, -12.0f, -18.0f, -24.0f, -36.0f, -48.0f, -60.0f };
 
         for (float db : ticks)
         {
             const int y = yForDb(meterBounds, db);
-            const bool major = db == 0.0f || db == -6.0f || db == -12.0f || db == -24.0f || db == -60.0f;
+            const bool major = db == 6.0f || db == 0.0f || db == -6.0f || db == -12.0f || db == -24.0f || db == -60.0f;
             const int tickLength = major ? juce::jmax(3, meterBounds.getWidth() / 3)
                                          : juce::jmax(2, meterBounds.getWidth() / 5);
             const float fy = (float)y + 0.5f;
@@ -1094,12 +1089,12 @@ private:
 
     static void drawHorizontalDbTicks(juce::Graphics& g, juce::Rectangle<int> meterBounds)
     {
-        static constexpr float ticks[] { 0.0f, -3.0f, -6.0f, -12.0f, -18.0f, -24.0f, -36.0f, -48.0f, -60.0f };
+        static constexpr float ticks[] { 6.0f, 0.0f, -3.0f, -6.0f, -12.0f, -18.0f, -24.0f, -36.0f, -48.0f, -60.0f };
 
         for (float db : ticks)
         {
             const int x = xForDb(meterBounds, db);
-            const bool major = db == 0.0f || db == -6.0f || db == -12.0f || db == -24.0f || db == -60.0f;
+            const bool major = db == 6.0f || db == 0.0f || db == -6.0f || db == -12.0f || db == -24.0f || db == -60.0f;
             const int tickLength = major ? juce::jmax(2, meterBounds.getHeight() / 2)
                                          : juce::jmax(1, meterBounds.getHeight() / 3);
             const float fx = (float)x + 0.5f;
@@ -1729,6 +1724,7 @@ private:
     std::map<int, int> autoLevelChannelActiveTicks;
     std::map<int, int> autoLevelMeasureTicks;
     std::map<int, int> autoLevelOverTargetTicks;
+    std::map<int, int> autoLevelUnderTargetTicks;
     std::map<int, juce::String> autoLevelUserNameById;
     std::map<juce::Component*, MidiLearnTarget> midiTargetsByComponent;
     std::map<juce::String, MidiLearnTarget> midiTargetsById;
@@ -1751,6 +1747,13 @@ private:
     double lastPersistentSettingsSaveMs = 0.0;
     double lastVideoBackgroundRepaintMs = 0.0;
     double lastTransmitPulseRepaintMs = 0.0;
+    double lastClipPulseRepaintMs = 0.0;
+    std::array<juce::Rectangle<int>, NinjamVst3AudioProcessor::maxLocalChannels> localChannelPulseBounds;
+    juce::Rectangle<int> masterChannelPulseBounds;
+    std::array<double, NinjamVst3AudioProcessor::maxLocalChannels> localClipStartMs {};
+    std::array<bool, NinjamVst3AudioProcessor::maxLocalChannels> localClipPulsing {};
+    double masterClipStartMs = 0.0;
+    bool masterClipPulsing = false;
     bool persistentSettingsDirty = false;
     juce::String lastSavedUiSettingsFingerprint;
     int autoLevelWorkTickCounter = 0;
