@@ -354,74 +354,25 @@ if (WIN32)
 endif()
 
 if (TARGET NINJAM_VST3_Standalone)
-    add_custom_target(NINJAM_VST3_SyncWebAssets
+    add_custom_target(NINJAM_VST3_RemoveStandaloneLegacyWebAssets
         COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/index.html"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/index.html"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/app.html"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/app.html"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/icon.png"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/icon.png"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/PoweredByVDONinja.png"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/PoweredByVDONinja.png"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/masks"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client/masks"
         VERBATIM
     )
-    add_dependencies(NINJAM_VST3_Standalone NINJAM_VST3_SyncWebAssets)
+    add_dependencies(NINJAM_VST3_Standalone NINJAM_VST3_RemoveStandaloneLegacyWebAssets)
 endif()
 
 if (TARGET NINJAM_VST3_VST3)
-    add_custom_target(NINJAM_VST3_SyncVst3WebAssets
+    add_custom_target(NINJAM_VST3_RemoveVst3LegacyWebAssets
         COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/index.html"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/index.html"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/app.html"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/app.html"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/icon.png"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/icon.png"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/PoweredByVDONinja.png"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/PoweredByVDONinja.png"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/masks"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_VST3>/../Resources/advanced-vdo-client/masks"
         VERBATIM
     )
-    add_dependencies(NINJAM_VST3_VST3 NINJAM_VST3_SyncVst3WebAssets)
+    add_dependencies(NINJAM_VST3_VST3 NINJAM_VST3_RemoveVst3LegacyWebAssets)
 endif()
 
 if (TARGET NINJAM_VST3_LV2)
-    add_custom_target(NINJAM_VST3_SyncLv2WebAssets
+    add_custom_target(NINJAM_VST3_RemoveLv2LegacyWebAssets
         COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/index.html"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client/index.html"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/app.html"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client/app.html"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/icon.png"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client/icon.png"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/PoweredByVDONinja.png"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client/PoweredByVDONinja.png"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_CURRENT_SOURCE_DIR}/advanced-vdo-client/masks"
-            "$<TARGET_FILE_DIR:NINJAM_VST3_LV2>/advanced-vdo-client/masks"
         VERBATIM
     )
-    add_dependencies(NINJAM_VST3_LV2 NINJAM_VST3_SyncLv2WebAssets)
+    add_dependencies(NINJAM_VST3_LV2 NINJAM_VST3_RemoveLv2LegacyWebAssets)
 endif()

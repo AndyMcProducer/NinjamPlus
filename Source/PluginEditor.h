@@ -256,11 +256,20 @@ public:
         return minV + norm * (maxV - minV);
     }
 
+    void resized() override
+    {
+        juce::Slider::resized();
+        updateDragSensitivityForCurrentBounds();
+    }
+
     void mouseDown(const juce::MouseEvent& e) override
     {
         leftInteractionActive = e.mods.isLeftButtonDown();
         if (leftInteractionActive)
+        {
+            updateDragSensitivityForCurrentBounds();
             juce::Slider::mouseDown(e);
+        }
     }
 
     void mouseDrag(const juce::MouseEvent& e) override
@@ -283,6 +292,13 @@ public:
     }
 
 private:
+    void updateDragSensitivityForCurrentBounds()
+    {
+        const bool horizontal = getSliderStyle() == juce::Slider::LinearHorizontal;
+        const int dragPixels = horizontal ? getWidth() : getHeight();
+        setMouseDragSensitivity(juce::jmax(1, dragPixels));
+    }
+
     bool leftInteractionActive = false;
 };
 
@@ -1640,6 +1656,17 @@ private:
     void setAbletonWindowSizePreset(int presetIndex);
     void updateHostResizeModeForConnectionStatus(int status);
     void showAboutWindow();
+    void beginUpdateCheck(bool userInitiated);
+    void completeUpdateCheck(bool userInitiated,
+                             bool requestOk,
+                             bool updateAvailable,
+                             const juce::String& latestVersion,
+                             const juce::String& releaseUrl,
+                             const juce::String& downloadUrl,
+                             const juce::String& errorMessage);
+    void showUpdateAvailablePrompt(const juce::String& latestVersion,
+                                   const juce::String& releaseUrl,
+                                   const juce::String& downloadUrl);
     void loadControlImages(const juce::File& themeDir);
     void updateEditorTimerInterval();
     void applyThemeColours();
@@ -1701,6 +1728,9 @@ private:
     juce::Rectangle<int> samplePadsWindowBounds { 0, 0, 980, 600 };
     bool samplePadsWindowBoundsValid = false;
     std::unique_ptr<juce::DialogWindow> aboutWindow;
+    std::atomic<bool> updateCheckInProgress { false };
+    bool updatePromptShowing = false;
+    double automaticUpdateCheckDueMs = 0.0;
     double lastResizeEventMs = 0.0;
     double suppressHeavyUiUntilMs = 0.0;
     int lastLaidOutEditorWidth = -1;

@@ -19,7 +19,7 @@
             width: 100%;
             height: 100%;
             display: grid;
-            grid-template-rows: auto 1fr;
+            grid-template-rows: auto 1fr auto;
         }
         .header {
             background: linear-gradient(180deg, #171a22 0%, #10131a 100%);
@@ -90,17 +90,69 @@
             display: block;
             background: #000;
         }
+        .footer {
+            min-height: 36px;
+            padding: 6px 14px;
+            border-top: 1px solid #2a3040;
+            background: #0f1218;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .beat-counter {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            min-width: 0;
+            color: #d8e0ef;
+            font-size: 12px;
+            font-variant-numeric: tabular-nums;
+        }
+        .beat-counter-label {
+            min-width: 64px;
+            color: #aeb7c9;
+            white-space: nowrap;
+        }
+        .beat-strip {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 3px;
+            min-width: 0;
+        }
+        .beat-dot {
+            width: 9px;
+            height: 9px;
+            border: 1px solid #344156;
+            border-radius: 2px;
+            background: #171d28;
+        }
+        .beat-dot.past {
+            background: #2d5d48;
+            border-color: #3e7b5d;
+        }
+        .beat-dot.active {
+            background: #46d87f;
+            border-color: #92f0b4;
+            box-shadow: 0 0 8px rgba(70,216,127,0.8);
+        }
         body.green-mode {
             background: #00ff00;
         }
         body.green-mode .app {
             grid-template-rows: 1fr;
         }
-        body.green-mode .header {
+        body.green-mode .header,
+        body.green-mode .footer {
             display: none;
         }
         body.green-mode .frame-wrap {
             background: #00ff00;
+        }
+        body.hide-footer .app {
+            grid-template-rows: auto 1fr;
+        }
+        body.hide-footer .footer {
+            display: none;
         }
     </style>
 </head>
@@ -117,6 +169,12 @@
         </div>
         <div class="frame-wrap">
             <iframe id="vdoFrame" allow="camera; microphone; fullscreen"></iframe>
+        </div>
+        <div class="footer">
+            <div class="beat-counter" id="beatCounter" aria-live="polite">
+                <span class="beat-counter-label" id="beatCounterText">BPI --/--</span>
+                <span class="beat-strip" id="beatStrip" aria-hidden="true"></span>
+            </div>
         </div>
     </div>
     <script>
@@ -219,6 +277,8 @@
         const labelValue = document.getElementById('labelValue');
         const syncValue = document.getElementById('syncValue');
         const peerStatusValue = document.getElementById('peerStatusValue');
+        const beatCounterText = document.getElementById('beatCounterText');
+        const beatStrip = document.getElementById('beatStrip');
 
         const ninjamSync = {
             intervalInfo: null,
@@ -228,21 +288,23 @@
             remoteDiagnostics: {},
             userLastSeenAt: {},
             userLastSampleKey: {},
-            setIntervalInfo(interval, pos, bpm, bpi, length, bufferMode, voiceChatMode) {
+            setIntervalInfo(interval, pos, bpm, bpi, length, bufferMode, voiceChatMode, globalBeat, wallClockMs) {
+                const timingOriginMs = (typeof wallClockMs === 'number' && isFinite(wallClockMs)) ? wallClockMs : Date.now();
                 this.intervalInfo = {
                     interval,
                     pos,
                     bpm,
                     bpi,
                     length: typeof length === 'number' ? length : 0,
+                    globalBeat: typeof globalBeat === 'number' && isFinite(globalBeat) ? globalBeat : NaN,
                     bufferMode: normalizeBufferMode(bufferMode || (voiceChatMode ? 'realtime' : 'remote')),
                     voiceChatMode: !!voiceChatMode,
-                    updatedAt: Date.now()
+                    updatedAt: timingOriginMs
                 };
             },
             setRemoteTimecode(userId, interval, timecode, bufferMs, sampleKey, voiceChatMode, diagnostics) {
                 const key = normalizeUserId(userId);
-                if (!key) {
+                if (!key || isServerBotUserId(key)) {
                     return;
                 }
                 this.remoteVoiceChatMode[key] = !!voiceChatMode;
@@ -284,6 +346,7 @@
             chunkEventsByStreamId: {},
             chunkStatsByUser: {},
             lastRosterRevision: '',
+            bufferRefreshSequence: 0,
             rosterTimerId: 0
         };
 
@@ -304,6 +367,22 @@
             value = value.replace(/@.*$/, '');
             value = value.replace(/[^a-z0-9._-]/g, '');
             return value;
+        }
+
+        function isServerBotUserId(userId) {
+            const key = normalizeUserId(userId);
+            const compact = key.replace(/[^a-z0-9]/g, '');
+            if (!compact) {
+                return false;
+            }
+            const botPrefixes = ['ninbot', 'jambot', 'ninjambot', 'jamulusbot', 'jamserverbot', 'ninjamserverbot', 'serverbot'];
+            for (let i = 0; i < botPrefixes.length; i++) {
+                const prefix = botPrefixes[i];
+                if (compact === prefix || compact.indexOf(prefix) === 0) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         function getOffsetStorageKey(userId) {
@@ -396,7 +475,7 @@
                 const sourceKeys = Object.keys(source);
                 for (let j = 0; j < sourceKeys.length; j++) {
                     const key = normalizeUserId(sourceKeys[j]);
-                    if (key) {
+                    if (key && !isServerBotUserId(key)) {
                         keys[key] = true;
                     }
                 }
@@ -419,9 +498,23 @@
             delete vdoState.bufferRefreshPendingUntilByUser[key];
         }
 
+        function requestLocalBufferRefresh(userKey, reason) {
+            const key = normalizeUserId(userKey);
+            if (!key) {
+                return false;
+            }
+            delete vdoState.lastAppliedBufferByUser[key];
+            const cleanReason = String(reason || 'local').replace(/[^a-z0-9._-]/gi, '') || 'local';
+            vdoState.bufferRefreshSequence += 1;
+            return scheduleBufferRefresh(
+                key,
+                'localBufferRefresh:' + cleanReason + ':' + vdoState.bufferRefreshSequence + ':' + Date.now()
+            );
+        }
+
         function resolveUserKeyFromLabel(label) {
             const normalizedLabel = normalizeUserId(label);
-            if (!normalizedLabel) {
+            if (!normalizedLabel || isServerBotUserId(normalizedLabel)) {
                 return '';
             }
             const trackedUsers = getTrackedUserKeys();
@@ -486,6 +579,7 @@
             vdoState.targetIdByUser[userKey] = targetId;
             if (changed) {
                 resetBufferApplicationState(userKey);
+                requestLocalBufferRefresh(userKey, 'target');
             }
             return changed;
         }
@@ -1092,6 +1186,51 @@
             updateSyncStatus(linkedUsers, trackedUsers.length);
         }
 
+        function getBeatCounterState() {
+            const info = ninjamSync.intervalInfo || {};
+            const bpi = parseInt(info.bpi || 0, 10) || 0;
+            if (bpi <= 0) {
+                return { bpi: 0, beat: 0 };
+            }
+            const length = typeof info.length === 'number' && isFinite(info.length) ? info.length : 0;
+            const pos = typeof info.pos === 'number' && isFinite(info.pos) ? info.pos : 0;
+            const interval = typeof info.interval === 'number' && isFinite(info.interval) ? info.interval : 0;
+            const bpm = typeof info.bpm === 'number' && isFinite(info.bpm) ? info.bpm : 0;
+            let totalBeat = NaN;
+            if (length > 0) {
+                const clampedPos = Math.max(0, Math.min(length - 1, pos));
+                totalBeat = (interval * bpi) + ((clampedPos / length) * bpi);
+            } else if (typeof info.globalBeat === 'number' && isFinite(info.globalBeat)) {
+                totalBeat = info.globalBeat;
+            }
+            if (isFinite(totalBeat) && bpm > 0 && typeof info.updatedAt === 'number' && isFinite(info.updatedAt)) {
+                totalBeat += Math.max(0, Date.now() - info.updatedAt) / (60000 / bpm);
+            }
+            if (!isFinite(totalBeat)) {
+                return { bpi: 0, beat: 0 };
+            }
+            const beatIndex = ((Math.floor(totalBeat) % bpi) + bpi) % bpi;
+            return { bpi: bpi, beat: beatIndex + 1 };
+        }
+
+        function renderBeatCounter() {
+            if (!beatCounterText || !beatStrip) {
+                return;
+            }
+            const state = getBeatCounterState();
+            if (state.bpi <= 0) {
+                beatCounterText.textContent = 'BPI --/--';
+                beatStrip.innerHTML = '';
+                return;
+            }
+            beatCounterText.textContent = 'BPI ' + state.beat + '/' + state.bpi;
+            beatStrip.innerHTML = '';
+            for (let i = 1; i <= state.bpi; i++) {
+                const dot = document.createElement('span');
+                dot.className = i === state.beat ? 'beat-dot active' : (i < state.beat ? 'beat-dot past' : 'beat-dot');
+                beatStrip.appendChild(dot);
+            }
+        }
         function updateSyncStatus(linkedUsers, trackedUsers) {
             const totalUsers = typeof trackedUsers === 'number' ? trackedUsers : getTrackedUserKeys().length;
             let totalLinkedUsers = typeof linkedUsers === 'number' ? linkedUsers : 0;
@@ -1116,8 +1255,8 @@
                 }
             }
             syncValue.textContent = 'Launch ' + appState.requestedBufferMs + 'ms | linked '
-                + totalLinkedUsers + '/' + totalUsers + ' | realtime ' + realtimeUsers
-                + ' | updates ' + appState.intervalMessages;
+                + totalLinkedUsers + '/' + totalUsers + ' | realtime ' + realtimeUsers;
+            renderBeatCounter();
             renderPeerStatuses();
         }
 
@@ -1211,7 +1350,7 @@
             const activeNow = {};
             for (let i = 0; i < activeUserKeys.length; i++) {
                 const key = normalizeUserId(activeUserKeys[i]);
-                if (key) {
+                if (key && !isServerBotUserId(key)) {
                     activeNow[key] = true;
                 }
             }
@@ -1288,7 +1427,9 @@
                     data.bpi,
                     typeof data.length === 'number' ? data.length : 0,
                     data.bufferMode,
-                    data.voiceChatMode
+                    data.voiceChatMode,
+                    typeof data.globalBeat === 'number' ? data.globalBeat : NaN,
+                    typeof data.wallClockMs === 'number' ? data.wallClockMs : NaN
                 );
                 updateSyncStatus();
                 return false;
@@ -1303,6 +1444,9 @@
             const receiverBufferMs = resolveIncomingBufferMs(data);
             const userKey = data.userId || data.userKey || '';
             const normalizedUserKey = normalizeUserId(userKey);
+            if (!normalizedUserKey || isServerBotUserId(normalizedUserKey)) {
+                return false;
+            }
             const intervalKey = String(data.interval ?? '');
             if (normalizedUserKey && intervalKey && vdoState.lastAppliedIntervalByUser[normalizedUserKey] !== intervalKey) {
                 vdoState.lastAppliedIntervalByUser[normalizedUserKey] = intervalKey;
@@ -1340,7 +1484,7 @@
                 handleIntervalMessage(item);
                 if (item.type === 'remoteTimecode' || item.type === 'videoTimecode') {
                     const userKey = normalizeUserId(item.userKey || item.userId || '');
-                    if (userKey) {
+                    if (userKey && !isServerBotUserId(userKey)) {
                         activePayloadUsers.push(userKey);
                     }
                 }
@@ -1613,7 +1757,9 @@
                 return;
             }
             setManualOffsetMs(userKey, offsetMs);
-            applyPeerBuffers(true);
+            if (!requestLocalBufferRefresh(userKey, 'manualOffset')) {
+                applyPeerBuffers(true);
+            }
         });
 
         if (vdoFrame) {
@@ -1632,10 +1778,14 @@
         if (appState.bg.toLowerCase() === 'green') {
             document.body.classList.add('green-mode');
         }
+        if (query.get('hideFooter') === '1') {
+            document.body.classList.add('hide-footer');
+        }
 
         roomValue.textContent = 'Room: ' + appState.room;
         labelValue.textContent = 'Label: ' + appState.label;
         updateSyncStatus();
+        setInterval(renderBeatCounter, 125);
         startIntervalSource();
         setInterval(pruneInactiveUsers, 1500);
     </script>

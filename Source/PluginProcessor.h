@@ -1023,7 +1023,6 @@ private:
     std::atomic<juce::uint64> sideSignalEventCounter { 0 };
     juce::String currentServer;
     juce::String currentUser;
-    juce::File videoHelperRootDir;
     mutable juce::CriticalSection intervalHelperPayloadLock;
     juce::String intervalHelperPayload { "[]" };
     double lastIntervalHelperPayloadWriteMs = 0.0;
@@ -1212,7 +1211,7 @@ private:
     void resetIntervalSyncTimingCache();
     bool consumeVideoTimingChangeEvent(const juce::String& eventId);
     void broadcastVideoTimingChange(double previousBpm, double newBpm, int bpi, int length, int timingDelayDeltaMs);
-    juce::File resolveVideoHelperRootDir() const;
+    void requestVideoBufferRefreshForMeasuredUsers();
     bool isAdvancedVideoClientAvailable(int port) const;
     bool ensureAdvancedVideoClientStarted();
     bool ensureZapVideoClientStarted();

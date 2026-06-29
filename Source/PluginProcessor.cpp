@@ -3,6 +3,7 @@
 #include "ZapVideoCodec.h"
 #include "Chromagram.h"
 #include "ChordDetector.h"
+#include "EmbeddedVdoHtml.h"
 #include "signalsmith-stretch/signalsmith-stretch.h"
 #include <juce_video/juce_video.h>
 
@@ -67,8 +68,7 @@ static constexpr int advancedVideoHelperMaxPort = 8199;
 class LocalVideoHttpServer final : private juce::Thread
 {
 public:
-    LocalVideoHttpServer(const juce::File& helperRootDir,
-                         std::function<juce::String()> intervalPayloadProviderIn,
+    LocalVideoHttpServer(std::function<juce::String()> intervalPayloadProviderIn,
                          std::function<juce::String()> zapFrameListProviderIn,
                          std::function<bool(const juce::String&, int, juce::MemoryBlock&)> zapFrameProviderIn,
                          std::function<juce::String(const juce::String&)> zapBrowserCameraEnableIn,
@@ -76,7 +76,6 @@ public:
                          std::function<juce::String()> zapBrowserCameraDisableIn,
                          std::function<bool(const juce::MemoryBlock&, const juce::String&, const juce::String&, bool, double, double, int, int)> zapBrowserFrameConsumerIn)
         : juce::Thread("NINJAMVideoHelperServer"),
-          helperRoot(helperRootDir),
           intervalPayloadProvider(std::move(intervalPayloadProviderIn)),
           zapFrameListProvider(std::move(zapFrameListProviderIn)),
           zapFrameProvider(std::move(zapFrameProviderIn)),
@@ -99,7 +98,7 @@ public:
             return listenPort.load() > 0;
 
         reloadStaticContent();
-        if (!helperRoot.isDirectory() || helperIndexHtml.isEmpty() || helperAppHtml.isEmpty())
+        if (helperIndexHtml.isEmpty() || helperAppHtml.isEmpty())
             return false;
 
         const int firstPort = juce::jlimit(1, 65535, preferredPort);
@@ -154,7 +153,6 @@ private:
         juce::MemoryBlock body;
     };
 
-    juce::File helperRoot;
     std::function<juce::String()> intervalPayloadProvider;
     std::function<juce::String()> zapFrameListProvider;
     std::function<bool(const juce::String&, int, juce::MemoryBlock&)> zapFrameProvider;
@@ -167,6 +165,7 @@ private:
     juce::String helperIndexHtml;
     juce::String helperAppHtml;
     juce::MemoryBlock helperIconPng;
+    juce::MemoryBlock helperPoweredByPng;
     juce::MemoryBlock helperCloudMaskPng;
     juce::ThreadPool clientThreadPool { 4 };
 
@@ -2086,6 +2085,17 @@ setInterval(refresh,33);
             return response;
         }
 
+        if (path == "/PoweredByVDONinja.png" && helperPoweredByPng.getSize() > 0)
+        {
+            HttpResponse response;
+            response.contentType = "image/png";
+            response.noStore = true;
+            response.body = helperPoweredByPng;
+            if (isHead)
+                response.body.reset();
+            return response;
+        }
+
         if ((path == "/zap-mask/cloud.png" || path == "/masks/cloud.png") && helperCloudMaskPng.getSize() > 0)
         {
             HttpResponse response;
@@ -2131,14 +2141,20 @@ setInterval(refresh,33);
 
     void reloadStaticContent()
     {
-        helperIndexHtml = helperRoot.getChildFile("index.html").loadFileAsString();
-        helperAppHtml = helperRoot.getChildFile("app.html").loadFileAsString();
+        helperIndexHtml = juce::String::fromUTF8(reinterpret_cast<const char*>(ninjamplus::embedded::vdoIndexHtml),
+                                                (int) ninjamplus::embedded::vdoIndexHtmlSize);
+        helperAppHtml = juce::String::fromUTF8(reinterpret_cast<const char*>(ninjamplus::embedded::vdoAppHtml),
+                                              (int) ninjamplus::embedded::vdoAppHtmlSize);
 
-        helperIconPng.reset();
-        helperRoot.getChildFile("icon.png").loadFileAsData(helperIconPng);
+        auto loadEmbeddedPng = [](juce::MemoryBlock& destination, const unsigned char* data, std::size_t size)
+        {
+            destination.reset();
+            destination.append(data, size);
+        };
 
-        helperCloudMaskPng.reset();
-        helperRoot.getChildFile("masks").getChildFile("cloud.png").loadFileAsData(helperCloudMaskPng);
+        loadEmbeddedPng(helperIconPng, ninjamplus::embedded::vdoIconPng, ninjamplus::embedded::vdoIconPngSize);
+        loadEmbeddedPng(helperPoweredByPng, ninjamplus::embedded::vdoPoweredByPng, ninjamplus::embedded::vdoPoweredByPngSize);
+        loadEmbeddedPng(helperCloudMaskPng, ninjamplus::embedded::vdoCloudMaskPng, ninjamplus::embedded::vdoCloudMaskPngSize);
     }
 };
 
@@ -4232,6 +4248,34 @@ namespace
         return userId.trim();
     }
 
+    bool isKnownNinjamServerBotUser(juce::String userId)
+    {
+        const juce::String key = normaliseOpusPeerId(userId);
+        juce::String compact;
+        for (auto ch : key)
+        {
+            if (juce::CharacterFunctions::isLetterOrDigit(ch))
+                compact << juce::String::charToString((juce_wchar) juce::CharacterFunctions::toLowerCase(ch));
+        }
+
+        if (compact.isEmpty())
+            return false;
+
+        static const char* const knownBotPrefixes[] = {
+            "ninbot", "jambot", "ninjambot", "jamulusbot",
+            "jamserverbot", "ninjamserverbot", "serverbot"
+        };
+
+        for (const auto* prefix : knownBotPrefixes)
+        {
+            const juce::String botPrefix(prefix);
+            if (compact == botPrefix || compact.startsWith(botPrefix))
+                return true;
+        }
+
+        return false;
+    }
+
     bool isHttpOrHttpsChatUrl(juce::String url)
     {
         url = url.trim().toLowerCase();
@@ -5064,7 +5108,6 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
     // Initialize JNetLib (WSAStartup on Windows)
     JNL::open_socketlib();
 
-    videoHelperRootDir = resolveVideoHelperRootDir();
     asyncChatTranslationWorker = std::make_unique<AsyncChatTranslationWorker>(*this);
     abletonLink = std::make_unique<ableton::LinkAudio>(120.0, getLinkPeerName().toStdString());
     refreshAbletonLinkActivation();
@@ -6256,6 +6299,35 @@ void NinjamVst3AudioProcessor::broadcastVideoTimingChange(double previousBpm, do
     sendIntervalSignal("videoTimingChange", juce::JSON::toString(juce::var(obj.get())));
 }
 
+void NinjamVst3AudioProcessor::requestVideoBufferRefreshForMeasuredUsers()
+{
+    if (!vdoVideoSyncEnabled.load(std::memory_order_relaxed) || !videoHelperRunning.load())
+        return;
+
+    bool refreshed = false;
+    {
+        const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+        if (!remoteLatencyFirmDelayMsByUser.empty())
+        {
+            const auto refreshId = ++videoBufferRefreshCounter;
+            for (const auto& userDelay : remoteLatencyFirmDelayMsByUser)
+            {
+                if (userDelay.first.isEmpty())
+                    continue;
+
+                remoteVideoBufferRefreshIdByUser[userDelay.first] = refreshId;
+                refreshed = true;
+            }
+        }
+    }
+
+    if (refreshed)
+    {
+        intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
+        lastIntervalHelperPayloadWriteMs = 0.0;
+    }
+}
+
 void NinjamVst3AudioProcessor::pruneDisconnectedRemoteSyncState()
 {
     std::set<juce::String> activeUserKeys;
@@ -6267,6 +6339,9 @@ void NinjamVst3AudioProcessor::pruneDisconnectedRemoteSyncState()
             continue;
 
         const juce::String userName = juce::String::fromUTF8(userNameChars);
+        if (isKnownNinjamServerBotUser(userName))
+            continue;
+
         const juce::String senderKey = normaliseOpusPeerId(userName);
         const juce::String canonicalUserKey = canonicalDelayUserKey(userName);
         if (senderKey.isNotEmpty())
@@ -6388,41 +6463,6 @@ static juce::File getThisModuleFile()
 #endif
 }
 
-juce::File NinjamVst3AudioProcessor::resolveVideoHelperRootDir() const
-{
-    juce::Array<juce::File> candidates;
-    juce::Array<juce::File> roots;
-
-    const juce::File exeDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
-    roots.add(exeDir);
-
-    const juce::File moduleFile = getThisModuleFile();
-    if (moduleFile.existsAsFile())
-        roots.addIfNotAlreadyThere(moduleFile.getParentDirectory());
-
-    for (const auto& root : roots)
-    {
-        juce::File probe = root;
-        for (int i = 0; i < 8; ++i)
-        {
-            candidates.add(probe.getChildFile("Resources").getChildFile("advanced-vdo-client"));
-            candidates.add(probe.getParentDirectory().getChildFile("Resources").getChildFile("advanced-vdo-client"));
-            candidates.add(probe.getChildFile("advanced-vdo-client"));
-            probe = probe.getParentDirectory();
-        }
-    }
-
-    for (const auto& dir : candidates)
-    {
-        if (dir.isDirectory()
-            && dir.getChildFile("index.html").existsAsFile()
-            && dir.getChildFile("app.html").existsAsFile())
-            return dir;
-    }
-
-    return {};
-}
-
 bool NinjamVst3AudioProcessor::isAdvancedVideoClientAvailable(int port) const
 {
     if (port <= 0)
@@ -6441,18 +6481,14 @@ bool NinjamVst3AudioProcessor::ensureAdvancedVideoClientStarted()
     if (advancedVideoServer != nullptr && existingPort > 0 && isAdvancedVideoClientAvailable(existingPort))
     {
         videoHelperRunning.store(true);
+        requestVideoBufferRefreshForMeasuredUsers();
         lastIntervalHelperPayloadWriteMs = 0.0;
         return true;
     }
 
-    const juce::File rootDir = resolveVideoHelperRootDir();
-    if (!rootDir.isDirectory())
-        return false;
-
     if (!advancedVideoServer)
     {
         advancedVideoServer = std::make_unique<LocalVideoHttpServer>(
-            rootDir,
             [this]()
             {
                 const juce::ScopedLock lock(intervalHelperPayloadLock);
@@ -6508,6 +6544,7 @@ bool NinjamVst3AudioProcessor::ensureAdvancedVideoClientStarted()
         if (isAdvancedVideoClientAvailable(helperPort))
         {
             videoHelperRunning.store(true);
+            requestVideoBufferRefreshForMeasuredUsers();
             lastIntervalHelperPayloadWriteMs = 0.0;
             return true;
         }
@@ -8271,10 +8308,13 @@ void NinjamVst3AudioProcessor::launchVideoSession()
         addSystemChatLine("NINJAMZap video transport disabled for VDO.");
     }
 
-    vdoVideoSyncEnabled.store(true, std::memory_order_relaxed);
+    const bool wasVdoSyncEnabled = vdoVideoSyncEnabled.exchange(true, std::memory_order_relaxed);
     intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
     lastIntervalHelperPayloadWriteMs = 0.0;
-    resetIntervalSyncTimingCache();
+    if (!wasVdoSyncEnabled)
+        resetIntervalSyncTimingCache();
+    else
+        requestVideoBufferRefreshForMeasuredUsers();
     {
         const juce::ScopedLock clientLock(ninjamClientLock);
         if (ninjamClient.GetStatus() == NJClient::NJC_STATUS_OK
@@ -8444,6 +8484,7 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
     const int bpi = juce::jmax(1, getBPI());
     const double bpm = juce::jmax(1.0, (double)getBPM());
     const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    const double wallClockMs = (double)juce::Time::currentTimeMillis();
     const double globalUnit = (double)displayInterval * (double)safeLength + (double)juce::jlimit(0, safeLength, pos);
     const double beatLength = (double)safeLength / (double)bpi;
     const double globalBeat = beatLength > 0.0 ? std::floor(globalUnit / beatLength) : 0.0;
@@ -8462,6 +8503,7 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
         infoObj->setProperty("globalUnit", globalUnit);
         infoObj->setProperty("globalBeat", globalBeat);
         infoObj->setProperty("videoClockMs", nowMs);
+        infoObj->setProperty("wallClockMs", wallClockMs);
         infoObj->setProperty("syncTag", syncTag);
         infoObj->setProperty("bufferMode", "remote");
         infoObj->setProperty("voiceChatMode", false);
@@ -8476,6 +8518,9 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
             continue;
 
         const juce::String userName = juce::String::fromUTF8(userNameChars);
+        if (isKnownNinjamServerBotUser(userName))
+            continue;
+
         const juce::String senderKey = normaliseOpusPeerId(userName);
         const juce::String canonicalUserKey = canonicalDelayUserKey(userName);
         const juce::String rosterKey = canonicalUserKey.isNotEmpty() ? canonicalUserKey : senderKey;
@@ -8916,6 +8961,9 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
         const char* name = ninjamClient.GetUserState(i, nullptr, nullptr, nullptr);
         if (name)
         {
+            if (isKnownNinjamServerBotUser(juce::String::fromUTF8(name)))
+                continue;
+
             bool hasAudioChannel = false;
             for (int ch = 0; ch < 32; ++ch)
             {
@@ -17559,7 +17607,8 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
             auto appliedIt = remoteLatencyLastAppliedIntervalByUser.find(senderKey);
             if (appliedIt != remoteLatencyLastAppliedIntervalByUser.end())
                 priorAppliedMarker = appliedIt->second;
-            bool shouldApply = (appliedIt == remoteLatencyLastAppliedIntervalByUser.end());
+            const bool isFirstAppliedDelay = (appliedIt == remoteLatencyLastAppliedIntervalByUser.end());
+            bool shouldApply = isFirstAppliedDelay;
             if (!shouldApply)
             {
                 const long long markerDelta = sourceMarkerKey - priorAppliedMarker;
@@ -17578,6 +17627,15 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
                 remoteLatencyLastAppliedIntervalByUser[senderKey] = sourceMarkerKey;
                 if (canonicalSenderKey.isNotEmpty())
                     remoteLatencyLastAppliedIntervalByUser[canonicalSenderKey] = sourceMarkerKey;
+                if (isFirstAppliedDelay && vdoVideoSyncEnabled.load(std::memory_order_relaxed) && videoHelperRunning.load())
+                {
+                    const auto refreshId = ++videoBufferRefreshCounter;
+                    remoteVideoBufferRefreshIdByUser[senderKey] = refreshId;
+                    if (canonicalSenderKey.isNotEmpty())
+                        remoteVideoBufferRefreshIdByUser[canonicalSenderKey] = refreshId;
+                    intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
+                    lastIntervalHelperPayloadWriteMs = 0.0;
+                }
             }
         }
     }

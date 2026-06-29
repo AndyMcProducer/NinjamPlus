@@ -9,6 +9,177 @@
 #include <thread>
 static juce::String normaliseColourPresetName(const juce::String& name);
 static juce::Colour colourFromPresetName(const juce::String& preset, const juce::Colour& fallback);
+
+static std::atomic<bool> ninjamAutomaticUpdateCheckStarted { false };
+
+struct NinjamUpdateCheckResult
+{
+    bool requestOk = false;
+    bool updateAvailable = false;
+    juce::String latestVersion;
+    juce::String releaseUrl;
+    juce::String downloadUrl;
+    juce::String errorMessage;
+};
+
+static juce::String stripNinjamVersionPrefix(juce::String version)
+{
+    version = version.trim();
+    if (version.startsWithIgnoreCase("refs/tags/"))
+        version = version.substring(10);
+    if (version.startsWithIgnoreCase("v"))
+        version = version.substring(1);
+    return version.upToFirstOccurrenceOf("-", false, false).trim();
+}
+
+static std::array<int, 4> parseNinjamVersionParts(const juce::String& versionText)
+{
+    std::array<int, 4> parts {};
+    juce::StringArray tokens;
+    tokens.addTokens(stripNinjamVersionPrefix(versionText), ".", "");
+    for (int i = 0; i < juce::jmin(4, tokens.size()); ++i)
+        parts[(size_t)i] = juce::jmax(0, tokens[i].getIntValue());
+    return parts;
+}
+
+static int compareNinjamVersions(const juce::String& currentVersion, const juce::String& latestVersion)
+{
+    const auto current = parseNinjamVersionParts(currentVersion);
+    const auto latest = parseNinjamVersionParts(latestVersion);
+    for (size_t i = 0; i < current.size(); ++i)
+    {
+        if (latest[i] > current[i])
+            return 1;
+        if (latest[i] < current[i])
+            return -1;
+    }
+    return 0;
+}
+
+static juce::String getNinjamUpdateObjectString(juce::DynamicObject* obj, const char* property)
+{
+    return obj != nullptr ? obj->getProperty(property).toString().trim() : juce::String();
+}
+
+static int scoreNinjamReleaseAssetForThisBuild(const juce::String& assetName, bool standaloneBuild)
+{
+    const juce::String lower = assetName.toLowerCase();
+#if JUCE_WINDOWS
+    if (!lower.contains("windows"))
+        return 0;
+    if (standaloneBuild && lower.contains("setup") && lower.endsWith(".exe"))
+        return 100;
+    if (standaloneBuild && lower.contains("standalone"))
+        return 80;
+    if (!standaloneBuild && lower.contains("vst3"))
+        return 80;
+#elif JUCE_MAC
+    if (!lower.contains("macos") && !lower.contains("mac"))
+        return 0;
+    if (standaloneBuild && lower.endsWith(".pkg"))
+        return 100;
+    if (standaloneBuild && lower.contains("standalone"))
+        return 80;
+    if (!standaloneBuild && lower.endsWith(".pkg"))
+        return 90;
+    if (!standaloneBuild && (lower.contains("vst3") || lower.contains("au")))
+        return 80;
+#elif JUCE_LINUX || JUCE_BSD
+    if (!lower.contains("linux"))
+        return 0;
+    if (standaloneBuild && lower.contains("standalone"))
+        return 90;
+    if (!standaloneBuild && lower.contains("lv2"))
+        return 85;
+    if (!standaloneBuild && lower.contains("vst3"))
+        return 80;
+#else
+    juce::ignoreUnused(standaloneBuild);
+#endif
+    return 0;
+}
+
+static juce::String chooseNinjamReleaseDownloadUrl(juce::DynamicObject* root, bool standaloneBuild)
+{
+    juce::String bestUrl;
+    int bestScore = 0;
+    if (root == nullptr)
+        return bestUrl;
+
+    if (auto* assets = root->getProperty("assets").getArray())
+    {
+        for (const auto& assetVar : *assets)
+        {
+            auto* asset = assetVar.getDynamicObject();
+            const juce::String name = getNinjamUpdateObjectString(asset, "name");
+            const juce::String url = getNinjamUpdateObjectString(asset, "browser_download_url");
+            if (name.isEmpty() || url.isEmpty())
+                continue;
+
+            const int score = scoreNinjamReleaseAssetForThisBuild(name, standaloneBuild);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestUrl = url;
+            }
+        }
+    }
+
+    return bestUrl;
+}
+
+static NinjamUpdateCheckResult fetchLatestNinjamReleaseInfo(const juce::String& currentVersion,
+                                                            bool standaloneBuild)
+{
+    static constexpr const char* latestApiUrl = "https://api.github.com/repos/AndyMcProducer/NinjamPlus/releases/latest";
+    static constexpr const char* latestReleasePageUrl = "https://github.com/AndyMcProducer/NinjamPlus/releases/latest";
+
+    NinjamUpdateCheckResult result;
+    result.releaseUrl = latestReleasePageUrl;
+
+    int statusCode = 0;
+    auto stream = juce::URL(latestApiUrl).createInputStream(
+        juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
+            .withConnectionTimeoutMs(7000)
+            .withNumRedirectsToFollow(3)
+            .withStatusCode(&statusCode)
+            .withExtraHeaders("User-Agent: NINJAMplus Update Checker\r\nAccept: application/vnd.github+json\r\n")
+            .withHttpRequestCmd("GET"));
+
+    if (stream == nullptr || (statusCode != 0 && (statusCode < 200 || statusCode >= 300)))
+    {
+        result.errorMessage = statusCode == 0
+            ? "Could not reach GitHub releases."
+            : "GitHub returned HTTP " + juce::String(statusCode) + ".";
+        return result;
+    }
+
+    const juce::String response = stream->readEntireStreamAsString();
+    const juce::var parsed = juce::JSON::parse(response);
+    auto* root = parsed.getDynamicObject();
+    if (root == nullptr)
+    {
+        result.errorMessage = "GitHub returned an unreadable release response.";
+        return result;
+    }
+
+    const juce::String tagName = getNinjamUpdateObjectString(root, "tag_name");
+    if (tagName.isEmpty())
+    {
+        result.errorMessage = "GitHub release response did not include a version tag.";
+        return result;
+    }
+
+    const juce::String htmlUrl = getNinjamUpdateObjectString(root, "html_url");
+    if (htmlUrl.isNotEmpty())
+        result.releaseUrl = htmlUrl;
+
+    result.requestOk = true;
+    result.latestVersion = tagName.startsWithIgnoreCase("v") ? tagName : "v" + tagName;
+    result.updateAvailable = compareNinjamVersions(currentVersion, tagName) > 0;
+    result.downloadUrl = chooseNinjamReleaseDownloadUrl(root, standaloneBuild);
+    return result;
+}
 #if JUCE_WINDOWS
 #include <windows.h>
 #include <shellapi.h>
@@ -1444,6 +1615,20 @@ static juce::String formatDbTickLabel(double db)
     return juce::String(dbInt) + " dB";
 }
 
+static int yForFaderProportion(juce::Rectangle<int> track, float proportion)
+{
+    const float p = juce::jlimit(0.0f, 1.0f, proportion);
+    return juce::roundToInt(juce::jmap(p, 0.0f, 1.0f,
+                                       (float)track.getBottom(), (float)track.getY()));
+}
+
+static int xForFaderProportion(juce::Rectangle<int> track, float proportion)
+{
+    const float p = juce::jlimit(0.0f, 1.0f, proportion);
+    return juce::roundToInt(juce::jmap(p, 0.0f, 1.0f,
+                                       (float)track.getX(), (float)track.getRight()));
+}
+
 void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int y, int width, int height,
                                                   float sliderPos, float minSliderPos, float maxSliderPos,
                                                   const juce::Slider::SliderStyle style, juce::Slider& slider)
@@ -1466,8 +1651,6 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
         g.drawRect(track);
 
         int tickX = track.getRight() + 6;
-        const float sliderTop = juce::jmin(minSliderPos, maxSliderPos);
-        const float sliderBottom = juce::jmax(minSliderPos, maxSliderPos);
 
         if (isDbThresholdFader(slider))
         {
@@ -1479,7 +1662,7 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
             {
                 const double value = juce::jlimit(minDb, maxDb, db);
                 const float prop = juce::jlimit(0.0f, 1.0f, (float)slider.valueToProportionOfLength(value));
-                const int yPos = juce::roundToInt(juce::jmap(prop, 0.0f, 1.0f, sliderBottom, sliderTop));
+                const int yPos = yForFaderProportion(track, prop);
                 const bool major = db == maxDb || db == minDb;
                 const int labelY = juce::jlimit(bounds.getY(), bounds.getBottom() - 14, yPos - 7);
 
@@ -1507,7 +1690,7 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
             float clampedGain = juce::jlimit(1.0e-6f, 2.0f, gain);
             float db = 20.0f * std::log10(clampedGain);
 
-            int yPos = juce::roundToInt(juce::jmap(prop, 0.0f, 1.0f, sliderBottom, sliderTop));
+            int yPos = yForFaderProportion(track, prop);
 
             float alpha = 0.7f;
             if (i == numTicksBelowZero) alpha = 0.95f;
@@ -1524,8 +1707,9 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
             else
                 label = juce::String((int)std::round(db)) + " dB";
 
+            const int labelY = juce::jlimit(bounds.getY(), bounds.getBottom() - 14, yPos - 7);
             g.setFont(9.0f);
-            g.drawText(label, tickX + 4, yPos - 7, 40, 14,
+            g.drawText(label, tickX + 4, labelY, 40, 14,
                        juce::Justification::centredLeft, false);
         }
     }
@@ -1544,8 +1728,6 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
 
         g.setColour(juce::Colours::black);
         g.drawRect(track);
-        const float sliderLeft = juce::jmin(minSliderPos, maxSliderPos);
-        const float sliderRight = juce::jmax(minSliderPos, maxSliderPos);
 
         if (isDbThresholdFader(slider))
         {
@@ -1557,16 +1739,17 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
             {
                 const double value = juce::jlimit(minDb, maxDb, db);
                 const float prop = juce::jlimit(0.0f, 1.0f, (float)slider.valueToProportionOfLength(value));
-                const int xPos = juce::roundToInt(juce::jmap(prop, 0.0f, 1.0f, sliderLeft, sliderRight));
+                const int xPos = xForFaderProportion(track, prop);
                 const bool major = db == maxDb || db == minDb;
 
                 g.setColour(juce::Colours::lightgrey.withAlpha(major ? 0.92f : 0.68f));
                 g.drawLine((float)xPos, (float)(track.getY() - 6),
                            (float)xPos, (float)(track.getBottom() + 6));
 
+                const int labelX = juce::jlimit(bounds.getX(), bounds.getRight() - 40, xPos - 20);
                 g.setFont(10.0f);
                 g.drawText(formatDbTickLabel(db),
-                           xPos - 20,
+                           labelX,
                            track.getBottom() + 8,
                            40,
                            14,
@@ -1589,7 +1772,7 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
             float clampedGain = juce::jlimit(1.0e-6f, 2.0f, gain);
             float db = 20.0f * std::log10(clampedGain);
 
-            int xPos = juce::roundToInt(juce::jmap(prop, 0.0f, 1.0f, sliderLeft, sliderRight));
+            int xPos = xForFaderProportion(track, prop);
 
             float alpha = 0.7f;
             if (i == numTicksBelowZero) alpha = 0.95f;
@@ -1606,9 +1789,10 @@ void FaderLookAndFeel::drawLinearSliderBackground(juce::Graphics& g, int x, int 
             else
                 label = juce::String((int)std::round(db)) + " dB";
 
+            const int labelX = juce::jlimit(bounds.getX(), bounds.getRight() - 40, xPos - 20);
             g.setFont(10.0f);
             g.drawText(label,
-                       xPos - 20,
+                       labelX,
                        track.getBottom() + 8,
                        40,
                        14,
@@ -8597,6 +8781,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     persistentSettingsDirty = false;
 
     updateEditorTimerInterval();
+    automaticUpdateCheckDueMs = juce::Time::getMillisecondCounterHiRes() + 4500.0;
 
     if (!audioProcessor.isStandaloneWrapper() && isAbletonLiveHost())
     {
@@ -9178,6 +9363,13 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
 {
     const double nowMs = juce::Time::getMillisecondCounterHiRes();
     const bool abletonHostEditor = !audioProcessor.isStandaloneWrapper() && isAbletonLiveHost();
+
+    if (automaticUpdateCheckDueMs > 0.0 && nowMs >= automaticUpdateCheckDueMs)
+    {
+        automaticUpdateCheckDueMs = 0.0;
+        if (!ninjamAutomaticUpdateCheckStarted.exchange(true))
+            beginUpdateCheck(false);
+    }
 
     const double transmitPulseRepaintMs = abletonHostEditor ? 250.0 : 33.0;
     if (transmitButton.isVisible()
@@ -11952,6 +12144,7 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
     menu.addItem(42, "Enable Chord Detection", true, audioProcessor.isChordDetectionEnabled());
     menu.addItem(46, "Enable Sample Pads / Looper", true, audioProcessor.isSamplePadsFeatureEnabled());
     menu.addItem(43, "Ableton Link Audio");
+    menu.addItem(47, "Check for Updates...");
     menu.addSubMenu("Metronome Sound", metronomeSoundMenu);
     menu.addSubMenu("Metronome Output", metronomeOutputMenu);
     menu.addSubMenu("Transport Sync Source", syncSourceMenu);
@@ -11995,6 +12188,11 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
                 resized();
                 repaint();
                 markPersistentSettingsDirty();
+            }
+            if (result == 47)
+            {
+                beginUpdateCheck(true);
+                return;
             }
             constexpr int callbackMetronomeOutputMonoMenuIdBase = 8000;
             constexpr int callbackMetronomeOutputStereoMenuIdBase = 8200;
@@ -12092,6 +12290,130 @@ void NinjamVst3AudioProcessorEditor::showAboutWindow()
     aboutWindow->enterModalState(true, nullptr, false);
 }
 
+void NinjamVst3AudioProcessorEditor::beginUpdateCheck(bool userInitiated)
+{
+    bool expected = false;
+    if (!updateCheckInProgress.compare_exchange_strong(expected, true))
+    {
+        if (userInitiated)
+        {
+            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
+                                                   "Check for Updates",
+                                                   "An update check is already running.",
+                                                   "OK",
+                                                   this);
+        }
+        return;
+    }
+
+    const juce::String currentVersion = audioProcessor.getVersionString();
+    const bool standaloneBuild = audioProcessor.isStandaloneWrapper();
+    juce::Component::SafePointer<NinjamVst3AudioProcessorEditor> safeThis(this);
+
+    std::thread([safeThis, currentVersion, standaloneBuild, userInitiated]
+    {
+        auto result = fetchLatestNinjamReleaseInfo(currentVersion, standaloneBuild);
+
+        juce::MessageManager::callAsync([safeThis, userInitiated, result = std::move(result)]() mutable
+        {
+            if (safeThis == nullptr)
+                return;
+
+            safeThis->updateCheckInProgress.store(false);
+            safeThis->completeUpdateCheck(userInitiated,
+                                          result.requestOk,
+                                          result.updateAvailable,
+                                          result.latestVersion,
+                                          result.releaseUrl,
+                                          result.downloadUrl,
+                                          result.errorMessage);
+        });
+    }).detach();
+}
+
+void NinjamVst3AudioProcessorEditor::completeUpdateCheck(bool userInitiated,
+                                                         bool requestOk,
+                                                         bool updateAvailable,
+                                                         const juce::String& latestVersion,
+                                                         const juce::String& releaseUrl,
+                                                         const juce::String& downloadUrl,
+                                                         const juce::String& errorMessage)
+{
+    if (!requestOk)
+    {
+        if (userInitiated)
+        {
+            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                   "Update Check Failed",
+                                                   errorMessage.isNotEmpty() ? errorMessage : "The latest release could not be checked.",
+                                                   "OK",
+                                                   this);
+        }
+        return;
+    }
+
+    if (!updateAvailable)
+    {
+        if (userInitiated)
+        {
+            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
+                                                   "NINJAMplus is Up to Date",
+                                                   "You are running " + audioProcessor.getVersionString() + ".",
+                                                   "OK",
+                                                   this);
+        }
+        return;
+    }
+
+    showUpdateAvailablePrompt(latestVersion, releaseUrl, downloadUrl);
+}
+
+void NinjamVst3AudioProcessorEditor::showUpdateAvailablePrompt(const juce::String& latestVersion,
+                                                               const juce::String& releaseUrl,
+                                                               const juce::String& downloadUrl)
+{
+    if (updatePromptShowing)
+        return;
+
+    updatePromptShowing = true;
+    const bool standaloneBuild = audioProcessor.isStandaloneWrapper();
+    const juce::String actionUrl = (standaloneBuild && downloadUrl.isNotEmpty()) ? downloadUrl : releaseUrl;
+    juce::String message;
+    message << "Current version: " << audioProcessor.getVersionString() << "\n"
+            << "Latest version: " << latestVersion << "\n\n";
+
+    if (standaloneBuild)
+    {
+        message << "Click Download Update to open the installer or release download in your browser. "
+                << "Close NINJAMplus before running the installer.";
+    }
+    else
+    {
+        message << "This plugin is running inside a DAW. Open the release page, download the plugin for your system, "
+                << "then close the DAW before installing the new version.";
+    }
+
+    auto* alert = new juce::AlertWindow("NINJAMplus Update Available",
+                                        message,
+                                        juce::AlertWindow::InfoIcon);
+    alert->addButton(standaloneBuild && downloadUrl.isNotEmpty() ? "Download Update" : "Open Release", 1,
+                     juce::KeyPress(juce::KeyPress::returnKey));
+    alert->addButton("Later", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+
+    juce::Component::SafePointer<NinjamVst3AudioProcessorEditor> safeThis(this);
+    alert->enterModalState(true,
+                           juce::ModalCallbackFunction::create(
+                               [safeThis, alert, actionUrl](int result)
+                               {
+                                   std::unique_ptr<juce::AlertWindow> alertOwner(alert);
+                                   if (safeThis != nullptr)
+                                       safeThis->updatePromptShowing = false;
+
+                                   if (result == 1 && actionUrl.isNotEmpty())
+                                       juce::URL(actionUrl).launchInDefaultBrowser();
+                               }),
+                           false);
+}
 void NinjamVst3AudioProcessorEditor::showReverbSettingsPopup()
 {
     showSettingsCallout(std::make_unique<ReverbSettingsPopupComponent>(audioProcessor), fxButton);

@@ -14,7 +14,7 @@
             color: #e7eaf0;
             font-family: "Segoe UI", Arial, sans-serif;
             display: grid;
-            grid-template-rows: auto 1fr;
+            grid-template-rows: auto 1fr auto;
             gap: 8px;
             padding: 8px;
         }
@@ -187,6 +187,52 @@
             display: block;
             background: #000;
         }
+        .footer {
+            min-height: 36px;
+            padding: 6px 10px;
+            border: 1px solid #2a3450;
+            border-radius: 6px;
+            background: #151d2d;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .beat-counter {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            min-width: 0;
+            color: #d8e0ef;
+            font-size: 12px;
+            font-variant-numeric: tabular-nums;
+        }
+        .beat-counter-label {
+            min-width: 64px;
+            color: #aeb7c9;
+            white-space: nowrap;
+        }
+        .beat-strip {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 3px;
+            min-width: 0;
+        }
+        .beat-dot {
+            width: 9px;
+            height: 9px;
+            border: 1px solid #344156;
+            border-radius: 2px;
+            background: #171d28;
+        }
+        .beat-dot.past {
+            background: #2d5d48;
+            border-color: #3e7b5d;
+        }
+        .beat-dot.active {
+            background: #46d87f;
+            border-color: #92f0b4;
+            box-shadow: 0 0 8px rgba(70,216,127,0.8);
+        }
     </style>
 </head>
 <body>
@@ -264,6 +310,12 @@
     <div class="frame-wrap">
         <iframe id="appFrame" allow="camera; microphone; fullscreen"></iframe>
     </div>
+    <div class="footer">
+        <div class="beat-counter" id="beatCounter" aria-live="polite">
+            <span class="beat-counter-label" id="beatCounterText">BPI --/--</span>
+            <span class="beat-strip" id="beatStrip" aria-hidden="true"></span>
+        </div>
+    </div>
     <script>
         const query = new URLSearchParams(window.location.search);
         const roomText = document.getElementById('roomText');
@@ -277,6 +329,8 @@
         const vdoCameraBgImage = document.getElementById('vdoCameraBgImage');
         const peerOffsets = document.getElementById('peerOffsets');
         const statusText = document.getElementById('statusText');
+        const beatCounterText = document.getElementById('beatCounterText');
+        const beatStrip = document.getElementById('beatStrip');
         const appFrame = document.getElementById('appFrame');
 
         const roomParam = query.get('room') || '';
@@ -446,6 +500,7 @@
             p.delete('view');
             applyCameraFxToMainParams(p);
             p.set('helperLoad', String(Date.now()));
+            p.set('hideFooter', '1');
             const q = p.toString();
             return q ? ('/app?' + q) : '/app';
         }
@@ -494,6 +549,22 @@
             return v;
         }
 
+        function isServerBotUserId(userId) {
+            const key = normalizeUserId(userId);
+            const compact = key.replace(/[^a-z0-9]/g, '');
+            if (!compact) {
+                return false;
+            }
+            const botPrefixes = ['ninbot', 'jambot', 'ninjambot', 'jamulusbot', 'jamserverbot', 'ninjamserverbot', 'serverbot'];
+            for (let i = 0; i < botPrefixes.length; i++) {
+                const prefix = botPrefixes[i];
+                if (compact === prefix || compact.indexOf(prefix) === 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         function offsetStorageKey(userId) {
             return 'ninjamPeerOffset:' + resolvedRoom + ':' + normalizeUserId(userId);
         }
@@ -524,8 +595,54 @@
         const userLastSeenAt = {};
         const userLastSampleKey = {};
         let lastRosterRevision = '';
+        let intervalInfo = null;
         const userStaleMs = 12000;
 
+        function getBeatCounterState() {
+            const info = intervalInfo || {};
+            const bpi = parseInt(info.bpi || 0, 10) || 0;
+            if (bpi <= 0) {
+                return { bpi: 0, beat: 0 };
+            }
+            const length = typeof info.length === 'number' && isFinite(info.length) ? info.length : 0;
+            const pos = typeof info.pos === 'number' && isFinite(info.pos) ? info.pos : 0;
+            const interval = typeof info.interval === 'number' && isFinite(info.interval) ? info.interval : 0;
+            const bpm = typeof info.bpm === 'number' && isFinite(info.bpm) ? info.bpm : 0;
+            let totalBeat = NaN;
+            if (length > 0) {
+                const clampedPos = Math.max(0, Math.min(length - 1, pos));
+                totalBeat = (interval * bpi) + ((clampedPos / length) * bpi);
+            } else if (typeof info.globalBeat === 'number' && isFinite(info.globalBeat)) {
+                totalBeat = info.globalBeat;
+            }
+            if (isFinite(totalBeat) && bpm > 0 && typeof info.updatedAt === 'number' && isFinite(info.updatedAt)) {
+                totalBeat += Math.max(0, Date.now() - info.updatedAt) / (60000 / bpm);
+            }
+            if (!isFinite(totalBeat)) {
+                return { bpi: 0, beat: 0 };
+            }
+            const beatIndex = ((Math.floor(totalBeat) % bpi) + bpi) % bpi;
+            return { bpi: bpi, beat: beatIndex + 1 };
+        }
+
+        function renderBeatCounter() {
+            if (!beatCounterText || !beatStrip) {
+                return;
+            }
+            const state = getBeatCounterState();
+            if (state.bpi <= 0) {
+                beatCounterText.textContent = 'BPI --/--';
+                beatStrip.innerHTML = '';
+                return;
+            }
+            beatCounterText.textContent = 'BPI ' + state.beat + '/' + state.bpi;
+            beatStrip.innerHTML = '';
+            for (let i = 1; i <= state.bpi; i++) {
+                const dot = document.createElement('span');
+                dot.className = i === state.beat ? 'beat-dot active' : (i < state.beat ? 'beat-dot past' : 'beat-dot');
+                beatStrip.appendChild(dot);
+            }
+        }
         function getMeasuredBufferMs(userId) {
             const v = measuredBufferMsByUser[normalizeUserId(userId)];
             return (typeof v === 'number' && isFinite(v) && v >= 0) ? Math.round(v) : null;
@@ -708,7 +825,7 @@
 
         function addUser(userId) {
             const key = normalizeUserId(userId);
-            if (!key) return false;
+            if (!key || isServerBotUserId(key)) return false;
             if (knownUsers[key]) return false;
             knownUsers[key] = String(userId || '').trim() || key;
             return true;
@@ -716,7 +833,7 @@
 
         function markUserSeen(userId) {
             const key = normalizeUserId(userId);
-            if (!key) return;
+            if (!key || isServerBotUserId(key)) return;
             userLastSeenAt[key] = Date.now();
         }
 
@@ -759,7 +876,7 @@
             const activeNow = {};
             for (let i = 0; i < activeUserKeys.length; i++) {
                 const key = normalizeUserId(activeUserKeys[i]);
-                if (key) {
+                if (key && !isServerBotUserId(key)) {
                     activeNow[key] = true;
                 }
             }
@@ -803,6 +920,7 @@
                 const k = window.localStorage.key(i) || '';
                 if (!k.startsWith(prefix)) continue;
                 const userId = k.slice(prefix.length);
+                if (isServerBotUserId(userId)) continue;
                 if (addUser(userId)) changed = true;
             }
             return changed;
@@ -908,6 +1026,20 @@
             for (let i = 0; i < items.length; i++) {
                 const msg = items[i] || {};
                 const type = String(msg.type || '');
+                if (type === 'intervalInfo') {
+                    const timingOriginMs = (typeof msg.wallClockMs === 'number' && isFinite(msg.wallClockMs)) ? msg.wallClockMs : Date.now();
+                    intervalInfo = {
+                        interval: msg.interval,
+                        pos: typeof msg.pos === 'number' ? msg.pos : 0,
+                        bpm: msg.bpm,
+                        bpi: msg.bpi,
+                        length: typeof msg.length === 'number' ? msg.length : 0,
+                        globalBeat: typeof msg.globalBeat === 'number' && isFinite(msg.globalBeat) ? msg.globalBeat : NaN,
+                        updatedAt: timingOriginMs
+                    };
+                    renderBeatCounter();
+                    continue;
+                }
                 if (type === 'activeRoster') {
                     applyActiveRosterMessage(msg);
                     continue;
@@ -916,6 +1048,9 @@
                     continue;
                 }
                 const userId = msg.userId || msg.userKey || '';
+                if (isServerBotUserId(userId)) {
+                    continue;
+                }
                 if (addUser(userId)) {
                     changed = true;
                 }
@@ -1074,6 +1209,8 @@
         }
 
         renderUsers();
+        renderBeatCounter();
+        setInterval(renderBeatCounter, 125);
         appFrame.addEventListener('load', pushAllOffsetsToFrame);
         appFrame.src = buildMainUrl();
         startUserDiscovery();
