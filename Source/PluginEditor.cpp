@@ -1819,10 +1819,10 @@ void FaderLookAndFeel::drawLinearSlider(juce::Graphics& g, int x, int y, int wid
     {
         drawLinearSliderBackground(g, x, y, width, height, sliderPos, minSliderPos, maxSliderPos, style, slider);
         bool isVert = (style == juce::Slider::LinearVertical);
-        float thumbW = isVert ? juce::jmin(34.0f, (float)width * 0.95f) : 40.0f;
+        float thumbW = isVert ? juce::jmin(22.0f, (float)width * 0.68f) : 40.0f;
         float thumbH = isVert ? 42.0f : (float)height * 0.95f;
-        float thumbX = isVert ? (float)x + (float)width  * 0.025f : sliderPos - thumbW * 0.5f;
-        float thumbY = isVert ? sliderPos - thumbH * 0.5f         : (float)y + (float)height * 0.025f;
+        float thumbX = isVert ? (float)x + ((float)width - thumbW) * 0.5f : sliderPos - thumbW * 0.5f;
+        float thumbY = isVert ? sliderPos - thumbH * 0.5f                 : (float)y + (float)height * 0.025f;
         // Clamp so thumb never clips outside the slider bounds
         thumbX = juce::jlimit((float)x,              (float)(x + width)  - thumbW, thumbX);
         thumbY = juce::jlimit((float)y,              (float)(y + height) - thumbH, thumbY);
@@ -1856,7 +1856,7 @@ void FaderLookAndFeel::drawLinearSlider(juce::Graphics& g, int x, int y, int wid
                                    bounds.getHeight() - 8);
 
         int thumbHeight = juce::jmin(52, track.getHeight() / 2);
-        int thumbWidth = 30;
+        int thumbWidth = juce::jmin(22, juce::jmax(10, (bounds.getWidth() * 68) / 100));
         int thumbY = juce::jlimit(bounds.getY(), bounds.getBottom() - thumbHeight,
                                   (int)sliderPos - thumbHeight / 2);
         juce::Rectangle<int> thumb(track.getCentreX() - thumbWidth / 2, thumbY, thumbWidth, thumbHeight);
