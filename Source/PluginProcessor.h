@@ -1267,7 +1267,7 @@ private:
     bool copyRemoteUserAudioForLooper(int userIndex, int numSamples);
     void updateSamplePadTransport(int transportPosition, int transportLength, int bpi);
     double getSamplePadBlockStartBeat(int transportPosition, int transportLength, int bpi, double& samplesPerBeat);
-    void updateSamplePadMidiHolds();
+    void updateSamplePadMidiHolds(double currentBeat, int bpi);
     void processSamplePadLooperRecording(int numSamples,
                                          double blockStartBeat,
                                          double samplesPerBeat,

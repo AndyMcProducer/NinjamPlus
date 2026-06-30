@@ -154,6 +154,66 @@
         body.hide-footer .footer {
             display: none;
         }
+        .obs-grid {
+            display: none;
+            width: 100%;
+            height: 100%;
+            background: #000;
+            gap: 0;
+            overflow: hidden;
+        }
+        .obs-tile {
+            min-width: 0;
+            min-height: 0;
+            background: #000;
+            overflow: hidden;
+        }
+        .obs-tile iframe {
+            width: 100%;
+            height: 100%;
+            border: 0;
+            display: block;
+            background: #000;
+        }
+        body.obs-mode {
+            background: #000;
+        }
+        body.obs-mode .app {
+            grid-template-rows: 1fr;
+        }
+        body.obs-mode .header,
+        body.obs-mode .footer {
+            display: none;
+        }
+        body.obs-mode .frame-wrap {
+            position: relative;
+            background: #000;
+        }
+        body.obs-mode #vdoFrame {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
+            pointer-events: none;
+        }
+        body.obs-mode .obs-grid {
+            display: grid;
+        }
+        .obs-grid.layout-tiles {
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        }
+        .obs-grid.layout-rows {
+            grid-template-columns: minmax(0, 1fr);
+        }
+        .obs-grid.layout-columns {
+            grid-auto-flow: column;
+            grid-auto-columns: minmax(280px, 1fr);
+            overflow-x: hidden;
+        }
+        .obs-grid.single {
+            grid-template-columns: minmax(0, 1fr);
+            grid-auto-flow: row;
+        }
     </style>
 </head>
 <body>
@@ -168,6 +228,7 @@
             </div>
         </div>
         <div class="frame-wrap">
+            <div id="obsGrid" class="obs-grid" aria-hidden="true"></div>
             <iframe id="vdoFrame" allow="camera; microphone; fullscreen"></iframe>
         </div>
         <div class="footer">
@@ -184,13 +245,23 @@
         const roomFromServer = ninjamServer ? ninjamServer.replace(/\./g, '_') : '';
         const resolvedRoom = roomParam || roomFromServer || 'ninjam';
         const minimumBufferMs = 0;
-
+        const obsMode = query.get('obs') === '1' || String(query.get('view') || '').toLowerCase() === 'obs';
         function normalizeBufferMode(value) {
             const mode = String(value || '').trim().toLowerCase();
             if (mode === 'realtime' || mode === 'voice' || mode === 'voicechat') {
                 return 'realtime';
             }
             return 'remote';
+        }
+
+        function normalizeObsLayout(value) {
+            const layout = String(value || 'tiles').toLowerCase();
+            return layout === 'rows' || layout === 'columns' ? layout : 'tiles';
+        }
+
+        function normalizeObsSlot(value) {
+            const slot = parseInt(value || '0', 10);
+            return isFinite(slot) ? Math.max(0, Math.min(12, slot)) : 0;
         }
 
         function normalizeCameraFx(value) {
@@ -209,7 +280,8 @@
 
         function normalizeVdoQualityPreset(value) {
             const preset = String(value || 'default').trim().toLowerCase();
-            if (preset === '1080p60' || preset === 'high' || preset === 'fullhd60') return '1080p60';
+            if (preset === '1080p60-8000' || preset === '1080p60hq' || preset === 'hq8000' || preset === 'high8000' || preset === '8000') return '1080p60-8000';
+            if (preset === '1080p60' || preset === 'high' || preset === 'fullhd60') return '1080p60-8000';
             if (preset === '1080p30' || preset === 'fullhd30') return '1080p30';
             if (preset === '720p60' || preset === 'hd60') return '720p60';
             if (preset === '720p30' || preset === 'hd30') return '720p30';
@@ -230,17 +302,23 @@
             return parseInt(query.get('fps') || query.get('fr') || query.get('frameRate') || '', 10) || 0;
         }
 
+        function queryBitrateValue() {
+            return parseInt(query.get('cameraBitrate') || query.get('vdoBitrate') || query.get('bitrate') || query.get('videobitrate') || query.get('vb') || '', 10) || 0;
+        }
+
         function initialVdoQualityPreset() {
             const directQuality = query.get('cameraQuality') || query.get('vdoQuality');
             if (directQuality) return normalizeVdoQualityPreset(directQuality);
             const quality = String(query.get('quality') || query.get('q') || '').trim().toLowerCase();
             const fps = queryFpsValue();
-            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60) return '1080p60';
+            const bitrate = queryBitrateValue();
+            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60 && bitrate >= 8000) return '1080p60-8000';
+            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60) return '1080p60-8000';
             if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps > 0 && fps <= 30) return '1080p30';
             if ((quality === '1' || quality === '720' || quality === '720p' || quality === 'hd') && fps >= 60) return '720p60';
             if ((quality === '1' || quality === '720' || quality === '720p' || quality === 'hd') && fps > 0 && fps <= 30) return '720p30';
             if ((quality === '2' || quality === '360' || quality === '360p' || quality === 'low') && fps > 0 && fps <= 30) return '360p30';
-            return 'default';
+            return '1080p60-8000';
         }
 
         function initialVdoCodec() {
@@ -264,6 +342,9 @@
             chunkedMs: parseInt(query.get('chunked') || '', 10) || 120,
             ninjamServer: ninjamServer,
             initialBufferMode: normalizeBufferMode(query.get('bufferMode')),
+            obsMode: obsMode,
+            obsLayout: normalizeObsLayout(query.get('obsLayout') || query.get('layout') || 'tiles'),
+            obsSlot: normalizeObsSlot(query.get('obsSlot') || query.get('slot') || '0'),
             cameraCodec: initialVdoCodec(),
             cameraQuality: initialVdoQualityPreset(),
             cameraFx: initialCameraFx(),
@@ -273,6 +354,7 @@
         };
 
         const vdoFrame = document.getElementById('vdoFrame');
+        const obsGrid = document.getElementById('obsGrid');
         const roomValue = document.getElementById('roomValue');
         const labelValue = document.getElementById('labelValue');
         const syncValue = document.getElementById('syncValue');
@@ -338,8 +420,10 @@
             lastAppliedBufferByUser: {},
             lastAppliedIntervalByUser: {},
             lastBufferRefreshIdByUser: {},
+            lastVoiceChatModeByUser: {},
             bufferRefreshTimersByUser: {},
             bufferRefreshPendingUntilByUser: {},
+            obsTilesByUser: {},
             latencyMsByUser: {},
             latencyTargetMsByUser: {},
             latencyUpdatedAtByUser: {},
@@ -735,6 +819,21 @@
             };
         }
 
+        function calculatedDefaultBufferCompensationMs(data) {
+            if (boolProp(data, 'bufferCalculated') !== true) {
+                return 0;
+            }
+            const requested = Math.round(appState.requestedBufferMs || 0);
+            return requested > minimumBufferMs ? requested : 0;
+        }
+
+        function calculatedBufferMs(data, value) {
+            if (!isFinite(value)) {
+                return NaN;
+            }
+            return Math.max(minimumBufferMs, Math.round(value - calculatedDefaultBufferCompensationMs(data)));
+        }
+
         function resolveIncomingBufferMs(data) {
             const measuredAudioDelayMs = getNonNegativeMessageMs(data, ['measuredAudioDelayMs', 'audioDelayMs']);
             const senderServerLatencyMs = getNonNegativeMessageMs(data, ['senderServerLatencyMs', 'remoteServerLatencyMs']);
@@ -742,21 +841,21 @@
             if (isFinite(measuredAudioDelayMs) && (isFinite(senderServerLatencyMs) || isFinite(receiverServerLatencyMs))) {
                 const sender = isFinite(senderServerLatencyMs) ? senderServerLatencyMs : 0;
                 const receiver = isFinite(receiverServerLatencyMs) ? receiverServerLatencyMs : 0;
-                return Math.max(minimumBufferMs, Math.round(measuredAudioDelayMs - sender - receiver));
+                return calculatedBufferMs(data, measuredAudioDelayMs - sender - receiver);
             }
 
             const receiverBufferMs = getNonNegativeMessageMs(data, ['receiverBufferMs']);
             if (isFinite(receiverBufferMs)) {
-                return Math.max(minimumBufferMs, Math.round(receiverBufferMs));
+                return calculatedBufferMs(data, receiverBufferMs);
             }
 
             const bufferTotalMs = getNonNegativeMessageMs(data, ['bufferTotalMs']);
             if (isFinite(bufferTotalMs)) {
-                return Math.max(minimumBufferMs, Math.round(bufferTotalMs));
+                return calculatedBufferMs(data, bufferTotalMs);
             }
 
             if (isFinite(measuredAudioDelayMs)) {
-                return Math.max(minimumBufferMs, Math.round(measuredAudioDelayMs));
+                return calculatedBufferMs(data, measuredAudioDelayMs);
             }
 
             return NaN;
@@ -1055,6 +1154,21 @@
             return false;
         }
 
+        function postToObsViewerFrame(userKey, message) {
+            const key = normalizeUserId(userKey);
+            const tile = key ? vdoState.obsTilesByUser[key] : null;
+            const frame = tile ? tile.frame : null;
+            if (!frame || !frame.contentWindow) {
+                return false;
+            }
+            try {
+                frame.contentWindow.postMessage(message, '*');
+                return true;
+            } catch (e) {
+            }
+            return false;
+        }
+
         function sendTargetedBuffer(userKey, bufferMs) {
             const targetId = vdoState.targetIdByUser[userKey];
             const streamId = vdoState.streamIdByUser[userKey];
@@ -1072,6 +1186,9 @@
                 if (!targetId) {
                     sent = postToVdo({ setBufferDelay: nextBuffer, target: streamId }) || sent;
                 }
+            }
+            if (appState.obsMode) {
+                sent = postToObsViewerFrame(userKey, { setBufferDelay: nextBuffer }) || sent;
             }
             return sent;
         }
@@ -1183,7 +1300,83 @@
                     vdoState.lastAppliedBufferByUser[userKey] = desiredBufferMs;
                 }
             }
+            renderObsGrid();
             updateSyncStatus(linkedUsers, trackedUsers.length);
+        }
+
+        function buildObsViewerUrl(streamId, userKey) {
+            const params = new URLSearchParams();
+            params.set('view', String(streamId || '').trim());
+            params.set('noaudio', '1');
+            params.set('buffer2', '0');
+            params.set('buffer', String(getDesiredBufferMs(userKey)));
+            params.set('autostart', '1');
+            params.set('playsinline', '1');
+            params.set('cleanoutput', '1');
+            return 'https://vdo.ninja/?' + params.toString();
+        }
+
+        function renderObsGrid() {
+            if (!appState.obsMode || !obsGrid) {
+                return;
+            }
+
+            const trackedUsers = getTrackedUserKeys().filter(function (userKey) {
+                return !!vdoState.streamIdByUser[userKey];
+            });
+            let displayUsers = trackedUsers;
+            if (appState.obsSlot > 0) {
+                displayUsers = trackedUsers[appState.obsSlot - 1] ? [trackedUsers[appState.obsSlot - 1]] : [];
+            }
+
+            obsGrid.className = 'obs-grid layout-' + appState.obsLayout + (appState.obsSlot > 0 ? ' single' : '');
+            const wanted = {};
+            for (let i = 0; i < displayUsers.length; i++) {
+                const userKey = displayUsers[i];
+                const streamId = vdoState.streamIdByUser[userKey];
+                if (!streamId) {
+                    continue;
+                }
+                wanted[userKey] = true;
+                let tile = vdoState.obsTilesByUser[userKey];
+                const desiredBufferMs = getDesiredBufferMs(userKey);
+                const desiredUrl = buildObsViewerUrl(streamId, userKey);
+                if (!tile) {
+                    const element = document.createElement('div');
+                    element.className = 'obs-tile';
+                    const frame = document.createElement('iframe');
+                    frame.setAttribute('allow', 'fullscreen; autoplay');
+                    frame.src = desiredUrl;
+                    element.appendChild(frame);
+                    tile = { element: element, frame: frame, streamId: streamId, bufferMs: desiredBufferMs };
+                    vdoState.obsTilesByUser[userKey] = tile;
+                } else if (tile.streamId !== streamId) {
+                    tile.streamId = streamId;
+                    tile.bufferMs = desiredBufferMs;
+                    tile.frame.src = desiredUrl;
+                } else if (tile.bufferMs !== desiredBufferMs) {
+                    tile.bufferMs = desiredBufferMs;
+                    postToObsViewerFrame(userKey, { setBufferDelay: desiredBufferMs });
+                }
+                if (tile.element.parentNode !== obsGrid) {
+                    obsGrid.appendChild(tile.element);
+                } else if (obsGrid.children[i] !== tile.element) {
+                    obsGrid.insertBefore(tile.element, obsGrid.children[i] || null);
+                }
+            }
+
+            const keys = Object.keys(vdoState.obsTilesByUser);
+            for (let i = 0; i < keys.length; i++) {
+                const key = keys[i];
+                if (wanted[key]) {
+                    continue;
+                }
+                const tile = vdoState.obsTilesByUser[key];
+                if (tile && tile.element && tile.element.parentNode) {
+                    tile.element.parentNode.removeChild(tile.element);
+                }
+                delete vdoState.obsTilesByUser[key];
+            }
         }
 
         function getBeatCounterState() {
@@ -1330,6 +1523,7 @@
                 delete vdoState.targetIdByUser[userKey];
                 delete vdoState.lastAppliedBufferByUser[userKey];
                 delete vdoState.lastBufferRefreshIdByUser[userKey];
+                delete vdoState.lastVoiceChatModeByUser[userKey];
                 if (vdoState.bufferRefreshTimersByUser[userKey]) {
                     clearTimeout(vdoState.bufferRefreshTimersByUser[userKey]);
                 }
@@ -1342,6 +1536,7 @@
                 changed = true;
             }
             if (changed) {
+                renderObsGrid();
                 updateSyncStatus();
             }
         }
@@ -1381,6 +1576,7 @@
                 }
 
                 delete vdoState.lastBufferRefreshIdByUser[userKey];
+                delete vdoState.lastVoiceChatModeByUser[userKey];
                 if (vdoState.bufferRefreshTimersByUser[userKey]) {
                     clearTimeout(vdoState.bufferRefreshTimersByUser[userKey]);
                 }
@@ -1394,6 +1590,7 @@
             }
 
             if (changed) {
+                renderObsGrid();
                 updateSyncStatus();
             }
         }
@@ -1447,6 +1644,11 @@
             if (!normalizedUserKey || isServerBotUserId(normalizedUserKey)) {
                 return false;
             }
+            const nextVoiceChatMode = !!data.voiceChatMode;
+            const previousVoiceChatMode = vdoState.lastVoiceChatModeByUser[normalizedUserKey];
+            const voiceChatModeChanged = typeof previousVoiceChatMode === 'boolean'
+                && previousVoiceChatMode !== nextVoiceChatMode;
+            vdoState.lastVoiceChatModeByUser[normalizedUserKey] = nextVoiceChatMode;
             const intervalKey = String(data.interval ?? '');
             if (normalizedUserKey && intervalKey && vdoState.lastAppliedIntervalByUser[normalizedUserKey] !== intervalKey) {
                 vdoState.lastAppliedIntervalByUser[normalizedUserKey] = intervalKey;
@@ -1466,6 +1668,13 @@
                 data.voiceChatMode,
                 diagnostics
             );
+            if (voiceChatModeChanged) {
+                delete vdoState.lastAppliedBufferByUser[normalizedUserKey];
+                if (nextVoiceChatMode) {
+                    sendTargetedBuffer(normalizedUserKey, minimumBufferMs);
+                }
+                requestLocalBufferRefresh(normalizedUserKey, nextVoiceChatMode ? 'voiceChatOn' : 'voiceChatOff');
+            }
             if (data.refreshBuffer && data.bufferRefreshEventId) {
                 const refreshUserKey = normalizeUserId(userKey);
                 if (refreshUserKey) {
@@ -1554,7 +1763,7 @@
 
         function vdoQualityPresetConfig(preset) {
             const quality = normalizeVdoQualityPreset(preset);
-            if (quality === '1080p60') return { quality: '0', width: 1920, height: 1080, fps: 60, bitrate: 6000 };
+            if (quality === '1080p60-8000' || quality === '1080p60') return { quality: '0', width: 1920, height: 1080, fps: 60, bitrate: 8000 };
             if (quality === '1080p30') return { quality: '0', width: 1920, height: 1080, fps: 30, bitrate: 4500 };
             if (quality === '720p60') return { quality: '1', width: 1280, height: 720, fps: 60, bitrate: 3500 };
             if (quality === '720p30') return { quality: '1', width: 1280, height: 720, fps: 30, bitrate: 2500 };
@@ -1685,6 +1894,10 @@
             // Keep the initial room join buffer minimal; the sync layer applies the
             // measured delay after load, and sending both can double the result.
             iframeParams.set('buffer', String(minimumBufferMs));
+            if (appState.obsMode) {
+                iframeParams.set('cleanoutput', '1');
+                iframeParams.set('autostart', '1');
+            }
             applyVdoCodecParams(iframeParams);
             applyVdoQualityParams(iframeParams);
             applyCameraFxParams(iframeParams);
@@ -1729,6 +1942,7 @@
             if (changed || latencyChanged) {
                 applyPeerBuffers(true);
             } else {
+                renderObsGrid();
                 updateSyncStatus();
             }
         }
@@ -1767,6 +1981,7 @@
                 vdoState.iframeLoaded = true;
                 requestVdoRoster();
                 applyPeerBuffers(true);
+                renderObsGrid();
                 if (vdoState.rosterTimerId) {
                     clearInterval(vdoState.rosterTimerId);
                 }
@@ -1777,6 +1992,9 @@
 
         if (appState.bg.toLowerCase() === 'green') {
             document.body.classList.add('green-mode');
+        }
+        if (appState.obsMode) {
+            document.body.classList.add('obs-mode');
         }
         if (query.get('hideFooter') === '1') {
             document.body.classList.add('hide-footer');

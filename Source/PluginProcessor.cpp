@@ -6169,6 +6169,13 @@ void NinjamVst3AudioProcessor::setVoiceChatMode(bool enabled)
 {
     voiceChatMode = enabled;
     syncLocalIntervalChannelConfig();
+
+    if (vdoVideoSyncEnabled.load(std::memory_order_relaxed) && videoHelperRunning.load(std::memory_order_relaxed))
+    {
+        requestVideoBufferRefreshForMeasuredUsers();
+        intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
+        lastIntervalHelperPayloadWriteMs = 0.0;
+    }
 }
 
 bool NinjamVst3AudioProcessor::isVoiceChatMode() const
@@ -13069,16 +13076,15 @@ double NinjamVst3AudioProcessor::getSamplePadBlockStartBeat(int transportPositio
     return (double)samplePadTransportInterval * (double)safeBpi + beatInInterval;
 }
 
-void NinjamVst3AudioProcessor::updateSamplePadMidiHolds()
+void NinjamVst3AudioProcessor::updateSamplePadMidiHolds(double currentBeat, int bpi)
 {
     if (!isSamplePadsFeatureEnabled())
         return;
 
-    const int bpi = juce::jmax(1, getBPI());
+    const int safeBpi = juce::jmax(1, bpi);
     const double nowMs = juce::Time::getMillisecondCounterHiRes();
-    const double currentBeat = (double)intervalIndex.load(std::memory_order_relaxed) * (double)bpi
-        + (double)juce::jlimit(0.0f, 1.0f, getIntervalProgress()) * (double)bpi;
-    const double candidate = nextSamplePadIntervalStartBeat(currentBeat, bpi);
+    const double safeCurrentBeat = std::isfinite(currentBeat) ? currentBeat : 0.0;
+    const double candidate = nextSamplePadIntervalStartBeat(safeCurrentBeat, safeBpi);
 
     const juce::ScopedLock lock(samplePadsLock);
     for (auto& pad : samplePads)
@@ -13098,9 +13104,9 @@ void NinjamVst3AudioProcessor::updateSamplePadMidiHolds()
         pad.recordPendingStart.store(false, std::memory_order_relaxed);
         pad.recordPendingStop.store(false, std::memory_order_relaxed);
         pad.recordScheduledStartBeat = candidate;
-        pad.recordScheduledCountdownBeats = (double)bpi;
+        pad.recordScheduledCountdownBeats = (double)safeBpi;
         pad.recordScheduledStopBeat = 0.0;
-        pad.recordLoopLengthBeatsOverride = bpi;
+        pad.recordLoopLengthBeatsOverride = safeBpi;
         pad.recordAutoStopAtScheduledEnd = false;
         pad.recordMatchBpiCanvas = false;
         pad.recordStartScheduled.store(true, std::memory_order_relaxed);
@@ -15100,9 +15106,7 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         if (pendingOutboundMidiRelayEvents.size() > 512)
             pendingOutboundMidiRelayEvents.erase(pendingOutboundMidiRelayEvents.begin(), pendingOutboundMidiRelayEvents.begin() + (long long)(pendingOutboundMidiRelayEvents.size() - 512));
     }
-    if (samplePadsEnabledAtBlock)
-        updateSamplePadMidiHolds();
-    else
+    if (!samplePadsEnabledAtBlock)
         samplePadsPeak.store(0.0f, std::memory_order_relaxed);
     injectInboundMidiRelayEvents(midiMessages);
 
@@ -15238,6 +15242,9 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
             samplePadBlockStartBeat = (double)blockStartSampleCounter / samplePadSamplesPerBeat;
         }
     }
+
+    if (samplePadsEnabledAtBlock)
+        updateSamplePadMidiHolds(samplePadBlockStartBeat, samplePadBpi);
 
     bool samplePadsNeedLocalSlot = false;
     if (samplePadsEnabledAtBlock)
