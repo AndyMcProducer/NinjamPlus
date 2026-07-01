@@ -73,15 +73,23 @@ public:
         for (int i = 0; i < bpi; ++i)
         {
             auto blockArea = juce::Rectangle<float>(i * blockWidth, 0.0f, blockWidth, blockHeight).reduced(2.0f);
-            if (i < currentBeat)
+            const bool isPast = i < currentBeat;
+            const bool isActive = i == currentBeat && currentBeat < bpi;
+            const bool isBarStart = (i % 4) == 0;
+            float activePulse = 0.0f;
+
+            if (isPast)
             {
                 g.setColour(onColor);
                 g.fillRect(blockArea);
             }
-            else if (i == currentBeat && currentBeat < bpi)
+            else if (isActive)
             {
                 const float subBeat = totalBeats - (float)currentBeat;
-                const float alpha = 0.6f + 0.4f * std::sin(subBeat * juce::MathConstants<float>::pi);
+                activePulse = std::sin(subBeat * juce::MathConstants<float>::pi);
+                const float alpha = 0.6f + 0.4f * activePulse;
+                g.setColour(onColor.withAlpha(0.18f + 0.22f * activePulse));
+                g.fillRect(blockArea.expanded(1.4f));
                 g.setColour(onColor.withAlpha(alpha));
                 g.fillRect(blockArea);
             }
@@ -89,6 +97,35 @@ public:
             {
                 g.setColour(offColor);
                 g.drawRect(blockArea, 1.0f);
+            }
+
+            const auto blockTextArea = blockArea.toNearestInt();
+            if (isActive && blockTextArea.getWidth() >= 5 && blockTextArea.getHeight() >= 7)
+            {
+                auto beatArea = blockTextArea;
+                if (isBarStart && beatArea.getHeight() >= 13)
+                    beatArea.removeFromBottom(juce::jmax(5, juce::roundToInt((float)beatArea.getHeight() * 0.34f)));
+
+                const juce::String beatText(currentBeat + 1);
+                const float fontSize = juce::jlimit(5.0f, 9.0f, juce::jmin(blockArea.getWidth() * 0.72f, beatArea.getHeight() * 0.8f));
+                g.setFont(juce::Font(fontSize, juce::Font::bold));
+                g.setColour(juce::Colours::black.withAlpha(0.28f + 0.72f * activePulse));
+                g.drawFittedText(beatText, beatArea, juce::Justification::centred, 1);
+            }
+
+            if (isBarStart && blockTextArea.getWidth() >= 5 && blockTextArea.getHeight() >= 9)
+            {
+                auto barArea = blockTextArea;
+                barArea = barArea.removeFromBottom(juce::jmax(5, juce::roundToInt((float)blockTextArea.getHeight() * 0.34f)));
+                const bool lit = isPast || isActive;
+                const float tabAlpha = isActive ? (0.32f + 0.48f * activePulse) : (lit ? 0.34f : 0.58f);
+                const float barAlpha = isActive ? (0.34f + 0.56f * activePulse) : (lit ? 0.7f : 0.72f);
+                auto tabArea = barArea.toFloat().reduced(1.0f, 0.5f);
+                g.setColour(lit ? juce::Colours::white.withAlpha(tabAlpha) : juce::Colour(0xff263244).withAlpha(tabAlpha));
+                g.fillRoundedRectangle(tabArea, 2.0f);
+                g.setFont(juce::Font(juce::jlimit(5.0f, 7.0f, blockArea.getHeight() * 0.34f), juce::Font::bold));
+                g.setColour(lit ? juce::Colours::black.withAlpha(barAlpha) : onColor.withAlpha(barAlpha));
+                g.drawFittedText(juce::String((i / 4) + 1), barArea, juce::Justification::centred, 1);
             }
         }
     }

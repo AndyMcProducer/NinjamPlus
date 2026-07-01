@@ -313,7 +313,21 @@ img,canvas{display:block;width:100%;height:100%;object-fit:contain}
 .stage-note{position:absolute;left:8px;right:8px;bottom:8px;padding:4px 6px;border-radius:4px;background:rgba(0,0,0,.58);color:#d7e4e6;font-size:11px;text-align:center;pointer-events:none}
 .stage-note:empty{display:none}
 .empty{margin:auto;color:#7f9195;font-size:13px}
-</style>
+.zap-footer{min-height:36px;padding:6px 10px;border-top:1px solid #34464a;background:#0f1218;display:flex;align-items:center;gap:10px}
+html.obs .zap-footer{display:none}
+.beat-counter{display:flex;align-items:center;gap:9px;width:100%;flex:1 1 auto;min-width:0;color:#fffdd0;font-size:12px;font-variant-numeric:tabular-nums}
+.beat-counter-label{min-width:64px;flex:0 0 auto;color:#fffdd0;white-space:nowrap}
+.beat-strip{display:flex;flex-wrap:nowrap;column-gap:3px;row-gap:10px;align-items:flex-start;width:100%;flex:1 1 auto;min-width:0;padding-bottom:8px}
+.beat-dot{height:13px;min-width:9px;flex:1 1 0;border:1px solid rgba(255,253,208,.28);border-radius:2px;background:rgba(0,0,0,.34);display:inline-flex;align-items:center;justify-content:center;position:relative;overflow:visible;color:transparent;font-variant-numeric:tabular-nums;user-select:none}
+.beat-dot.past{background:#fffdd0;border-color:#fffdd0}
+.beat-dot.active{background:#fffdd0;border-color:#fffdd0;box-shadow:0 0 9px rgba(255,253,208,var(--beat-glow-alpha,.85))}
+.beat-current-number,.beat-bar-label{position:absolute;left:0;right:0;text-align:center;line-height:1;pointer-events:none}
+.beat-current-number{top:1px;color:rgba(0,0,0,var(--beat-number-alpha,.95));font-size:7px;font-weight:800}
+.beat-current-number.compact{font-size:6px}.beat-current-number.tiny{font-size:5px}
+.beat-bar-label{bottom:-8px;height:8px;min-width:100%;display:flex;align-items:center;justify-content:center;background:rgba(18,18,16,.95);border:1px solid rgba(255,253,208,.28);border-top:0;border-radius:0 0 3px 3px;color:rgba(255,253,208,.78);font-size:6px;font-weight:700}
+.beat-bar-label.compact{font-size:5px}
+.beat-dot.past .beat-bar-label{background:rgba(255,255,255,.36);border-color:rgba(255,255,255,.44);color:rgba(0,0,0,.72)}
+.beat-dot.active .beat-bar-label{background:#fffdd0;border-color:#fffdd0;color:rgba(0,0,0,var(--beat-number-alpha,.95));box-shadow:0 2px 7px rgba(255,253,208,var(--beat-glow-alpha,.85))}</style>
 </head>
 <body>
 <header><h1>NINJAMZap Video</h1><div id="status">Waiting for video frames</div></header>
@@ -340,9 +354,12 @@ img,canvas{display:block;width:100%;height:100%;object-fit:contain}
   <canvas id="browserCanvas" width="640" height="360" style="display:none"></canvas>
 </section>
 <main id="grid"><div class="empty">No Zap video streams yet</div></main>
+<footer class="zap-footer"><div class="beat-counter" id="beatCounter" aria-live="polite"><span class="beat-counter-label" id="beatCounterText">BPI --/--</span><span class="beat-strip" id="beatStrip" aria-hidden="true"></span></div></footer>
 <script>
 const grid=document.getElementById('grid');
 const statusEl=document.getElementById('status');
+const beatCounterText=document.getElementById('beatCounterText');
+const beatStrip=document.getElementById('beatStrip');
 const camSelect=document.getElementById('camSelect');
 const camCodec=document.getElementById('camCodec');
 const camSize=document.getElementById('camSize');
@@ -388,6 +405,7 @@ let browserSettingsApplying=false;
 let browserPendingSettingsApply=false;
 let browserApplySettingsTimer=0;
 let browserActiveCodec='mjpeg';
+let latestIntervalInfo=null;
 let refreshInFlight=false;
 let browserFxSegmenter=null;
 let browserFxSegmenterLoading=null;
@@ -408,6 +426,74 @@ if(urlParams.get('mask')) camMask.value=urlParams.get('mask');
 function ms(value){
   const n=Number(value||0);
   return Number.isFinite(n)&&n>0?String(Math.round(n)):'0';
+}
+function intervalInfoFromPayload(payload){
+  if(!Array.isArray(payload)) return null;
+  return payload.find(entry=>String(entry.type||'')==='intervalInfo')||null;
+}
+function streamsFromPayload(payload){
+  if(!Array.isArray(payload)) return [];
+  return payload.filter(entry=>String(entry.type||'')!=='intervalInfo');
+}
+function getZapBeatState(){
+  const info=latestIntervalInfo;
+  if(!info) return {bpi:0,beat:0,phase:0};
+  const bpi=Math.max(1,Math.min(256,parseInt(info.bpi||'0',10)||0));
+  if(!bpi) return {bpi:0,beat:0,phase:0};
+  const bpm=Math.max(0,Number(info.bpm||0));
+  let totalBeat=Number(info.globalBeat);
+  if(!Number.isFinite(totalBeat)){
+    const pos=Math.max(0,Number(info.pos||0));
+    const length=Math.max(1,Number(info.length||0));
+    totalBeat=(pos/length)*bpi;
+  }
+  const wallClockMs=Number(info.wallClockMs||0);
+  if(bpm>0&&wallClockMs>0){
+    const elapsedMinutes=(Date.now()-wallClockMs)/60000;
+    if(Number.isFinite(elapsedMinutes)&&elapsedMinutes>-0.25&&elapsedMinutes<0.25)
+      totalBeat+=elapsedMinutes*bpm;
+  }
+  if(!Number.isFinite(totalBeat)) return {bpi:0,beat:0,phase:0};
+  const wrappedBeat=((totalBeat%bpi)+bpi)%bpi;
+  const beatIndex=Math.floor(wrappedBeat);
+  return {bpi:bpi,beat:beatIndex+1,phase:wrappedBeat-beatIndex};
+}
+function renderBeatCounter(){
+  if(!beatCounterText||!beatStrip) return;
+  const state=getZapBeatState();
+  if(state.bpi<=0){
+    beatCounterText.textContent='BPI --/--';
+    beatStrip.innerHTML='';
+    return;
+  }
+  const phase=Math.max(0,Math.min(1,state.phase||0));
+  const pulse=Math.sin(phase*Math.PI);
+  const numberAlpha=(0.34+0.66*pulse).toFixed(3);
+  const glowAlpha=(0.45+0.45*pulse).toFixed(3);
+  beatCounterText.textContent='BPI '+state.beat+'/'+state.bpi;
+  beatStrip.innerHTML='';
+  for(let i=1;i<=state.bpi;i++){
+    const dot=document.createElement('span');
+    const isActive=i===state.beat;
+    dot.className=isActive?'beat-dot active':(i<state.beat?'beat-dot past':'beat-dot');
+    if(isActive){
+      dot.style.setProperty('--beat-number-alpha',numberAlpha);
+      dot.style.setProperty('--beat-glow-alpha',glowAlpha);
+      const currentNumber=document.createElement('span');
+      const beatLabel=String(i);
+      currentNumber.className='beat-current-number'+(beatLabel.length>2?' tiny':(beatLabel.length>1?' compact':''));
+      currentNumber.textContent=beatLabel;
+      dot.appendChild(currentNumber);
+    }
+    if((i-1)%4===0){
+      const barLabel=document.createElement('span');
+      const label=String(Math.floor((i-1)/4)+1);
+      barLabel.className='beat-bar-label'+(label.length>1?' compact':'');
+      barLabel.textContent=label;
+      dot.appendChild(barLabel);
+    }
+    beatStrip.appendChild(dot);
+  }
 }
 function setCamStatus(text){ camStatus.textContent=text; }
 function normalizedGridLayout(value){
@@ -1683,6 +1769,7 @@ function renderBrowserFxPreview(){
   try{ drawBrowserFxFrame(browserFxPreviewCtx,browserFxPreview.width,browserFxPreview.height); }catch(e){}
 }
 function renderTiles(){
+  renderBeatCounter();
   renderBrowserFxPreview();
   for(const [,tile] of tiles){
     applyDisplayMaskToTile(tile);
@@ -1696,7 +1783,9 @@ async function refresh(){
   refreshInFlight=true;
   try{
     const res=await fetch('/zap-frames',{cache:'no-store'});
-    const allStreams=await res.json();
+    const payload=await res.json();
+    latestIntervalInfo=intervalInfoFromPayload(payload)||latestIntervalInfo;
+    const allStreams=streamsFromPayload(payload);
     const localZapIndex=allStreams.findIndex(stream=>String(stream.streamKey||'')==='local:zap-camera');
     const showDirectLocalPreview=browserStream&&!obsMode&&!obsStreamFilter&&obsSlotFilter===0;
     let streams=obsStreamFilter?allStreams.filter(stream=>String(stream.streamKey||'')===obsStreamFilter):allStreams;
@@ -4688,7 +4777,7 @@ namespace
         return "Pad " + juce::String(padIndex + 1);
     }
 
-    static juce::File getNinjamplusSettingsDirectory()
+    static juce::PropertiesFile::Options makeNinjamplusSettingsOptions()
     {
         juce::PropertiesFile::Options options;
         options.applicationName = JucePlugin_Name;
@@ -4703,7 +4792,246 @@ namespace
 #else
         options.folderName = JucePlugin_Name;
 #endif
-        return options.getDefaultFile().getParentDirectory();
+        return options;
+    }
+
+    static juce::File getNinjamplusSettingsDirectory()
+    {
+        return makeNinjamplusSettingsOptions().getDefaultFile().getParentDirectory();
+    }
+
+    constexpr int serverLicenseResultDisagree = 0;
+    constexpr int serverLicenseResultAgree = 1;
+    constexpr int serverLicenseResultAgreeAlways = 2;
+
+    static juce::uint64 getStableServerLicenseHash(const juce::String& text)
+    {
+        juce::uint64 hash = 14695981039346656037ull;
+        const auto* bytes = reinterpret_cast<const unsigned char*>(text.toRawUTF8());
+
+        while (*bytes != 0)
+        {
+            hash ^= (juce::uint64)*bytes++;
+            hash *= 1099511628211ull;
+        }
+
+        return hash;
+    }
+
+    static juce::String toFixedLowercaseHex(juce::uint64 value)
+    {
+        static constexpr char hexDigits[] = "0123456789abcdef";
+        char chars[17] {};
+
+        for (int i = 15; i >= 0; --i)
+        {
+            chars[i] = hexDigits[value & 0x0f];
+            value >>= 4;
+        }
+
+        return juce::String(chars);
+    }
+
+    static juce::String normaliseServerLicenseServerKey(juce::String server)
+    {
+        server = server.trim().toLowerCase();
+        return server.isNotEmpty() ? server : juce::String("unknown-server");
+    }
+
+    static juce::String makeServerLicenseAlwaysSettingsKey(const juce::String& serverKey,
+                                                           const juce::String& licenseText)
+    {
+        return "serverLicenseAlways."
+             + toFixedLowercaseHex(getStableServerLicenseHash(serverKey + "\n" + licenseText));
+    }
+
+    static juce::Component* findLicenseDialogAnchorComponent()
+    {
+        if (auto* focused = juce::Component::getCurrentlyFocusedComponent())
+            if (auto* topLevel = focused->getTopLevelComponent())
+                return topLevel;
+
+        auto& desktop = juce::Desktop::getInstance();
+        for (int i = desktop.getNumComponents(); --i >= 0;)
+            if (auto* component = desktop.getComponent(i))
+                if (component->isShowing())
+                    return component;
+
+        return nullptr;
+    }
+
+    class ServerLicenseAgreementComponent final : public juce::Component
+    {
+    public:
+        ServerLicenseAgreementComponent(const juce::String& serverName,
+                                        const juce::String& licenseText)
+        {
+            setSize(560, 430);
+
+            const juce::String target = serverName.trim().isNotEmpty() ? serverName.trim()
+                                                                       : juce::String("this server");
+            introLabel.setText("The server has requested that you agree to these terms before connecting to " + target + ".",
+                               juce::dontSendNotification);
+            introLabel.setJustificationType(juce::Justification::centredLeft);
+            introLabel.setColour(juce::Label::textColourId, juce::Colours::white);
+            addAndMakeVisible(introLabel);
+
+            termsBox.setMultiLine(true);
+            termsBox.setReadOnly(true);
+            termsBox.setScrollbarsShown(true);
+            termsBox.setCaretVisible(false);
+            termsBox.setText(licenseText.trim().isNotEmpty() ? licenseText.trim()
+                                                             : juce::String("No license text was provided by the server."));
+            termsBox.setColour(juce::TextEditor::backgroundColourId, juce::Colour(0xff11161c));
+            termsBox.setColour(juce::TextEditor::textColourId, juce::Colours::white);
+            termsBox.setColour(juce::TextEditor::outlineColourId, juce::Colour(0xff3f4d5b));
+            termsBox.setColour(juce::TextEditor::focusedOutlineColourId, juce::Colour(0xff5b7fa0));
+            addAndMakeVisible(termsBox);
+
+            configureButton(disagreeButton, serverLicenseResultDisagree, juce::Colour(0xff5c2525));
+            configureButton(agreeAlwaysButton, serverLicenseResultAgreeAlways, juce::Colour(0xff394f6d));
+            configureButton(agreeButton, serverLicenseResultAgree, juce::Colour(0xff24623b));
+        }
+
+        void paint(juce::Graphics& g) override
+        {
+            g.fillAll(juce::Colour(0xff20262e));
+        }
+
+        void resized() override
+        {
+            auto area = getLocalBounds().reduced(16);
+            introLabel.setBounds(area.removeFromTop(44));
+            area.removeFromTop(10);
+
+            auto buttons = area.removeFromBottom(34);
+            area.removeFromBottom(12);
+            termsBox.setBounds(area);
+
+            disagreeButton.setBounds(buttons.removeFromLeft(96));
+            agreeButton.setBounds(buttons.removeFromRight(86));
+            buttons.removeFromRight(8);
+            agreeAlwaysButton.setBounds(buttons.removeFromRight(124));
+        }
+
+    private:
+        void configureButton(juce::TextButton& button, int result, juce::Colour colour)
+        {
+            button.setColour(juce::TextButton::buttonColourId, colour);
+            button.setColour(juce::TextButton::buttonOnColourId, colour.brighter(0.15f));
+            button.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
+            button.onClick = [this, result]
+            {
+                if (auto* dialog = findParentComponentOfClass<juce::DialogWindow>())
+                    dialog->exitModalState(result);
+            };
+            addAndMakeVisible(button);
+        }
+
+        juce::Label introLabel;
+        juce::TextEditor termsBox;
+        juce::TextButton disagreeButton { "Disagree" };
+        juce::TextButton agreeAlwaysButton { "Agree Always" };
+        juce::TextButton agreeButton { "Agree" };
+    };
+
+    class ServerLicenseAlwaysConfirmComponent final : public juce::Component
+    {
+    public:
+        ServerLicenseAlwaysConfirmComponent()
+        {
+            setSize(500, 170);
+
+            messageLabel.setText("By Agreeing Always to this Server/Room's terms of use you agree every time you re-enter you will adhere to the terms of the server.",
+                                 juce::dontSendNotification);
+            messageLabel.setJustificationType(juce::Justification::centredLeft);
+            messageLabel.setColour(juce::Label::textColourId, juce::Colours::white);
+            addAndMakeVisible(messageLabel);
+
+            disagreeButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff5c2525));
+            disagreeButton.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
+            disagreeButton.onClick = [this] { close(serverLicenseResultDisagree); };
+            addAndMakeVisible(disagreeButton);
+
+            agreeButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff24623b));
+            agreeButton.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
+            agreeButton.onClick = [this] { close(serverLicenseResultAgree); };
+            addAndMakeVisible(agreeButton);
+        }
+
+        void paint(juce::Graphics& g) override
+        {
+            g.fillAll(juce::Colour(0xff20262e));
+        }
+
+        void resized() override
+        {
+            auto area = getLocalBounds().reduced(16);
+            auto buttons = area.removeFromBottom(34);
+            area.removeFromBottom(12);
+            messageLabel.setBounds(area);
+
+            agreeButton.setBounds(buttons.removeFromRight(86));
+            buttons.removeFromRight(8);
+            disagreeButton.setBounds(buttons.removeFromRight(96));
+        }
+
+    private:
+        void close(int result)
+        {
+            if (auto* dialog = findParentComponentOfClass<juce::DialogWindow>())
+                dialog->exitModalState(result);
+        }
+
+        juce::Label messageLabel;
+        juce::TextButton disagreeButton { "Disagree" };
+        juce::TextButton agreeButton { "Agree" };
+    };
+
+    static juce::DialogWindow* launchServerLicenseAgreementDialog(const juce::String& serverName,
+                                                                  const juce::String& licenseText,
+                                                                  std::function<void(int)> completion)
+    {
+        juce::DialogWindow::LaunchOptions options;
+        options.content.setOwned(new ServerLicenseAgreementComponent(serverName, licenseText));
+        options.dialogTitle = "Server License Agreement";
+        options.dialogBackgroundColour = juce::Colour(0xff20262e);
+        options.escapeKeyTriggersCloseButton = false;
+        options.useNativeTitleBar = false;
+        options.resizable = false;
+        options.componentToCentreAround = findLicenseDialogAnchorComponent();
+
+        auto* dialog = options.create();
+        dialog->enterModalState(true,
+                                juce::ModalCallbackFunction::create([completion = std::move(completion)](int result) mutable
+                                {
+                                    if (completion != nullptr)
+                                        completion(result);
+                                }),
+                                true);
+        return dialog;
+    }
+
+    static juce::DialogWindow* launchServerLicenseAlwaysConfirmDialog(std::function<void(int)> completion)
+    {
+        juce::DialogWindow::LaunchOptions options;
+        options.content.setOwned(new ServerLicenseAlwaysConfirmComponent());
+        options.dialogTitle = "Agree Always";
+        options.dialogBackgroundColour = juce::Colour(0xff20262e);
+        options.escapeKeyTriggersCloseButton = false;
+        options.useNativeTitleBar = false;
+        options.resizable = false;
+        options.componentToCentreAround = findLicenseDialogAnchorComponent();
+
+        auto* dialog = options.create();
+        dialog->enterModalState(true,
+                                juce::ModalCallbackFunction::create([completion = std::move(completion)](int result) mutable
+                                {
+                                    if (completion != nullptr)
+                                        completion(result);
+                                }),
+                                true);
+        return dialog;
     }
 
     static juce::String sanitiseSamplePadBankName(const juce::String& name)
@@ -8096,6 +8424,38 @@ juce::String NinjamVst3AudioProcessor::buildZapVideoFrameListJson() const
 {
     juce::Array<juce::var> entries;
     const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    const double wallClockMs = (double)juce::Time::currentTimeMillis();
+    const int bpi = juce::jmax(1, cachedNinjamBpi.load(std::memory_order_relaxed));
+    const double bpm = juce::jmax(1.0, (double)cachedNinjamBpm.load(std::memory_order_relaxed));
+    const int transportLength = juce::jmax(1, cachedNinjamTransportLen.load(std::memory_order_relaxed));
+    int transportPos = juce::jlimit(0, transportLength, cachedNinjamTransportPos.load(std::memory_order_relaxed));
+    if (isTransportSyncEnabled() && (!hostWasPlaying.load() || syncWaitForInterval.load()))
+    {
+        transportPos = 0;
+    }
+    else if (isTransportSyncEnabled() && hostWasPlaying.load())
+    {
+        const int basePos = syncDisplayPositionOffset.load();
+        int relativePos = transportPos - basePos;
+        if (relativePos < 0)
+            relativePos += transportLength;
+        transportPos = juce::jlimit(0, transportLength, relativePos);
+    }
+    const double intervalProgress = juce::jlimit(0.0, 1.0, (double)transportPos / (double)transportLength);
+    const double globalBeat = (double)getDisplayIntervalIndex() * (double)bpi + intervalProgress * (double)bpi;
+    {
+        juce::DynamicObject::Ptr infoObj = new juce::DynamicObject();
+        infoObj->setProperty("type", "intervalInfo");
+        infoObj->setProperty("interval", getDisplayIntervalIndex());
+        infoObj->setProperty("pos", transportPos);
+        infoObj->setProperty("length", transportLength);
+        infoObj->setProperty("bpm", bpm);
+        infoObj->setProperty("bpi", bpi);
+        infoObj->setProperty("globalBeat", globalBeat);
+        infoObj->setProperty("videoClockMs", nowMs);
+        infoObj->setProperty("wallClockMs", wallClockMs);
+        entries.add(juce::var(infoObj.get()));
+    }
 
     const juce::ScopedLock lock(zapVideoFrameLock);
     for (const auto& entry : remoteVideoFrameInfoByUser)
@@ -14259,16 +14619,128 @@ bool NinjamVst3AudioProcessor::isBusesLayoutSupported (const BusesLayout& layout
     return true;
 }
 
+void NinjamVst3AudioProcessor::showServerLicenseAgreementAsync(const juce::String& serverName,
+                                                               const juce::String& licenseText,
+                                                               const juce::String& settingsKey)
+{
+    auto* editor = dynamic_cast<juce::Component*>(getActiveEditor());
+    juce::Component::SafePointer<juce::Component> safeEditor(editor);
+
+    if (safeEditor == nullptr)
+    {
+        serverLicenseDialogActive.store(false, std::memory_order_release);
+        return;
+    }
+
+    const juce::String reconnectHost = pendingConnectHost.trim().isNotEmpty() ? pendingConnectHost.trim()
+                                                                              : serverName.trim();
+    const juce::String reconnectUser = pendingConnectOriginalUser;
+    const juce::String reconnectPass = pendingConnectPass;
+
+    auto finishDecision = [this, safeEditor, reconnectHost, reconnectUser, reconnectPass, settingsKey](int finalResult,
+                                                                                                      bool rememberAlways) mutable
+    {
+        if (safeEditor == nullptr)
+            return;
+
+        serverLicenseDialogActive.store(false, std::memory_order_release);
+
+        if (finalResult == serverLicenseResultAgree)
+        {
+            if (rememberAlways)
+            {
+                juce::PropertiesFile settings(makeNinjamplusSettingsOptions());
+                settings.setValue(settingsKey, true);
+                settings.saveIfNeeded();
+            }
+            else
+            {
+                pendingServerLicenseApprovalKey = settingsKey;
+            }
+
+            if (reconnectHost.trim().isNotEmpty())
+                connectToServer(reconnectHost, reconnectUser, reconnectPass);
+
+            return;
+        }
+
+        const juce::String current = currentServer.trim();
+        const juce::String pending = pendingConnectHost.trim();
+        if (reconnectHost.trim().isEmpty()
+            || current.equalsIgnoreCase(reconnectHost.trim())
+            || pending.equalsIgnoreCase(reconnectHost.trim()))
+            disconnectFromServer();
+    };
+
+    launchServerLicenseAgreementDialog(serverName, licenseText,
+        [this, safeEditor, finishDecision](int result) mutable
+        {
+            if (safeEditor == nullptr)
+                return;
+
+            if (result == serverLicenseResultAgreeAlways)
+            {
+                launchServerLicenseAlwaysConfirmDialog(
+                    [safeEditor, finishDecision](int confirmResult) mutable
+                    {
+                        if (safeEditor == nullptr)
+                            return;
+
+                        const bool agreedAlways = confirmResult == serverLicenseResultAgree;
+                        finishDecision(agreedAlways ? serverLicenseResultAgree : serverLicenseResultDisagree,
+                                       agreedAlways);
+                    });
+                return;
+            }
+
+            finishDecision(result == serverLicenseResultAgree ? serverLicenseResultAgree
+                                                              : serverLicenseResultDisagree,
+                           false);
+        });
+}
+
+int NinjamVst3AudioProcessor::handleServerLicenseAgreement(const juce::String& licenseText)
+{
+    const juce::String trimmedLicense = licenseText.trim();
+    if (trimmedLicense.isEmpty())
+        return 1;
+
+    if (!juce::MessageManager::getInstance()->isThisTheMessageThread())
+    {
+        disconnectAfterLicenseRejected.store(true, std::memory_order_release);
+        return 0;
+    }
+
+    juce::String serverName = currentServer.trim();
+    if (serverName.isEmpty())
+        serverName = pendingConnectHost.trim();
+
+    const juce::String serverKey = normaliseServerLicenseServerKey(serverName);
+    const juce::String settingsKey = makeServerLicenseAlwaysSettingsKey(serverKey, trimmedLicense);
+
+    if (pendingServerLicenseApprovalKey == settingsKey)
+    {
+        pendingServerLicenseApprovalKey.clear();
+        return 1;
+    }
+
+    juce::PropertiesFile settings(makeNinjamplusSettingsOptions());
+    if (settings.getBoolValue(settingsKey, false))
+        return 1;
+
+    if (!serverLicenseDialogActive.exchange(true, std::memory_order_acq_rel))
+        showServerLicenseAgreementAsync(serverName, trimmedLicense, settingsKey);
+
+    disconnectAfterLicenseRejected.store(true, std::memory_order_release);
+    return 0;
+}
+
 int NinjamVst3AudioProcessor::LicenseAgreementCallback(void* userData, const char* licensetext)
 {
-    // Auto-accept license for now (or log it)
-    // Ideally, show a dialog to the user
-    // Since this is called from Run(), which we call from timerCallback (UI thread),
-    // we can show a message box.
-    // However, for automation/testing, we might want to auto-accept.
+    if (auto* processor = static_cast<NinjamVst3AudioProcessor*>(userData))
+        return processor->handleServerLicenseAgreement(juce::String::fromUTF8(licensetext != nullptr ? licensetext : ""));
 
-    // Simple auto-accept for this proof of concept:
-    return 1;
+    return 0;
 }
 
 void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, const juce::String& type, const juce::String& payload)
@@ -17694,6 +18166,12 @@ void NinjamVst3AudioProcessor::timerCallback()
                                                  std::memory_order_release);
     }
     noteSlowIntervalStep("clientRun", juce::Time::getMillisecondCounterHiRes() - stepStartMs);
+
+    if (disconnectAfterLicenseRejected.exchange(false, std::memory_order_acq_rel))
+    {
+        disconnectFromServer();
+        return;
+    }
 
     int status = NJClient::NJC_STATUS_DISCONNECTED;
     bool serverSupportsZapVideo = false;

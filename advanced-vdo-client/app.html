@@ -103,37 +103,104 @@
             display: flex;
             align-items: center;
             gap: 9px;
+            width: 100%;
+            flex: 1 1 auto;
             min-width: 0;
-            color: #d8e0ef;
+            color: #fffdd0;
             font-size: 12px;
             font-variant-numeric: tabular-nums;
         }
         .beat-counter-label {
             min-width: 64px;
-            color: #aeb7c9;
+            flex: 0 0 auto;
+            color: #fffdd0;
             white-space: nowrap;
         }
         .beat-strip {
             display: flex;
-            flex-wrap: wrap;
-            gap: 3px;
+            flex-wrap: nowrap;
+            column-gap: 3px;
+            row-gap: 10px;
+            align-items: flex-start;
+            width: 100%;
+            flex: 1 1 auto;
             min-width: 0;
+            padding-bottom: 8px;
         }
         .beat-dot {
-            width: 9px;
-            height: 9px;
-            border: 1px solid #344156;
+            height: 13px;
+            min-width: 9px;
+            flex: 1 1 0;
+            border: 1px solid rgba(255,253,208,0.28);
             border-radius: 2px;
-            background: #171d28;
+            background: rgba(0,0,0,0.34);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: visible;
+            color: transparent;
+            font-variant-numeric: tabular-nums;
+            user-select: none;
         }
         .beat-dot.past {
-            background: #2d5d48;
-            border-color: #3e7b5d;
+            background: #fffdd0;
+            border-color: #fffdd0;
         }
         .beat-dot.active {
-            background: #46d87f;
-            border-color: #92f0b4;
-            box-shadow: 0 0 8px rgba(70,216,127,0.8);
+            background: #fffdd0;
+            border-color: #fffdd0;
+            box-shadow: 0 0 9px rgba(255,253,208,var(--beat-glow-alpha,0.85));
+        }
+        .beat-current-number,
+        .beat-bar-label {
+            position: absolute;
+            left: 0;
+            right: 0;
+            text-align: center;
+            line-height: 1;
+            pointer-events: none;
+        }
+        .beat-current-number {
+            top: 1px;
+            color: rgba(0,0,0,var(--beat-number-alpha,0.95));
+            font-size: 7px;
+            font-weight: 800;
+        }
+        .beat-current-number.compact {
+            font-size: 6px;
+        }
+        .beat-current-number.tiny {
+            font-size: 5px;
+        }
+        .beat-bar-label {
+            bottom: -8px;
+            height: 8px;
+            min-width: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(18,18,16,0.95);
+            border: 1px solid rgba(255,253,208,0.28);
+            border-top: 0;
+            border-radius: 0 0 3px 3px;
+            color: rgba(255,253,208,0.78);
+            font-size: 6px;
+            font-weight: 700;
+        }
+        .beat-bar-label.compact {
+            font-size: 5px;
+        }
+        .beat-dot.past .beat-bar-label {
+            background: rgba(255,255,255,0.36);
+            border-color: rgba(255,255,255,0.44);
+            color: rgba(0,0,0,0.72);
+        }
+        .beat-dot.active .beat-bar-label {
+            background: #fffdd0;
+            border-color: #fffdd0;
+            color: rgba(0,0,0,var(--beat-number-alpha,0.95));
+            box-shadow: 0 2px 7px rgba(255,253,208,var(--beat-glow-alpha,0.85));
         }
         body.green-mode {
             background: #00ff00;
@@ -1402,8 +1469,10 @@
             if (!isFinite(totalBeat)) {
                 return { bpi: 0, beat: 0 };
             }
-            const beatIndex = ((Math.floor(totalBeat) % bpi) + bpi) % bpi;
-            return { bpi: bpi, beat: beatIndex + 1 };
+            const wrappedBeat = ((totalBeat % bpi) + bpi) % bpi;
+            const beatIndex = Math.floor(wrappedBeat);
+            const beatPhase = wrappedBeat - beatIndex;
+            return { bpi: bpi, beat: beatIndex + 1, phase: beatPhase };
         }
 
         function renderBeatCounter() {
@@ -1416,11 +1485,32 @@
                 beatStrip.innerHTML = '';
                 return;
             }
+            const phase = Math.max(0, Math.min(1, state.phase || 0));
+            const pulse = Math.sin(phase * Math.PI);
+            const numberAlpha = (0.34 + 0.66 * pulse).toFixed(3);
+            const glowAlpha = (0.45 + 0.45 * pulse).toFixed(3);
             beatCounterText.textContent = 'BPI ' + state.beat + '/' + state.bpi;
             beatStrip.innerHTML = '';
             for (let i = 1; i <= state.bpi; i++) {
                 const dot = document.createElement('span');
-                dot.className = i === state.beat ? 'beat-dot active' : (i < state.beat ? 'beat-dot past' : 'beat-dot');
+                const isActive = i === state.beat;
+                dot.className = isActive ? 'beat-dot active' : (i < state.beat ? 'beat-dot past' : 'beat-dot');
+                if (isActive) {
+                    dot.style.setProperty('--beat-number-alpha', numberAlpha);
+                    dot.style.setProperty('--beat-glow-alpha', glowAlpha);
+                    const currentNumber = document.createElement('span');
+                    const beatLabel = String(i);
+                    currentNumber.className = 'beat-current-number' + (beatLabel.length > 2 ? ' tiny' : (beatLabel.length > 1 ? ' compact' : ''));
+                    currentNumber.textContent = beatLabel;
+                    dot.appendChild(currentNumber);
+                }
+                if ((i - 1) % 4 === 0) {
+                    const barLabel = document.createElement('span');
+                    const label = String(Math.floor((i - 1) / 4) + 1);
+                    barLabel.className = 'beat-bar-label' + (label.length > 1 ? ' compact' : '');
+                    barLabel.textContent = label;
+                    dot.appendChild(barLabel);
+                }
                 beatStrip.appendChild(dot);
             }
         }

@@ -515,6 +515,11 @@ public:
     juce::String getIntervalSyncStatusText() const;
 
 private:
+    int handleServerLicenseAgreement(const juce::String& licenseText);
+    void showServerLicenseAgreementAsync(const juce::String& serverName,
+                                         const juce::String& licenseText,
+                                         const juce::String& settingsKey);
+
     struct ZapVideoFrameInfo
     {
         juce::String streamKey;
@@ -615,6 +620,9 @@ private:
     juce::String pendingConnectPass;
     int pendingConnectNameAttempt = 0;
     bool duplicateNameRetryEnabled = false;
+    juce::String pendingServerLicenseApprovalKey;
+    std::atomic<bool> disconnectAfterLicenseRejected { false };
+    std::atomic<bool> serverLicenseDialogActive { false };
     
     // Chat storage
     juce::CriticalSection chatLock;
