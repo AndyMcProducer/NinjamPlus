@@ -347,8 +347,9 @@
 
         function normalizeVdoQualityPreset(value) {
             const preset = String(value || 'default').trim().toLowerCase();
-            if (preset === '1080p60-8000' || preset === '1080p60hq' || preset === 'hq8000' || preset === 'high8000' || preset === '8000') return '1080p60-8000';
-            if (preset === '1080p60' || preset === 'high' || preset === 'fullhd60') return '1080p60-8000';
+            if (preset === '1080p60-10000' || preset === '1080p60hq' || preset === 'hq10000' || preset === 'high10000' || preset === '10000') return '1080p60-10000';
+            if (preset === '1080p60-8000' || preset === 'hq8000' || preset === 'high8000' || preset === '8000') return '1080p60-10000';
+            if (preset === '1080p60' || preset === 'high' || preset === 'fullhd60') return '1080p60-10000';
             if (preset === '1080p30' || preset === 'fullhd30') return '1080p30';
             if (preset === '720p60' || preset === 'hd60') return '720p60';
             if (preset === '720p30' || preset === 'hd30') return '720p30';
@@ -379,13 +380,13 @@
             const quality = String(query.get('quality') || query.get('q') || '').trim().toLowerCase();
             const fps = queryFpsValue();
             const bitrate = queryBitrateValue();
-            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60 && bitrate >= 8000) return '1080p60-8000';
-            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60) return '1080p60-8000';
+            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60 && bitrate >= 8000) return '1080p60-10000';
+            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60) return '1080p60-10000';
             if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps > 0 && fps <= 30) return '1080p30';
             if ((quality === '1' || quality === '720' || quality === '720p' || quality === 'hd') && fps >= 60) return '720p60';
             if ((quality === '1' || quality === '720' || quality === '720p' || quality === 'hd') && fps > 0 && fps <= 30) return '720p30';
             if ((quality === '2' || quality === '360' || quality === '360p' || quality === 'low') && fps > 0 && fps <= 30) return '360p30';
-            return '1080p60-8000';
+            return '1080p60-10000';
         }
 
         function initialVdoCodec() {
@@ -488,6 +489,8 @@
             lastAppliedIntervalByUser: {},
             lastBufferRefreshIdByUser: {},
             lastVoiceChatModeByUser: {},
+            bufferApplyRetryTimersByUser: {},
+            bufferApplyRetryAttemptsByUser: {},
             bufferRefreshTimersByUser: {},
             bufferRefreshPendingUntilByUser: {},
             obsTilesByUser: {},
@@ -505,6 +508,7 @@
         const remoteUserStaleMs = 12000;
         const vdoLatencyStaleMs = 8000;
         const vdoLatencyMaxStepMs = 50;
+        const bufferApplyRetryDelaysMs = [350, 900, 1800, 3200];
 
         if (!appState.intervalSource) {
             appState.intervalSource = window.location.origin + '/intervals';
@@ -634,6 +638,18 @@
             return Object.keys(keys).sort();
         }
 
+        function clearBufferApplyRetryState(userKey) {
+            const key = normalizeUserId(userKey);
+            if (!key) {
+                return;
+            }
+            if (vdoState.bufferApplyRetryTimersByUser[key]) {
+                clearTimeout(vdoState.bufferApplyRetryTimersByUser[key]);
+            }
+            delete vdoState.bufferApplyRetryTimersByUser[key];
+            delete vdoState.bufferApplyRetryAttemptsByUser[key];
+        }
+
         function resetBufferApplicationState(userKey) {
             const key = normalizeUserId(userKey);
             if (!key) {
@@ -642,6 +658,7 @@
             delete vdoState.lastAppliedBufferByUser[key];
             delete vdoState.lastAppliedIntervalByUser[key];
             delete vdoState.lastBufferRefreshIdByUser[key];
+            clearBufferApplyRetryState(key);
             if (vdoState.bufferRefreshTimersByUser[key]) {
                 clearTimeout(vdoState.bufferRefreshTimersByUser[key]);
             }
@@ -656,10 +673,16 @@
             }
             delete vdoState.lastAppliedBufferByUser[key];
             const cleanReason = String(reason || 'local').replace(/[^a-z0-9._-]/gi, '') || 'local';
+            const flushFirst = cleanReason === 'target'
+                || cleanReason === 'guestConnected'
+                || cleanReason === 'pushConnection'
+                || cleanReason === 'voiceChatOn'
+                || cleanReason === 'voiceChatOff';
             vdoState.bufferRefreshSequence += 1;
             return scheduleBufferRefresh(
                 key,
-                'localBufferRefresh:' + cleanReason + ':' + vdoState.bufferRefreshSequence + ':' + Date.now()
+                'localBufferRefresh:' + cleanReason + ':' + vdoState.bufferRefreshSequence + ':' + Date.now(),
+                flushFirst
             );
         }
 
@@ -1260,6 +1283,54 @@
             return sent;
         }
 
+        function scheduleBufferApplyRetries(userKey) {
+            const key = normalizeUserId(userKey);
+            if (!key || (!vdoState.targetIdByUser[key] && !vdoState.streamIdByUser[key])) {
+                return false;
+            }
+
+            clearBufferApplyRetryState(key);
+            vdoState.bufferApplyRetryAttemptsByUser[key] = 0;
+
+            function hasTarget() {
+                return !!(vdoState.targetIdByUser[key] || vdoState.streamIdByUser[key]);
+            }
+
+            function applyAfterRefresh() {
+                delete vdoState.bufferApplyRetryTimersByUser[key];
+                if (!hasTarget()) {
+                    clearBufferApplyRetryState(key);
+                    return;
+                }
+
+                sendTargetedRefresh(key);
+                vdoState.bufferApplyRetryTimersByUser[key] = setTimeout(function () {
+                    delete vdoState.bufferApplyRetryTimersByUser[key];
+                    if (!hasTarget()) {
+                        clearBufferApplyRetryState(key);
+                        return;
+                    }
+
+                    const desiredBufferMs = getDesiredBufferMs(key);
+                    if (sendTargetedBuffer(key, desiredBufferMs)) {
+                        vdoState.lastAppliedBufferByUser[key] = desiredBufferMs;
+                    }
+                    updateSyncStatus();
+
+                    const attempt = (vdoState.bufferApplyRetryAttemptsByUser[key] || 0) + 1;
+                    vdoState.bufferApplyRetryAttemptsByUser[key] = attempt;
+                    if (attempt >= bufferApplyRetryDelaysMs.length) {
+                        clearBufferApplyRetryState(key);
+                        return;
+                    }
+                    vdoState.bufferApplyRetryTimersByUser[key] = setTimeout(applyAfterRefresh, bufferApplyRetryDelaysMs[attempt]);
+                }, 150);
+            }
+
+            vdoState.bufferApplyRetryTimersByUser[key] = setTimeout(applyAfterRefresh, bufferApplyRetryDelaysMs[0]);
+            return true;
+        }
+
         function sendTargetedRefresh(userKey) {
             const targetId = vdoState.targetIdByUser[userKey];
             const streamId = vdoState.streamIdByUser[userKey];
@@ -1300,7 +1371,7 @@
             return false;
         }
 
-        function scheduleBufferRefresh(userKey, refreshEventId) {
+        function scheduleBufferRefresh(userKey, refreshEventId, flushFirst) {
             const key = normalizeUserId(userKey);
             const eventId = String(refreshEventId || '');
             if (!key || !eventId || vdoState.lastBufferRefreshIdByUser[key] === eventId) {
@@ -1310,10 +1381,14 @@
                 return false;
             }
             vdoState.lastBufferRefreshIdByUser[key] = eventId;
+            clearBufferApplyRetryState(key);
             if (vdoState.bufferRefreshTimersByUser[key]) {
                 clearTimeout(vdoState.bufferRefreshTimersByUser[key]);
             }
             vdoState.bufferRefreshPendingUntilByUser[key] = Date.now() + 150;
+            if (flushFirst) {
+                sendTargetedBuffer(key, minimumBufferMs);
+            }
             sendTargetedRefresh(key);
             vdoState.bufferRefreshTimersByUser[key] = setTimeout(function () {
                 delete vdoState.bufferRefreshTimersByUser[key];
@@ -1321,6 +1396,7 @@
                 const desiredBufferMs = getDesiredBufferMs(key);
                 if (sendTargetedBuffer(key, desiredBufferMs)) {
                     vdoState.lastAppliedBufferByUser[key] = desiredBufferMs;
+                    scheduleBufferApplyRetries(key);
                 }
                 updateSyncStatus();
             }, 150);
@@ -1360,11 +1436,13 @@
                 if (hasAppliedBuffer && lastAppliedBuffer !== desiredBufferMs) {
                     if (sendTargetedBuffer(userKey, desiredBufferMs)) {
                         vdoState.lastAppliedBufferByUser[userKey] = desiredBufferMs;
+                        scheduleBufferApplyRetries(userKey);
                     }
                     continue;
                 }
                 if (sendTargetedBuffer(userKey, desiredBufferMs)) {
                     vdoState.lastAppliedBufferByUser[userKey] = desiredBufferMs;
+                    scheduleBufferApplyRetries(userKey);
                 }
             }
             renderObsGrid();
@@ -1613,6 +1691,7 @@
                 delete vdoState.targetIdByUser[userKey];
                 delete vdoState.lastAppliedBufferByUser[userKey];
                 delete vdoState.lastBufferRefreshIdByUser[userKey];
+                clearBufferApplyRetryState(userKey);
                 delete vdoState.lastVoiceChatModeByUser[userKey];
                 if (vdoState.bufferRefreshTimersByUser[userKey]) {
                     clearTimeout(vdoState.bufferRefreshTimersByUser[userKey]);
@@ -1666,6 +1745,7 @@
                 }
 
                 delete vdoState.lastBufferRefreshIdByUser[userKey];
+                clearBufferApplyRetryState(userKey);
                 delete vdoState.lastVoiceChatModeByUser[userKey];
                 if (vdoState.bufferRefreshTimersByUser[userKey]) {
                     clearTimeout(vdoState.bufferRefreshTimersByUser[userKey]);
@@ -1770,7 +1850,7 @@
                 if (refreshUserKey) {
                     delete vdoState.lastAppliedBufferByUser[refreshUserKey];
                 }
-                scheduleBufferRefresh(userKey, data.bufferRefreshEventId);
+                scheduleBufferRefresh(userKey, data.bufferRefreshEventId, true);
             }
             return false;
         }
@@ -1853,7 +1933,7 @@
 
         function vdoQualityPresetConfig(preset) {
             const quality = normalizeVdoQualityPreset(preset);
-            if (quality === '1080p60-8000' || quality === '1080p60') return { quality: '0', width: 1920, height: 1080, fps: 60, bitrate: 8000 };
+            if (quality === '1080p60-10000' || quality === '1080p60') return { quality: '0', width: 1920, height: 1080, fps: 60, bitrate: 10000 };
             if (quality === '1080p30') return { quality: '0', width: 1920, height: 1080, fps: 30, bitrate: 4500 };
             if (quality === '720p60') return { quality: '1', width: 1280, height: 720, fps: 60, bitrate: 3500 };
             if (quality === '720p30') return { quality: '1', width: 1280, height: 720, fps: 30, bitrate: 2500 };
@@ -2012,12 +2092,26 @@
             }
 
             if (data.action === 'guest-connected' && data.streamID) {
-                changed = registerPeerTarget(data.streamID, extractPeerLabel(data), data.UUID || data.streamID) || changed;
+                const label = extractPeerLabel(data);
+                const targetId = data.UUID || data.streamID;
+                const targetChanged = registerPeerTarget(data.streamID, label, targetId);
+                changed = targetChanged || changed;
+                if (!targetChanged) {
+                    const userKey = resolveUserKeyFromPeerIds(data.streamID, targetId, label);
+                    requestLocalBufferRefresh(userKey, 'guestConnected');
+                }
             } else if (data.action === 'push-connection' && data.streamID) {
                 if (data.value === false) {
                     changed = unregisterPeerTarget(data.streamID) || changed;
                 } else {
-                    changed = registerPeerTarget(data.streamID, extractPeerLabel(data), data.UUID || data.streamID) || changed;
+                    const label = extractPeerLabel(data);
+                    const targetId = data.UUID || data.streamID;
+                    const targetChanged = registerPeerTarget(data.streamID, label, targetId);
+                    changed = targetChanged || changed;
+                    if (!targetChanged) {
+                        const userKey = resolveUserKeyFromPeerIds(data.streamID, targetId, label);
+                        requestLocalBufferRefresh(userKey, 'pushConnection');
+                    }
                 }
             }
 

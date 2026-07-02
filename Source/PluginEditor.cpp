@@ -4140,7 +4140,7 @@ public:
           onClosed(std::move(onClosedCallback)),
           abletonHosted(abletonHostedWindow)
     {
-        setUsingNativeTitleBar(!abletonHosted);
+        setUsingNativeTitleBar(true);
         const auto initialSize = abletonHosted
             ? chatPopoutSizeForPreset(abletonChatWindowSizePreset)
             : juce::Rectangle<int>(0, 0, 500, 400);

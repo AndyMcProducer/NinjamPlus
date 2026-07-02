@@ -172,6 +172,37 @@
             max-width: 190px;
             object-fit: contain;
             flex: 0 0 auto;
+            cursor: context-menu;
+        }
+        .vdo-credit-menu {
+            position: fixed;
+            z-index: 50;
+            min-width: 170px;
+            padding: 4px;
+            border: 1px solid #3f4f73;
+            border-radius: 4px;
+            background: #151d2d;
+            box-shadow: 0 10px 24px rgba(0,0,0,0.36);
+            display: none;
+        }
+        .vdo-credit-menu.open {
+            display: block;
+        }
+        .vdo-credit-menu button {
+            width: 100%;
+            height: 28px;
+            border: 0;
+            border-radius: 3px;
+            background: transparent;
+            color: #e7eaf0;
+            text-align: left;
+            padding: 0 9px;
+            cursor: pointer;
+        }
+        .vdo-credit-menu button:hover,
+        .vdo-credit-menu button:focus-visible {
+            background: #293655;
+            outline: none;
         }
         .frame-wrap {
             border: 1px solid #2a3450;
@@ -345,7 +376,7 @@
             <label class="obs-control" for="vdoCameraQuality">Quality
                 <select id="vdoCameraQuality">
                     <option value="default">Default</option>
-                    <option value="1080p60-8000">1080p60 HQ 8000 kbps</option>
+                    <option value="1080p60-10000">1080p60 HQ 10000 kbps</option>
                     <option value="1080p30">1080p30</option>
                     <option value="720p60">720p60</option>
                     <option value="720p30">720p30</option>
@@ -371,8 +402,11 @@
         <div class="peer-offsets" id="peerOffsets"></div>
         <div class="header-meta">
             <span class="status" id="statusText"></span>
-            <img class="vdo-credit" src="PoweredByVDONinja.png" alt="" aria-hidden="true">
+            <img id="vdoCredit" class="vdo-credit" src="PoweredByVDONinja.png" alt="Powered by VDO.Ninja" title="Right-click for VDO options">
         </div>
+    </div>
+    <div class="vdo-credit-menu" id="vdoCreditMenu" role="menu" aria-hidden="true">
+        <button id="openDirectorRoom" type="button" role="menuitem">Open director room</button>
     </div>
     <div class="frame-wrap">
         <iframe id="appFrame" allow="camera; microphone; fullscreen"></iframe>
@@ -396,6 +430,9 @@
         const vdoCameraBgImage = document.getElementById('vdoCameraBgImage');
         const peerOffsets = document.getElementById('peerOffsets');
         const statusText = document.getElementById('statusText');
+        const vdoCredit = document.getElementById('vdoCredit');
+        const vdoCreditMenu = document.getElementById('vdoCreditMenu');
+        const openDirectorRoom = document.getElementById('openDirectorRoom');
         const beatCounterText = document.getElementById('beatCounterText');
         const beatStrip = document.getElementById('beatStrip');
         const appFrame = document.getElementById('appFrame');
@@ -440,8 +477,9 @@
 
         function normalizeVdoQualityPreset(value) {
             const preset = String(value || 'default').trim().toLowerCase();
-            if (preset === '1080p60-8000' || preset === '1080p60hq' || preset === 'hq8000' || preset === 'high8000' || preset === '8000') return '1080p60-8000';
-            if (preset === '1080p60' || preset === 'high' || preset === 'fullhd60') return '1080p60-8000';
+            if (preset === '1080p60-10000' || preset === '1080p60hq' || preset === 'hq10000' || preset === 'high10000' || preset === '10000') return '1080p60-10000';
+            if (preset === '1080p60-8000' || preset === 'hq8000' || preset === 'high8000' || preset === '8000') return '1080p60-10000';
+            if (preset === '1080p60' || preset === 'high' || preset === 'fullhd60') return '1080p60-10000';
             if (preset === '1080p30' || preset === 'fullhd30') return '1080p30';
             if (preset === '720p60' || preset === 'hd60') return '720p60';
             if (preset === '720p30' || preset === 'hd30') return '720p30';
@@ -472,13 +510,13 @@
             const quality = String(query.get('quality') || query.get('q') || '').trim().toLowerCase();
             const fps = queryFpsValue();
             const bitrate = queryBitrateValue();
-            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60 && bitrate >= 8000) return '1080p60-8000';
-            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60) return '1080p60-8000';
+            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60 && bitrate >= 8000) return '1080p60-10000';
+            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60) return '1080p60-10000';
             if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps > 0 && fps <= 30) return '1080p30';
             if ((quality === '1' || quality === '720' || quality === '720p' || quality === 'hd') && fps >= 60) return '720p60';
             if ((quality === '1' || quality === '720' || quality === '720p' || quality === 'hd') && fps > 0 && fps <= 30) return '720p30';
             if ((quality === '2' || quality === '360' || quality === '360p' || quality === 'low') && fps > 0 && fps <= 30) return '360p30';
-            return '1080p60-8000';
+            return '1080p60-10000';
         }
 
         function initialVdoCodec() {
@@ -598,6 +636,63 @@
             }
             url.search = params.toString();
             return url.toString();
+        }
+
+        function buildDirectorRoomUrl() {
+            const url = new URL('https://vdo.ninja/');
+            url.searchParams.set('director', resolvedRoom);
+            const label = String(query.get('label') || '').trim();
+            if (label) {
+                url.searchParams.set('label', label);
+            }
+            return url.toString();
+        }
+
+        function hideVdoCreditMenu() {
+            if (!vdoCreditMenu) {
+                return;
+            }
+            vdoCreditMenu.classList.remove('open');
+            vdoCreditMenu.setAttribute('aria-hidden', 'true');
+        }
+
+        function showVdoCreditMenu(x, y) {
+            if (!vdoCreditMenu) {
+                return;
+            }
+            vdoCreditMenu.classList.add('open');
+            vdoCreditMenu.setAttribute('aria-hidden', 'false');
+            const rect = vdoCreditMenu.getBoundingClientRect();
+            const left = Math.max(4, Math.min(x, window.innerWidth - rect.width - 4));
+            const top = Math.max(4, Math.min(y, window.innerHeight - rect.height - 4));
+            vdoCreditMenu.style.left = left + 'px';
+            vdoCreditMenu.style.top = top + 'px';
+            if (openDirectorRoom) {
+                openDirectorRoom.focus();
+            }
+        }
+
+        if (vdoCredit && vdoCreditMenu && openDirectorRoom) {
+            vdoCredit.addEventListener('contextmenu', function (event) {
+                event.preventDefault();
+                showVdoCreditMenu(event.clientX, event.clientY);
+            });
+            vdoCreditMenu.addEventListener('click', function (event) {
+                event.stopPropagation();
+            });
+            openDirectorRoom.addEventListener('click', function () {
+                const directorUrl = buildDirectorRoomUrl();
+                hideVdoCreditMenu();
+                window.open(directorUrl, '_blank', 'noopener');
+            });
+            document.addEventListener('click', hideVdoCreditMenu);
+            document.addEventListener('keydown', function (event) {
+                if (event.key === 'Escape') {
+                    hideVdoCreditMenu();
+                }
+            });
+            window.addEventListener('resize', hideVdoCreditMenu);
+            window.addEventListener('scroll', hideVdoCreditMenu, true);
         }
 
         function copyTextToClipboard(text) {

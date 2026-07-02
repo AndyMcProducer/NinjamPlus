@@ -107,9 +107,9 @@ public:
                     beatArea.removeFromBottom(juce::jmax(5, juce::roundToInt((float)beatArea.getHeight() * 0.34f)));
 
                 const juce::String beatText(currentBeat + 1);
-                const float fontSize = juce::jlimit(5.0f, 9.0f, juce::jmin(blockArea.getWidth() * 0.72f, beatArea.getHeight() * 0.8f));
+                const float fontSize = juce::jlimit(7.0f, 15.0f, juce::jmin(blockArea.getWidth() * 0.9f, beatArea.getHeight() * 0.96f));
                 g.setFont(juce::Font(fontSize, juce::Font::bold));
-                g.setColour(juce::Colours::black.withAlpha(0.28f + 0.72f * activePulse));
+                g.setColour(juce::Colours::black.withAlpha(0.72f + 0.28f * activePulse));
                 g.drawFittedText(beatText, beatArea, juce::Justification::centred, 1);
             }
 
@@ -123,8 +123,8 @@ public:
                 auto tabArea = barArea.toFloat().reduced(1.0f, 0.5f);
                 g.setColour(lit ? juce::Colours::white.withAlpha(tabAlpha) : juce::Colour(0xff263244).withAlpha(tabAlpha));
                 g.fillRoundedRectangle(tabArea, 2.0f);
-                g.setFont(juce::Font(juce::jlimit(5.0f, 7.0f, blockArea.getHeight() * 0.34f), juce::Font::bold));
-                g.setColour(lit ? juce::Colours::black.withAlpha(barAlpha) : onColor.withAlpha(barAlpha));
+                g.setFont(juce::Font(juce::jlimit(6.0f, 9.0f, barArea.getHeight() * 0.88f), juce::Font::bold));
+                g.setColour(lit ? juce::Colours::black.withAlpha(juce::jmax(barAlpha, 0.78f)) : onColor.withAlpha(juce::jmax(barAlpha, 0.78f)));
                 g.drawFittedText(juce::String((i / 4) + 1), barArea, juce::Justification::centred, 1);
             }
         }
