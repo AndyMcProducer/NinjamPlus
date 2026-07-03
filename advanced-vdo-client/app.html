@@ -650,6 +650,17 @@
             delete vdoState.bufferApplyRetryAttemptsByUser[key];
         }
 
+        function clearEstimatedVdoLatency(userKey) {
+            const key = normalizeUserId(userKey);
+            if (!key) {
+                return;
+            }
+            delete vdoState.latencyMsByUser[key];
+            delete vdoState.latencyTargetMsByUser[key];
+            delete vdoState.latencyUpdatedAtByUser[key];
+            delete vdoState.chunkStatsByUser[key];
+        }
+
         function resetBufferApplicationState(userKey) {
             const key = normalizeUserId(userKey);
             if (!key) {
@@ -659,6 +670,7 @@
             delete vdoState.lastAppliedIntervalByUser[key];
             delete vdoState.lastBufferRefreshIdByUser[key];
             clearBufferApplyRetryState(key);
+            clearEstimatedVdoLatency(key);
             if (vdoState.bufferRefreshTimersByUser[key]) {
                 clearTimeout(vdoState.bufferRefreshTimersByUser[key]);
             }
@@ -1387,6 +1399,7 @@
             }
             vdoState.bufferRefreshPendingUntilByUser[key] = Date.now() + 150;
             if (flushFirst) {
+                clearEstimatedVdoLatency(key);
                 sendTargetedBuffer(key, minimumBufferMs);
             }
             sendTargetedRefresh(key);
