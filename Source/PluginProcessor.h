@@ -435,6 +435,8 @@ public:
 
     void setSpreadOutputsEnabled(bool shouldEnable);
     bool isSpreadOutputsEnabled() const;
+    void setMobileHotspotModeEnabled(bool shouldEnable);
+    bool isMobileHotspotModeEnabled() const;
 
     enum class SyncMode : int
     {
@@ -1036,6 +1038,8 @@ private:
     double lastIntervalHelperPayloadWriteMs = 0.0;
     std::atomic<bool> intervalHelperPayloadForceWrite { false };
     std::atomic<juce::uint64> vdoRosterRevision { 0 };
+    std::atomic<bool> mobileHotspotModeEnabled { false };
+    double lastMobileHotspotHeartbeatSendMs = 0.0;
     std::atomic<bool> vdoVideoSyncEnabled { false };
     std::atomic<bool> vdoCarrierChannelConfigured { false };
     std::atomic<bool> videoHelperRunning { false };

@@ -10631,6 +10631,18 @@ bool NinjamVst3AudioProcessor::isSpreadOutputsEnabled() const
     return spreadOutputsEnabled.load();
 }
 
+void NinjamVst3AudioProcessor::setMobileHotspotModeEnabled(bool shouldEnable)
+{
+    mobileHotspotModeEnabled.store(shouldEnable, std::memory_order_relaxed);
+    if (!shouldEnable)
+        lastMobileHotspotHeartbeatSendMs = 0.0;
+}
+
+bool NinjamVst3AudioProcessor::isMobileHotspotModeEnabled() const
+{
+    return mobileHotspotModeEnabled.load(std::memory_order_relaxed);
+}
+
 int NinjamVst3AudioProcessor::getCodecMode() const
 {
     const bool multiChanAuto = numLocalChannels.load() > 1 && opusSyncAvailable.load();
@@ -15305,6 +15317,8 @@ void NinjamVst3AudioProcessor::ChatMessage_Callback(void* userData, NJClient* in
     };
     auto processInboundSideSignal = [self, &processOpusSyncSupport](const juce::String& sender, const juce::String& type, const juce::String& payload, juce::String* outEventId) -> bool
     {
+        if (type == "mobileHotspotKeepalive")
+            return true;
         if (type == "opusSyncSupport")
             return processOpusSyncSupport(sender, payload, outEventId);
         juce::ignoreUnused(outEventId);
@@ -17825,6 +17839,7 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     state.setProperty("metronomeSoundKey", getMetronomeSoundKey(), nullptr);
     state.setProperty("metronomeOutputChannel", getMetronomeOutputChannel(), nullptr);
     state.setProperty("transmitLocal", isTransmittingLocal(), nullptr);
+    state.setProperty("mobileHotspotMode", isMobileHotspotModeEnabled(), nullptr);
     state.setProperty("chordDetectionEnabled", isChordDetectionEnabled(), nullptr);
     state.setProperty("samplePadsVolume", (double)getSamplePadVolume(), nullptr);
     state.setProperty("samplePadsLimiter", isSamplePadLimiterEnabled(), nullptr);
@@ -17916,6 +17931,7 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setMetronomeSoundKey(state.getProperty("metronomeSoundKey", getClassicMetronomeSoundKey()).toString());
     setMetronomeOutputChannel((int)state.getProperty("metronomeOutputChannel", 0));
     setTransmitLocal((bool)state.getProperty("transmitLocal", false));
+    setMobileHotspotModeEnabled((bool)state.getProperty("mobileHotspotMode", false));
     setChordDetectionEnabled((bool)state.getProperty("chordDetectionEnabled", true));
     setSamplePadVolume(juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("samplePadsVolume", 1.0)));
     setSamplePadLimiterEnabled((bool)state.getProperty("samplePadsLimiter", false));
@@ -18187,6 +18203,17 @@ void NinjamVst3AudioProcessor::timerCallback()
     if (serverSupportsSideSignal)
         ninjamSideSignalServerSupported.store(true, std::memory_order_relaxed);
     const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    if (status == NJClient::NJC_STATUS_OK
+        && mobileHotspotModeEnabled.load(std::memory_order_relaxed)
+        && (lastMobileHotspotHeartbeatSendMs <= 0.0 || (nowMs - lastMobileHotspotHeartbeatSendMs) >= 500.0))
+    {
+        const juce::ScopedLock clientLock(ninjamClientLock);
+        if (ninjamClient.GetStatus() == NJClient::NJC_STATUS_OK)
+        {
+            ninjamClient.ChatMessage_Send("SIDE_SIGNAL", "*", "mobileHotspotKeepalive", "x", nullptr);
+            lastMobileHotspotHeartbeatSendMs = nowMs;
+        }
+    }
     const bool vdoSyncActive = vdoVideoSyncEnabled.load(std::memory_order_relaxed)
         && !ninjamZapVideoEnabled.load(std::memory_order_relaxed);
     const bool wantsSideSignalVideoCap = vdoSyncActive
