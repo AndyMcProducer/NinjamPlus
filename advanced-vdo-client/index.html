@@ -520,7 +520,7 @@
         }
 
         function initialVdoCodec() {
-            return normalizeVdoCodec(query.get('cameraCodec') || query.get('vdoCodec') || query.get('codec') || query.get('videocodec') || 'default');
+            return normalizeVdoCodec(query.get('cameraCodec') || query.get('vdoCodec') || query.get('chunkcodec') || query.get('codec') || query.get('videocodec') || 'default');
         }
 
         function initialCameraFx() {
@@ -557,6 +557,7 @@
             params.delete('vb');
             params.delete('cameraCodec');
             params.delete('vdoCodec');
+            params.delete('chunkcodec');
             params.delete('codec');
             params.delete('codecs');
             params.delete('videocodec');
@@ -638,8 +639,16 @@
             return url.toString();
         }
 
+        function vdoBaseUrl() {
+            const candidate = String(query.get('vdoBase') || query.get('vdoUrl') || '').trim();
+            if (/^https?:\/\//i.test(candidate)) {
+                return candidate.replace(/[?#].*$/, '').replace(/\/?$/, '/');
+            }
+            return 'https://vdo.ninja/alpha/';
+        }
+
         function buildDirectorRoomUrl() {
-            const url = new URL('https://vdo.ninja/');
+            const url = new URL(vdoBaseUrl());
             url.searchParams.set('director', resolvedRoom);
             const label = String(query.get('label') || '').trim();
             if (label) {
@@ -887,16 +896,10 @@
         }
 
         function resolveIncomingBufferMs(msg) {
-            const measuredAudioDelayMs = getNonNegativeMessageMs(msg, ['measuredAudioDelayMs', 'audioDelayMs']);
-            const senderServerLatencyMs = getNonNegativeMessageMs(msg, ['senderServerLatencyMs', 'remoteServerLatencyMs']);
-            const receiverServerLatencyMs = getNonNegativeMessageMs(msg, ['receiverServerLatencyMs', 'localServerLatencyMs']);
-            if (isFinite(measuredAudioDelayMs) && (isFinite(senderServerLatencyMs) || isFinite(receiverServerLatencyMs))) {
-                const sender = isFinite(senderServerLatencyMs) ? senderServerLatencyMs : 0;
-                const receiver = isFinite(receiverServerLatencyMs) ? receiverServerLatencyMs : 0;
-                return Math.max(0, Math.round(measuredAudioDelayMs - sender - receiver));
-            }
-
             const receiverBufferMs = getNonNegativeMessageMs(msg, ['receiverBufferMs']);
+            if (boolProp(msg, 'receiverBufferFinal') === true && isFinite(receiverBufferMs)) {
+                return Math.max(0, Math.round(receiverBufferMs));
+            }
             if (isFinite(receiverBufferMs)) {
                 return Math.max(0, Math.round(receiverBufferMs));
             }
@@ -904,6 +907,15 @@
             const bufferTotalMs = getNonNegativeMessageMs(msg, ['bufferTotalMs']);
             if (isFinite(bufferTotalMs)) {
                 return Math.max(0, Math.round(bufferTotalMs));
+            }
+
+            const measuredAudioDelayMs = getNonNegativeMessageMs(msg, ['measuredAudioDelayMs', 'audioDelayMs']);
+            const senderServerLatencyMs = getNonNegativeMessageMs(msg, ['senderServerLatencyMs', 'remoteServerLatencyMs']);
+            const receiverServerLatencyMs = getNonNegativeMessageMs(msg, ['receiverServerLatencyMs', 'localServerLatencyMs']);
+            if (isFinite(measuredAudioDelayMs) && (isFinite(senderServerLatencyMs) || isFinite(receiverServerLatencyMs))) {
+                const sender = isFinite(senderServerLatencyMs) ? senderServerLatencyMs : 0;
+                const receiver = isFinite(receiverServerLatencyMs) ? receiverServerLatencyMs : 0;
+                return Math.max(0, Math.round(measuredAudioDelayMs - sender - receiver));
             }
 
             if (isFinite(measuredAudioDelayMs)) {
@@ -1105,13 +1117,16 @@
 
         function applyActiveRosterMessage(msg) {
             const revision = String(msg.revision ?? msg.videoClockMs ?? '');
+            if (!Array.isArray(msg.users) || !msg.users.length) {
+                return;
+            }
             if (revision && lastRosterRevision === revision) {
                 return;
             }
             if (revision) {
                 lastRosterRevision = revision;
             }
-            pruneUsersMissingFromPayload(Array.isArray(msg.users) ? msg.users : []);
+            pruneUsersMissingFromPayload(msg.users);
         }
 
         function loadUsersFromStorage() {

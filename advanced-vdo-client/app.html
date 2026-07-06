@@ -390,7 +390,7 @@
         }
 
         function initialVdoCodec() {
-            return normalizeVdoCodec(query.get('cameraCodec') || query.get('vdoCodec') || query.get('codec') || query.get('videocodec') || 'default');
+            return normalizeVdoCodec(query.get('cameraCodec') || query.get('vdoCodec') || query.get('chunkcodec') || query.get('codec') || query.get('videocodec') || 'default');
         }
 
         function initialCameraFx() {
@@ -399,15 +399,31 @@
             return normalizeCameraFx(query.get('effects') || query.get('effect') || 'off');
         }
 
+        function queryInteger(names, fallback, min, max) {
+            for (let i = 0; i < names.length; i++) {
+                const raw = query.get(names[i]);
+                if (raw === null || raw === '') {
+                    continue;
+                }
+                const parsed = parseInt(raw, 10);
+                if (!isFinite(parsed)) {
+                    continue;
+                }
+                return Math.max(min, Math.min(max, parsed));
+            }
+            return fallback;
+        }
+
         const appState = {
             room: resolvedRoom,
             label: query.get('label') || 'NINJAM',
+            vdoSyncUserKey: query.get('vdoSyncUserKey') || '',
             store: query.get('store') || '',
             bg: query.get('bg') || '',
             intervalSource: query.get('intervalSource') || '',
             intervalPollMs: parseInt(query.get('intervalPollMs') || '', 10) || 500,
             requestedBufferMs: Math.max(minimumBufferMs, parseInt(query.get('buffer') || '', 10) || minimumBufferMs),
-            chunkedMs: parseInt(query.get('chunked') || '', 10) || 120,
+            chunkedMs: queryInteger(['chunkbitrate', 'chunked', 'bitrate'], 900, 60, 100000),
             ninjamServer: ninjamServer,
             initialBufferMode: normalizeBufferMode(query.get('bufferMode')),
             obsMode: obsMode,
@@ -499,6 +515,10 @@
             latencyUpdatedAtByUser: {},
             chunkEventsByStreamId: {},
             chunkStatsByUser: {},
+            mappingSourceByUser: {},
+            mappingDiagnosticsByUser: {},
+            lastResolveSource: '',
+            lastResolveDiagnostic: '',
             lastRosterRevision: '',
             bufferRefreshSequence: 0,
             rosterTimerId: 0
@@ -699,12 +719,15 @@
         }
 
         function resolveUserKeyFromLabel(label) {
+            vdoState.lastResolveSource = '';
+            vdoState.lastResolveDiagnostic = '';
             const normalizedLabel = normalizeUserId(label);
             if (!normalizedLabel || isServerBotUserId(normalizedLabel)) {
                 return '';
             }
             const trackedUsers = getTrackedUserKeys();
             if (trackedUsers.indexOf(normalizedLabel) >= 0) {
+                vdoState.lastResolveSource = 'exact-label';
                 return normalizedLabel;
             }
 
@@ -713,10 +736,14 @@
                 const candidate = trackedUsers[i];
                 if (normalizedLabel.indexOf(candidate) >= 0 || candidate.indexOf(normalizedLabel) >= 0) {
                     if (matchedUser && matchedUser !== candidate) {
+                        vdoState.lastResolveDiagnostic = 'ambiguous label ' + normalizedLabel;
                         return '';
                     }
                     matchedUser = candidate;
                 }
+            }
+            if (matchedUser) {
+                vdoState.lastResolveSource = 'fuzzy-label';
             }
             return matchedUser;
         }
@@ -759,10 +786,21 @@
                 return false;
             }
             const targetId = String(explicitTargetId || cleanStreamId).trim();
+            const mappingSource = vdoState.lastResolveSource || 'label';
+            const existingStreamId = vdoState.streamIdByUser[userKey];
+            if (existingStreamId && existingStreamId !== cleanStreamId) {
+                const existingSource = vdoState.mappingSourceByUser[userKey] || '';
+                if (!(mappingSource === 'exact-label' && existingSource !== 'exact-label')) {
+                    vdoState.mappingDiagnosticsByUser[userKey] = 'duplicate stream ' + existingStreamId + ' / ' + cleanStreamId;
+                    return true;
+                }
+            }
             const changed = vdoState.streamIdByUser[userKey] !== cleanStreamId
                 || vdoState.targetIdByUser[userKey] !== targetId;
             vdoState.streamIdByUser[userKey] = cleanStreamId;
             vdoState.targetIdByUser[userKey] = targetId;
+            vdoState.mappingSourceByUser[userKey] = mappingSource;
+            delete vdoState.mappingDiagnosticsByUser[userKey];
             if (changed) {
                 resetBufferApplicationState(userKey);
                 requestLocalBufferRefresh(userKey, 'target');
@@ -784,6 +822,8 @@
                     delete vdoState.streamIdByUser[userKey];
                     delete vdoState.targetIdByUser[userKey];
                     delete vdoState.chunkStatsByUser[userKey];
+                    delete vdoState.mappingSourceByUser[userKey];
+                    delete vdoState.mappingDiagnosticsByUser[userKey];
                     resetBufferApplicationState(userKey);
                     changed = true;
                 }
@@ -937,16 +977,10 @@
         }
 
         function resolveIncomingBufferMs(data) {
-            const measuredAudioDelayMs = getNonNegativeMessageMs(data, ['measuredAudioDelayMs', 'audioDelayMs']);
-            const senderServerLatencyMs = getNonNegativeMessageMs(data, ['senderServerLatencyMs', 'remoteServerLatencyMs']);
-            const receiverServerLatencyMs = getNonNegativeMessageMs(data, ['receiverServerLatencyMs', 'localServerLatencyMs']);
-            if (isFinite(measuredAudioDelayMs) && (isFinite(senderServerLatencyMs) || isFinite(receiverServerLatencyMs))) {
-                const sender = isFinite(senderServerLatencyMs) ? senderServerLatencyMs : 0;
-                const receiver = isFinite(receiverServerLatencyMs) ? receiverServerLatencyMs : 0;
-                return calculatedBufferMs(data, measuredAudioDelayMs - sender - receiver);
-            }
-
             const receiverBufferMs = getNonNegativeMessageMs(data, ['receiverBufferMs']);
+            if (boolProp(data, 'receiverBufferFinal') === true && isFinite(receiverBufferMs)) {
+                return Math.max(minimumBufferMs, Math.round(receiverBufferMs));
+            }
             if (isFinite(receiverBufferMs)) {
                 return calculatedBufferMs(data, receiverBufferMs);
             }
@@ -954,6 +988,15 @@
             const bufferTotalMs = getNonNegativeMessageMs(data, ['bufferTotalMs']);
             if (isFinite(bufferTotalMs)) {
                 return calculatedBufferMs(data, bufferTotalMs);
+            }
+
+            const measuredAudioDelayMs = getNonNegativeMessageMs(data, ['measuredAudioDelayMs', 'audioDelayMs']);
+            const senderServerLatencyMs = getNonNegativeMessageMs(data, ['senderServerLatencyMs', 'remoteServerLatencyMs']);
+            const receiverServerLatencyMs = getNonNegativeMessageMs(data, ['receiverServerLatencyMs', 'localServerLatencyMs']);
+            if (isFinite(measuredAudioDelayMs) && (isFinite(senderServerLatencyMs) || isFinite(receiverServerLatencyMs))) {
+                const sender = isFinite(senderServerLatencyMs) ? senderServerLatencyMs : 0;
+                const receiver = isFinite(receiverServerLatencyMs) ? receiverServerLatencyMs : 0;
+                return Math.max(minimumBufferMs, Math.round(measuredAudioDelayMs - sender - receiver));
             }
 
             if (isFinite(measuredAudioDelayMs)) {
@@ -1192,17 +1235,24 @@
                     continue;
                 }
                 const targetMs = getNumericProperty(chunkStats, ['buffer_buffer']);
+                const deltaMs = getNumericProperty(chunkStats, ['buffer_delta']);
                 const levelMs = getNumericProperty(chunkStats, ['buffer_level']);
                 const nextStats = {
                     targetMs: isFinite(targetMs) ? targetMs : NaN,
+                    deltaMs: isFinite(deltaMs) ? deltaMs : NaN,
                     levelMs: isFinite(levelMs) ? levelMs : NaN,
+                    scheduler: typeof chunkStats.scheduler === 'string' ? chunkStats.scheduler : '',
+                    audioContextState: typeof chunkStats.audio_context_state === 'string' ? chunkStats.audio_context_state : '',
                     rebuffering: chunkStats.rebuffering === true,
                     updatedAt: Date.now()
                 };
                 const prior = vdoState.chunkStatsByUser[userKey] || {};
                 changed = changed
                     || Math.round(prior.targetMs || -1) !== Math.round(nextStats.targetMs || -1)
+                    || Math.round(prior.deltaMs || -1) !== Math.round(nextStats.deltaMs || -1)
                     || Math.round(prior.levelMs || -1) !== Math.round(nextStats.levelMs || -1)
+                    || prior.scheduler !== nextStats.scheduler
+                    || prior.audioContextState !== nextStats.audioContextState
                     || prior.rebuffering !== nextStats.rebuffering;
                 vdoState.chunkStatsByUser[userKey] = nextStats;
             }
@@ -1471,7 +1521,7 @@
             params.set('autostart', '1');
             params.set('playsinline', '1');
             params.set('cleanoutput', '1');
-            return 'https://vdo.ninja/?' + params.toString();
+            return vdoIframeBaseUrl() + '?' + params.toString();
         }
 
         function renderObsGrid() {
@@ -1659,15 +1709,22 @@
                 const chunkStats = vdoState.chunkStatsByUser[userKey] || {};
                 const chunkText = (typeof chunkStats.updatedAt === 'number' && (Date.now() - chunkStats.updatedAt) < 8000)
                     ? (' | chunk target ' + formatMaybeMs(chunkStats.targetMs)
+                        + ' delta ' + formatMaybeMs(chunkStats.deltaMs)
                         + ' level ' + formatMaybeMs(chunkStats.levelMs)
+                        + (chunkStats.scheduler ? (' scheduler ' + chunkStats.scheduler) : '')
+                        + (chunkStats.audioContextState ? (' ctx ' + chunkStats.audioContextState) : '')
                         + (chunkStats.rebuffering ? ' rebuffering' : ''))
+                    : '';
+                const mappingSource = vdoState.mappingSourceByUser[userKey] || 'unmapped';
+                const mappingDiagnostic = vdoState.mappingDiagnosticsByUser[userKey]
+                    ? (' | ' + vdoState.mappingDiagnosticsByUser[userKey])
                     : '';
                 const streamId = vdoState.streamIdByUser[userKey];
                 const chunkEvent = streamId ? vdoState.chunkEventsByStreamId[streamId] : null;
                 const chunkEventText = (chunkEvent && (Date.now() - chunkEvent.updatedAt) < 8000)
                     ? (' | last chunk ' + chunkEvent.direction + ' ' + chunkEvent.type + ' ts ' + formatMaybeMs(chunkEvent.ts))
                     : '';
-                const detailText = userKey + ': ' + diagnostics.text + vdoText + chunkText + chunkEventText;
+                const detailText = userKey + ': ' + diagnostics.text + vdoText + chunkText + ' | map ' + mappingSource + mappingDiagnostic + chunkEventText;
                 light.title = detailText + '\nClick to copy';
                 light.setAttribute('aria-label', detailText);
                 light.addEventListener('click', function () {
@@ -1715,6 +1772,8 @@
                 delete vdoState.latencyTargetMsByUser[userKey];
                 delete vdoState.latencyUpdatedAtByUser[userKey];
                 delete vdoState.chunkStatsByUser[userKey];
+                delete vdoState.mappingSourceByUser[userKey];
+                delete vdoState.mappingDiagnosticsByUser[userKey];
                 changed = true;
             }
             if (changed) {
@@ -1769,6 +1828,8 @@
                 delete vdoState.latencyTargetMsByUser[userKey];
                 delete vdoState.latencyUpdatedAtByUser[userKey];
                 delete vdoState.chunkStatsByUser[userKey];
+                delete vdoState.mappingSourceByUser[userKey];
+                delete vdoState.mappingDiagnosticsByUser[userKey];
                 changed = true;
             }
 
@@ -1783,13 +1844,16 @@
                 return false;
             }
             const revision = String(data.revision ?? data.videoClockMs ?? '');
+            if (!Array.isArray(data.users) || !data.users.length) {
+                return false;
+            }
             if (revision && vdoState.lastRosterRevision === revision) {
                 return false;
             }
             if (revision) {
                 vdoState.lastRosterRevision = revision;
             }
-            const users = Array.isArray(data.users) ? data.users : [];
+            const users = data.users;
             pruneUsersMissingFromPayload(users);
             return true;
         }
@@ -1870,18 +1934,10 @@
 
         function processIntervalPayload(payload) {
             const items = Array.isArray(payload) ? payload : [payload];
-            const activePayloadUsers = [];
             for (let i = 0; i < items.length; i++) {
                 const item = items[i] || {};
                 handleIntervalMessage(item);
-                if (item.type === 'remoteTimecode' || item.type === 'videoTimecode') {
-                    const userKey = normalizeUserId(item.userKey || item.userId || '');
-                    if (userKey && !isServerBotUserId(userKey)) {
-                        activePayloadUsers.push(userKey);
-                    }
-                }
             }
-            pruneUsersMissingFromPayload(activePayloadUsers);
             pruneInactiveUsers();
             applyPeerBuffers(false);
         }
@@ -1940,7 +1996,9 @@
 
         function applyVdoCodecParams(params) {
             if (appState.cameraCodec !== 'default') {
+                // codec controls RTP/fallback paths; chunkcodec controls chunked video.
                 params.set('codec', appState.cameraCodec);
+                params.set('chunkcodec', appState.cameraCodec);
             }
         }
 
@@ -1978,6 +2036,38 @@
                     params.set('imagelist', encodeURIComponent(JSON.stringify([appState.cameraBgImage])));
                 }
             }
+        }
+
+        function applyVdoTransportOverrideParams(params) {
+            const names = [
+                'relay',
+                'private',
+                'privacy',
+                'tcp',
+                'speedtest',
+                'turn',
+                'stun',
+                'addstun',
+                'apiserver',
+                'wss',
+                'wss2'
+            ];
+            for (let i = 0; i < names.length; i++) {
+                const name = names[i];
+                if (query.has(name)) {
+                    params.set(name, query.get(name) || '');
+                }
+            }
+        }
+
+        function vdoIframeBaseUrl() {
+            const candidate = String(query.get('vdoBase') || query.get('vdoUrl') || '').trim();
+            if (/^https?:\/\//i.test(candidate)) {
+                return candidate.replace(/[?#].*$/, '').replace(/\/?$/, '/');
+            }
+            // NINJam sync currently depends on VDO.Ninja alpha chunked-mode fixes.
+            // Use vdoBase=https://vdo.ninja/ after those fixes are promoted.
+            return 'https://vdo.ninja/alpha/';
         }
 
         function postEvalToVdo(source) {
@@ -2068,10 +2158,64 @@
         function buildIframeUrl() {
             const iframeParams = new URLSearchParams();
             iframeParams.set('room', appState.room);
-            iframeParams.set('label', appState.label);
-            iframeParams.set('chunked', String(Math.max(60, appState.chunkedMs || 120)));
+            iframeParams.set('label', normalizeUserId(appState.vdoSyncUserKey || appState.label) || appState.label);
+            applyVdoCodecParams(iframeParams);
+            applyVdoQualityParams(iframeParams);
+            applyCameraFxParams(iframeParams);
+            /*
+             * VDO.Ninja sync-mode parameter contract:
+             *
+             * - chunked/chunkbitrate/bitrate/maxvideobitrate are video bitrate
+             *   controls in kbps. They are not NINJam interval or playout-buffer
+             *   durations. A previous bug sent low buffer-derived values here,
+             *   which made chunked video encode at 60-120 kbps and stay blurry.
+             * - chunkcodec is the chunked-video codec preference. codec is still
+             *   sent too for regular VDO/RTP fallback paths, but chunked mode
+             *   does not use codec by itself.
+             * - buffer is only the initial VDO viewer target. NINJam owns the
+             *   actual per-peer delay and sends live setBufferDelay updates once
+             *   measured route/user data arrives.
+             * - chunkbufferadaptive=0 keeps VDO from moving the receiver buffer
+             *   behind NINJam's back. If experimenting without NINJam sync, this
+             *   can be enabled with chunkbufferfloor/chunkbufferceil.
+             * - chunkindex=1 and chunknack=1 opt into indexed reliability framing
+             *   so skipped/missing chunks are observable and recoverable.
+             * - chunkcache is a resend cache window, not the playout delay. Keep
+             *   it bounded; NACKs are useful only before the receiver gives up on
+             *   a frame, even when the musical/video delay is much longer.
+             * - chunkedbuffer is the sender pacing/adaptation window. Raising it
+             *   can tolerate bursty SCTP delivery but also delays down-adaptation.
+             * - chunkadapt=bitrate is conservative for music sessions. hybrid or
+             *   framerate may recover harder under cellular congestion, but can
+             *   make motion less even for all viewers because the encoder is shared.
+             * - relay/tcp/speedtest/turn/stun/wss2 are optional test/deployment
+             *   pass-throughs. For far TURN/TCP testing, prefer relay=<region>&tcp.
+             *   speedtest=<region>&tcp can filter out all TURN entries when the
+             *   speedtest endpoint only advertises UDP for that region.
+             * - wss/wss2 select VDO's signaling endpoint only. Do not use the VDO
+             *   handshake websocket as an app-level command/control channel.
+             * - vdoBase/vdoUrl can override the VDO deployment. Until the required
+             *   chunked-mode fixes are promoted, sync mode defaults to alpha.
+             */
+            iframeParams.set('chunked', String(Math.max(60, appState.chunkedMs || 900)));
+            iframeParams.set('chunkbitrate', String(Math.max(60, appState.chunkedMs || 900)));
+            iframeParams.set('bitrate', String(Math.max(60, appState.chunkedMs || 900)));
+            iframeParams.set('maxvideobitrate', String(Math.max(60, appState.chunkedMs || 900)));
+            iframeParams.set('chunkindex', query.get('chunkindex') || '1');
+            iframeParams.set('chunknack', query.get('chunknack') || '1');
+            iframeParams.set('chunknackattempts', String(queryInteger(['chunknackattempts'], 8, 1, 20)));
+            iframeParams.set('chunknackdelay', String(queryInteger(['chunknackdelay'], 250, 50, 5000)));
+            iframeParams.set('chunkchunksize', String(queryInteger(['chunkchunksize'], 4096, 2048, 65536)));
+            iframeParams.set('chunkcache', String(queryInteger(['chunkcache'], 30000, 0, 60000)));
             iframeParams.set('chunkbufferadaptive', '0');
+            iframeParams.set('chunkbufferfloor', '0');
             iframeParams.set('chunkbufferceil', '180000');
+            iframeParams.set('chunkedbuffer', String(queryInteger(['chunkedbuffer', 'sendingbuffer'], 1500, 100, 60000)));
+            iframeParams.set('chunkadapt', query.get('chunkadapt') || 'bitrate');
+            iframeParams.set('chunkadaptfloor', String(queryInteger(['chunkadaptfloor'], 300, 0, 10000)));
+            iframeParams.set('chunkadaptceil', String(queryInteger(['chunkadaptceil'], Math.max(60, appState.chunkedMs || 900), 0, 100000)));
+            iframeParams.set('chunkadaptthreshold', String(queryInteger(['chunkadaptthreshold'], 500, 0, 10000)));
+            iframeParams.set('chunkadaptinterval', String(queryInteger(['chunkadaptinterval'], 1200, 100, 60000)));
             iframeParams.set('noaudio', '1');
             iframeParams.set('buffer2', '0');
             // Keep the initial room join buffer minimal; the sync layer applies the
@@ -2081,10 +2225,8 @@
                 iframeParams.set('cleanoutput', '1');
                 iframeParams.set('autostart', '1');
             }
-            applyVdoCodecParams(iframeParams);
-            applyVdoQualityParams(iframeParams);
-            applyCameraFxParams(iframeParams);
-            return 'https://vdo.ninja/?' + iframeParams.toString();
+            applyVdoTransportOverrideParams(iframeParams);
+            return vdoIframeBaseUrl() + '?' + iframeParams.toString();
         }
 
         function handleVdoMessage(data) {
