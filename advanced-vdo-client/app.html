@@ -348,6 +348,7 @@
         function normalizeVdoQualityPreset(value) {
             const preset = String(value || 'default').trim().toLowerCase();
             if (preset === '1080p60-10000' || preset === '1080p60hq' || preset === 'hq10000' || preset === 'high10000' || preset === '10000') return '1080p60-10000';
+            if (preset === '1080p30-10000' || preset === '1080p30hq' || preset === 'fullhd30hq') return '1080p30-10000';
             if (preset === '1080p60-8000' || preset === 'hq8000' || preset === 'high8000' || preset === '8000') return '1080p60-10000';
             if (preset === '1080p60' || preset === 'high' || preset === 'fullhd60') return '1080p60-10000';
             if (preset === '1080p30' || preset === 'fullhd30') return '1080p30';
@@ -367,7 +368,7 @@
         }
 
         function queryFpsValue() {
-            return parseInt(query.get('fps') || query.get('fr') || query.get('frameRate') || '', 10) || 0;
+            return parseInt(query.get('fps') || query.get('fr') || query.get('frameRate') || query.get('mfr') || query.get('maxframerate') || '', 10) || 0;
         }
 
         function queryBitrateValue() {
@@ -382,11 +383,12 @@
             const bitrate = queryBitrateValue();
             if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60 && bitrate >= 8000) return '1080p60-10000';
             if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60) return '1080p60-10000';
+            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps > 0 && fps <= 30 && bitrate >= 8000) return '1080p30-10000';
             if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps > 0 && fps <= 30) return '1080p30';
             if ((quality === '1' || quality === '720' || quality === '720p' || quality === 'hd') && fps >= 60) return '720p60';
             if ((quality === '1' || quality === '720' || quality === '720p' || quality === 'hd') && fps > 0 && fps <= 30) return '720p30';
             if ((quality === '2' || quality === '360' || quality === '360p' || quality === 'low') && fps > 0 && fps <= 30) return '360p30';
-            return '1080p60-10000';
+            return 'default';
         }
 
         function initialVdoCodec() {
@@ -2004,7 +2006,8 @@
 
         function vdoQualityPresetConfig(preset) {
             const quality = normalizeVdoQualityPreset(preset);
-            if (quality === '1080p60-10000' || quality === '1080p60') return { quality: '0', width: 1920, height: 1080, fps: 60, bitrate: 10000 };
+            if (quality === '1080p60-10000' || quality === '1080p60') return { quality: '0', width: 1920, height: 1080, mfr: 60, bitrate: 10000 };
+            if (quality === '1080p30-10000') return { quality: '0', width: 1920, height: 1080, fps: 30, bitrate: 10000 };
             if (quality === '1080p30') return { quality: '0', width: 1920, height: 1080, fps: 30, bitrate: 4500 };
             if (quality === '720p60') return { quality: '1', width: 1280, height: 720, fps: 60, bitrate: 3500 };
             if (quality === '720p30') return { quality: '1', width: 1280, height: 720, fps: 30, bitrate: 2500 };
@@ -2018,7 +2021,8 @@
                 return;
             }
             params.set('quality', config.quality);
-            params.set('fps', String(config.fps));
+            if (config.fps) params.set('fps', String(config.fps));
+            if (config.mfr) params.set('mfr', String(config.mfr));
             params.set('bitrate', String(config.bitrate));
         }
 
@@ -2092,13 +2096,12 @@
                 'var cfg=' + JSON.stringify(config) + ';' +
                 'try{' +
                 'session.quality=' + JSON.stringify(config.quality) + ';' +
-                'session.frameRate=cfg.fps;' +
-                'session.maxframeRate=cfg.fps;' +
+                'if(cfg.fps){session.frameRate=cfg.fps;session.maxframeRate=cfg.fps;}else if(cfg.mfr){delete session.frameRate;session.maxframeRate=cfg.mfr;}' +
                 'session.bitrate=cfg.bitrate;' +
                 'var stream=session.streamSrc||null;' +
                 'var track=stream&&stream.getVideoTracks?stream.getVideoTracks()[0]:null;' +
                 'if(track&&track.readyState==="live"&&track.applyConstraints){' +
-                'track.applyConstraints({width:{ideal:cfg.width},height:{ideal:cfg.height},frameRate:{ideal:cfg.fps,max:cfg.fps}})' +
+                'var c={width:{ideal:cfg.width},height:{ideal:cfg.height}};if(cfg.fps)c.frameRate={ideal:cfg.fps,max:cfg.fps};else if(cfg.mfr)c.frameRate={max:cfg.mfr};track.applyConstraints(c)' +
                 '.then(function(){try{session.currentCameraConstraints=track.getSettings();}catch(e){}})' +
                 '.catch(function(e){try{errorlog(e&&e.message?e.message:e);}catch(_){}});' +
                 '}' +

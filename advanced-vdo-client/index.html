@@ -375,12 +375,12 @@
             </label>
             <label class="obs-control" for="vdoCameraQuality">Quality
                 <select id="vdoCameraQuality">
-                    <option value="default">Default</option>
-                    <option value="1080p60-10000">1080p60 HQ 10000 kbps</option>
-                    <option value="1080p30">1080p30</option>
+                    <option value="default">720p30 Default</option>
                     <option value="720p60">720p60</option>
-                    <option value="720p30">720p30</option>
+                    <option value="1080p30-10000">1080p HQ 30fps</option>
+                    <option value="1080p30">1080p30</option>
                     <option value="360p30">360p30</option>
+                    <option value="1080p60-10000">1080p HQ 60fps</option>
                 </select>
             </label>
             <label class="obs-control" for="vdoCameraFx">Camera FX
@@ -478,6 +478,7 @@
         function normalizeVdoQualityPreset(value) {
             const preset = String(value || 'default').trim().toLowerCase();
             if (preset === '1080p60-10000' || preset === '1080p60hq' || preset === 'hq10000' || preset === 'high10000' || preset === '10000') return '1080p60-10000';
+            if (preset === '1080p30-10000' || preset === '1080p30hq' || preset === 'fullhd30hq') return '1080p30-10000';
             if (preset === '1080p60-8000' || preset === 'hq8000' || preset === 'high8000' || preset === '8000') return '1080p60-10000';
             if (preset === '1080p60' || preset === 'high' || preset === 'fullhd60') return '1080p60-10000';
             if (preset === '1080p30' || preset === 'fullhd30') return '1080p30';
@@ -497,7 +498,7 @@
         }
 
         function queryFpsValue() {
-            return parseInt(query.get('fps') || query.get('fr') || query.get('frameRate') || '', 10) || 0;
+            return parseInt(query.get('fps') || query.get('fr') || query.get('frameRate') || query.get('mfr') || query.get('maxframerate') || '', 10) || 0;
         }
 
         function queryBitrateValue() {
@@ -512,11 +513,12 @@
             const bitrate = queryBitrateValue();
             if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60 && bitrate >= 8000) return '1080p60-10000';
             if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps >= 60) return '1080p60-10000';
+            if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps > 0 && fps <= 30 && bitrate >= 8000) return '1080p30-10000';
             if ((quality === '0' || quality === '1080' || quality === '1080p' || quality === 'fullhd' || quality === 'high') && fps > 0 && fps <= 30) return '1080p30';
             if ((quality === '1' || quality === '720' || quality === '720p' || quality === 'hd') && fps >= 60) return '720p60';
             if ((quality === '1' || quality === '720' || quality === '720p' || quality === 'hd') && fps > 0 && fps <= 30) return '720p30';
             if ((quality === '2' || quality === '360' || quality === '360p' || quality === 'low') && fps > 0 && fps <= 30) return '360p30';
-            return '1080p60-10000';
+            return 'default';
         }
 
         function initialVdoCodec() {
@@ -552,6 +554,8 @@
             params.delete('fps');
             params.delete('fr');
             params.delete('frameRate');
+            params.delete('mfr');
+            params.delete('maxframerate');
             params.delete('bitrate');
             params.delete('videobitrate');
             params.delete('vb');
