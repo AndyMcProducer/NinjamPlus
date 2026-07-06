@@ -1163,7 +1163,7 @@ function closeBrowserVideoEncoder(){
 }
 async function startBrowserVideoEncoder(codec,width,height,fps){
   if(codec==='mjpeg') return;
-  if(!('VideoEncoder' in window)||!('VideoFrame' in window)) throw new Error('Browser WebCodecs encoder unavailable');
+  if(!('VideoEncoder' in window)||!('VideoFrame' in window)) throw new Error('Browser video encoder unavailable');
   browserEncoderCodec=codec;
   const config=await getSupportedEncoderConfig(codec,width,height,fps);
   if(!config) throw new Error(codec.toUpperCase()+' browser encoder unsupported');
@@ -8754,6 +8754,10 @@ void NinjamVst3AudioProcessor::launchVideoSession()
         room = "ninjam_room";
     const juce::String cleanUserLabel = normaliseChatTargetNick(currentUser);
     const juce::String label = cleanUserLabel.isNotEmpty() ? cleanUserLabel : "NINJAM";
+    const juce::String canonicalCurrentUserKey = canonicalDelayUserKey(currentUser);
+    const juce::String syncUserKey = canonicalCurrentUserKey.isNotEmpty()
+        ? canonicalCurrentUserKey
+        : canonicalDelayUserKey(label);
     static constexpr int minimumVdoBufferMs = 0;
     int viewDelayMs = 0;
     {
@@ -8762,17 +8766,47 @@ void NinjamVst3AudioProcessor::launchVideoSession()
             viewDelayMs = juce::jmax(viewDelayMs, juce::jmax(0, entry.second));
     }
     const int launchBufferMs = juce::jmax(minimumVdoBufferMs, viewDelayMs);
-    const int chunkMs = juce::jlimit(60, 800, (int)std::llround((double)launchBufferMs * 0.25));
+    const int videoBitrateKbps = juce::jlimit(300, 2500, 900);
 
     if (ensureAdvancedVideoClientStarted())
     {
         const int helperPort = advancedVideoHelperPort.load();
         juce::URL helperUrl("http://127.0.0.1:" + juce::String(helperPort) + "/buffer-room");
+        // VDO sync mode is video-only. NINJam remains the audio clock, while
+        // the helper sends live per-peer VDO buffer updates. Keep the URL
+        // bitrate knobs (chunked/chunkbitrate/bitrate/maxvideobitrate) in kbps;
+        // do not derive them from launchBufferMs or BPI/BPM delay. That earlier
+        // unit mix-up made chunked video encode at 60-120 kbps. Tweak video quality
+        // with videoBitrateKbps, fps, quality, or the helper's camera presets.
+        // Tweak loss recovery with chunknack/chunkchunksize/chunkcache, and
+        // cellular/backpressure behavior with chunkedbuffer/chunkadapt*, without
+        // changing the NINJam-owned receiver delay contract.
         helperUrl = helperUrl.withParameter("room", room)
                              .withParameter("label", label)
+                             .withParameter("vdoSyncUserKey", syncUserKey)
                              .withParameter("bufferMode", "remote")
                              .withParameter("buffer", juce::String(launchBufferMs))
-                             .withParameter("chunked", juce::String(chunkMs))
+                             .withParameter("chunked", juce::String(videoBitrateKbps))
+                             .withParameter("chunkbitrate", juce::String(videoBitrateKbps))
+                             .withParameter("bitrate", juce::String(videoBitrateKbps))
+                             .withParameter("maxvideobitrate", juce::String(videoBitrateKbps))
+                             .withParameter("quality", "1")
+                             .withParameter("fps", "30")
+                             .withParameter("chunkindex", "1")
+                             .withParameter("chunknack", "1")
+                             .withParameter("chunknackattempts", "8")
+                             .withParameter("chunknackdelay", "250")
+                             .withParameter("chunkchunksize", "4096")
+                             .withParameter("chunkcache", "30000")
+                             .withParameter("chunkbufferadaptive", "0")
+                             .withParameter("chunkbufferfloor", "0")
+                             .withParameter("chunkbufferceil", "180000")
+                             .withParameter("chunkedbuffer", "1500")
+                             .withParameter("chunkadapt", "bitrate")
+                             .withParameter("chunkadaptfloor", "300")
+                             .withParameter("chunkadaptceil", juce::String(videoBitrateKbps))
+                             .withParameter("chunkadaptthreshold", "500")
+                             .withParameter("chunkadaptinterval", "1200")
                              .withParameter("helperVersion", getVersionString())
                              .withParameter("cacheBust", juce::String((juce::int64)juce::Time::getMillisecondCounter()));
         {
@@ -8803,12 +8837,32 @@ void NinjamVst3AudioProcessor::launchVideoSession()
         return;
     }
 
-    juce::URL url("https://vdo.ninja/");
+    // NINJam sync currently depends on VDO.Ninja alpha chunked-mode fixes.
+    // Switch this fallback to https://vdo.ninja/ after those fixes are promoted.
+    juce::URL url("https://vdo.ninja/alpha/");
     url = url.withParameter("room", room)
              .withParameter("label", label)
-             .withParameter("chunked", juce::String(chunkMs))
+             .withParameter("chunked", juce::String(videoBitrateKbps))
+             .withParameter("chunkbitrate", juce::String(videoBitrateKbps))
+             .withParameter("bitrate", juce::String(videoBitrateKbps))
+             .withParameter("maxvideobitrate", juce::String(videoBitrateKbps))
+             .withParameter("quality", "1")
+             .withParameter("fps", "30")
+             .withParameter("chunkindex", "1")
+             .withParameter("chunknack", "1")
+             .withParameter("chunknackattempts", "8")
+             .withParameter("chunknackdelay", "250")
+             .withParameter("chunkchunksize", "4096")
+             .withParameter("chunkcache", "30000")
              .withParameter("chunkbufferadaptive", "0")
+             .withParameter("chunkbufferfloor", "0")
              .withParameter("chunkbufferceil", "180000")
+             .withParameter("chunkedbuffer", "1500")
+             .withParameter("chunkadapt", "bitrate")
+             .withParameter("chunkadaptfloor", "300")
+             .withParameter("chunkadaptceil", juce::String(videoBitrateKbps))
+             .withParameter("chunkadaptthreshold", "500")
+             .withParameter("chunkadaptinterval", "1200")
              .withParameter("noaudio", "1")
              .withParameter("buffer2", "0")
              .withParameter("buffer", juce::String(launchBufferMs));
@@ -9099,6 +9153,7 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
             userObj->setProperty("bufferTotalMs", (double)bufferMs);
             userObj->setProperty("senderBufferMs", 0.0);
             userObj->setProperty("receiverBufferMs", (double)bufferMs);
+            userObj->setProperty("receiverBufferFinal", true);
             userObj->setProperty("measuredAudioDelayMs", (double)bufferMs);
             if (remoteServerLatencyMs >= 0)
                 userObj->setProperty("senderServerLatencyMs", (double)remoteServerLatencyMs);
@@ -18065,10 +18120,34 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
                 const double deltaMs = std::abs((double)elapsedMs - baselineMs);
                 const double spikeThresholdMs = juce::jlimit(5.0, 20.0, baselineMs * 0.30 + 2.0);
                 if (deltaMs > spikeThresholdMs)
+                {
+                    const int spikeDirection = elapsedMs > baselineMs ? 1 : -1;
+                    if (avgState.rejectedSpikeDirection != spikeDirection)
+                    {
+                        avgState.rejectedSpikeDirection = spikeDirection;
+                        avgState.rejectedSpikeCount = 0;
+                        avgState.rejectedSpikeSumMs = 0.0;
+                    }
+                    avgState.rejectedSpikeCount += 1;
+                    avgState.rejectedSpikeSumMs += (double)elapsedMs;
+                    if (avgState.rejectedSpikeCount >= 3)
+                    {
+                        avgState.sampleCount = avgState.rejectedSpikeCount;
+                        avgState.sumMs = avgState.rejectedSpikeSumMs;
+                        avgState.averageMs = avgState.sumMs / (double)juce::jmax(1, avgState.sampleCount);
+                        avgState.firmAverageMs = avgState.averageMs;
+                        avgState.rejectedSpikeCount = 0;
+                        avgState.rejectedSpikeDirection = 0;
+                        avgState.rejectedSpikeSumMs = 0.0;
+                    }
                     includeInAverage = false;
+                }
             }
             if (includeInAverage)
             {
+                avgState.rejectedSpikeCount = 0;
+                avgState.rejectedSpikeDirection = 0;
+                avgState.rejectedSpikeSumMs = 0.0;
                 avgState.sampleCount += 1;
                 avgState.sumMs += (double)elapsedMs;
                 avgState.averageMs = avgState.sumMs / (double)juce::jmax(1, avgState.sampleCount);

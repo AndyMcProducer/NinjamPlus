@@ -1141,6 +1141,9 @@ private:
         double averageMs = 0.0;
         double firmAverageMs = 0.0;
         double lastMeasurementMs = -1.0;
+        int rejectedSpikeCount = 0;
+        int rejectedSpikeDirection = 0;
+        double rejectedSpikeSumMs = 0.0;
     };
     std::map<juce::String, RemoteLatencyAverageState> remoteLatencyAverageByUser;
     juce::CriticalSection opusSyncPeerLock;
