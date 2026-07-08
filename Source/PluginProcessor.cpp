@@ -6295,6 +6295,8 @@ void NinjamVst3AudioProcessor::broadcastIntervalSyncTag(const juce::String& targ
     obj->setProperty("eventId", "intervalTag:" + (userId.isNotEmpty() ? userId : currentUser) + ":" + juce::String(++sideSignalEventCounter));
     const juce::String payload = juce::JSON::toString(juce::var(obj.get()));
     const juce::String safeTarget = target.isNotEmpty() ? target : "*";
+    if (mobileHotspotModeEnabled.load(std::memory_order_relaxed))
+        sendSideSignal(safeTarget, "intervalSyncTag", payload);
     sendIntervalSignal("intervalSyncTag", payload, safeTarget);
     return;
 }
@@ -16929,6 +16931,8 @@ void NinjamVst3AudioProcessor::IntervalMediaItem_Callback(void* userData, NJClie
         {
             const juce::String type    = obj->getProperty("sig").toString();
             const juce::String payload = obj->getProperty("data").toString();
+            if (type == "mobileHotspotKeepalive")
+                return;
             if (type.isNotEmpty() && payload.isNotEmpty())
                 self->processSyncSignal(sender, type, payload);
         }
@@ -18286,12 +18290,8 @@ void NinjamVst3AudioProcessor::timerCallback()
         && mobileHotspotModeEnabled.load(std::memory_order_relaxed)
         && (lastMobileHotspotHeartbeatSendMs <= 0.0 || (nowMs - lastMobileHotspotHeartbeatSendMs) >= 500.0))
     {
-        const juce::ScopedLock clientLock(ninjamClientLock);
-        if (ninjamClient.GetStatus() == NJClient::NJC_STATUS_OK)
-        {
-            ninjamClient.ChatMessage_Send("SIDE_SIGNAL", "*", "mobileHotspotKeepalive", "x", nullptr);
-            lastMobileHotspotHeartbeatSendMs = nowMs;
-        }
+        sendIntervalSignal("mobileHotspotKeepalive", "x", "*");
+        lastMobileHotspotHeartbeatSendMs = nowMs;
     }
     const bool vdoSyncActive = vdoVideoSyncEnabled.load(std::memory_order_relaxed)
         && !ninjamZapVideoEnabled.load(std::memory_order_relaxed);
