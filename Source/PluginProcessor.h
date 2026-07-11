@@ -88,6 +88,8 @@ public:
     // NINJAM actions
     void connectToServer(juce::String host, juce::String user, juce::String pass);
     void disconnectFromServer();
+    void setAutoReconnectEnabled(bool shouldEnable);
+    bool isAutoReconnectEnabled() const;
     void sendChatMessage(juce::String msg);
     void sendChatAttachment(const juce::String& kind, const juce::String& url);
     
@@ -517,6 +519,9 @@ public:
     juce::String getIntervalSyncStatusText() const;
 
 private:
+    void cancelAutoReconnect(bool suppressUntilManualConnect);
+    void scheduleAutoReconnect(double nowMs, const juce::String& reason);
+    bool attemptAutoReconnect(double nowMs, int status);
     int handleServerLicenseAgreement(const juce::String& licenseText);
     void showServerLicenseAgreementAsync(const juce::String& serverName,
                                          const juce::String& licenseText,
@@ -622,6 +627,12 @@ private:
     juce::String pendingConnectPass;
     int pendingConnectNameAttempt = 0;
     bool duplicateNameRetryEnabled = false;
+    std::atomic<bool> autoReconnectEnabled { true };
+    std::atomic<bool> autoReconnectSuppressed { true };
+    std::atomic<int> autoReconnectAttemptCount { 0 };
+    std::atomic<double> autoReconnectNextAttemptMs { 0.0 };
+    std::atomic<double> autoReconnectAttemptStartedMs { 0.0 };
+    std::atomic<double> autoReconnectConnectedSinceMs { 0.0 };
     juce::String pendingServerLicenseApprovalKey;
     std::atomic<bool> disconnectAfterLicenseRejected { false };
     std::atomic<bool> serverLicenseDialogActive { false };

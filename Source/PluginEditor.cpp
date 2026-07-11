@@ -12143,7 +12143,8 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
     menu.addItem(41, "Midi Settings");
     menu.addItem(42, "Enable Chord Detection", true, audioProcessor.isChordDetectionEnabled());
     menu.addItem(46, "Enable Sample Pads / Looper", true, audioProcessor.isSamplePadsFeatureEnabled());
-    menu.addItem(48, "Mobile Hotspot", true, audioProcessor.isMobileHotspotModeEnabled());
+    menu.addItem(48, "Mobile Hotspot Keepalive", true, audioProcessor.isMobileHotspotModeEnabled());
+    menu.addItem(49, "Automatically Reconnect", true, audioProcessor.isAutoReconnectEnabled());
     menu.addItem(43, "Ableton Link Audio");
     menu.addItem(47, "Check for Updates...");
     menu.addSubMenu("Metronome Sound", metronomeSoundMenu);
@@ -12198,6 +12199,12 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
             if (result == 48)
             {
                 audioProcessor.setMobileHotspotModeEnabled(!audioProcessor.isMobileHotspotModeEnabled());
+                markPersistentSettingsDirty();
+                return;
+            }
+            if (result == 49)
+            {
+                audioProcessor.setAutoReconnectEnabled(!audioProcessor.isAutoReconnectEnabled());
                 markPersistentSettingsDirty();
                 return;
             }

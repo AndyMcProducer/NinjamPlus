@@ -8,6 +8,9 @@
 Thumbs.db
 .vscode/
 .vs/
+node_modules/
+playwright-report/
+test-results/
 *.user
 *.suo
 *.opensdf

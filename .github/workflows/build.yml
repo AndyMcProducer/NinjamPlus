@@ -13,6 +13,7 @@ env:
 jobs:
   windows:
     name: Windows (Standalone, VST3)
+    if: github.event_name != 'push' || github.repository != 'steveseguin/NinjamPlus'
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -74,6 +75,30 @@ jobs:
         run: >
           cmake --build build --config Release
           --target NINJAM_VST3_Standalone NINJAM_VST3_VST3
+
+      - name: Validate VST3 with pluginval
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Join-Path $env:RUNNER_TEMP "pluginval_Windows.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "pluginval"
+          Invoke-WebRequest -Uri "https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_Windows.zip" -OutFile $zip
+          $expectedHash = "C08E61CE3B96DB41636F8EC7E76F4C7E2C13EBDAC7FA1B5A1F52B4F32EC715AB"
+          $actualHash = (Get-FileHash -Path $zip -Algorithm SHA256).Hash
+          if ($actualHash -ne $expectedHash) { throw "pluginval checksum mismatch: $actualHash" }
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $plugin = Resolve-Path "build\NINJAMplus\Release\VST3\NINJAMplus.vst3"
+          New-Item -ItemType Directory -Path "pluginval-logs" -Force | Out-Null
+          & (Join-Path $dir "pluginval.exe") --strictness-level 5 --random-seed 0x4e494e4a --output-dir "pluginval-logs" --output-filename "NINJAMplus-pluginval.txt" --verbose $plugin.Path
+          if ($LASTEXITCODE -ne 0) { throw "pluginval failed with exit code $LASTEXITCODE" }
+
+      - name: Upload pluginval log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pluginval-windows
+          path: pluginval-logs
+          if-no-files-found: warn
 
       - name: Package
         shell: pwsh
@@ -151,6 +176,7 @@ jobs:
 
   linux:
     name: Linux (Standalone, VST3, LV2)
+    if: github.event_name != 'push' || github.repository != 'steveseguin/NinjamPlus'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -287,6 +313,7 @@ jobs:
 
   mac:
     name: macOS (Standalone, AU, VST3)
+    if: github.event_name != 'push' || github.repository != 'steveseguin/NinjamPlus'
     runs-on: macos-14
     steps:
       - name: Checkout

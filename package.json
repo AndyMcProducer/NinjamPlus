@@ -4,13 +4,18 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "embed:vdo": "node scripts/embed-vdo-assets.js",
+    "check:vdo-embed": "node scripts/embed-vdo-assets.js --check",
+    "test": "npm run check:vdo-embed && playwright test"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "ws": "^8.19.0"
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1"
   }
 }

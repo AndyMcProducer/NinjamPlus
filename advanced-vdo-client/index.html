@@ -1352,21 +1352,42 @@
 
         function startUserDiscovery() {
             if (intervalSource.startsWith('ws:') || intervalSource.startsWith('wss:')) {
-                try {
-                    const ws = new WebSocket(intervalSource);
-                    ws.onmessage = function (event) {
-                        try {
-                            const payload = JSON.parse(event.data);
-                            processIntervalData(payload);
-                        } catch (e) {
-                        }
-                    };
-                } catch (e) {
+                let wsReconnectDelay = 250;
+                const wsMaxReconnectDelay = 4000;
+                function connectWs() {
+                    try {
+                        const ws = new WebSocket(intervalSource);
+                        ws.onopen = function () {
+                            wsReconnectDelay = 250;
+                        };
+                        ws.onmessage = function (event) {
+                            try {
+                                const payload = JSON.parse(event.data);
+                                processIntervalData(payload);
+                            } catch (e) {
+                            }
+                        };
+                        ws.onclose = function () {
+                            setTimeout(connectWs, wsReconnectDelay);
+                            wsReconnectDelay = Math.min(wsReconnectDelay * 2, wsMaxReconnectDelay);
+                        };
+                        ws.onerror = function () {
+                            try { ws.close(); } catch (e) {}
+                        };
+                    } catch (e) {
+                        setTimeout(connectWs, wsReconnectDelay);
+                        wsReconnectDelay = Math.min(wsReconnectDelay * 2, wsMaxReconnectDelay);
+                    }
                 }
+                connectWs();
                 return;
             }
-            pollIntervalUsers();
-            setInterval(pollIntervalUsers, 800);
+            function tick() {
+                Promise.resolve(pollIntervalUsers()).finally(function () {
+                    setTimeout(tick, 800);
+                });
+            }
+            tick();
         }
 
         obsBtn.addEventListener('click', function () {

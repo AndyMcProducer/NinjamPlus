@@ -168,6 +168,7 @@ private:
     juce::MemoryBlock helperPoweredByPng;
     juce::MemoryBlock helperCloudMaskPng;
     juce::ThreadPool clientThreadPool { 4 };
+    const juce::String helperRequestToken { juce::Uuid().toString() };
 
     class ClientJob final : public juce::ThreadPoolJob
     {
@@ -263,7 +264,7 @@ private:
         return {};
     }
 
-    static juce::String getZapViewerHtml()
+    juce::String getZapViewerHtml() const
     {
         juce::String html;
         html << R"HTML(<!doctype html>
@@ -356,6 +357,10 @@ html.obs .zap-footer{display:none}
 <main id="grid"><div class="empty">No Zap video streams yet</div></main>
 <footer class="zap-footer"><div class="beat-counter" id="beatCounter" aria-live="polite"><span class="beat-counter-label" id="beatCounterText">BPI --/--</span><span class="beat-strip" id="beatStrip" aria-hidden="true"></span></div></footer>
 <script>
+const helperRequestToken='__NINJAM_HELPER_TOKEN__';
+function helperMutationUrl(url){
+  return url+(url.includes('?')?'&':'?')+'token='+encodeURIComponent(helperRequestToken);
+}
 const grid=document.getElementById('grid');
 const statusEl=document.getElementById('status');
 const beatCounterText=document.getElementById('beatCounterText');
@@ -990,7 +995,7 @@ async function refreshCameras(){
   }
 }
 async function armBrowserZapSend(codec){
-  const res=await fetch('/zap-browser-camera-enable?codec='+encodeURIComponent(codec||'mjpeg'),{method:'POST',cache:'no-store'});
+  const res=await fetch(helperMutationUrl('/zap-browser-camera-enable?codec='+encodeURIComponent(codec||'mjpeg')),{method:'POST',cache:'no-store'});
   const payload=await res.json().catch(()=>({ok:false,error:'helper did not return JSON'}));
   if(!res.ok||!payload.ok) throw new Error(payload.error||'Zap camera send could not start');
   browserSendArmed=true;
@@ -999,7 +1004,7 @@ async function armBrowserZapSend(codec){
 }
 async function disarmBrowserZapSend(){
   browserSendArmed=false;
-  try{ await fetch('/zap-browser-camera-stop',{method:'POST',cache:'no-store'}); }catch(e){}
+  try{ await fetch(helperMutationUrl('/zap-browser-camera-stop'),{method:'POST',cache:'no-store'}); }catch(e){}
 }
 async function pollBrowserCameraState(){
   if(!browserStream||!browserEncoder) return;
@@ -1058,7 +1063,7 @@ async function postBrowserJpeg(blob,captureStartedMs,encodeMs,width,height){
     +'&width='+encodeURIComponent(String(width||0))
     +'&height='+encodeURIComponent(String(height||0))
     +'&seq='+encodeURIComponent(String(++browserFrameCounter));
-  const res=await fetch(url,{method:'POST',headers:{'Content-Type':'image/jpeg'},body:blob,cache:'no-store'});
+  const res=await fetch(helperMutationUrl(url),{method:'POST',headers:{'Content-Type':'image/jpeg'},body:blob,cache:'no-store'});
   if(!res.ok&&res.status!==204) throw new Error('helper rejected frame '+String(res.status));
   setCamStatus('Browser camera sending MJPEG '+String(width)+'x'+String(height)+' @ '+String(selectedTransportFps())+'fps');
 }
@@ -1077,7 +1082,7 @@ async function postBrowserEncodedBytes(bytes,codec,captureStartedMs,encodeMs,wid
     +'&key='+encodeURIComponent(keyFrame?'1':'0')
     +'&config='+encodeURIComponent(configBase64||'')
     +'&seq='+encodeURIComponent(String(++browserFrameCounter));
-  const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:bytes,cache:'no-store'});
+  const res=await fetch(helperMutationUrl(url),{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:bytes,cache:'no-store'});
   if(!res.ok&&res.status!==204) throw new Error('helper rejected frame '+String(res.status));
     const payloadLabel=bytes&&bytes.length?'frame':'config';
     setCamStatus('Browser camera sending '+codec.toUpperCase()+' '+payloadLabel+' '+String(width)+'x'+String(height)+' @ '+String(selectedTransportFps())+'fps');
@@ -1844,7 +1849,7 @@ setInterval(refresh,33);
 </script>
 </body>
 </html>)HTML";
-        return html;
+        return html.replace("__NINJAM_HELPER_TOKEN__", helperRequestToken);
     }
 
     void handleClient(juce::StreamingSocket& client)
@@ -1986,6 +1991,13 @@ setInterval(refresh,33);
                 response.body = makeUtf8Body("{\"ok\":false,\"error\":\"POST required\"}");
                 return response;
             }
+            if (getQueryParam(requestTarget, "token") != helperRequestToken)
+            {
+                response.statusCode = 403;
+                response.statusText = "Forbidden";
+                response.body = makeUtf8Body("{\"ok\":false,\"error\":\"invalid helper token\"}");
+                return response;
+            }
 
             const bool isEnable = path == "/zap-browser-camera-enable";
             juce::String payload = isEnable
@@ -2027,6 +2039,13 @@ setInterval(refresh,33);
                 response.statusCode = 405;
                 response.statusText = "Method Not Allowed";
                 response.body = makeUtf8Body("{\"ok\":false,\"error\":\"POST required\"}");
+                return response;
+            }
+            if (getQueryParam(requestTarget, "token") != helperRequestToken)
+            {
+                response.statusCode = 403;
+                response.statusText = "Forbidden";
+                response.body = makeUtf8Body("{\"ok\":false,\"error\":\"invalid helper token\"}");
                 return response;
             }
 
@@ -2212,6 +2231,9 @@ setInterval(refresh,33);
         header << "Content-Type: " << response.contentType << "\r\n";
         header << "Content-Length: " << (juce::int64) response.body.getSize() << "\r\n";
         header << "Connection: close\r\n";
+        header << "X-Content-Type-Options: nosniff\r\n";
+        header << "X-Frame-Options: SAMEORIGIN\r\n";
+        header << "Cross-Origin-Resource-Policy: same-origin\r\n";
         if (response.noStore)
         {
             header << "Cache-Control: no-store, no-cache, must-revalidate\r\n";
@@ -5443,6 +5465,7 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
 
 void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String user, juce::String pass)
 {
+    cancelAutoReconnect(false);
     stopNinjamZapVideoTransportForDisconnect();
     stopAdvancedVideoClient();
     ninjamZapServerVideoSupported.store(false, std::memory_order_relaxed);
@@ -5528,6 +5551,7 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
 
 void NinjamVst3AudioProcessor::disconnectFromServer()
 {
+    cancelAutoReconnect(true);
     duplicateNameRetryEnabled = false;
     pendingConnectNameAttempt = 0;
     ninjamZapServerVideoSupported.store(false, std::memory_order_relaxed);
@@ -5576,6 +5600,98 @@ void NinjamVst3AudioProcessor::disconnectFromServer()
     opusSyncHasLegacyClients.store(false);
     lastServerLatencyProbeAttemptMs = 0.0;
     applyCodecPreference();
+}
+
+void NinjamVst3AudioProcessor::setAutoReconnectEnabled(bool shouldEnable)
+{
+    autoReconnectEnabled.store(shouldEnable, std::memory_order_relaxed);
+    if (!shouldEnable)
+    {
+        cancelAutoReconnect(true);
+        return;
+    }
+
+    autoReconnectSuppressed.store(false, std::memory_order_relaxed);
+    int status = NJClient::NJC_STATUS_DISCONNECTED;
+    {
+        const juce::ScopedLock clientLock(ninjamClientLock);
+        status = ninjamClient.GetStatus();
+    }
+    if ((status == NJClient::NJC_STATUS_DISCONNECTED || status == NJClient::NJC_STATUS_CANTCONNECT)
+        && pendingConnectHost.trim().isNotEmpty())
+        scheduleAutoReconnect(juce::Time::getMillisecondCounterHiRes(), "connection unavailable");
+}
+
+bool NinjamVst3AudioProcessor::isAutoReconnectEnabled() const
+{
+    return autoReconnectEnabled.load(std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::cancelAutoReconnect(bool suppressUntilManualConnect)
+{
+    autoReconnectNextAttemptMs.store(0.0, std::memory_order_relaxed);
+    autoReconnectAttemptStartedMs.store(0.0, std::memory_order_relaxed);
+    autoReconnectAttemptCount.store(0, std::memory_order_relaxed);
+    autoReconnectConnectedSinceMs.store(0.0, std::memory_order_relaxed);
+    autoReconnectSuppressed.store(suppressUntilManualConnect, std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::scheduleAutoReconnect(double nowMs, const juce::String& reason)
+{
+    if (!autoReconnectEnabled.load(std::memory_order_relaxed)
+        || autoReconnectSuppressed.load(std::memory_order_relaxed)
+        || pendingConnectHost.trim().isEmpty()
+        || autoReconnectNextAttemptMs.load(std::memory_order_relaxed) > 0.0)
+        return;
+
+    const int attemptCount = autoReconnectAttemptCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int exponent = juce::jlimit(0, 5, attemptCount - 1);
+    const int baseDelayMs = juce::jmin(30000, 1000 * (1 << exponent));
+    const int jitterMs = (attemptCount * 137) % 401;
+    const int delayMs = baseDelayMs + jitterMs;
+    autoReconnectNextAttemptMs.store(nowMs + (double)delayMs, std::memory_order_relaxed);
+
+    const juce::String reasonText = reason.trim().isNotEmpty() ? reason.trim() : "connection lost";
+    addSystemChatLine("NINJAM " + reasonText + "; reconnect attempt "
+                      + juce::String(attemptCount) + " in "
+                      + juce::String((double)delayMs / 1000.0, 1) + "s.");
+}
+
+bool NinjamVst3AudioProcessor::attemptAutoReconnect(double nowMs, int status)
+{
+    if (!autoReconnectEnabled.load(std::memory_order_relaxed)
+        || autoReconnectSuppressed.load(std::memory_order_relaxed)
+        || autoReconnectNextAttemptMs.load(std::memory_order_relaxed) <= 0.0
+        || nowMs < autoReconnectNextAttemptMs.load(std::memory_order_relaxed)
+        || (status != NJClient::NJC_STATUS_DISCONNECTED && status != NJClient::NJC_STATUS_CANTCONNECT))
+        return false;
+
+    const juce::String reconnectHost = pendingConnectHost.trim();
+    const juce::String reconnectUser = pendingConnectOriginalUser.trim();
+    const juce::String reconnectPass = pendingConnectPass;
+    if (reconnectHost.isEmpty())
+    {
+        cancelAutoReconnect(true);
+        return false;
+    }
+
+    autoReconnectNextAttemptMs.store(0.0, std::memory_order_relaxed);
+    pendingConnectNameAttempt = 0;
+    duplicateNameRetryEnabled = true;
+    addSystemChatLine("Reconnecting to " + reconnectHost + "...");
+    {
+        const juce::ScopedLock lifecycleLock(ninjamAudioLifecycleLock);
+        const juce::ScopedLock clientLock(ninjamClientLock);
+        ninjamClient.Disconnect();
+        applyCodecPreference();
+        ninjamClient.Connect(reconnectHost.toRawUTF8(), reconnectUser.toRawUTF8(), reconnectPass.toRawUTF8());
+    }
+    currentServer = reconnectHost;
+    currentUser = reconnectUser;
+    refreshAbletonLinkActivation();
+    autoReconnectAttemptStartedMs.store(nowMs, std::memory_order_relaxed);
+    lastStatus = NJClient::NJC_STATUS_PRECONNECT;
+    return true;
 }
 
 void NinjamVst3AudioProcessor::sendChatMessage(juce::String msg)
@@ -8768,7 +8884,8 @@ void NinjamVst3AudioProcessor::launchVideoSession()
             viewDelayMs = juce::jmax(viewDelayMs, juce::jmax(0, entry.second));
     }
     const int launchBufferMs = juce::jmax(minimumVdoBufferMs, viewDelayMs);
-    const int videoBitrateKbps = juce::jlimit(300, 2500, 900);
+    const int videoBitrateKbps = 600;
+    const int videoBitrateCeilingKbps = 900;
 
     if (ensureAdvancedVideoClientStarted())
     {
@@ -8786,12 +8903,13 @@ void NinjamVst3AudioProcessor::launchVideoSession()
         helperUrl = helperUrl.withParameter("room", room)
                              .withParameter("label", label)
                              .withParameter("vdoSyncUserKey", syncUserKey)
+                             .withParameter("cameraQuality", "default")
                              .withParameter("bufferMode", "remote")
                              .withParameter("buffer", juce::String(launchBufferMs))
                              .withParameter("chunked", juce::String(videoBitrateKbps))
                              .withParameter("chunkbitrate", juce::String(videoBitrateKbps))
                              .withParameter("bitrate", juce::String(videoBitrateKbps))
-                             .withParameter("maxvideobitrate", juce::String(videoBitrateKbps))
+                             .withParameter("maxvideobitrate", juce::String(videoBitrateCeilingKbps))
                              .withParameter("quality", "1")
                              .withParameter("fps", "30")
                              .withParameter("chunkindex", "1")
@@ -8803,12 +8921,14 @@ void NinjamVst3AudioProcessor::launchVideoSession()
                              .withParameter("chunkbufferadaptive", "0")
                              .withParameter("chunkbufferfloor", "0")
                              .withParameter("chunkbufferceil", "180000")
-                             .withParameter("chunkedbuffer", "1500")
-                             .withParameter("chunkadapt", "bitrate")
-                             .withParameter("chunkadaptfloor", "300")
-                             .withParameter("chunkadaptceil", juce::String(videoBitrateKbps))
-                             .withParameter("chunkadaptthreshold", "500")
-                             .withParameter("chunkadaptinterval", "1200")
+                             .withParameter("chunkedbuffer", "900")
+                             .withParameter("chunkadapt", "hybrid")
+                             .withParameter("chunkadaptfloor", "60")
+                             .withParameter("chunkadaptceil", juce::String(videoBitrateCeilingKbps))
+                             .withParameter("chunkadaptthreshold", "220")
+                             .withParameter("chunkadaptmaxdrop", "24")
+                             .withParameter("chunkadaptinterval", "600")
+                             .withParameter("chunkadaptresolution", "1")
                              .withParameter("helperVersion", getVersionString())
                              .withParameter("cacheBust", juce::String((juce::int64)juce::Time::getMillisecondCounter()));
         {
@@ -8847,7 +8967,7 @@ void NinjamVst3AudioProcessor::launchVideoSession()
              .withParameter("chunked", juce::String(videoBitrateKbps))
              .withParameter("chunkbitrate", juce::String(videoBitrateKbps))
              .withParameter("bitrate", juce::String(videoBitrateKbps))
-             .withParameter("maxvideobitrate", juce::String(videoBitrateKbps))
+             .withParameter("maxvideobitrate", juce::String(videoBitrateCeilingKbps))
              .withParameter("quality", "1")
              .withParameter("fps", "30")
              .withParameter("chunkindex", "1")
@@ -8859,12 +8979,14 @@ void NinjamVst3AudioProcessor::launchVideoSession()
              .withParameter("chunkbufferadaptive", "0")
              .withParameter("chunkbufferfloor", "0")
              .withParameter("chunkbufferceil", "180000")
-             .withParameter("chunkedbuffer", "1500")
-             .withParameter("chunkadapt", "bitrate")
-             .withParameter("chunkadaptfloor", "300")
-             .withParameter("chunkadaptceil", juce::String(videoBitrateKbps))
-             .withParameter("chunkadaptthreshold", "500")
-             .withParameter("chunkadaptinterval", "1200")
+             .withParameter("chunkedbuffer", "900")
+             .withParameter("chunkadapt", "hybrid")
+             .withParameter("chunkadaptfloor", "60")
+             .withParameter("chunkadaptceil", juce::String(videoBitrateCeilingKbps))
+             .withParameter("chunkadaptthreshold", "220")
+             .withParameter("chunkadaptmaxdrop", "24")
+             .withParameter("chunkadaptinterval", "600")
+             .withParameter("chunkadaptresolution", "1")
              .withParameter("noaudio", "1")
              .withParameter("buffer2", "0")
              .withParameter("buffer", juce::String(launchBufferMs));
@@ -17899,6 +18021,7 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     state.setProperty("metronomeOutputChannel", getMetronomeOutputChannel(), nullptr);
     state.setProperty("transmitLocal", isTransmittingLocal(), nullptr);
     state.setProperty("mobileHotspotMode", isMobileHotspotModeEnabled(), nullptr);
+    state.setProperty("autoReconnectEnabled", isAutoReconnectEnabled(), nullptr);
     state.setProperty("chordDetectionEnabled", isChordDetectionEnabled(), nullptr);
     state.setProperty("samplePadsVolume", (double)getSamplePadVolume(), nullptr);
     state.setProperty("samplePadsLimiter", isSamplePadLimiterEnabled(), nullptr);
@@ -17991,6 +18114,7 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setMetronomeOutputChannel((int)state.getProperty("metronomeOutputChannel", 0));
     setTransmitLocal((bool)state.getProperty("transmitLocal", false));
     setMobileHotspotModeEnabled((bool)state.getProperty("mobileHotspotMode", false));
+    setAutoReconnectEnabled((bool)state.getProperty("autoReconnectEnabled", true));
     setChordDetectionEnabled((bool)state.getProperty("chordDetectionEnabled", true));
     setSamplePadVolume(juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("samplePadsVolume", 1.0)));
     setSamplePadLimiterEnabled((bool)state.getProperty("samplePadsLimiter", false));
@@ -18286,6 +18410,19 @@ void NinjamVst3AudioProcessor::timerCallback()
     if (serverSupportsSideSignal)
         ninjamSideSignalServerSupported.store(true, std::memory_order_relaxed);
     const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    if (status == NJClient::NJC_STATUS_PRECONNECT
+        && autoReconnectAttemptStartedMs.load(std::memory_order_relaxed) > 0.0
+        && (nowMs - autoReconnectAttemptStartedMs.load(std::memory_order_relaxed)) >= 20000.0)
+    {
+        {
+            const juce::ScopedLock lifecycleLock(ninjamAudioLifecycleLock);
+            const juce::ScopedLock clientLock(ninjamClientLock);
+            ninjamClient.Disconnect();
+        }
+        autoReconnectAttemptStartedMs.store(0.0, std::memory_order_relaxed);
+        status = NJClient::NJC_STATUS_DISCONNECTED;
+        scheduleAutoReconnect(nowMs, "connection attempt timed out");
+    }
     if (status == NJClient::NJC_STATUS_OK
         && mobileHotspotModeEnabled.load(std::memory_order_relaxed)
         && (lastMobileHotspotHeartbeatSendMs <= 0.0 || (nowMs - lastMobileHotspotHeartbeatSendMs) >= 500.0))
@@ -18318,8 +18455,34 @@ void NinjamVst3AudioProcessor::timerCallback()
 
     if (status != lastStatus)
     {
+        const bool lostConnectedSession = lastStatus == NJClient::NJC_STATUS_OK
+            && (status == NJClient::NJC_STATUS_DISCONNECTED
+                || status == NJClient::NJC_STATUS_CANTCONNECT
+                || status == NJClient::NJC_STATUS_INVALIDAUTH);
+        if (lostConnectedSession)
+        {
+            stopNinjamZapVideoTransportForDisconnect();
+            ninjamZapServerVideoSupported.store(false, std::memory_order_relaxed);
+            ninjamSideSignalServerSupported.store(false, std::memory_order_relaxed);
+            lastNinjamVideoCapSendMs = 0.0;
+            opusSyncServerSupported.store(false);
+            {
+                const juce::ScopedLock lock(opusSyncPeerLock);
+                opusSyncPeers.clear();
+            }
+            invalidateIntervalSyncLatencyState(false);
+            opusSyncAvailable.store(false);
+            opusSyncHasLegacyClients.store(false);
+            lastIntervalSyncFallbackSubscriptionMs = 0.0;
+            setIntervalSyncStatusText({});
+            lastBroadcastIntervalTag.store(-1);
+            resetIntervalSyncTimingCache();
+            applyCodecPreference();
+        }
+
         if (status == NJClient::NJC_STATUS_CANTCONNECT || status == NJClient::NJC_STATUS_INVALIDAUTH)
         {
+            autoReconnectAttemptStartedMs.store(0.0, std::memory_order_relaxed);
             juce::String err = juce::String::fromUTF8(ninjamClient.GetErrorStr());
             juce::Logger::writeToLog("NINJAM Error (" + juce::String(status) + "): " + err);
 
@@ -18349,6 +18512,7 @@ void NinjamVst3AudioProcessor::timerCallback()
 
                 duplicateNameRetryEnabled = false;
                 pendingConnectNameAttempt = 0;
+                cancelAutoReconnect(true);
                 addSystemChatLine("Username retry failed after 3 attempts; disconnected.");
                 {
                     const juce::ScopedLock lifecycleLock(ninjamAudioLifecycleLock);
@@ -18360,9 +18524,19 @@ void NinjamVst3AudioProcessor::timerCallback()
                 refreshAbletonLinkActivation();
                 status = NJClient::NJC_STATUS_DISCONNECTED;
             }
+
+            if (status == NJClient::NJC_STATUS_INVALIDAUTH)
+                cancelAutoReconnect(true);
         }
         else if (status == NJClient::NJC_STATUS_OK)
         {
+            const bool reconnected = autoReconnectAttemptCount.load(std::memory_order_relaxed) > 0;
+            autoReconnectNextAttemptMs.store(0.0, std::memory_order_relaxed);
+            autoReconnectAttemptStartedMs.store(0.0, std::memory_order_relaxed);
+            autoReconnectConnectedSinceMs.store(nowMs, std::memory_order_relaxed);
+            autoReconnectSuppressed.store(false, std::memory_order_relaxed);
+            if (reconnected)
+                addSystemChatLine("NINJAM connection restored.");
             duplicateNameRetryEnabled = false;
             pendingConnectNameAttempt = 0;
             opusSyncServerSupported.store(false);
@@ -18410,32 +18584,25 @@ void NinjamVst3AudioProcessor::timerCallback()
             setIntervalSyncStatusText({});
             syncLocalIntervalChannelConfig();
         }
-        else if (lastStatus == NJClient::NJC_STATUS_OK
-                 && (status == NJClient::NJC_STATUS_DISCONNECTED
-                     || status == NJClient::NJC_STATUS_CANTCONNECT
-                     || status == NJClient::NJC_STATUS_INVALIDAUTH))
+        else if (status == NJClient::NJC_STATUS_DISCONNECTED)
         {
-            stopNinjamZapVideoTransportForDisconnect();
-            ninjamZapServerVideoSupported.store(false, std::memory_order_relaxed);
-            ninjamSideSignalServerSupported.store(false, std::memory_order_relaxed);
-            lastNinjamVideoCapSendMs = 0.0;
-            opusSyncServerSupported.store(false);
-            {
-                const juce::ScopedLock lock(opusSyncPeerLock);
-                opusSyncPeers.clear();
-            }
-            {
-                invalidateIntervalSyncLatencyState(false);
-            }
-            opusSyncAvailable.store(false);
-            opusSyncHasLegacyClients.store(false);
-            lastIntervalSyncFallbackSubscriptionMs = 0.0;
-            setIntervalSyncStatusText({});
-            lastBroadcastIntervalTag.store(-1);
-            resetIntervalSyncTimingCache();
-            applyCodecPreference();
+            autoReconnectAttemptStartedMs.store(0.0, std::memory_order_relaxed);
         }
         lastStatus = status;
+    }
+
+    if (status == NJClient::NJC_STATUS_OK
+        && autoReconnectConnectedSinceMs.load(std::memory_order_relaxed) > 0.0
+        && (nowMs - autoReconnectConnectedSinceMs.load(std::memory_order_relaxed)) >= 30000.0)
+    {
+        autoReconnectAttemptCount.store(0, std::memory_order_relaxed);
+        autoReconnectConnectedSinceMs.store(0.0, std::memory_order_relaxed);
+    }
+    else if (status == NJClient::NJC_STATUS_DISCONNECTED || status == NJClient::NJC_STATUS_CANTCONNECT)
+    {
+        scheduleAutoReconnect(nowMs, status == NJClient::NJC_STATUS_CANTCONNECT ? "connection failed" : "connection lost");
+        if (attemptAutoReconnect(nowMs, status))
+            return;
     }
 
     if (isLinkAudioEnabled() && isLinkAudioReceiveEnabled())
