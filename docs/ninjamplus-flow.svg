@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="980" viewBox="0 0 1600 980" role="img" aria-labelledby="title desc">
-	<title id="title">How NINJAMplus coordinates NINJAM audio and VDO.Ninja chunked video</title>
-	<desc id="desc">A two-lane architecture diagram. NINJAM carries interval-aligned music, while a local helper synchronizes VDO.Ninja chunked video to the NINJAM clock. Chunk indexing, pacing, retransmission, and adaptive bitrate, frame rate, and resolution keep video moving on weak uplinks.</desc>
+	<title id="title">How NINJAMplus keeps music and video together</title>
+	<desc id="desc">A simple two-part diagram. NINJAM keeps the musicians playing in time, while the VDO.Ninja Video Room keeps everyone visible and adjusts video quality when an Internet connection becomes weak.</desc>
 	<defs>
 		<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
 			<stop offset="0" stop-color="#09111f"/>
@@ -52,15 +52,15 @@
 	<g transform="translate(72 66)">
 		<rect x="0" y="2" width="10" height="74" rx="5" fill="url(#audioGlow)"/>
 		<rect x="15" y="2" width="10" height="74" rx="5" fill="url(#videoGlow)"/>
-		<text x="48" y="39" class="title">One musical clock · two coordinated transports</text>
-		<text x="49" y="70" class="subtitle">NINJAMplus keeps the music aligned; VDO.Ninja chunked mode keeps the people visible.</text>
+		<text x="48" y="39" class="title">Play together · see everyone · stay in time</text>
+		<text x="49" y="70" class="subtitle">NINJAMplus handles the music while the Video Room keeps everyone visible.</text>
 	</g>
 
 	<!-- Audio lane -->
 	<g transform="translate(72 178)">
 		<rect width="1456" height="270" rx="28" fill="#0b1726" stroke="#214358" stroke-width="2" filter="url(#shadow)"/>
 		<rect x="0" y="0" width="1456" height="5" rx="3" fill="url(#audioGlow)"/>
-		<text x="34" y="47" class="lane" fill="#5eead4">AUDIO · NINJAM INTERVAL PATH</text>
+		<text x="34" y="47" class="lane" fill="#5eead4">MUSIC · NINJAM KEEPS EVERYONE IN TIME</text>
 
 		<g transform="translate(34 74)">
 			<rect width="230" height="152" rx="20" fill="#102235" stroke="#28526a"/>
@@ -77,11 +77,11 @@
 		<g transform="translate(365 74)">
 			<rect width="278" height="152" rx="20" fill="#102b38" stroke="#2dd4bf" stroke-width="2"/>
 			<text x="25" y="43" class="cardTitle">NINJAMplus</text>
-			<text x="25" y="75" class="cardText">Standalone or DAW plug-in</text>
+			<text x="25" y="75" class="cardText">App or music software</text>
 			<rect x="25" y="96" width="98" height="30" rx="15" fill="#153d45"/>
-			<text x="74" y="116" text-anchor="middle" class="pill" fill="#99f6e4">encode</text>
+			<text x="74" y="116" text-anchor="middle" class="pill" fill="#99f6e4">your music</text>
 			<rect x="133" y="96" width="119" height="30" rx="15" fill="#153d45"/>
-			<text x="192" y="116" text-anchor="middle" class="pill" fill="#99f6e4">mix + clock</text>
+			<text x="192" y="116" text-anchor="middle" class="pill" fill="#99f6e4">shared timing</text>
 		</g>
 
 		<path d="M656 150 H729" stroke="#5eead4" stroke-width="4" fill="none" marker-end="url(#arrowAudio)"/>
@@ -90,10 +90,10 @@
 			<rect width="278" height="152" rx="20" fill="#102235" stroke="#28526a"/>
 			<circle cx="44" cy="42" r="20" fill="none" stroke="#67e8f9" stroke-width="2"/>
 			<path d="M28 42h32M44 22c7 7 10 13 10 20s-3 13-10 20M44 22c-7 7-10 13-10 20s3 13 10 20" fill="none" stroke="#67e8f9" stroke-width="2"/>
-			<text x="78" y="47" class="cardTitle">NINJAM server</text>
-			<text x="25" y="83" class="cardText">Tempo + BPI authority</text>
-			<text x="25" y="110" class="cardText">Exchanges completed</text>
-			<text x="25" y="133" class="cardText">musical intervals</text>
+			<text x="78" y="47" class="cardTitle">Shared jam room</text>
+			<text x="25" y="83" class="cardText">Keeps the shared tempo</text>
+			<text x="25" y="110" class="cardText">Passes each musician's</text>
+			<text x="25" y="133" class="cardText">part to the group</text>
 		</g>
 
 		<path d="M1035 150 H1108" stroke="#5eead4" stroke-width="4" fill="none" marker-end="url(#arrowAudio)"/>
@@ -101,13 +101,13 @@
 		<g transform="translate(1123 74)">
 			<rect width="299" height="152" rx="20" fill="#102235" stroke="#28526a"/>
 			<text x="25" y="40" class="cardTitle">Remote performer</text>
-			<text x="25" y="72" class="cardText">Hears the previous interval</text>
+			<text x="25" y="72" class="cardText">Hears everyone in musical time</text>
 			<g transform="translate(25 93)">
 				<rect width="114" height="36" rx="10" fill="#12323f" stroke="#2dd4bf"/>
-				<text x="57" y="23" text-anchor="middle" class="pill" fill="#99f6e4">PLAY n</text>
+				<text x="57" y="23" text-anchor="middle" class="pill" fill="#99f6e4">PLAY</text>
 				<path d="M126 18h20" stroke="#5eead4" stroke-width="2" marker-end="url(#arrowAudio)"/>
 				<rect x="158" width="116" height="36" rx="10" fill="#12323f" stroke="#2dd4bf"/>
-				<text x="216" y="23" text-anchor="middle" class="pill" fill="#99f6e4">HEAR n−1</text>
+				<text x="216" y="23" text-anchor="middle" class="pill" fill="#99f6e4">TOGETHER</text>
 			</g>
 		</g>
 	</g>
@@ -116,71 +116,71 @@
 	<g transform="translate(72 474)">
 		<rect width="1456" height="384" rx="28" fill="#151226" stroke="#443062" stroke-width="2" filter="url(#shadow)"/>
 		<rect x="0" y="0" width="1456" height="5" rx="3" fill="url(#videoGlow)"/>
-		<text x="34" y="47" class="lane" fill="#c4b5fd">VIDEO · VDO.NINJA CHUNKED / WEBCODECS PATH</text>
+		<text x="34" y="47" class="lane" fill="#c4b5fd">VIDEO · VDO.NINJA CHUNKED MODE</text>
 
 		<g transform="translate(34 76)">
 			<rect width="216" height="194" rx="20" fill="#211936" stroke="#554071"/>
 			<circle cx="42" cy="40" r="20" fill="#34234f" stroke="#c4b5fd" stroke-width="2"/>
 			<path d="M31 34h20v14H31zM51 38l10-6v18l-10-6z" fill="none" stroke="#ddd6fe" stroke-width="2.5" stroke-linejoin="round"/>
 			<text x="74" y="45" class="cardTitle">Browser</text>
-			<text x="25" y="83" class="cardText">Camera capture</text>
-			<text x="25" y="110" class="cardText">Current Chromium</text>
-			<text x="25" y="137" class="cardText">WebCodecs required</text>
+			<text x="25" y="83" class="cardText">Uses your camera</text>
+			<text x="25" y="110" class="cardText">Opens separately</text>
+			<text x="25" y="137" class="cardText">Keep this tab open</text>
 			<rect x="25" y="154" width="166" height="26" rx="13" fill="#302149"/>
-			<text x="108" y="172" text-anchor="middle" class="pill" fill="#ddd6fe">video only · noaudio</text>
+			<text x="108" y="172" text-anchor="middle" class="pill" fill="#ddd6fe">music stays in the app</text>
 		</g>
 
 		<path d="M262 173 H320" stroke="#c4b5fd" stroke-width="4" fill="none" marker-end="url(#arrowVideo)"/>
 
 		<g transform="translate(335 76)">
 			<rect width="236" height="194" rx="20" fill="#211936" stroke="#7c5aa4"/>
-			<text x="24" y="42" class="cardTitle">Local helper</text>
-			<text x="24" y="74" class="cardText">127.0.0.1 only</text>
-			<text x="24" y="101" class="cardText">Embeds VDO.Ninja</text>
-			<text x="24" y="128" class="cardText">Applies peer delay</text>
+			<text x="24" y="42" class="cardTitle">Video Room</text>
+			<text x="24" y="74" class="cardText">Joins everyone</text>
+			<text x="24" y="101" class="cardText">Matches each video</text>
+			<text x="24" y="128" class="cardText">to the music</text>
 			<rect x="24" y="150" width="188" height="29" rx="14" fill="#3b2856"/>
-			<text x="118" y="170" text-anchor="middle" class="pill" fill="#e9d5ff">NINJAM owns buffer</text>
+			<text x="118" y="170" text-anchor="middle" class="pill" fill="#e9d5ff">automatic timing</text>
 		</g>
 
 		<path d="M583 173 H641" stroke="#c4b5fd" stroke-width="4" fill="none" marker-end="url(#arrowVideo)"/>
 
 		<g transform="translate(656 76)">
 			<rect width="510" height="246" rx="22" fill="#25183b" stroke="#a78bfa" stroke-width="2"/>
-			<text x="25" y="41" class="cardTitle">Chunked resilience engine</text>
-			<text x="25" y="67" class="cardText">WebRTC data channels · paced and recoverable</text>
+			<text x="25" y="41" class="cardTitle">Chunked mode</text>
+			<text x="25" y="67" class="cardText">Helps video remain useful when a connection struggles</text>
 
 			<g transform="translate(25 88)">
 				<rect width="138" height="58" rx="13" fill="#352253" stroke="#8b5cf6"/>
-				<circle cx="20" cy="18" r="11" fill="#c4b5fd"/><text x="20" y="23" text-anchor="middle" class="step">1</text>
-				<text x="40" y="22" class="small">Encode</text>
-				<text x="14" y="45" class="micro">WebCodecs frame</text>
+				<circle cx="20" cy="18" r="6" fill="#c4b5fd"/>
+				<text x="35" y="22" class="small">Normal</text>
+				<text x="14" y="45" class="micro">clear, smooth video</text>
 			</g>
-			<path d="M169 117h26" stroke="#c4b5fd" stroke-width="2" marker-end="url(#arrowVideo)"/>
+			<path d="M169 117h26" stroke="#6d5b8f" stroke-width="2"/>
 			<g transform="translate(203 88)">
 				<rect width="138" height="58" rx="13" fill="#352253" stroke="#8b5cf6"/>
-				<circle cx="20" cy="18" r="11" fill="#c4b5fd"/><text x="20" y="23" text-anchor="middle" class="step">2</text>
-				<text x="40" y="22" class="small">Index</text>
-				<text x="14" y="45" class="micro">4 KiB payloads</text>
+				<circle cx="20" cy="18" r="6" fill="#c4b5fd"/>
+				<text x="35" y="22" class="small">Adjust</text>
+				<text x="14" y="45" class="micro">quality gently lowers</text>
 			</g>
-			<path d="M347 117h26" stroke="#c4b5fd" stroke-width="2" marker-end="url(#arrowVideo)"/>
+			<path d="M347 117h26" stroke="#6d5b8f" stroke-width="2"/>
 			<g transform="translate(381 88)">
 				<rect width="104" height="58" rx="13" fill="#352253" stroke="#8b5cf6"/>
-				<circle cx="20" cy="18" r="11" fill="#c4b5fd"/><text x="20" y="23" text-anchor="middle" class="step">3</text>
-				<text x="40" y="22" class="small">Pace</text>
-				<text x="14" y="45" class="micro">backpressure</text>
+				<circle cx="20" cy="18" r="6" fill="#c4b5fd"/>
+				<text x="35" y="22" class="small">Stay on</text>
+				<text x="14" y="45" class="micro">video keeps going</text>
 			</g>
 
 			<g transform="translate(25 162)">
 				<rect width="214" height="58" rx="13" fill="#352253" stroke="#8b5cf6"/>
-				<circle cx="20" cy="18" r="11" fill="#f0abfc"/><text x="20" y="23" text-anchor="middle" class="step">4</text>
-				<text x="40" y="22" class="small">NACK + resend cache</text>
-				<text x="14" y="45" class="micro">repair gaps before deadline</text>
+				<circle cx="20" cy="18" r="6" fill="#f0abfc"/>
+				<text x="35" y="22" class="small">Music stays first</text>
+				<text x="14" y="45" class="micro">the jam remains the priority</text>
 			</g>
 			<g transform="translate(251 162)">
 				<rect width="234" height="58" rx="13" fill="#352253" stroke="#8b5cf6"/>
-				<circle cx="20" cy="18" r="11" fill="#f0abfc"/><text x="20" y="23" text-anchor="middle" class="step">5</text>
-				<text x="40" y="22" class="small">Adapt + recover</text>
-				<text x="14" y="45" class="micro">bitrate · frames · resolution</text>
+				<circle cx="20" cy="18" r="6" fill="#f0abfc"/>
+				<text x="35" y="22" class="small">Improve again</text>
+				<text x="14" y="45" class="micro">quality returns automatically</text>
 			</g>
 		</g>
 
@@ -190,39 +190,39 @@
 			<rect width="171" height="194" rx="20" fill="#211936" stroke="#554071"/>
 			<text x="20" y="40" class="cardTitle">Remote</text>
 			<text x="20" y="67" class="cardTitle">video</text>
-			<text x="20" y="105" class="cardText">Deadline-aware</text>
-			<text x="20" y="132" class="cardText">playout keeps</text>
-			<text x="20" y="159" class="cardText">later frames moving</text>
+			<text x="20" y="105" class="cardText">Arrives in time</text>
+			<text x="20" y="132" class="cardText">with the other</text>
+			<text x="20" y="159" class="cardText">musicians</text>
 		</g>
 
 		<!-- NINJAM clock to helper feedback -->
 		<path d="M744 -26 V-48 H453 V64" stroke="#fbbf24" stroke-width="3" stroke-dasharray="7 7" fill="none" marker-end="url(#arrowSync)"/>
 		<rect x="493" y="-67" width="210" height="35" rx="17" fill="#3d2e1a" stroke="#fbbf24"/>
-		<text x="598" y="-44" text-anchor="middle" class="pill" fill="#fde68a">live per-peer delay updates</text>
+		<text x="598" y="-44" text-anchor="middle" class="pill" fill="#fde68a">music timing shared with video</text>
 
 		<!-- Weak-link callout -->
 		<g transform="translate(34 294)">
 			<rect width="586" height="60" rx="16" fill="#1c2731" stroke="#65a30d"/>
 			<circle cx="30" cy="30" r="16" fill="#365314"/>
 			<path d="M22 34l7-8 6 5 7-10" fill="none" stroke="#bef264" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-			<text x="58" y="25" class="small" fill="#d9f99d">WEAK-UPLINK SAFETY NET</text>
-			<text x="58" y="46" class="micro">600 kbps start · 60 kbps emergency floor · 360p → 180p · automatic recovery</text>
+			<text x="58" y="25" class="small" fill="#d9f99d">WHEN THE CONNECTION GETS WEAK</text>
+			<text x="58" y="46" class="micro">Video becomes simpler instead of disappearing completely.</text>
 		</g>
 		<g transform="translate(644 294)">
 			<rect width="778" height="60" rx="16" fill="#241f34" stroke="#624c80"/>
-			<text x="24" y="25" class="small" fill="#e9d5ff">FAIL GRACEFULLY, NOT SILENTLY</text>
-			<text x="24" y="46" class="micro">At 200–800 kbps, expect reduced cadence and resolution. NINJAM audio remains separate.</text>
+			<text x="24" y="25" class="small" fill="#e9d5ff">WHEN THE CONNECTION IMPROVES</text>
+			<text x="24" y="46" class="micro">Video quality comes back automatically. The music continues separately.</text>
 		</g>
 	</g>
 
 	<g transform="translate(72 897)">
 		<rect width="1456" height="50" rx="16" fill="#101a29" stroke="#26364d"/>
 		<circle cx="30" cy="25" r="7" fill="#5eead4" filter="url(#softGlow)"/>
-		<text x="51" y="31" class="footer">Audio stays NINJAM-owned</text>
-		<circle cx="346" cy="25" r="4" fill="#64748b"/>
-		<text x="366" y="31" class="footer">VDO carries video only</text>
-		<circle cx="624" cy="25" r="4" fill="#64748b"/>
-		<text x="644" y="31" class="footer">The helper keeps both aligned</text>
+		<text x="51" y="31" class="footer">NINJAM keeps the music in time</text>
+		<circle cx="394" cy="25" r="4" fill="#64748b"/>
+		<text x="414" y="31" class="footer">VDO.Ninja shows the room</text>
+		<circle cx="696" cy="25" r="4" fill="#64748b"/>
+		<text x="716" y="31" class="footer">NINJAMplus keeps them together</text>
 		<text x="1422" y="31" text-anchor="end" class="small" fill="#94a3b8">NINJAMplus</text>
 	</g>
 </svg>
