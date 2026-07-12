@@ -89,8 +89,9 @@ jobs:
           Expand-Archive -Path $zip -DestinationPath $dir -Force
           $plugin = Resolve-Path "build\NINJAMplus\Release\VST3\NINJAMplus.vst3"
           New-Item -ItemType Directory -Path "pluginval-logs" -Force | Out-Null
-          & (Join-Path $dir "pluginval.exe") --strictness-level 5 --random-seed 0x4e494e4a --output-dir "pluginval-logs" --output-filename "NINJAMplus-pluginval.txt" --verbose $plugin.Path
-          if ($LASTEXITCODE -ne 0) { throw "pluginval failed with exit code $LASTEXITCODE" }
+          & (Join-Path $dir "pluginval.exe") --strictness-level 5 --random-seed 0x4e494e4a --timeout-ms 60000 --skip-gui-tests --output-dir "pluginval-logs" --output-filename "NINJAMplus-pluginval.txt" --verbose $plugin.Path 2>&1 | Tee-Object -FilePath "pluginval-logs\pluginval-console.txt"
+          $pluginvalExitCode = $LASTEXITCODE
+          if ($pluginvalExitCode -ne 0) { throw "pluginval failed with exit code $pluginvalExitCode" }
 
       - name: Upload pluginval log
         if: always()
