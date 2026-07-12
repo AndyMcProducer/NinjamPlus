@@ -345,6 +345,23 @@
             return isFinite(strength) ? Math.max(1, Math.min(20, strength)) : 4;
         }
 
+        function normalizeCameraBufferMode(value) {
+            const mode = String(value || 'sync').trim().toLowerCase();
+            return mode === 'realtime' || mode === 'real-time' || mode === 'rt' || mode === 'live' ? 'realtime' : 'sync';
+        }
+
+        function cameraLabelBufferMode(label) {
+            const raw = String(label || '').toLowerCase();
+            return /\[(rt|realtime|real-time)\]/.test(raw) || /(^|[\s_-])(rt|realtime|real-time)($|[\s_-])/.test(raw)
+                ? 'realtime'
+                : 'sync';
+        }
+
+        function localVdoLabel() {
+            const base = normalizeUserId(appState.vdoSyncUserKey || appState.label) || appState.label;
+            return appState.cameraBufferMode === 'realtime' ? (base + ' [Realtime]') : base;
+        }
+
         function normalizeVdoQualityPreset(value) {
             const preset = String(value || 'default').trim().toLowerCase();
             if (preset === '1080p60-10000' || preset === '1080p60hq' || preset === 'hq10000' || preset === 'high10000' || preset === '10000') return '1080p60-10000';
@@ -436,6 +453,7 @@
             cameraFx: initialCameraFx(),
             cameraFxStrength: normalizeCameraFxStrength(query.get('cameraFxStrength') || query.get('effectvalue') || query.get('ev') || '4'),
             cameraBgImage: query.get('cameraBgImage') || query.get('backgroundImage') || query.get('bgImage') || '',
+            cameraBufferMode: normalizeCameraBufferMode(query.get('cameraBufferMode') || query.get('sourceBufferMode') || query.get('cameraMode') || query.get('vdoCameraMode') || 'sync'),
             intervalMessages: 0
         };
 
@@ -502,6 +520,7 @@
             iframeLoaded: false,
             streamIdByUser: {},
             targetIdByUser: {},
+            cameraTargetsByUser: {},
             labelByStreamId: {},
             lastAppliedBufferByUser: {},
             lastAppliedIntervalByUser: {},
@@ -645,7 +664,8 @@
             const keys = {};
             const sets = [
                 ninjamSync.remoteBuffers,
-                ninjamSync.remoteTimecodes
+                ninjamSync.remoteTimecodes,
+                vdoState.cameraTargetsByUser
             ];
             for (let i = 0; i < sets.length; i++) {
                 const source = sets[i] || {};
@@ -658,6 +678,170 @@
                 }
             }
             return Object.keys(keys).sort();
+        }
+
+        function makeCameraTargetKey(streamId, targetId) {
+            const target = String(targetId || '').trim();
+            const stream = String(streamId || '').trim();
+            return target || stream;
+        }
+
+        function cameraTargetSort(a, b) {
+            const modeA = a && a.bufferMode === 'realtime' ? 1 : 0;
+            const modeB = b && b.bufferMode === 'realtime' ? 1 : 0;
+            if (modeA !== modeB) {
+                return modeA - modeB;
+            }
+            return String((a && a.streamId) || '').localeCompare(String((b && b.streamId) || ''));
+        }
+
+        function getUserCameraTargets(userKey) {
+            const key = normalizeUserId(userKey);
+            if (!key) {
+                return [];
+            }
+            const map = vdoState.cameraTargetsByUser[key] || {};
+            const targets = Object.keys(map)
+                .map(function (targetKey) { return map[targetKey]; })
+                .filter(function (target) { return target && (target.streamId || target.targetId); })
+                .sort(cameraTargetSort);
+            if (!targets.length && (vdoState.streamIdByUser[key] || vdoState.targetIdByUser[key])) {
+                return [{
+                    streamId: vdoState.streamIdByUser[key] || '',
+                    targetId: vdoState.targetIdByUser[key] || '',
+                    bufferMode: 'sync',
+                    label: vdoState.streamIdByUser[key] ? (vdoState.labelByStreamId[vdoState.streamIdByUser[key]] || '') : ''
+                }];
+            }
+            return targets;
+        }
+
+        function userHasCameraTargets(userKey) {
+            return getUserCameraTargets(userKey).length > 0;
+        }
+
+        function updatePrimaryCameraTarget(userKey) {
+            const key = normalizeUserId(userKey);
+            if (!key) {
+                return;
+            }
+            const targets = getUserCameraTargets(key);
+            if (!targets.length) {
+                delete vdoState.streamIdByUser[key];
+                delete vdoState.targetIdByUser[key];
+                return;
+            }
+            vdoState.streamIdByUser[key] = targets[0].streamId || '';
+            vdoState.targetIdByUser[key] = targets[0].targetId || targets[0].streamId || '';
+        }
+
+        function deleteUserCameraTargets(userKey) {
+            const key = normalizeUserId(userKey);
+            if (!key) {
+                return false;
+            }
+            const targets = getUserCameraTargets(key);
+            for (let i = 0; i < targets.length; i++) {
+                if (targets[i].streamId) {
+                    delete vdoState.labelByStreamId[targets[i].streamId];
+                    delete vdoState.chunkEventsByStreamId[targets[i].streamId];
+                }
+            }
+            delete vdoState.cameraTargetsByUser[key];
+            delete vdoState.streamIdByUser[key];
+            delete vdoState.targetIdByUser[key];
+            return targets.length > 0;
+        }
+
+        function setUserCameraTarget(userKey, streamId, targetId, label, bufferMode) {
+            const key = normalizeUserId(userKey);
+            const cleanStreamId = String(streamId || '').trim();
+            const cleanTargetId = String(targetId || cleanStreamId).trim();
+            const targetKey = makeCameraTargetKey(cleanStreamId, cleanTargetId);
+            if (!key || !targetKey) {
+                return false;
+            }
+            if (!vdoState.cameraTargetsByUser[key]) {
+                vdoState.cameraTargetsByUser[key] = {};
+            }
+            const mode = normalizeCameraBufferMode(bufferMode || cameraLabelBufferMode(label));
+            const previous = vdoState.cameraTargetsByUser[key][targetKey] || {};
+            const next = {
+                streamId: cleanStreamId,
+                targetId: cleanTargetId,
+                label: String(label || ''),
+                bufferMode: mode,
+                updatedAt: Date.now()
+            };
+            const changed = previous.streamId !== next.streamId
+                || previous.targetId !== next.targetId
+                || previous.label !== next.label
+                || previous.bufferMode !== next.bufferMode;
+            vdoState.cameraTargetsByUser[key][targetKey] = next;
+            if (cleanStreamId) {
+                vdoState.labelByStreamId[cleanStreamId] = next.label;
+            }
+            updatePrimaryCameraTarget(key);
+            return changed;
+        }
+
+        function removeCameraTargetByStreamId(streamId) {
+            const cleanStreamId = String(streamId || '').trim();
+            if (!cleanStreamId) {
+                return false;
+            }
+            delete vdoState.labelByStreamId[cleanStreamId];
+            delete vdoState.chunkEventsByStreamId[cleanStreamId];
+            let changed = false;
+            const users = Object.keys(vdoState.cameraTargetsByUser || {});
+            for (let i = 0; i < users.length; i++) {
+                const userKey = users[i];
+                const map = vdoState.cameraTargetsByUser[userKey] || {};
+                const targetKeys = Object.keys(map);
+                let userChanged = false;
+                for (let j = 0; j < targetKeys.length; j++) {
+                    const targetKey = targetKeys[j];
+                    const target = map[targetKey];
+                    if (target && target.streamId === cleanStreamId) {
+                        delete map[targetKey];
+                        userChanged = true;
+                    }
+                }
+                if (!Object.keys(map).length) {
+                    delete vdoState.cameraTargetsByUser[userKey];
+                }
+                if (userChanged) {
+                    updatePrimaryCameraTarget(userKey);
+                    resetBufferApplicationState(userKey);
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        function findUserKeyForCameraTarget(streamId, targetId) {
+            const cleanStreamId = String(streamId || '').trim();
+            const cleanTargetId = String(targetId || '').trim();
+            const users = Object.keys(vdoState.cameraTargetsByUser || {});
+            for (let i = 0; i < users.length; i++) {
+                const userKey = users[i];
+                const targets = getUserCameraTargets(userKey);
+                for (let j = 0; j < targets.length; j++) {
+                    const target = targets[j];
+                    if ((cleanTargetId && target.targetId === cleanTargetId) || (cleanStreamId && target.streamId === cleanStreamId)) {
+                        return userKey;
+                    }
+                }
+            }
+            return '';
+        }
+
+        function getCameraTargetDesiredBufferMs(userKey, target) {
+            return target && target.bufferMode === 'realtime' ? minimumBufferMs : getDesiredBufferMs(userKey);
+        }
+
+        function obsTileKeyForTarget(userKey, target) {
+            return normalizeUserId(userKey) + ':' + (makeCameraTargetKey(target && target.streamId, target && target.targetId) || 'camera');
         }
 
         function clearBufferApplyRetryState(userKey) {
@@ -775,7 +959,7 @@
             return (typeof value === 'number' && isFinite(value)) ? (Math.round(value) + 'ms') : '?';
         }
 
-        function registerPeerTarget(streamId, label, explicitTargetId) {
+        function registerPeerTarget(streamId, label, explicitTargetId, explicitBufferMode) {
             const cleanStreamId = String(streamId || '').trim();
             if (!cleanStreamId) {
                 return false;
@@ -789,49 +973,24 @@
             }
             const targetId = String(explicitTargetId || cleanStreamId).trim();
             const mappingSource = vdoState.lastResolveSource || 'label';
-            const existingStreamId = vdoState.streamIdByUser[userKey];
-            if (existingStreamId && existingStreamId !== cleanStreamId) {
-                const existingSource = vdoState.mappingSourceByUser[userKey] || '';
-                if (!(mappingSource === 'exact-label' && existingSource !== 'exact-label')) {
-                    vdoState.mappingDiagnosticsByUser[userKey] = 'duplicate stream ' + existingStreamId + ' / ' + cleanStreamId;
-                    return true;
-                }
-            }
-            const changed = vdoState.streamIdByUser[userKey] !== cleanStreamId
-                || vdoState.targetIdByUser[userKey] !== targetId;
-            vdoState.streamIdByUser[userKey] = cleanStreamId;
-            vdoState.targetIdByUser[userKey] = targetId;
+            const bufferMode = normalizeCameraBufferMode(explicitBufferMode || cameraLabelBufferMode(label));
+            const changed = setUserCameraTarget(userKey, cleanStreamId, targetId, label, bufferMode);
             vdoState.mappingSourceByUser[userKey] = mappingSource;
-            delete vdoState.mappingDiagnosticsByUser[userKey];
+            const cameraCount = getUserCameraTargets(userKey).length;
+            if (cameraCount > 1) {
+                vdoState.mappingDiagnosticsByUser[userKey] = cameraCount + ' camera sources';
+            } else {
+                delete vdoState.mappingDiagnosticsByUser[userKey];
+            }
             if (changed) {
                 resetBufferApplicationState(userKey);
-                requestLocalBufferRefresh(userKey, 'target');
+                requestLocalBufferRefresh(userKey, bufferMode === 'realtime' ? 'targetRealtime' : 'target');
             }
             return changed;
         }
 
         function unregisterPeerTarget(streamId) {
-            const cleanStreamId = String(streamId || '').trim();
-            if (!cleanStreamId) {
-                return false;
-            }
-            delete vdoState.labelByStreamId[cleanStreamId];
-            let changed = false;
-            const trackedUsers = Object.keys(vdoState.streamIdByUser);
-            for (let i = 0; i < trackedUsers.length; i++) {
-                const userKey = trackedUsers[i];
-                if (vdoState.streamIdByUser[userKey] === cleanStreamId) {
-                    delete vdoState.streamIdByUser[userKey];
-                    delete vdoState.targetIdByUser[userKey];
-                    delete vdoState.chunkStatsByUser[userKey];
-                    delete vdoState.mappingSourceByUser[userKey];
-                    delete vdoState.mappingDiagnosticsByUser[userKey];
-                    resetBufferApplicationState(userKey);
-                    changed = true;
-                }
-            }
-            delete vdoState.chunkEventsByStreamId[cleanStreamId];
-            return changed;
+            return removeCameraTargetByStreamId(streamId);
         }
 
         function getStringProperty(objectValue, keyNames) {
@@ -1021,6 +1180,11 @@
         }
 
         function resolveUserKeyFromPeerIds(streamId, targetId, label) {
+            const targetMatch = findUserKeyForCameraTarget(streamId, targetId);
+            if (targetMatch) {
+                return targetMatch;
+            }
+
             const cleanTargetId = String(targetId || '').trim();
             if (cleanTargetId) {
                 const users = Object.keys(vdoState.targetIdByUser || {});
@@ -1308,9 +1472,8 @@
             return false;
         }
 
-        function postToObsViewerFrame(userKey, message) {
-            const key = normalizeUserId(userKey);
-            const tile = key ? vdoState.obsTilesByUser[key] : null;
+        function postToObsViewerFrame(tileKey, message) {
+            const tile = vdoState.obsTilesByUser[String(tileKey || '')] || null;
             const frame = tile ? tile.frame : null;
             if (!frame || !frame.contentWindow) {
                 return false;
@@ -1323,33 +1486,46 @@
             return false;
         }
 
-        function sendTargetedBuffer(userKey, bufferMs) {
-            const targetId = vdoState.targetIdByUser[userKey];
-            const streamId = vdoState.streamIdByUser[userKey];
-            if (!targetId && !streamId) {
+        function sendBufferToCameraTarget(target, bufferMs) {
+            if (!target || (!target.targetId && !target.streamId)) {
                 return false;
             }
             const nextBuffer = Math.max(minimumBufferMs, Math.round(bufferMs));
             let sent = false;
-            if (targetId) {
-                sent = postToVdo({ setBufferDelay: nextBuffer, UUID: targetId }) || sent;
-                sent = postToVdo({ setBufferDelay: nextBuffer, target: targetId }) || sent;
+            if (target.targetId) {
+                sent = postToVdo({ setBufferDelay: nextBuffer, UUID: target.targetId }) || sent;
+                sent = postToVdo({ setBufferDelay: nextBuffer, target: target.targetId }) || sent;
             }
-            if (streamId) {
-                sent = postToVdo({ setBufferDelay: nextBuffer, streamID: streamId }) || sent;
-                if (!targetId) {
-                    sent = postToVdo({ setBufferDelay: nextBuffer, target: streamId }) || sent;
+            if (target.streamId) {
+                sent = postToVdo({ setBufferDelay: nextBuffer, streamID: target.streamId }) || sent;
+                if (!target.targetId) {
+                    sent = postToVdo({ setBufferDelay: nextBuffer, target: target.streamId }) || sent;
                 }
             }
-            if (appState.obsMode) {
-                sent = postToObsViewerFrame(userKey, { setBufferDelay: nextBuffer }) || sent;
+            return sent;
+        }
+
+        function sendTargetedBuffer(userKey, bufferMs) {
+            const key = normalizeUserId(userKey);
+            const targets = getUserCameraTargets(key);
+            if (!targets.length) {
+                return false;
+            }
+            let sent = false;
+            for (let i = 0; i < targets.length; i++) {
+                const target = targets[i];
+                const targetBuffer = target.bufferMode === 'realtime' ? minimumBufferMs : bufferMs;
+                sent = sendBufferToCameraTarget(target, targetBuffer) || sent;
+                if (appState.obsMode) {
+                    sent = postToObsViewerFrame(obsTileKeyForTarget(key, target), { setBufferDelay: Math.max(minimumBufferMs, Math.round(targetBuffer)) }) || sent;
+                }
             }
             return sent;
         }
 
         function scheduleBufferApplyRetries(userKey) {
             const key = normalizeUserId(userKey);
-            if (!key || (!vdoState.targetIdByUser[key] && !vdoState.streamIdByUser[key])) {
+            if (!key || !userHasCameraTargets(key)) {
                 return false;
             }
 
@@ -1357,7 +1533,7 @@
             vdoState.bufferApplyRetryAttemptsByUser[key] = 0;
 
             function hasTarget() {
-                return !!(vdoState.targetIdByUser[key] || vdoState.streamIdByUser[key]);
+                return userHasCameraTargets(key);
             }
 
             function applyAfterRefresh() {
@@ -1396,9 +1572,8 @@
         }
 
         function sendTargetedRefresh(userKey) {
-            const targetId = vdoState.targetIdByUser[userKey];
-            const streamId = vdoState.streamIdByUser[userKey];
-            if (!targetId && !streamId) {
+            const targets = getUserCameraTargets(userKey);
+            if (!targets.length) {
                 return false;
             }
             let sent = false;
@@ -1410,14 +1585,17 @@
                 actionMsg[targetKey] = targetValue;
                 sent = postToVdo(actionMsg) || sent;
             }
-            if (targetId) {
-                sendRefresh('UUID', targetId);
-                sendRefresh('target', targetId);
-            }
-            if (streamId) {
-                sendRefresh('streamID', streamId);
-                if (!targetId) {
-                    sendRefresh('target', streamId);
+            for (let i = 0; i < targets.length; i++) {
+                const target = targets[i];
+                if (target.targetId) {
+                    sendRefresh('UUID', target.targetId);
+                    sendRefresh('target', target.targetId);
+                }
+                if (target.streamId) {
+                    sendRefresh('streamID', target.streamId);
+                    if (!target.targetId) {
+                        sendRefresh('target', target.streamId);
+                    }
                 }
             }
             return sent;
@@ -1441,7 +1619,7 @@
             if (!key || !eventId || vdoState.lastBufferRefreshIdByUser[key] === eventId) {
                 return false;
             }
-            if (!vdoState.targetIdByUser[key] && !vdoState.streamIdByUser[key]) {
+            if (!userHasCameraTargets(key)) {
                 return false;
             }
             vdoState.lastBufferRefreshIdByUser[key] = eventId;
@@ -1482,7 +1660,7 @@
             let linkedUsers = 0;
             for (let i = 0; i < trackedUsers.length; i++) {
                 const userKey = trackedUsers[i];
-                const hasTarget = !!(vdoState.targetIdByUser[userKey] || vdoState.streamIdByUser[userKey]);
+                const hasTarget = userHasCameraTargets(userKey);
                 if (hasTarget) {
                     linkedUsers += 1;
                 } else {
@@ -1514,12 +1692,12 @@
             updateSyncStatus(linkedUsers, trackedUsers.length);
         }
 
-        function buildObsViewerUrl(streamId, userKey) {
+        function buildObsViewerUrl(streamId, userKey, target) {
             const params = new URLSearchParams();
             params.set('view', String(streamId || '').trim());
             params.set('noaudio', '1');
             params.set('buffer2', '0');
-            params.set('buffer', String(getDesiredBufferMs(userKey)));
+            params.set('buffer', String(getCameraTargetDesiredBufferMs(userKey, target)));
             params.set('autostart', '1');
             params.set('playsinline', '1');
             params.set('cleanoutput', '1');
@@ -1531,26 +1709,35 @@
                 return;
             }
 
-            const trackedUsers = getTrackedUserKeys().filter(function (userKey) {
-                return !!vdoState.streamIdByUser[userKey];
-            });
-            let displayUsers = trackedUsers;
+            const cameraEntries = [];
+            const trackedUsers = getTrackedUserKeys();
+            for (let u = 0; u < trackedUsers.length; u++) {
+                const userKey = trackedUsers[u];
+                const targets = getUserCameraTargets(userKey).filter(function (target) { return !!target.streamId; });
+                for (let t = 0; t < targets.length; t++) {
+                    cameraEntries.push({ userKey: userKey, target: targets[t], tileKey: obsTileKeyForTarget(userKey, targets[t]) });
+                }
+            }
+            let displayEntries = cameraEntries;
             if (appState.obsSlot > 0) {
-                displayUsers = trackedUsers[appState.obsSlot - 1] ? [trackedUsers[appState.obsSlot - 1]] : [];
+                displayEntries = cameraEntries[appState.obsSlot - 1] ? [cameraEntries[appState.obsSlot - 1]] : [];
             }
 
             obsGrid.className = 'obs-grid layout-' + appState.obsLayout + (appState.obsSlot > 0 ? ' single' : '');
             const wanted = {};
-            for (let i = 0; i < displayUsers.length; i++) {
-                const userKey = displayUsers[i];
-                const streamId = vdoState.streamIdByUser[userKey];
+            for (let i = 0; i < displayEntries.length; i++) {
+                const entry = displayEntries[i];
+                const userKey = entry.userKey;
+                const target = entry.target;
+                const streamId = target.streamId;
+                const tileKey = entry.tileKey;
                 if (!streamId) {
                     continue;
                 }
-                wanted[userKey] = true;
-                let tile = vdoState.obsTilesByUser[userKey];
-                const desiredBufferMs = getDesiredBufferMs(userKey);
-                const desiredUrl = buildObsViewerUrl(streamId, userKey);
+                wanted[tileKey] = true;
+                let tile = vdoState.obsTilesByUser[tileKey];
+                const desiredBufferMs = getCameraTargetDesiredBufferMs(userKey, target);
+                const desiredUrl = buildObsViewerUrl(streamId, userKey, target);
                 if (!tile) {
                     const element = document.createElement('div');
                     element.className = 'obs-tile';
@@ -1559,14 +1746,14 @@
                     frame.src = desiredUrl;
                     element.appendChild(frame);
                     tile = { element: element, frame: frame, streamId: streamId, bufferMs: desiredBufferMs };
-                    vdoState.obsTilesByUser[userKey] = tile;
+                    vdoState.obsTilesByUser[tileKey] = tile;
                 } else if (tile.streamId !== streamId) {
                     tile.streamId = streamId;
                     tile.bufferMs = desiredBufferMs;
                     tile.frame.src = desiredUrl;
                 } else if (tile.bufferMs !== desiredBufferMs) {
                     tile.bufferMs = desiredBufferMs;
-                    postToObsViewerFrame(userKey, { setBufferDelay: desiredBufferMs });
+                    postToObsViewerFrame(tileKey, { setBufferDelay: desiredBufferMs });
                 }
                 if (tile.element.parentNode !== obsGrid) {
                     obsGrid.appendChild(tile.element);
@@ -1665,7 +1852,7 @@
                 const trackedKeys = getTrackedUserKeys();
                 for (let i = 0; i < trackedKeys.length; i++) {
                     const userKey = trackedKeys[i];
-                    if (vdoState.targetIdByUser[userKey] || vdoState.streamIdByUser[userKey]) {
+                    if (userHasCameraTargets(userKey)) {
                         totalLinkedUsers += 1;
                     }
                     if (isRealtimePeerMode(userKey)) {
@@ -1759,8 +1946,7 @@
                 delete ninjamSync.remoteBuffers[userKey];
                 delete ninjamSync.remoteVoiceChatMode[userKey];
                 delete ninjamSync.remoteDiagnostics[userKey];
-                delete vdoState.streamIdByUser[userKey];
-                delete vdoState.targetIdByUser[userKey];
+                deleteUserCameraTargets(userKey);
                 delete vdoState.lastAppliedBufferByUser[userKey];
                 delete vdoState.lastBufferRefreshIdByUser[userKey];
                 clearBufferApplyRetryState(userKey);
@@ -1809,14 +1995,8 @@
                 delete ninjamSync.remoteVoiceChatMode[userKey];
                 delete ninjamSync.remoteDiagnostics[userKey];
 
-                const streamId = vdoState.streamIdByUser[userKey];
-                if (streamId) {
-                    changed = unregisterPeerTarget(streamId) || changed;
-                } else {
-                    delete vdoState.streamIdByUser[userKey];
-                    delete vdoState.targetIdByUser[userKey];
-                    delete vdoState.lastAppliedBufferByUser[userKey];
-                }
+                changed = deleteUserCameraTargets(userKey) || changed;
+                delete vdoState.lastAppliedBufferByUser[userKey];
 
                 delete vdoState.lastBufferRefreshIdByUser[userKey];
                 clearBufferApplyRetryState(userKey);
@@ -2150,6 +2330,7 @@
             appState.cameraFx = normalizeCameraFx(settings.cameraFx || appState.cameraFx);
             appState.cameraFxStrength = normalizeCameraFxStrength(settings.cameraFxStrength || appState.cameraFxStrength);
             appState.cameraBgImage = String(settings.cameraBgImage || '');
+            appState.cameraBufferMode = normalizeCameraBufferMode(settings.cameraBufferMode || appState.cameraBufferMode);
             if (!changed || changed === 'quality') {
                 applyLiveVdoQuality();
             }
@@ -2161,7 +2342,7 @@
         function buildIframeUrl() {
             const iframeParams = new URLSearchParams();
             iframeParams.set('room', appState.room);
-            iframeParams.set('label', normalizeUserId(appState.vdoSyncUserKey || appState.label) || appState.label);
+            iframeParams.set('label', localVdoLabel());
             applyVdoCodecParams(iframeParams);
             applyVdoQualityParams(iframeParams);
             applyCameraFxParams(iframeParams);

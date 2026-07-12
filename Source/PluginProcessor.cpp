@@ -6422,6 +6422,7 @@ void NinjamVst3AudioProcessor::refreshOpusSyncAvailabilityFromUsers()
 void NinjamVst3AudioProcessor::setTransmitLocal(bool shouldTransmit)
 {
     isTransmitting = shouldTransmit;
+    applyCodecPreference();
     syncLocalIntervalChannelConfig();
 }
 
@@ -6429,15 +6430,30 @@ void NinjamVst3AudioProcessor::syncLocalIntervalChannelConfig()
 {
     const bool shouldTransmit = isTransmitting;
     const int bitrate = shouldTransmit ? localBitrate : 24;
-    const int flags = voiceChatMode ? 2 : 0;
+    const int normalFlags = 0;
+    const int voiceFlags = 2;
     const int numCh = juce::jlimit(1, maxLocalChannels, numLocalChannels.load());
     const bool multiChanAuto = numCh > 1 && opusSyncAvailable.load() && shouldTransmit;
     const bool singleStereoLocal = numCh == 1 && getLocalChannelInput(0) < 0;
+    const int voiceChannel = voiceChatMode ? getVoiceChatNinjamChannelIndex() : -1;
+    const bool voiceChannelAvailable = voiceChannel >= 0 && voiceChannel < ninjamClient.GetMaxLocalChannels();
     const bool cameraVideoEnabled = ninjamZapCameraSendEnabled.load(std::memory_order_relaxed);
     const bool vdoZapCarrierEnabled = vdoVideoSyncEnabled.load(std::memory_order_relaxed)
                                    && ninjamSideSignalServerSupported.load(std::memory_order_relaxed)
                                    && !ninjamZapVideoEnabled.load(std::memory_order_relaxed);
     const int videoChannel = (cameraVideoEnabled || vdoZapCarrierEnabled) ? getNinjamZapVideoChannelIndex() : -1;
+    const int maxManagedChannel = maxLocalChannels + 2;
+
+    auto configureVoiceChannel = [&](int sourceChannel)
+    {
+        if (!voiceChannelAvailable)
+            return;
+
+        ninjamClient.SetLocalChannelInfo(voiceChannel, "Voice",
+            true, shouldTransmit ? sourceChannel : 1023,
+            true, bitrate, true, true, false, 0, true, voiceFlags);
+        ninjamClient.SetLocalChannelMonitoring(voiceChannel, false, 0.f, false, 0.f, true, true, false, false);
+    };
 
     if (multiChanAuto)
     {
@@ -6447,8 +6463,8 @@ void NinjamVst3AudioProcessor::syncLocalIntervalChannelConfig()
         if (ch0Name.isEmpty()) ch0Name = "Mix";
         ninjamClient.SetLocalChannelInfo(0, ch0Name.toRawUTF8(),
             true, numCh,          // srcch = mix buffer at inputs[numCh]
-            true, bitrate, true, true, false, 0, true, flags);
-        // Mute engine local output — monitor block handles local audio routing with proper stereo.
+            true, bitrate, true, true, false, 0, true, normalFlags);
+        // Mute engine local output - monitor block handles local audio routing with proper stereo.
         ninjamClient.SetLocalChannelMonitoring(0, false, 0.f, false, 0.f, true, true, false, false);
         for (int i = 0; i < numCh; ++i)
         {
@@ -6456,12 +6472,13 @@ void NinjamVst3AudioProcessor::syncLocalIntervalChannelConfig()
             if (chName.isEmpty()) chName = "Ch " + juce::String(i + 1);
             ninjamClient.SetLocalChannelInfo(i + 1, chName.toRawUTF8(),
                 true, i,          // srcch = original buffer slot i
-                true, bitrate, true, true, false, 0, true, flags);
+                true, bitrate, true, true, false, 0, true, normalFlags);
             ninjamClient.SetLocalChannelMonitoring(i + 1, false, 0.f, false, 0.f, true, true, false, false);
         }
+        configureVoiceChannel(numCh + 2);
         configureNinjamZapVideoLocalChannel();
-        for (int i = numCh + 1; i <= maxLocalChannels + 1; ++i)
-            if (i != videoChannel)
+        for (int i = numCh + 1; i <= maxManagedChannel; ++i)
+            if (i != (voiceChannelAvailable ? voiceChannel : -1) && i != videoChannel)
                 ninjamClient.DeleteLocalChannel(i);
     }
     else
@@ -6471,12 +6488,13 @@ void NinjamVst3AudioProcessor::syncLocalIntervalChannelConfig()
         if (ch0Name.isEmpty()) ch0Name = "Input";
         const int sourceChannel = shouldTransmit ? (singleStereoLocal ? 1024 : 0) : 1023;
         ninjamClient.SetLocalChannelInfo(0, ch0Name.toRawUTF8(),
-            true, sourceChannel, true, bitrate, true, true, false, 0, true, flags);
-        // Mute engine local output — monitor block handles local audio routing with proper stereo.
+            true, sourceChannel, true, bitrate, true, true, false, 0, true, normalFlags);
+        // Mute engine local output - monitor block handles local audio routing with proper stereo.
         ninjamClient.SetLocalChannelMonitoring(0, false, 0.f, false, 0.f, true, true, false, false);
+        configureVoiceChannel(singleStereoLocal ? 2 : 1);
         configureNinjamZapVideoLocalChannel();
-        for (int i = 1; i <= maxLocalChannels + 1; ++i)
-            if (i != videoChannel)
+        for (int i = 1; i <= maxManagedChannel; ++i)
+            if (i != (voiceChannelAvailable ? voiceChannel : -1) && i != videoChannel)
                 ninjamClient.DeleteLocalChannel(i);
     }
 
@@ -6498,6 +6516,7 @@ int NinjamVst3AudioProcessor::getLocalBitrate() const
 void NinjamVst3AudioProcessor::setVoiceChatMode(bool enabled)
 {
     voiceChatMode = enabled;
+    applyCodecPreference();
     syncLocalIntervalChannelConfig();
 
     if (vdoVideoSyncEnabled.load(std::memory_order_relaxed) && videoHelperRunning.load(std::memory_order_relaxed))
@@ -6513,17 +6532,27 @@ bool NinjamVst3AudioProcessor::isVoiceChatMode() const
     return voiceChatMode;
 }
 
+int NinjamVst3AudioProcessor::getVoiceChatNinjamChannelIndex() const
+{
+    const int numCh = juce::jlimit(1, maxLocalChannels, numLocalChannels.load());
+    const bool multiChanAuto = numCh > 1 && opusSyncAvailable.load() && isTransmittingLocal();
+    return multiChanAuto ? numCh + 1 : 1;
+}
+
 void NinjamVst3AudioProcessor::applyCodecPreference()
 {
     const int numCh = juce::jlimit(1, maxLocalChannels, numLocalChannels.load());
-    const bool multiChanAuto = numCh > 1 && opusSyncAvailable.load();
+    const bool multiChanAuto = numCh > 1 && opusSyncAvailable.load() && isTransmittingLocal();
     const int decodeCaps = NJClient::NJCLIENT_CAP_DECODE_VORBIS | NJClient::NJCLIENT_CAP_DECODE_OPUS;
+    unsigned int vorbisMask = 0x1u;
+    const int voiceChannel = voiceChatMode ? getVoiceChatNinjamChannelIndex() : -1;
+    if (voiceChannel > 0 && voiceChannel < 32)
+        vorbisMask |= (1u << voiceChannel);
 
     if (multiChanAuto)
     {
         // ch 0: Vorbis only (mixdown for all clients)
         // ch 1..N: Opus only (per-channel for our VST3 clients)
-        unsigned int vorbisMask = 0x1u;
         unsigned int opusMask = 0u;
         for (int i = 0; i < numCh; ++i)
             opusMask |= (1u << (i + 1));
@@ -6535,7 +6564,7 @@ void NinjamVst3AudioProcessor::applyCodecPreference()
     {
         // Single channel or no VST3 peers: Vorbis only
         ninjamClient.SetCodecCapabilities(NJClient::NJCLIENT_CAP_ENCODE_VORBIS, decodeCaps);
-        ninjamClient.SetCodecConfig(0x1u, 0u);
+        ninjamClient.SetCodecConfig(vorbisMask, 0u);
     }
 }
 
@@ -6986,12 +7015,33 @@ bool NinjamVst3AudioProcessor::isNinjamRemoteChannelVideoOnly(int userIndex, int
     return chName != nullptr && ((flags & kNinjamZapVideoOnlyChannelFlag) != 0);
 }
 
+
+bool NinjamVst3AudioProcessor::isRemoteUserVoiceChatMode(int userIndex)
+{
+    for (int channelIndex = 0; channelIndex < 32; ++channelIndex)
+    {
+        int flags = 0;
+        const char* channelName = ninjamClient.GetUserChannelState(userIndex, channelIndex,
+                                                                   nullptr, nullptr, nullptr,
+                                                                   nullptr, nullptr, nullptr,
+                                                                   &flags);
+        if (channelName != nullptr
+            && ((flags & kNinjamZapVideoOnlyChannelFlag) == 0)
+            && ((flags & 2) != 0))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 int NinjamVst3AudioProcessor::syncNinjamZapVideoSubscriptions(bool subscribe)
 {
     if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
         return 0;
 
     int videoChannelCount = 0;
+
     const int numUsers = ninjamClient.GetNumUsers();
     for (int userIndex = 0; userIndex < numUsers; ++userIndex)
     {
@@ -7152,7 +7202,8 @@ int NinjamVst3AudioProcessor::getNinjamZapVideoChannelIndex() const
 {
     const int numCh = juce::jlimit(1, maxLocalChannels, numLocalChannels.load());
     const bool multiChanAuto = numCh > 1 && opusSyncAvailable.load() && isTransmittingLocal();
-    return multiChanAuto ? numCh + 1 : 1;
+    const int firstExtraChannel = multiChanAuto ? numCh + 1 : 1;
+    return firstExtraChannel + (voiceChatMode ? 1 : 0);
 }
 
 void NinjamVst3AudioProcessor::configureNinjamZapVideoLocalChannel()
@@ -8949,19 +9000,7 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
         const juce::String rosterKey = canonicalUserKey.isNotEmpty() ? canonicalUserKey : senderKey;
         if (rosterKey.isNotEmpty())
             activeRoster.add(rosterKey);
-        bool remoteSub = false;
-        float remoteChVol = 1.0f, remoteChPan = 0.0f;
-        bool remoteChMute = false, remoteChSolo = false;
-        int remoteOutCh = 0, remoteFlags = 0;
-        const char* remoteChannelName = ninjamClient.GetUserChannelState(userIdx, 0,
-                                         &remoteSub,
-                                         &remoteChVol,
-                                         &remoteChPan,
-                                         &remoteChMute,
-                                         &remoteChSolo,
-                                         &remoteOutCh,
-                                         &remoteFlags);
-        const bool remoteVoiceChatMode = (remoteChannelName != nullptr) && ((remoteFlags & 2) != 0);
+        const bool remoteVoiceChatMode = isRemoteUserVoiceChatMode(userIdx);
         time_t lastUpdate = 0;
         double maxLen = 0.0;
         const double userPos = ninjamClient.GetUserSessionPos(userIdx, &lastUpdate, &maxLen);
@@ -10017,6 +10056,40 @@ float NinjamVst3AudioProcessor::getLocalInputGain() const
     return localChannelGains[0].load();
 }
 
+void NinjamVst3AudioProcessor::setVoiceChannelGain(float gain)
+{
+    voiceChannelGain.store(gain);
+}
+
+float NinjamVst3AudioProcessor::getVoiceChannelGain() const
+{
+    return voiceChannelGain.load();
+}
+
+void NinjamVst3AudioProcessor::setVoiceChannelInput(int inputIndex)
+{
+    voiceChannelInput.store(inputIndex);
+}
+
+int NinjamVst3AudioProcessor::getVoiceChannelInput() const
+{
+    return voiceChannelInput.load();
+}
+
+float NinjamVst3AudioProcessor::getVoiceChannelPeak() const
+{
+    return voiceChannelPeak.load();
+}
+
+float NinjamVst3AudioProcessor::getVoiceChannelPeakLeft() const
+{
+    return voiceChannelPeakL.load();
+}
+
+float NinjamVst3AudioProcessor::getVoiceChannelPeakRight() const
+{
+    return voiceChannelPeakR.load();
+}
 void NinjamVst3AudioProcessor::setNumLocalChannels(int num)
 {
     const int previous = numLocalChannels.load();
@@ -15745,6 +15818,8 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
 
     if (localChannelBuffer.getNumChannels() < maxLocalChannels || localChannelBuffer.getNumSamples() < numSamples)
         localChannelBuffer.setSize(maxLocalChannels, numSamples, false, false, true);
+    if (voiceChannelBuffer.getNumChannels() < 1 || voiceChannelBuffer.getNumSamples() < numSamples)
+        voiceChannelBuffer.setSize(1, numSamples, false, false, true);
 
     int requestedLocal = numLocalChannels.load();
     int actualLocal = juce::jlimit(1, maxLocalChannels, requestedLocal);
@@ -15989,6 +16064,89 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         if (localMaxR > globalLocalMaxR)
             globalLocalMaxR = localMaxR;
     }
+
+    voiceChannelBuffer.clear(0, 0, numSamples);
+    int voiceSourceLeft = -1;
+    int voiceSourceRight = -1;
+    const int selectedVoiceInput = voiceChannelInput.load(std::memory_order_relaxed);
+
+    if (selectedVoiceInput == kLocalInputLinkAudioSentinel)
+    {
+        const int left = totalInputChannels;
+        const int right = linkInputChannels > 1 ? totalInputChannels + 1 : left;
+        if (linkInputChannels > 0 && left < totalAvailableInputChannels)
+            voiceChannelBuffer.addFrom(0, 0, tempInputBuffer, left, 0, numSamples, linkInputChannels > 1 ? 0.5f : 1.0f);
+        if (linkInputChannels > 1 && right < totalAvailableInputChannels)
+            voiceChannelBuffer.addFrom(0, 0, tempInputBuffer, right, 0, numSamples, 0.5f);
+        voiceSourceLeft = linkInputChannels > 0 ? left : -1;
+        voiceSourceRight = linkInputChannels > 1 ? right : voiceSourceLeft;
+    }
+    else if (selectedVoiceInput >= 0)
+    {
+        if (totalInputChannels > 0)
+        {
+            const int left = juce::jlimit(0, totalInputChannels - 1, selectedVoiceInput);
+            voiceChannelBuffer.copyFrom(0, 0, tempInputBuffer, left, 0, numSamples);
+            voiceSourceLeft = left;
+            voiceSourceRight = left;
+        }
+    }
+    else if (totalInputChannels > 0)
+    {
+        const int pairIndex = -1 - selectedVoiceInput;
+        int left = pairIndex * 2;
+        int right = left + 1;
+        if (left < 0 || left >= totalInputChannels)
+            left = juce::jlimit(0, totalInputChannels - 1, left);
+        if (right < 0 || right >= totalInputChannels)
+            right = left;
+        voiceChannelBuffer.addFrom(0, 0, tempInputBuffer, left, 0, numSamples, right != left ? 0.5f : 1.0f);
+        if (right != left)
+            voiceChannelBuffer.addFrom(0, 0, tempInputBuffer, right, 0, numSamples, 0.5f);
+        voiceSourceLeft = left;
+        voiceSourceRight = right;
+    }
+
+    const float voiceGain = voiceChannelGain.load(std::memory_order_relaxed);
+    if (voiceGain != 1.0f)
+        voiceChannelBuffer.applyGain(0, 0, numSamples, voiceGain);
+
+    const float* voiceData = voiceChannelBuffer.getReadPointer(0);
+    float voiceMax = 0.0f;
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const float a = std::abs(voiceData[i]);
+        if (a > voiceMax)
+            voiceMax = a;
+    }
+
+    float voiceMaxL = 0.0f;
+    float voiceMaxR = 0.0f;
+    if (voiceSourceLeft >= 0 && voiceSourceLeft < totalAvailableInputChannels)
+    {
+        const float* leftData = tempInputBuffer.getReadPointer(voiceSourceLeft);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const float a = std::abs(leftData[i] * voiceGain);
+            if (a > voiceMaxL)
+                voiceMaxL = a;
+        }
+    }
+    if (voiceSourceRight >= 0 && voiceSourceRight < totalAvailableInputChannels)
+    {
+        const float* rightData = tempInputBuffer.getReadPointer(voiceSourceRight);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const float a = std::abs(rightData[i] * voiceGain);
+            if (a > voiceMaxR)
+                voiceMaxR = a;
+        }
+    }
+    if (voiceSourceRight < 0)
+        voiceMaxR = voiceMaxL;
+    voiceChannelPeak.store(voiceMax, std::memory_order_relaxed);
+    voiceChannelPeakL.store(voiceMaxL, std::memory_order_relaxed);
+    voiceChannelPeakR.store(voiceMaxR, std::memory_order_relaxed);
 
     for (int ch = actualLocal; ch < maxLocalChannels; ++ch)
     {
@@ -16262,6 +16420,9 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
             actualInputChannels = 1;
         }
     }
+
+    if (voiceChatMode && actualInputChannels < (int)std::size(inputs))
+        inputs[actualInputChannels++] = voiceChannelBuffer.getWritePointer(0);
 
     float* outputs[32];
     int totalOutputChannels = 0;
@@ -16585,6 +16746,20 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         }
     }
 
+    if ((monitorEnabled || transmitEnabled) && voiceChatMode && numOutputBusesOut > 0)
+    {
+        auto mainBus = getBusBuffer(buffer, false, 0);
+        const int outChans = mainBus.getNumChannels();
+        const int voiceOutputIndex = juce::jmin(numLocalChannels.load(), maxLocalChannels);
+        const int outLeft = voiceOutputIndex * 2;
+        const int outRight = outLeft + 1;
+        if (outLeft < outChans)
+            mainBus.addFrom(outLeft, 0, voiceChannelBuffer, 0, 0, numSamples);
+        if (outRight < outChans)
+            mainBus.addFrom(outRight, 0, voiceChannelBuffer, 0, 0, numSamples);
+        else if (outLeft == 0 && outChans == 1)
+            mainBus.addFrom(0, 0, voiceChannelBuffer, 0, 0, numSamples);
+    }
     if ((monitorEnabled || transmitEnabled) && samplePadsActiveThisBlock && numOutputBusesOut > 0)
     {
         auto mainBus = getBusBuffer(buffer, false, 0);
@@ -17941,6 +18116,8 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     }
     for (int channel = 0; channel < maxLocalChannels; ++channel)
         state.setProperty("localInput" + juce::String(channel), getLocalChannelInput(channel), nullptr);
+    state.setProperty("voiceInput", getVoiceChannelInput(), nullptr);
+    state.setProperty("voiceGain", (double)getVoiceChannelGain(), nullptr);
 
     if (auto xml = state.createXml())
         copyXmlToBinary(*xml, destData);
@@ -18044,6 +18221,8 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     }
     for (int channel = 0; channel < maxLocalChannels; ++channel)
         setLocalChannelInput(channel, (int)state.getProperty("localInput" + juce::String(channel), -1));
+    setVoiceChannelInput((int)state.getProperty("voiceInput", 0));
+    setVoiceChannelGain(juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("voiceGain", 1.0)));
 }
 
 void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarkerBeat, long long localMarkerSampleCount, double intervalDurationMs)

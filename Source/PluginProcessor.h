@@ -118,6 +118,13 @@ public:
     int getLocalBitrate() const;
     void setVoiceChatMode(bool enabled);
     bool isVoiceChatMode() const;
+    void setVoiceChannelGain(float gain);
+    float getVoiceChannelGain() const;
+    void setVoiceChannelInput(int inputIndex);
+    int getVoiceChannelInput() const;
+    float getVoiceChannelPeak() const;
+    float getVoiceChannelPeakLeft() const;
+    float getVoiceChannelPeakRight() const;
 
     // Chat
     juce::StringArray getChatMessages();
@@ -682,6 +689,7 @@ private:
     juce::AudioBuffer<float> tempInputBuffer;
     juce::AudioBuffer<float> localChannelBuffer;
     juce::AudioBuffer<float> localMixBuffer;   // 1-ch mix used by multiChanAuto Vorbis slot
+    juce::AudioBuffer<float> voiceChannelBuffer;
     std::unique_ptr<LocalChordAnalyzer> localChordAnalyzer;
     std::array<std::unique_ptr<LocalChordAnalyzer>, maxRemoteChordUsers> remoteChordAnalyzers;
     std::atomic<bool> chordDetectionEnabled { true };
@@ -689,17 +697,22 @@ private:
     std::array<juce::String, maxRemoteChordUsers> remoteChordUserKeys;
     std::atomic<float> masterOutputGain { 1.0f };
     std::atomic<float> localInputGain { 1.0f };
+    std::atomic<float> voiceChannelGain { 1.0f };
     std::atomic<float> masterPeak { 0.0f };
     std::atomic<float> masterPeakL { 0.0f };
     std::atomic<float> masterPeakR { 0.0f };
     std::atomic<float> localPeak { 0.0f };
     std::atomic<float> localPeakL { 0.0f };
     std::atomic<float> localPeakR { 0.0f };
+    std::atomic<float> voiceChannelPeak { 0.0f };
+    std::atomic<float> voiceChannelPeakL { 0.0f };
+    std::atomic<float> voiceChannelPeakR { 0.0f };
     std::array<std::atomic<float>, maxLocalChannels> localChannelGains;
     std::array<std::atomic<float>, maxLocalChannels> localChannelPeaks;
     std::array<std::atomic<float>, maxLocalChannels> localChannelPeaksL;
     std::array<std::atomic<float>, maxLocalChannels> localChannelPeaksR;
     std::array<std::atomic<int>, maxLocalChannels> localChannelInputs;
+    std::atomic<int> voiceChannelInput { 0 };
     std::array<std::atomic<float>, maxLocalChannels> localChannelReverbSends;
     std::array<std::atomic<float>, maxLocalChannels> localChannelDelaySends;
     juce::CriticalSection localChannelNamesLock;
@@ -1270,7 +1283,9 @@ private:
     void clearZapVideoFrameState();
     void stopNinjamZapVideoTransportForDisconnect();
     void syncLocalIntervalChannelConfig();
+    int getVoiceChatNinjamChannelIndex() const;
     bool isNinjamRemoteChannelVideoOnly(int userIndex, int channelIndex);
+    bool isRemoteUserVoiceChatMode(int userIndex);
     int syncNinjamZapVideoSubscriptions(bool subscribe);
     int ensureRawIntervalSyncFallbackSubscriptions();
     void addSystemChatLine(const juce::String& message);

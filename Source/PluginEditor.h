@@ -1572,6 +1572,11 @@ private:
     std::array<LeftClickOnlySlider, NinjamVst3AudioProcessor::maxLocalChannels> localDelaySendKnobs;
     std::array<juce::Label, NinjamVst3AudioProcessor::maxLocalChannels> localReverbSendLabels;
     std::array<juce::Label, NinjamVst3AudioProcessor::maxLocalChannels> localDelaySendLabels;
+    juce::Label voiceChannelNameLabel{ "VoiceName", "Voice" };
+    NonlinearFaderSlider voiceFader;
+    MasterPeakMeter voicePeakMeter;
+    juce::ComboBox voiceInputSelector;
+    juce::Label voiceDbLabel;
     juce::Label masterFaderLabel{ "Master", "Master" };
     NonlinearFaderSlider masterFader;
     MasterPeakMeter masterPeakMeter;
@@ -1662,6 +1667,7 @@ private:
     void applyOscMappings();
     void applyRemoteMidiRelaySelection(int channel, int inputIndex);
     void refreshLocalInputSelector(int channel);
+    void refreshVoiceInputSelector();
     void showMidiOptionsPopup();
     void showLinkAudioOptionsPopup();
     void refreshExternalMidiInputDevices();
@@ -1816,9 +1822,12 @@ private:
     double lastTransmitPulseRepaintMs = 0.0;
     double lastClipPulseRepaintMs = 0.0;
     std::array<juce::Rectangle<int>, NinjamVst3AudioProcessor::maxLocalChannels> localChannelPulseBounds;
+    juce::Rectangle<int> voiceChannelPulseBounds;
     juce::Rectangle<int> masterChannelPulseBounds;
     std::array<double, NinjamVst3AudioProcessor::maxLocalChannels> localClipStartMs {};
     std::array<bool, NinjamVst3AudioProcessor::maxLocalChannels> localClipPulsing {};
+    double voiceClipStartMs = 0.0;
+    bool voiceClipPulsing = false;
     double masterClipStartMs = 0.0;
     bool masterClipPulsing = false;
     bool persistentSettingsDirty = false;

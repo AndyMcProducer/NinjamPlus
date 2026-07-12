@@ -55,6 +55,16 @@
         .bar button:hover {
             background: #293655;
         }
+        .peer-info-toggle {
+            min-width: 34px;
+            padding: 0 8px;
+        }
+        body.peer-info-hidden .peer-offsets {
+            display: none;
+        }
+        body.peer-info-hidden .header-meta .status {
+            display: none;
+        }
         .obs-tools,
         .camera-tools {
             display: flex;
@@ -336,6 +346,7 @@
 <body>
     <div class="bar">
         <span class="room" id="roomText"></span>
+        <button id="peerInfoToggle" class="peer-info-toggle" type="button" title="Hide peer info">Info</button>
         <div class="obs-tools">
             <label class="obs-control" for="obsLayout">OBS view
                 <select id="obsLayout">
@@ -383,6 +394,12 @@
                     <option value="1080p60-10000">1080p HQ 60fps</option>
                 </select>
             </label>
+            <label class="obs-control" for="vdoCameraBufferMode">Mode
+                <select id="vdoCameraBufferMode">
+                    <option value="sync">NINJAM Sync</option>
+                    <option value="realtime">Realtime</option>
+                </select>
+            </label>
             <label class="obs-control" for="vdoCameraFx">Camera FX
                 <select id="vdoCameraFx">
                     <option value="off">Off</option>
@@ -420,11 +437,13 @@
     <script>
         const query = new URLSearchParams(window.location.search);
         const roomText = document.getElementById('roomText');
+        const peerInfoToggle = document.getElementById('peerInfoToggle');
         const obsBtn = document.getElementById('obsBtn');
         const obsLayout = document.getElementById('obsLayout');
         const obsSource = document.getElementById('obsSource');
         const vdoCameraCodec = document.getElementById('vdoCameraCodec');
         const vdoCameraQuality = document.getElementById('vdoCameraQuality');
+        const vdoCameraBufferMode = document.getElementById('vdoCameraBufferMode');
         const vdoCameraFx = document.getElementById('vdoCameraFx');
         const vdoCameraFxStrength = document.getElementById('vdoCameraFxStrength');
         const vdoCameraBgImage = document.getElementById('vdoCameraBgImage');
@@ -473,6 +492,28 @@
         function normalizeCameraFxStrength(value) {
             const strength = parseInt(value || '4', 10);
             return isFinite(strength) ? Math.max(1, Math.min(20, strength)) : 4;
+        }
+
+        function normalizeCameraBufferMode(value) {
+            const mode = String(value || 'sync').trim().toLowerCase();
+            return mode === 'realtime' || mode === 'real-time' || mode === 'rt' || mode === 'live' ? 'realtime' : 'sync';
+        }
+
+        function peerInfoStorageKey() {
+            return 'ninjamPeerInfoHidden:' + resolvedRoom;
+        }
+
+        function setPeerInfoHidden(hidden) {
+            const nextHidden = !!hidden;
+            document.body.classList.toggle('peer-info-hidden', nextHidden);
+            if (peerInfoToggle) {
+                peerInfoToggle.textContent = nextHidden ? 'Show info' : 'Info';
+                peerInfoToggle.title = nextHidden ? 'Show peer info' : 'Hide peer info';
+                peerInfoToggle.setAttribute('aria-pressed', nextHidden ? 'true' : 'false');
+            }
+            if (window.localStorage) {
+                window.localStorage.setItem(peerInfoStorageKey(), nextHidden ? '1' : '0');
+            }
         }
 
         function normalizeVdoQualityPreset(value) {
@@ -565,9 +606,14 @@
             params.delete('codec');
             params.delete('codecs');
             params.delete('videocodec');
+            params.delete('cameraBufferMode');
+            params.delete('sourceBufferMode');
+            params.delete('cameraMode');
+            params.delete('vdoCameraMode');
 
             const codec = normalizeVdoCodec(vdoCameraCodec ? vdoCameraCodec.value : 'default');
             const quality = normalizeVdoQualityPreset(vdoCameraQuality ? vdoCameraQuality.value : 'default');
+            const cameraBufferMode = normalizeCameraBufferMode(vdoCameraBufferMode ? vdoCameraBufferMode.value : 'sync');
             const fx = normalizeCameraFx(vdoCameraFx ? vdoCameraFx.value : 'off');
             const strength = normalizeCameraFxStrength(vdoCameraFxStrength ? vdoCameraFxStrength.value : '4');
             const bgImage = String(vdoCameraBgImage ? vdoCameraBgImage.value : '').trim();
@@ -576,6 +622,7 @@
                 params.set('cameraCodec', codec);
             }
             params.set('cameraQuality', quality);
+            params.set('cameraBufferMode', cameraBufferMode);
             if (fx !== 'off') {
                 params.set('cameraFx', fx);
             } else {
@@ -598,6 +645,9 @@
         }
         if (vdoCameraQuality) {
             vdoCameraQuality.value = initialVdoQualityPreset();
+        }
+        if (vdoCameraBufferMode) {
+            vdoCameraBufferMode.value = normalizeCameraBufferMode(query.get('cameraBufferMode') || query.get('sourceBufferMode') || query.get('cameraMode') || query.get('vdoCameraMode') || 'sync');
         }
         if (vdoCameraFx) {
             vdoCameraFx.value = initialCameraFx();
@@ -1384,6 +1434,7 @@
             return {
                 cameraCodec: normalizeVdoCodec(vdoCameraCodec ? vdoCameraCodec.value : 'default'),
                 cameraQuality: normalizeVdoQualityPreset(vdoCameraQuality ? vdoCameraQuality.value : 'default'),
+                cameraBufferMode: normalizeCameraBufferMode(vdoCameraBufferMode ? vdoCameraBufferMode.value : 'sync'),
                 cameraFx: normalizeCameraFx(vdoCameraFx ? vdoCameraFx.value : 'off'),
                 cameraFxStrength: normalizeCameraFxStrength(vdoCameraFxStrength ? vdoCameraFxStrength.value : '4'),
                 cameraBgImage: String(vdoCameraBgImage ? vdoCameraBgImage.value : '').trim()
@@ -1407,8 +1458,8 @@
                     changed: changed || ''
                 }, window.location.origin);
             }
-            statusText.textContent = changed === 'codec'
-                ? 'Codec saved for next VDO reconnect'
+            statusText.textContent = (changed === 'codec' || changed === 'mode')
+                ? 'Camera mode saved for next VDO reconnect'
                 : 'Camera settings sent to VDO live';
         }
 
@@ -1417,6 +1468,9 @@
         }
         if (vdoCameraQuality) {
             vdoCameraQuality.addEventListener('change', function () { sendVdoCameraSettingsLive('quality'); });
+        }
+        if (vdoCameraBufferMode) {
+            vdoCameraBufferMode.addEventListener('change', function () { sendVdoCameraSettingsLive('mode'); });
         }
         if (vdoCameraFx) {
             vdoCameraFx.addEventListener('change', function () { sendVdoCameraSettingsLive('fx'); });
@@ -1427,6 +1481,13 @@
         }
         if (vdoCameraBgImage) {
             vdoCameraBgImage.addEventListener('change', function () { sendVdoCameraSettingsLive('fx'); });
+        }
+
+        if (peerInfoToggle) {
+            peerInfoToggle.addEventListener('click', function () {
+                setPeerInfoHidden(!document.body.classList.contains('peer-info-hidden'));
+            });
+            setPeerInfoHidden(window.localStorage && window.localStorage.getItem(peerInfoStorageKey()) === '1');
         }
 
         renderUsers();
