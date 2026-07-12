@@ -172,7 +172,6 @@ target_sources(NINJAM_VST3 PRIVATE
     Source/StandaloneApp.cpp
     Source/ZapVideoCodec.cpp
     Source/ZapVideoCodec.h
-    # ProVideoCodec is optional (FFmpeg-based). Do not add unconditionally.
     
     # NINJAM Core
     ${NINJAM_ROOT}/ninjam/njclient.cpp

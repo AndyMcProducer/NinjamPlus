@@ -19,6 +19,7 @@ test-results/
 # Build artefacts (CMake/MSBuild)
 build/
 build_*/
+Source - Copy/
 local_deps/
 CMakeFiles/
 cmake_install.cmake
