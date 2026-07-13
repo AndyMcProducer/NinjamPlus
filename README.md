@@ -20,7 +20,7 @@ NINJAMplus coordinates two separate transports:
 
 1. **NINJAM carries the music.** The app or plug-in sends compressed audio to a NINJAM server, receives the other performers' interval audio, and mixes it against the shared tempo and BPI (beats per interval).
 2. **VDO.Ninja carries optional video only.** Clicking **Video Room** starts a local loopback helper and opens a browser. The helper embeds VDO.Ninja, derives the room from the active NINJAM connection, and continuously applies per-peer video delay updates from the NINJAM timing data.
-3. **Chunked mode protects weak uplinks.** WebCodecs encodes video into indexed chunks sent over WebRTC data channels. Pacing prevents an overloaded sender queue, NACKs request missing chunks from a bounded resend cache, and hybrid adaptation reduces bitrate, frame cadence, and resolution before the video stalls completely.
+3. **Chunked mode protects weak uplinks.** WebCodecs encodes video into indexed chunks sent over WebRTC data channels. Pacing prevents an overloaded sender queue, NACKs request missing chunks from a bounded resend cache, and bitrate/resolution adaptation reduces bandwidth without moving the video timeline.
 
 The browser room uses `noaudio=1`: NINJAM remains the audio clock and audio transport. Do not use the VDO.Ninja browser audio as a substitute for the NINJAM mix.
 
@@ -53,8 +53,9 @@ The selected audio bitrate and the video bitrate share the same uplink. On const
 
 - **Musical, not conversational, latency:** the interval delay is deliberate. Speech through the music path will also arrive on an interval boundary.
 - **Video follows the music:** the helper delays each peer's video to match measured NINJAM timing. A freshly joined peer can take a moment to settle.
-- **Graceful degradation on weak upload:** the default chunked profile begins around 600 kbps and can fall to an emergency 60 kbps target. At the low end, expect low resolution and slideshow-like motion rather than a frozen or permanently broken feed.
-- **Automatic recovery:** healthy capacity lets the video return toward normal cadence and source resolution. Sudden network changes may briefly force a keyframe or rebuffer.
+- **Quality first, graceful degradation on weak upload:** the default 720p30 profile begins around 2.5 Mbps and can fall to an emergency 60 kbps target. Sustained pressure lowers bitrate and resolution while preserving source timestamps and frame cadence.
+- **Synchronization first:** normal adaptation never discards raw source frames. A severely impaired individual route may still skip timestamped frames as a last resort so it catches up instead of showing increasingly late video.
+- **Automatic recovery:** healthy capacity lets the video return toward its source resolution and full bitrate. Sudden network changes may briefly force a keyframe or rebuffer without moving the NINJAM-owned playout target.
 - **Audio remains the priority:** video can be closed without ending the NINJAM session.
 - **Native reconnection:** unexpected NINJAM disconnects retry automatically with bounded exponential backoff. A manual disconnect, rejected licence, or invalid credentials will not reconnect in a loop.
 - **Effects cost resources:** background blur/removal and high-quality 1080p modes need more CPU/GPU and upload bandwidth.
@@ -73,7 +74,7 @@ The standard WebRTC video path is optimized for live motion and may collapse int
 4. The receiver detects missing indexes and sends NACK requests.
 5. The sender or relay resends available payloads from a time-bounded cache.
 6. A playout watchdog drops frames that can no longer complete before their deadline, allowing later frames to continue.
-7. Buffer-pressure reports drive hybrid adaptation: bitrate first, then fewer input frames, then 360p and emergency 180p tiers. Recovery uses hysteresis and fresh keyframes.
+7. Buffer-pressure reports drive bitrate adaptation and 360p/emergency 180p tiers. Raw input cadence remains intact, and recovery uses hysteresis plus fresh keyframes.
 8. NINJAMplus remains authoritative for each peer's playout delay and updates the helper live.
 
 ### Default resilience profile
@@ -82,8 +83,8 @@ These are implementation defaults for the NINJAMplus helper. They are advanced d
 
 | URL parameter | Default | Purpose |
 | --- | ---: | --- |
-| `chunked`, `chunkbitrate`, `bitrate` | `600` | Initial video target in kbps for this integration |
-| `maxvideobitrate`, `chunkadaptceil` | `900` | Default adaptive ceiling in kbps; a selected quality preset can raise it |
+| `chunked`, `chunkbitrate`, `bitrate` | `2500` | Initial 720p30 video target in kbps for this integration |
+| `maxvideobitrate`, `chunkadaptceil` | `2500` | Default adaptive ceiling in kbps; a selected quality preset can raise it |
 | `chunkadaptfloor` | `60` | Emergency bitrate floor in kbps |
 | `chunkindex` | `1` | Adds indexed reliability framing |
 | `chunknack` | `1` | Requests missing chunks |
@@ -91,11 +92,11 @@ These are implementation defaults for the NINJAMplus helper. They are advanced d
 | `chunknackdelay` | `250` | Initial NACK spacing in milliseconds; measured RTT can influence retries |
 | `chunkchunksize` | `4096` | Payload size in bytes |
 | `chunkcache` | `30000` | Bounded resend-cache window in milliseconds; not video delay |
-| `chunkedbuffer` | `900` | Sender pacing/adaptation window in milliseconds |
-| `chunkadapt` | `hybrid` | Reduce bitrate and then shed frames under pressure |
-| `chunkadaptthreshold` | `220` | Pressure guard in milliseconds |
-| `chunkadaptmaxdrop` | `24` | Upper bound for adaptive frame shedding |
-| `chunkadaptinterval` | `600` | Adaptation evaluation interval in milliseconds |
+| `chunkedbuffer` | `500` | Sender pacing/adaptation window in milliseconds; bounds stale transport backlog during route collapse |
+| `chunkadapt` | `bitrate` | Reduce bitrate without discarding raw source frames |
+| `chunkadaptthreshold` | `500` | Pressure guard in milliseconds |
+| `chunkadaptmaxdrop` | `0` | Disables global adaptive frame shedding so timestamps remain continuous |
+| `chunkadaptinterval` | `1200` | Minimum interval between bitrate changes in milliseconds |
 | `chunkadaptresolution` | `1` | Enables source, 360p, and emergency 180p tiers |
 | `chunkbufferadaptive` | `0` | Prevents VDO.Ninja from overriding NINJAM-owned playout timing |
 
