@@ -9115,7 +9115,7 @@ void NinjamVst3AudioProcessorEditor::resized()
     auto area = getLocalBounds().reduced(10);
 
     // Bottom: Interval Display
-    auto bottomRow = area.removeFromBottom(40);
+    auto bottomRow = area.removeFromBottom(62);
     intervalDisplay.setBounds(bottomRow);
     area.removeFromBottom(10);
 

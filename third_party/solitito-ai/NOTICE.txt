@@ -1,0 +1,4 @@
+Solitito AI assets downloaded from https://huggingface.co/greblus/solitito-ai
+Model: chord_model_v31_16k.onnx
+Original DSP weights: dsp_weights.json
+License on Hugging Face model card: MIT

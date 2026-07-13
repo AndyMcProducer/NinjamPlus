@@ -14,6 +14,7 @@
 #include <memory>
 #include <deque>
 #include <array>
+#include <vector>
 
 #include "ninjam/njclient.h"
 #include "ZapVideoCodec.h"
@@ -33,7 +34,7 @@ class LocalVideoHttpServer;
 class ZapVideoDecodeWorker;
 class ZapCameraSender;
 class AsyncChatTranslationWorker;
-class LocalChordAnalyzer;
+class BatchedChordAnalyzer;
 
 namespace ableton
 {
@@ -178,6 +179,10 @@ public:
     juce::String getUserChordLabel(int userIndex) const;
     double getUserChordCpuPercent(int userIndex) const;
     int getUserChordMemoryKb(int userIndex) const;
+    juce::String getMasterChordLabel() const;
+    double getMasterChordCpuPercent() const;
+    int getMasterChordMemoryKb() const;
+    std::vector<juce::String> getMasterChordTimeline() const;
     void setChordDetectionEnabled(bool enabled);
     bool isChordDetectionEnabled() const;
     void setUserChordDetectionEnabled(int userIndex, bool enabled);
@@ -690,11 +695,15 @@ private:
     juce::AudioBuffer<float> localChannelBuffer;
     juce::AudioBuffer<float> localMixBuffer;   // 1-ch mix used by multiChanAuto Vorbis slot
     juce::AudioBuffer<float> voiceChannelBuffer;
-    std::unique_ptr<LocalChordAnalyzer> localChordAnalyzer;
-    std::array<std::unique_ptr<LocalChordAnalyzer>, maxRemoteChordUsers> remoteChordAnalyzers;
+    juce::AudioBuffer<float> masterChordScratchBuffer;
+    std::unique_ptr<BatchedChordAnalyzer> chordAnalyzer;
     std::atomic<bool> chordDetectionEnabled { true };
     std::array<std::atomic<bool>, maxRemoteChordUsers> remoteChordDetectionEnabled;
     std::array<juce::String, maxRemoteChordUsers> remoteChordUserKeys;
+    mutable juce::CriticalSection masterChordTimelineLock;
+    std::vector<juce::String> masterChordTimeline;
+    int masterChordTimelineInterval = -1;
+    int masterChordTimelineBpi = 0;
     std::atomic<float> masterOutputGain { 1.0f };
     std::atomic<float> localInputGain { 1.0f };
     std::atomic<float> voiceChannelGain { 1.0f };
@@ -1218,6 +1227,7 @@ private:
     int getDisplayIntervalIndex() const;
     void emitMidiTimecode(juce::MidiBuffer& midiMessages, int numSamples, int pos, int length);
     void updateMetronomeEngineVolume();
+    void updateMasterChordTimeline();
     bool loadCustomMetronomeSoundFile(const juce::File& file);
     void clearCustomMetronomeSoundFile();
     void resetMetronomeClickVoices();

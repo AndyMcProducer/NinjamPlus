@@ -64,15 +64,51 @@ public:
         const int currentBeat = (int)totalBeats;
 
         auto bounds = getLocalBounds().toFloat();
+        auto chordArea = bounds.removeFromTop(18.0f);
+        bounds.removeFromTop(3.0f);
         const float blockWidth = bounds.getWidth() / (float)bpi;
         const float blockHeight = bounds.getHeight();
 
         const juce::Colour onColor = juce::Colour(0xFFFFFDD0);
         const juce::Colour offColor = juce::Colours::black.withAlpha(0.3f);
+        const juce::Colour chordColor = juce::Colour(0xff56d8c9);
+        const auto chordTimeline = processor.getMasterChordTimeline();
+        const float chordBlockWidth = chordArea.getWidth() / (float)bpi;
 
         for (int i = 0; i < bpi; ++i)
         {
-            auto blockArea = juce::Rectangle<float>(i * blockWidth, 0.0f, blockWidth, blockHeight).reduced(2.0f);
+            auto cell = juce::Rectangle<float>(chordArea.getX() + (float)i * chordBlockWidth,
+                                               chordArea.getY(),
+                                               chordBlockWidth,
+                                               chordArea.getHeight()).reduced(2.0f, 1.0f);
+            const juce::String chord = i < (int)chordTimeline.size() ? chordTimeline[(size_t)i] : juce::String();
+            const bool hasChord = chord.isNotEmpty() && chord != "--" && chord != "Off";
+            const bool isActiveChord = i == currentBeat && currentBeat < bpi;
+
+            if (hasChord)
+            {
+                g.setColour(chordColor.withAlpha(isActiveChord ? 0.88f : 0.62f));
+                g.fillRoundedRectangle(cell, 2.0f);
+                if (cell.getWidth() >= 18.0f && cell.getHeight() >= 9.0f)
+                {
+                    g.setFont(juce::Font(juce::jlimit(7.0f, 11.0f, cell.getHeight() * 0.82f), juce::Font::bold));
+                    g.setColour(juce::Colours::black.withAlpha(0.86f));
+                    g.drawFittedText(chord, cell.toNearestInt(), juce::Justification::centred, 1);
+                }
+            }
+            else
+            {
+                g.setColour(juce::Colours::black.withAlpha(isActiveChord ? 0.28f : 0.16f));
+                g.drawRoundedRectangle(cell, 2.0f, 1.0f);
+            }
+        }
+
+        for (int i = 0; i < bpi; ++i)
+        {
+            auto blockArea = juce::Rectangle<float>(bounds.getX() + (float)i * blockWidth,
+                                                    bounds.getY(),
+                                                    blockWidth,
+                                                    blockHeight).reduced(2.0f);
             const bool isPast = i < currentBeat;
             const bool isActive = i == currentBeat && currentBeat < bpi;
             const bool isBarStart = (i % 4) == 0;

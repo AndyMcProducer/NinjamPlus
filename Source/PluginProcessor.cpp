@@ -3,12 +3,17 @@
 #include "ZapVideoCodec.h"
 #include "Chromagram.h"
 #include "ChordDetector.h"
+#include "SolititoChordModel.h"
 #include "EmbeddedVdoHtml.h"
 #include "signalsmith-stretch/signalsmith-stretch.h"
 #include <juce_video/juce_video.h>
 
 #ifndef NINJAMPLUS_HAS_AUBIO
  #define NINJAMPLUS_HAS_AUBIO 0
+#endif
+
+#ifndef NINJAMPLUS_HAS_ONNX_CHORDS
+ #define NINJAMPLUS_HAS_ONNX_CHORDS 0
 #endif
 
 #if NINJAMPLUS_HAS_AUBIO
@@ -2678,17 +2683,63 @@ private:
 };
 #endif
 
-class LocalChordAnalyzer final
+static juce::File findSolititoChordAsset(const char* fileName)
+{
+    std::vector<juce::File> dirs;
+
+#if defined(NINJAMPLUS_SOLITITO_ASSET_DIR)
+    dirs.push_back(juce::File(juce::String(NINJAMPLUS_SOLITITO_ASSET_DIR)));
+#endif
+
+    const juce::File moduleFile = getThisModuleFile();
+    if (moduleFile.exists())
+    {
+        const auto moduleDir = moduleFile.getParentDirectory();
+        dirs.push_back(moduleDir.getChildFile("solitito-ai"));
+        dirs.push_back(moduleDir.getChildFile("Resources").getChildFile("solitito-ai"));
+        dirs.push_back(moduleDir.getParentDirectory().getChildFile("Resources").getChildFile("solitito-ai"));
+    }
+
+    const auto exeDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
+    dirs.push_back(exeDir.getChildFile("solitito-ai"));
+    dirs.push_back(exeDir.getChildFile("Resources").getChildFile("solitito-ai"));
+
+    for (const auto& dir : dirs)
+    {
+        const auto candidate = dir.getChildFile(fileName);
+        if (candidate.existsAsFile())
+            return candidate;
+    }
+
+    return {};
+}
+class BatchedChordAnalyzer final
     : private juce::Thread
 {
 public:
-    LocalChordAnalyzer()
-        : juce::Thread("NINJAMLocalChordAnalyzer")
+    static constexpr int localTrackIndex = 0;
+    static constexpr int remoteTrackBase = 1;
+    static constexpr int masterTrackIndex = remoteTrackBase + NinjamVst3AudioProcessor::maxRemoteChordUsers;
+    static constexpr int trackCount = masterTrackIndex + 1;
+
+    static int remoteTrackIndexForUser(int userIndex)
     {
-        memoryKb.store(estimateMemoryKb());
+        return remoteTrackBase + userIndex;
     }
 
-    ~LocalChordAnalyzer() override
+    BatchedChordAnalyzer()
+        : juce::Thread("NINJAMBatchedChordAnalyzer")
+    {
+        solititoModel = std::make_unique<SolititoChordModel>(trackCount);
+        solititoModel->load(findSolititoChordAsset("chord_model_v31_16k.onnx"),
+                            findSolititoChordAsset("dsp_weights_v31_16k.bin"));
+
+        for (auto& track : tracks)
+            track.memoryKb.store(estimateTrackMemoryKb(), std::memory_order_relaxed);
+        memoryKb.store(estimateTotalMemoryKb(), std::memory_order_relaxed);
+    }
+
+    ~BatchedChordAnalyzer() override
     {
         stop();
     }
@@ -2699,60 +2750,46 @@ public:
         stopThread(1000);
 
         sampleRate = newSampleRate > 1.0 ? newSampleRate : 44100.0;
-        frame.assign((size_t)frameSize, 0.0);
-        averagedChroma.assign(12, 0.0);
-        readBuffer.assign((size_t)frameSize * 4, 0.0f);
-        const int newRingSize = juce::jmax(frameSize * 16, (int)std::round(sampleRate));
-        ringBuffer.assign((size_t)newRingSize, 0.0f);
-        audioFifo = std::make_unique<juce::AbstractFifo>(newRingSize);
-        frameFill = 0;
-        rmsSmoothed = 0.0;
-        samplesSinceCpuUpdate = 0;
-        analysisMsSinceCpuUpdate = 0.0;
-        chromaHistory = {};
-        chromaHistoryWrite = 0;
-        chromaHistorySize = 0;
-        resetChordDecisionState();
-        droppedSamples.store(0, std::memory_order_relaxed);
-        cpuPercent.store(0.0, std::memory_order_relaxed);
+        for (auto& track : tracks)
+            prepareTrack(track, sampleRate);
 
-        const int roundedRate = juce::jlimit(8000, 192000, (int)std::round(sampleRate));
-        requestedSampleRate.store(roundedRate, std::memory_order_relaxed);
-        configureChromagram(roundedRate);
-        memoryKb.store(estimateMemoryKb(newRingSize), std::memory_order_relaxed);
-
+        memoryKb.store(estimateTotalMemoryKb(), std::memory_order_relaxed);
         ready.store(true, std::memory_order_release);
         startThread(juce::Thread::Priority::background);
     }
 
-    void processBlock(const float* input, int numSamples, int inputSampleRate = 0)
+    void processBlock(int trackIndex, const float* input, int numSamples, int inputSampleRate = 0)
     {
-        processFrames(input, numSamples, 1, inputSampleRate);
+        processFrames(trackIndex, input, numSamples, 1, inputSampleRate);
     }
 
-    void processInterleavedBlock(const float* input, int numFrames, int numChannels, int inputSampleRate)
+    void processInterleavedBlock(int trackIndex, const float* input, int numFrames, int numChannels, int inputSampleRate)
     {
-        processFrames(input, numFrames, juce::jmax(1, numChannels), inputSampleRate);
+        processFrames(trackIndex, input, numFrames, juce::jmax(1, numChannels), inputSampleRate);
     }
 
-    void processFrames(const float* input, int numFrames, int numChannels, int inputSampleRate)
+    void processFrames(int trackIndex, const float* input, int numFrames, int numChannels, int inputSampleRate)
     {
         if (!ready.load(std::memory_order_acquire))
             return;
 
-        if (input == nullptr || numFrames <= 0 || audioFifo == nullptr || ringBuffer.empty())
+        auto* track = getTrack(trackIndex);
+        if (track == nullptr)
+            return;
+
+        if (input == nullptr || numFrames <= 0 || track->audioFifo == nullptr || track->ringBuffer.empty())
         {
-            markNoInput();
+            markNoInput(trackIndex);
             return;
         }
 
         if (inputSampleRate > 1000)
-            requestedSampleRate.store(juce::jlimit(8000, 192000, inputSampleRate), std::memory_order_relaxed);
+            track->requestedSampleRate.store(juce::jlimit(8000, 192000, inputSampleRate), std::memory_order_relaxed);
 
-        int writableSamples = juce::jmin(numFrames, audioFifo->getFreeSpace());
+        int writableSamples = juce::jmin(numFrames, track->audioFifo->getFreeSpace());
         if (writableSamples <= 0)
         {
-            droppedSamples.fetch_add(numFrames, std::memory_order_relaxed);
+            track->droppedSamples.fetch_add(numFrames, std::memory_order_relaxed);
             return;
         }
 
@@ -2760,26 +2797,52 @@ public:
         if (writableSamples < numFrames)
         {
             inputStartFrame = numFrames - writableSamples;
-            droppedSamples.fetch_add(numFrames - writableSamples, std::memory_order_relaxed);
+            track->droppedSamples.fetch_add(numFrames - writableSamples, std::memory_order_relaxed);
         }
 
         int start1 = 0;
         int size1 = 0;
         int start2 = 0;
         int size2 = 0;
-        audioFifo->prepareToWrite(writableSamples, start1, size1, start2, size2);
+        track->audioFifo->prepareToWrite(writableSamples, start1, size1, start2, size2);
 
-        copyMonoFramesToRing(input, inputStartFrame, numChannels, start1, size1);
-        copyMonoFramesToRing(input, inputStartFrame + size1, numChannels, start2, size2);
+        copyMonoFramesToRing(*track, input, inputStartFrame, numChannels, start1, size1);
+        copyMonoFramesToRing(*track, input, inputStartFrame + size1, numChannels, start2, size2);
 
-        audioFifo->finishedWrite(size1 + size2);
+        track->audioFifo->finishedWrite(size1 + size2);
         samplesAvailable.signal();
     }
 
-    void markNoInput()
+    void markNoInput(int trackIndex)
     {
-        chordValid.store(false, std::memory_order_relaxed);
-        noteValid.store(false, std::memory_order_relaxed);
+        if (auto* track = getTrack(trackIndex))
+        {
+            track->chordValid.store(false, std::memory_order_relaxed);
+            track->noteValid.store(false, std::memory_order_relaxed);
+        }
+    }
+
+    void resetTrack(int trackIndex)
+    {
+        if (auto* track = getTrack(trackIndex))
+        {
+            track->chordValid.store(false, std::memory_order_relaxed);
+            track->noteValid.store(false, std::memory_order_relaxed);
+            track->resetRequested.store(true, std::memory_order_release);
+            samplesAvailable.signal();
+        }
+    }
+
+    void markAllNoInput()
+    {
+        for (int i = 0; i < trackCount; ++i)
+            markNoInput(i);
+    }
+
+    void resetAllTracks()
+    {
+        for (int i = 0; i < trackCount; ++i)
+            resetTrack(i);
     }
 
     void stop()
@@ -2810,8 +2873,8 @@ public:
             case ChordDetector::Major:       suffix = intervals == 7 ? "maj7" : ""; break;
             case ChordDetector::Minor:       suffix = intervals == 7 ? "m7" : "m"; break;
             case ChordDetector::Suspended:   suffix = intervals == 2 ? "sus2" : (intervals == 4 ? "sus4" : "sus"); break;
-            case ChordDetector::Dominant:    suffix = "7"; break;
-            case ChordDetector::Dimished5th: suffix = "dim"; break;
+            case ChordDetector::Dominant:    suffix = intervals == 13 ? "13" : (intervals == 9 ? "9" : "7"); break;
+            case ChordDetector::Dimished5th: suffix = intervals == 7 ? "dim7" : (intervals == 5 ? "m7b5" : "dim"); break;
             case ChordDetector::Augmented5th:suffix = "aug"; break;
             default:                         suffix = ""; break;
         }
@@ -2819,20 +2882,24 @@ public:
         return juce::String(getPitchClassName(root)) + suffix;
     }
 
-    juce::String getLabel() const
+    juce::String getLabel(int trackIndex) const
     {
-        if (chordValid.load(std::memory_order_relaxed))
+        const auto* track = getTrack(trackIndex);
+        if (track == nullptr)
+            return "--";
+
+        if (track->chordValid.load(std::memory_order_relaxed))
         {
-            const int root = chordRoot.load(std::memory_order_relaxed);
-            const int quality = chordQuality.load(std::memory_order_relaxed);
-            const int intervals = chordIntervals.load(std::memory_order_relaxed);
+            const int root = track->chordRoot.load(std::memory_order_relaxed);
+            const int quality = track->chordQuality.load(std::memory_order_relaxed);
+            const int intervals = track->chordIntervals.load(std::memory_order_relaxed);
             if (root >= 0 && root < 12)
                 return formatChordLabel(root, quality, intervals);
         }
 
-        if (noteValid.load(std::memory_order_relaxed))
+        if (track->noteValid.load(std::memory_order_relaxed))
         {
-            const int root = noteRoot.load(std::memory_order_relaxed);
+            const int root = track->noteRoot.load(std::memory_order_relaxed);
             if (root >= 0 && root < 12)
                 return getPitchClassName(root);
         }
@@ -2840,18 +2907,80 @@ public:
         return "--";
     }
 
-    double getCpuPercent() const
+    double getCpuPercent(int trackIndex) const
     {
-        return cpuPercent.load(std::memory_order_relaxed);
+        const auto* track = getTrack(trackIndex);
+        return track != nullptr ? track->cpuPercent.load(std::memory_order_relaxed) : 0.0;
     }
 
-    int getMemoryKb() const
+    int getMemoryKb(int trackIndex) const
+    {
+        const auto* track = getTrack(trackIndex);
+        return track != nullptr ? track->memoryKb.load(std::memory_order_relaxed) : 0;
+    }
+
+    int getTotalMemoryKb() const
     {
         return memoryKb.load(std::memory_order_relaxed);
     }
 
 private:
-    static int estimateMemoryKb(int fifoSamples = 48000)
+    static constexpr int frameSize = 512;
+    static constexpr int chromaCalculationIntervalSamples = 2048;
+    static constexpr int chromaHistoryFrames = 8;
+    static constexpr int stableCandidateHitThreshold = 3;
+    static constexpr int stableChordChangeHitThreshold = 6;
+    static constexpr int stableNoteHitThreshold = 1;
+    static constexpr int stableNoteChangeHitThreshold = 4;
+    static constexpr int invalidClearThresholdFrames = 8;
+    static constexpr double silenceRmsThreshold = 0.001;
+
+    struct PendingChordCandidate
+    {
+        int trackIndex = -1;
+        std::array<double, 12> chroma {};
+        std::array<float, SolititoChordModel::contextFloats> solititoFeatures {};
+        bool hasSolititoFeatures = false;
+    };
+
+    struct TrackState
+    {
+        std::unique_ptr<Chromagram> chromagram;
+        std::unique_ptr<juce::AbstractFifo> audioFifo;
+        ChordDetector chordDetector;
+        std::vector<double> frame;
+        std::array<double, 12> averagedChroma {};
+        std::array<std::array<double, 12>, chromaHistoryFrames> chromaHistory {};
+        std::vector<float> ringBuffer;
+        std::vector<float> readBuffer;
+        double sampleRate = 44100.0;
+        double rmsSmoothed = 0.0;
+        double analysisMsSinceCpuUpdate = 0.0;
+        int samplesSinceCpuUpdate = 0;
+        int analyzerSampleRate = 0;
+        int frameFill = 0;
+        int chromaHistoryWrite = 0;
+        int chromaHistorySize = 0;
+        int pendingChordKey = -1;
+        int pendingChordHits = 0;
+        int pendingNoteRoot = -1;
+        int pendingNoteHits = 0;
+        int displayedChordKey = -1;
+        int invalidChordFrames = 0;
+        std::atomic<bool> resetRequested { false };
+        std::atomic<bool> chordValid { false };
+        std::atomic<bool> noteValid { false };
+        std::atomic<int> chordRoot { -1 };
+        std::atomic<int> noteRoot { -1 };
+        std::atomic<int> chordQuality { ChordDetector::Major };
+        std::atomic<int> chordIntervals { 0 };
+        std::atomic<double> cpuPercent { 0.0 };
+        std::atomic<int> memoryKb { 0 };
+        std::atomic<int> requestedSampleRate { 44100 };
+        std::atomic<long long> droppedSamples { 0 };
+    };
+
+    static int estimateTrackMemoryKb(int fifoSamples = 48000)
     {
         constexpr int bufferSize = 8192;
         constexpr int downsampledFrameSize = 512 / 4;
@@ -2859,18 +2988,69 @@ private:
                                       + 12 + downsampledFrameSize + 512) * sizeof(double);
         const size_t kissFftBuffers = (size_t)bufferSize * 2 * sizeof(float) * 2;
         const size_t fifoBytes = (size_t)juce::jmax(0, fifoSamples) * sizeof(float);
-        const size_t bytes = doubleVectors + kissFftBuffers + fifoBytes + sizeof(ChordDetector) + (64 * 1024);
+        const size_t bytes = doubleVectors + kissFftBuffers + fifoBytes + sizeof(ChordDetector) + 2048;
         return (int)((bytes + 1023) / 1024);
     }
 
-    void copyMonoFramesToRing(const float* input, int inputStartFrame, int numChannels, int ringStart, int count)
+    static int estimateMemoryKb(int fifoSamples = 48000)
+    {
+        return estimateTrackMemoryKb(fifoSamples) * trackCount + 64;
+    }
+
+    int estimateTotalMemoryKb() const
+    {
+        const int fifoSamples = juce::jmax(1, (int)std::round(sampleRate));
+        int total = estimateMemoryKb(fifoSamples);
+        if (solititoModel != nullptr)
+            total += solititoModel->getMemoryKb();
+        return total;
+    }
+
+    TrackState* getTrack(int trackIndex)
+    {
+        return trackIndex >= 0 && trackIndex < trackCount ? &tracks[(size_t)trackIndex] : nullptr;
+    }
+
+    const TrackState* getTrack(int trackIndex) const
+    {
+        return trackIndex >= 0 && trackIndex < trackCount ? &tracks[(size_t)trackIndex] : nullptr;
+    }
+
+    void prepareTrack(TrackState& track, double newSampleRate)
+    {
+        track.sampleRate = newSampleRate > 1.0 ? newSampleRate : 44100.0;
+        track.frame.assign((size_t)frameSize, 0.0);
+        track.averagedChroma.fill(0.0);
+        track.readBuffer.assign((size_t)frameSize * 4, 0.0f);
+        const int newRingSize = juce::jmax(frameSize * 16, (int)std::round(track.sampleRate));
+        track.ringBuffer.assign((size_t)newRingSize, 0.0f);
+        track.audioFifo = std::make_unique<juce::AbstractFifo>(newRingSize);
+        track.frameFill = 0;
+        track.rmsSmoothed = 0.0;
+        track.samplesSinceCpuUpdate = 0;
+        track.analysisMsSinceCpuUpdate = 0.0;
+        track.chromaHistory = {};
+        track.chromaHistoryWrite = 0;
+        track.chromaHistorySize = 0;
+        resetTrackDecisionState(track);
+        track.resetRequested.store(false, std::memory_order_relaxed);
+        track.droppedSamples.store(0, std::memory_order_relaxed);
+        track.cpuPercent.store(0.0, std::memory_order_relaxed);
+
+        const int roundedRate = juce::jlimit(8000, 192000, (int)std::round(track.sampleRate));
+        track.requestedSampleRate.store(roundedRate, std::memory_order_relaxed);
+        configureChromagram(track, roundedRate);
+        track.memoryKb.store(estimateTrackMemoryKb(newRingSize), std::memory_order_relaxed);
+    }
+
+    void copyMonoFramesToRing(TrackState& track, const float* input, int inputStartFrame, int numChannels, int ringStart, int count)
     {
         if (count <= 0)
             return;
 
         if (numChannels <= 1)
         {
-            std::memcpy(ringBuffer.data() + ringStart,
+            std::memcpy(track.ringBuffer.data() + ringStart,
                         input + inputStartFrame,
                         (size_t)count * sizeof(float));
             return;
@@ -2879,160 +3059,332 @@ private:
         for (int i = 0; i < count; ++i)
         {
             const int source = (inputStartFrame + i) * numChannels;
-            ringBuffer[(size_t)(ringStart + i)] = 0.5f * (input[source] + input[source + 1]);
+            track.ringBuffer[(size_t)(ringStart + i)] = 0.5f * (input[source] + input[source + 1]);
         }
     }
 
-    void configureChromagram(int newSampleRate)
+    void configureChromagram(TrackState& track, int newSampleRate)
     {
-        analyzerSampleRate = juce::jlimit(8000, 192000, newSampleRate);
-        sampleRate = (double)analyzerSampleRate;
-        chromagram = std::make_unique<Chromagram>(frameSize, analyzerSampleRate);
-        chromagram->setChromaCalculationInterval(chromaCalculationIntervalSamples);
-        frameFill = 0;
-        rmsSmoothed = 0.0;
-        chromaHistory = {};
-        chromaHistoryWrite = 0;
-        chromaHistorySize = 0;
-        resetChordDecisionState();
+        track.analyzerSampleRate = juce::jlimit(8000, 192000, newSampleRate);
+        track.sampleRate = (double)track.analyzerSampleRate;
+        track.chromagram = std::make_unique<Chromagram>(frameSize, track.analyzerSampleRate);
+        track.chromagram->setChromaCalculationInterval(chromaCalculationIntervalSamples);
+        track.frameFill = 0;
+        track.rmsSmoothed = 0.0;
+        track.chromaHistory = {};
+        track.chromaHistoryWrite = 0;
+        track.chromaHistorySize = 0;
+        resetTrackDecisionState(track);
     }
 
     void run() override
     {
+        std::vector<PendingChordCandidate> chordBatch;
+        chordBatch.reserve((size_t)trackCount);
+
         while (!threadShouldExit())
         {
-            if (!readAvailableSamples())
+            chordBatch.clear();
+            bool didWork = false;
+
+            for (int i = 0; i < trackCount; ++i)
+            {
+                auto& track = tracks[(size_t)i];
+                if (track.resetRequested.exchange(false, std::memory_order_acquire))
+                {
+                    resetTrackAnalysis(track, i);
+                    didWork = true;
+                }
+
+                if (readAvailableSamples(track, i, chordBatch))
+                    didWork = true;
+            }
+
+            if (!chordBatch.empty())
+                classifyChordBatch(chordBatch);
+
+            if (!didWork)
                 samplesAvailable.wait(20);
         }
     }
 
-    bool readAvailableSamples()
+    bool readAvailableSamples(TrackState& track, int trackIndex, std::vector<PendingChordCandidate>& chordBatch)
     {
         if (!ready.load(std::memory_order_acquire))
             return false;
 
-        if (audioFifo == nullptr || ringBuffer.empty() || readBuffer.empty())
+        if (track.audioFifo == nullptr || track.ringBuffer.empty() || track.readBuffer.empty())
             return false;
 
-        const int requestedRate = requestedSampleRate.load(std::memory_order_relaxed);
-        if (chromagram == nullptr || requestedRate != analyzerSampleRate)
-            configureChromagram(requestedRate);
+        const int requestedRate = track.requestedSampleRate.load(std::memory_order_relaxed);
+        if (track.chromagram == nullptr || requestedRate != track.analyzerSampleRate)
+            configureChromagram(track, requestedRate);
 
-        const int available = audioFifo->getNumReady();
+        const int available = track.audioFifo->getNumReady();
         if (available <= 0)
             return false;
 
-        const int toRead = juce::jmin(available, (int)readBuffer.size());
+        const int toRead = juce::jmin(available, (int)track.readBuffer.size());
         int start1 = 0;
         int size1 = 0;
         int start2 = 0;
         int size2 = 0;
-        audioFifo->prepareToRead(toRead, start1, size1, start2, size2);
+        track.audioFifo->prepareToRead(toRead, start1, size1, start2, size2);
 
         if (size1 > 0)
-            std::memcpy(readBuffer.data(), ringBuffer.data() + start1, (size_t)size1 * sizeof(float));
+            std::memcpy(track.readBuffer.data(), track.ringBuffer.data() + start1, (size_t)size1 * sizeof(float));
         if (size2 > 0)
-            std::memcpy(readBuffer.data() + size1, ringBuffer.data() + start2, (size_t)size2 * sizeof(float));
+            std::memcpy(track.readBuffer.data() + size1, track.ringBuffer.data() + start2, (size_t)size2 * sizeof(float));
 
-        audioFifo->finishedRead(size1 + size2);
+        track.audioFifo->finishedRead(size1 + size2);
 
         const double startMs = juce::Time::getMillisecondCounterHiRes();
         const int samplesRead = size1 + size2;
-        for (int i = 0; i < samplesRead; ++i)
+        if (solititoModel != nullptr && solititoModel->isAvailable())
         {
-            frame[(size_t)frameFill++] = (double)readBuffer[(size_t)i];
-            if (frameFill >= frameSize)
+            std::vector<SolititoChordModel::Candidate> solititoCandidates;
+            solititoModel->appendSamples(trackIndex,
+                                         track.readBuffer.data(),
+                                         samplesRead,
+                                         requestedRate,
+                                         solititoCandidates);
+
+            for (const auto& solititoCandidate : solititoCandidates)
             {
-                processFrame();
-                frameFill = 0;
+                PendingChordCandidate candidate;
+                candidate.trackIndex = solititoCandidate.trackIndex;
+                candidate.solititoFeatures = solititoCandidate.features;
+                candidate.hasSolititoFeatures = true;
+                chordBatch.push_back(candidate);
+            }
+
+            double energy = 0.0;
+            for (int i = 0; i < samplesRead; ++i)
+                energy += (double)track.readBuffer[(size_t)i] * (double)track.readBuffer[(size_t)i];
+            const double blockRms = samplesRead > 0 ? std::sqrt(energy / (double)samplesRead) : 0.0;
+            if (blockRms < silenceRmsThreshold)
+                noteInvalidChordFrame(track);
+        }
+        else
+        {
+            for (int i = 0; i < samplesRead; ++i)
+            {
+                track.frame[(size_t)track.frameFill++] = (double)track.readBuffer[(size_t)i];
+                if (track.frameFill >= frameSize)
+                {
+                    processFrame(track, trackIndex, chordBatch);
+                    track.frameFill = 0;
+                }
             }
         }
 
         const double elapsedMs = juce::Time::getMillisecondCounterHiRes() - startMs;
-        analysisMsSinceCpuUpdate += juce::jmax(0.0, elapsedMs);
-        samplesSinceCpuUpdate += samplesRead;
-
-        const int updateSamples = juce::jmax(1, (int)std::round(sampleRate));
-        if (samplesSinceCpuUpdate >= updateSamples)
-        {
-            const double realTimeMs = ((double)samplesSinceCpuUpdate / sampleRate) * 1000.0;
-            const double rawCpu = realTimeMs > 0.0 ? (analysisMsSinceCpuUpdate / realTimeMs) * 100.0 : 0.0;
-            const double previous = cpuPercent.load(std::memory_order_relaxed);
-            const double smoothed = previous <= 0.0 ? rawCpu : previous * 0.75 + rawCpu * 0.25;
-            cpuPercent.store(juce::jlimit(0.0, 200.0, smoothed), std::memory_order_relaxed);
-            analysisMsSinceCpuUpdate = 0.0;
-            samplesSinceCpuUpdate = 0;
-        }
+        track.analysisMsSinceCpuUpdate += juce::jmax(0.0, elapsedMs);
+        updateCpuUsage(track, samplesRead);
 
         return true;
     }
 
-    void processFrame()
+    void updateCpuUsage(TrackState& track, int samplesRead)
     {
-        double energy = 0.0;
-        for (double sample : frame)
-            energy += sample * sample;
+        track.samplesSinceCpuUpdate += samplesRead;
 
-        const double frameRms = std::sqrt(energy / (double)frame.size());
-        rmsSmoothed = frameRms > rmsSmoothed ? frameRms : rmsSmoothed * 0.92 + frameRms * 0.08;
+        const int updateSamples = juce::jmax(1, (int)std::round(track.sampleRate));
+        if (track.samplesSinceCpuUpdate >= updateSamples)
+        {
+            const double realTimeMs = ((double)track.samplesSinceCpuUpdate / track.sampleRate) * 1000.0;
+            const double rawCpu = realTimeMs > 0.0 ? (track.analysisMsSinceCpuUpdate / realTimeMs) * 100.0 : 0.0;
+            const double previous = track.cpuPercent.load(std::memory_order_relaxed);
+            const double smoothed = previous <= 0.0 ? rawCpu : previous * 0.75 + rawCpu * 0.25;
+            track.cpuPercent.store(juce::jlimit(0.0, 200.0, smoothed), std::memory_order_relaxed);
+            track.analysisMsSinceCpuUpdate = 0.0;
+            track.samplesSinceCpuUpdate = 0;
+        }
+    }
 
-        chromagram->processAudioFrame(frame.data());
-        if (!chromagram->isReady())
+    void resetTrackAnalysis(TrackState& track, int trackIndex)
+    {
+        if (solititoModel != nullptr)
+            solititoModel->resetTrack(trackIndex);
+
+        discardQueuedAudio(track);
+        track.frameFill = 0;
+        track.rmsSmoothed = 0.0;
+        track.samplesSinceCpuUpdate = 0;
+        track.analysisMsSinceCpuUpdate = 0.0;
+        track.averagedChroma.fill(0.0);
+        track.chromaHistory = {};
+        track.chromaHistoryWrite = 0;
+        track.chromaHistorySize = 0;
+        resetTrackDecisionState(track);
+    }
+
+    void discardQueuedAudio(TrackState& track)
+    {
+        if (track.audioFifo == nullptr || track.readBuffer.empty())
             return;
 
-        if (rmsSmoothed < silenceRmsThreshold)
+        while (track.audioFifo->getNumReady() > 0)
         {
-            noteInvalidChordFrame();
+            const int toRead = juce::jmin(track.audioFifo->getNumReady(), (int)track.readBuffer.size());
+            if (toRead <= 0)
+                break;
+
+            int start1 = 0;
+            int size1 = 0;
+            int start2 = 0;
+            int size2 = 0;
+            track.audioFifo->prepareToRead(toRead, start1, size1, start2, size2);
+            track.audioFifo->finishedRead(size1 + size2);
+        }
+    }
+
+    void processFrame(TrackState& track, int trackIndex, std::vector<PendingChordCandidate>& chordBatch)
+    {
+        double energy = 0.0;
+        for (double sample : track.frame)
+            energy += sample * sample;
+
+        const double frameRms = std::sqrt(energy / (double)track.frame.size());
+        track.rmsSmoothed = frameRms > track.rmsSmoothed ? frameRms : track.rmsSmoothed * 0.92 + frameRms * 0.08;
+
+        track.chromagram->processAudioFrame(track.frame.data());
+        if (!track.chromagram->isReady())
+            return;
+
+        if (track.rmsSmoothed < silenceRmsThreshold)
+        {
+            noteInvalidChordFrame(track);
             return;
         }
 
-        auto chroma = chromagram->getChromagram();
+        auto chroma = track.chromagram->getChromagram();
         double chromaTotal = 0.0;
         for (double value : chroma)
             chromaTotal += std::abs(value);
 
         if (chromaTotal <= 1.0e-9)
         {
-            noteInvalidChordFrame();
+            noteInvalidChordFrame(track);
             return;
         }
 
-        chromaHistory[(size_t)chromaHistoryWrite].fill(0.0);
+        track.chromaHistory[(size_t)track.chromaHistoryWrite].fill(0.0);
         for (int i = 0; i < 12 && i < (int)chroma.size(); ++i)
-            chromaHistory[(size_t)chromaHistoryWrite][(size_t)i] = chroma[(size_t)i];
-        chromaHistoryWrite = (chromaHistoryWrite + 1) % chromaHistoryFrames;
-        chromaHistorySize = juce::jmin(chromaHistorySize + 1, chromaHistoryFrames);
+            track.chromaHistory[(size_t)track.chromaHistoryWrite][(size_t)i] = chroma[(size_t)i];
+        track.chromaHistoryWrite = (track.chromaHistoryWrite + 1) % chromaHistoryFrames;
+        track.chromaHistorySize = juce::jmin(track.chromaHistorySize + 1, chromaHistoryFrames);
 
-        averagedChroma.assign(12, 0.0);
-        for (int h = 0; h < chromaHistorySize; ++h)
+        track.averagedChroma.fill(0.0);
+        for (int h = 0; h < track.chromaHistorySize; ++h)
             for (int i = 0; i < 12; ++i)
-                averagedChroma[(size_t)i] += chromaHistory[(size_t)h][(size_t)i];
+                track.averagedChroma[(size_t)i] += track.chromaHistory[(size_t)h][(size_t)i];
 
-        const double scale = 1.0 / (double)juce::jmax(1, chromaHistorySize);
-        for (double& value : averagedChroma)
+        const double scale = 1.0 / (double)juce::jmax(1, track.chromaHistorySize);
+        for (double& value : track.averagedChroma)
             value *= scale;
 
         int dominantPitchClass = -1;
-        if (hasEnoughHarmonicContent(averagedChroma))
+        if (hasEnoughHarmonicContent(track.averagedChroma))
         {
-            chordDetector.detectChord(averagedChroma);
-            if (chordDetector.rootNote < 0 || chordDetector.rootNote >= 12)
+            PendingChordCandidate candidate;
+            candidate.trackIndex = trackIndex;
+            candidate.chroma = track.averagedChroma;
+            chordBatch.push_back(candidate);
+            return;
+        }
+
+        if (!hasDominantPitchClass(track.averagedChroma, dominantPitchClass))
+        {
+            noteInvalidChordFrame(track);
+            return;
+        }
+
+        publishNoteCandidate(track, dominantPitchClass);
+    }
+
+    void classifyChordBatch(std::vector<PendingChordCandidate>& chordBatch)
+    {
+        const double startMs = juce::Time::getMillisecondCounterHiRes();
+
+        if (solititoModel != nullptr && solititoModel->isAvailable())
+        {
+            std::array<int, trackCount> latestSolititoCandidateByTrack;
+            latestSolititoCandidateByTrack.fill(-1);
+            for (int i = 0; i < (int)chordBatch.size(); ++i)
             {
-                noteInvalidChordFrame();
-                return;
+                const auto& candidate = chordBatch[(size_t)i];
+                if (candidate.hasSolititoFeatures && candidate.trackIndex >= 0 && candidate.trackIndex < trackCount)
+                    latestSolititoCandidateByTrack[(size_t)candidate.trackIndex] = i;
             }
 
-            publishChordCandidate(chordDetector.rootNote, chordDetector.quality, chordDetector.intervals);
-            return;
+            std::vector<SolititoChordModel::Candidate> solititoCandidates;
+            solititoCandidates.reserve((size_t)trackCount);
+            for (int latestIndex : latestSolititoCandidateByTrack)
+            {
+                if (latestIndex < 0)
+                    continue;
+
+                const auto& candidate = chordBatch[(size_t)latestIndex];
+                SolititoChordModel::Candidate solititoCandidate;
+                solititoCandidate.trackIndex = candidate.trackIndex;
+                solititoCandidate.features = candidate.solititoFeatures;
+                solititoCandidates.push_back(solititoCandidate);
+            }
+
+            std::vector<SolititoChordModel::Prediction> predictions;
+            if (!solititoCandidates.empty() && solititoModel->runBatch(solititoCandidates, predictions))
+            {
+                for (const auto& prediction : predictions)
+                {
+                    auto* track = getTrack(prediction.trackIndex);
+                    if (track == nullptr || track->resetRequested.load(std::memory_order_acquire))
+                        continue;
+
+                    if (prediction.isNoise || prediction.root < 0 || prediction.root >= 12 || prediction.confidence < 0.05f)
+                    {
+                        noteInvalidChordFrame(*track);
+                        continue;
+                    }
+
+                    if (prediction.isNote)
+                        publishNoteCandidate(*track, prediction.root);
+                    else
+                        publishChordCandidate(*track, prediction.root, prediction.quality, prediction.intervals);
+                }
+            }
         }
 
-        if (!hasDominantPitchClass(averagedChroma, dominantPitchClass))
+        for (auto& candidate : chordBatch)
         {
-            noteInvalidChordFrame();
-            return;
+            if (candidate.hasSolititoFeatures)
+                continue;
+
+            auto* track = getTrack(candidate.trackIndex);
+            if (track == nullptr || track->resetRequested.load(std::memory_order_acquire))
+                continue;
+
+            track->chordDetector.detectChord(candidate.chroma.data());
+            if (track->chordDetector.rootNote < 0 || track->chordDetector.rootNote >= 12)
+            {
+                noteInvalidChordFrame(*track);
+                continue;
+            }
+
+            publishChordCandidate(*track,
+                                  track->chordDetector.rootNote,
+                                  track->chordDetector.quality,
+                                  track->chordDetector.intervals);
         }
 
-        publishNoteCandidate(dominantPitchClass);
+        const double elapsedMs = juce::jmax(0.0, juce::Time::getMillisecondCounterHiRes() - startMs);
+        if (elapsedMs > 0.0 && !chordBatch.empty())
+        {
+            const double perCandidateMs = elapsedMs / (double)chordBatch.size();
+            for (const auto& candidate : chordBatch)
+                if (auto* track = getTrack(candidate.trackIndex))
+                    track->analysisMsSinceCpuUpdate += perCandidateMs;
+        }
     }
 
     static int makeChordKey(int root, int quality, int intervals)
@@ -3040,34 +3392,34 @@ private:
         return root * 100 + quality * 10 + intervals;
     }
 
-    void resetChordDecisionState()
+    static void resetTrackDecisionState(TrackState& track)
     {
-        pendingChordKey = -1;
-        pendingChordHits = 0;
-        pendingNoteRoot = -1;
-        pendingNoteHits = 0;
-        displayedChordKey = -1;
-        invalidChordFrames = 0;
-        chordRoot.store(-1, std::memory_order_relaxed);
-        chordQuality.store(ChordDetector::Major, std::memory_order_relaxed);
-        chordIntervals.store(0, std::memory_order_relaxed);
-        chordValid.store(false, std::memory_order_relaxed);
-        noteRoot.store(-1, std::memory_order_relaxed);
-        noteValid.store(false, std::memory_order_relaxed);
+        track.pendingChordKey = -1;
+        track.pendingChordHits = 0;
+        track.pendingNoteRoot = -1;
+        track.pendingNoteHits = 0;
+        track.displayedChordKey = -1;
+        track.invalidChordFrames = 0;
+        track.chordRoot.store(-1, std::memory_order_relaxed);
+        track.chordQuality.store(ChordDetector::Major, std::memory_order_relaxed);
+        track.chordIntervals.store(0, std::memory_order_relaxed);
+        track.chordValid.store(false, std::memory_order_relaxed);
+        track.noteRoot.store(-1, std::memory_order_relaxed);
+        track.noteValid.store(false, std::memory_order_relaxed);
     }
 
-    void noteInvalidChordFrame()
+    static void noteInvalidChordFrame(TrackState& track)
     {
-        pendingChordKey = -1;
-        pendingChordHits = 0;
-        pendingNoteRoot = -1;
-        pendingNoteHits = 0;
+        track.pendingChordKey = -1;
+        track.pendingChordHits = 0;
+        track.pendingNoteRoot = -1;
+        track.pendingNoteHits = 0;
 
-        if (++invalidChordFrames >= invalidClearThresholdFrames)
-            resetChordDecisionState();
+        if (++track.invalidChordFrames >= invalidClearThresholdFrames)
+            resetTrackDecisionState(track);
     }
 
-    static bool hasEnoughHarmonicContent(const std::vector<double>& chroma)
+    static bool hasEnoughHarmonicContent(const std::array<double, 12>& chroma)
     {
         double sum = 0.0;
         double max1 = 0.0;
@@ -3122,7 +3474,7 @@ private:
         return strongPitchClasses >= 2;
     }
 
-    static bool hasDominantPitchClass(const std::vector<double>& chroma, int& dominantPitchClass)
+    static bool hasDominantPitchClass(const std::array<double, 12>& chroma, int& dominantPitchClass)
     {
         dominantPitchClass = -1;
 
@@ -3130,7 +3482,7 @@ private:
         double max1 = 0.0;
         int strongPitchClasses = 0;
 
-        for (int i = 0; i < 12 && i < (int)chroma.size(); ++i)
+        for (int i = 0; i < 12; ++i)
         {
             const double v = std::abs(chroma[(size_t)i]);
             sum += v;
@@ -3159,115 +3511,76 @@ private:
         return strongPitchClasses <= 4;
     }
 
-    void publishNoteCandidate(int root)
+    static void publishNoteCandidate(TrackState& track, int root)
     {
-        invalidChordFrames = 0;
-        pendingChordKey = -1;
-        pendingChordHits = 0;
+        track.invalidChordFrames = 0;
+        track.pendingChordKey = -1;
+        track.pendingChordHits = 0;
 
-        if (root == pendingNoteRoot)
-            pendingNoteHits = juce::jmin(pendingNoteHits + 1, 1000);
+        if (root == track.pendingNoteRoot)
+            track.pendingNoteHits = juce::jmin(track.pendingNoteHits + 1, 1000);
         else
         {
-            pendingNoteRoot = root;
-            pendingNoteHits = 1;
+            track.pendingNoteRoot = root;
+            track.pendingNoteHits = 1;
         }
 
-        const int displayedNote = noteRoot.load(std::memory_order_relaxed);
-        if (noteValid.load(std::memory_order_relaxed) && root == displayedNote)
+        const int displayedNote = track.noteRoot.load(std::memory_order_relaxed);
+        if (track.noteValid.load(std::memory_order_relaxed) && root == displayedNote)
             return;
 
         const int requiredHits = displayedNote >= 0 ? stableNoteChangeHitThreshold : stableNoteHitThreshold;
-        if (pendingNoteHits < requiredHits)
+        if (track.pendingNoteHits < requiredHits)
             return;
 
-        noteRoot.store(root, std::memory_order_relaxed);
-        noteValid.store(true, std::memory_order_relaxed);
-        chordValid.store(false, std::memory_order_relaxed);
+        track.noteRoot.store(root, std::memory_order_relaxed);
+        track.noteValid.store(true, std::memory_order_relaxed);
+        track.chordValid.store(false, std::memory_order_relaxed);
     }
 
-    void publishChordCandidate(int root, int quality, int intervals)
+    static void publishChordCandidate(TrackState& track, int root, int quality, int intervals)
     {
         const int candidateKey = makeChordKey(root, quality, intervals);
-        invalidChordFrames = 0;
-        pendingNoteRoot = -1;
-        pendingNoteHits = 0;
+        track.invalidChordFrames = 0;
+        track.pendingNoteRoot = -1;
+        track.pendingNoteHits = 0;
 
-        if (candidateKey == pendingChordKey)
-            pendingChordHits = juce::jmin(pendingChordHits + 1, 1000);
+        if (candidateKey == track.pendingChordKey)
+            track.pendingChordHits = juce::jmin(track.pendingChordHits + 1, 1000);
         else
         {
-            pendingChordKey = candidateKey;
-            pendingChordHits = 1;
+            track.pendingChordKey = candidateKey;
+            track.pendingChordHits = 1;
         }
 
-        if (candidateKey == displayedChordKey)
+        if (candidateKey == track.displayedChordKey)
         {
-            noteRoot.store(-1, std::memory_order_relaxed);
-            noteValid.store(false, std::memory_order_relaxed);
-            chordValid.store(true, std::memory_order_relaxed);
+            track.noteRoot.store(-1, std::memory_order_relaxed);
+            track.noteValid.store(false, std::memory_order_relaxed);
+            track.chordValid.store(true, std::memory_order_relaxed);
             return;
         }
 
-        const int requiredHits = displayedChordKey >= 0 ? stableChordChangeHitThreshold : stableCandidateHitThreshold;
-        if (pendingChordHits < requiredHits)
+        const int requiredHits = track.displayedChordKey >= 0 ? stableChordChangeHitThreshold : stableCandidateHitThreshold;
+        if (track.pendingChordHits < requiredHits)
             return;
 
-        displayedChordKey = candidateKey;
-        chordRoot.store(root, std::memory_order_relaxed);
-        chordQuality.store(quality, std::memory_order_relaxed);
-        chordIntervals.store(intervals, std::memory_order_relaxed);
-        noteRoot.store(-1, std::memory_order_relaxed);
-        noteValid.store(false, std::memory_order_relaxed);
-        chordValid.store(true, std::memory_order_relaxed);
+        track.displayedChordKey = candidateKey;
+        track.chordRoot.store(root, std::memory_order_relaxed);
+        track.chordQuality.store(quality, std::memory_order_relaxed);
+        track.chordIntervals.store(intervals, std::memory_order_relaxed);
+        track.noteRoot.store(-1, std::memory_order_relaxed);
+        track.noteValid.store(false, std::memory_order_relaxed);
+        track.chordValid.store(true, std::memory_order_relaxed);
     }
 
-    static constexpr int frameSize = 512;
-    static constexpr int chromaCalculationIntervalSamples = 2048;
-    static constexpr int chromaHistoryFrames = 8;
-    static constexpr int stableCandidateHitThreshold = 3;
-    static constexpr int stableChordChangeHitThreshold = 6;
-    static constexpr int stableNoteHitThreshold = 1;
-    static constexpr int stableNoteChangeHitThreshold = 4;
-    static constexpr int invalidClearThresholdFrames = 8;
-    static constexpr double silenceRmsThreshold = 0.001;
-
-    std::unique_ptr<Chromagram> chromagram;
-    std::unique_ptr<juce::AbstractFifo> audioFifo;
-    ChordDetector chordDetector;
-    std::vector<double> frame;
-    std::vector<double> averagedChroma;
-    std::array<std::array<double, 12>, chromaHistoryFrames> chromaHistory {};
-    std::vector<float> ringBuffer;
-    std::vector<float> readBuffer;
+    std::array<TrackState, trackCount> tracks;
+    std::unique_ptr<SolititoChordModel> solititoModel;
     juce::WaitableEvent samplesAvailable;
     double sampleRate = 44100.0;
-    double rmsSmoothed = 0.0;
-    double analysisMsSinceCpuUpdate = 0.0;
-    int samplesSinceCpuUpdate = 0;
-    int analyzerSampleRate = 0;
-    int frameFill = 0;
-    int chromaHistoryWrite = 0;
-    int chromaHistorySize = 0;
-    int pendingChordKey = -1;
-    int pendingChordHits = 0;
-    int pendingNoteRoot = -1;
-    int pendingNoteHits = 0;
-    int displayedChordKey = -1;
-    int invalidChordFrames = 0;
     std::atomic<bool> ready { false };
-    std::atomic<bool> chordValid { false };
-    std::atomic<bool> noteValid { false };
-    std::atomic<int> chordRoot { -1 };
-    std::atomic<int> noteRoot { -1 };
-    std::atomic<int> chordQuality { ChordDetector::Major };
-    std::atomic<int> chordIntervals { 0 };
-    std::atomic<double> cpuPercent { 0.0 };
     std::atomic<int> memoryKb { 0 };
-    std::atomic<int> requestedSampleRate { 44100 };
-    std::atomic<long long> droppedSamples { 0 };
 };
-
 class AsyncChatTranslationWorker final : private juce::Thread
 {
 public:
@@ -5398,10 +5711,8 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
         return std::sin(x);
     });
 
-    localChordAnalyzer = std::make_unique<LocalChordAnalyzer>();
+    chordAnalyzer = std::make_unique<BatchedChordAnalyzer>();
     linkTimingState = std::make_unique<LinkTimingState>();
-    for (auto& analyzer : remoteChordAnalyzers)
-        analyzer = std::make_unique<LocalChordAnalyzer>();
 
     setLatencySamples(0);
     startTimer(20); // Run NINJAM client loop every 20ms
@@ -9669,14 +9980,12 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
                 {
                     remoteChordUserKeys[(size_t)i] = u.name;
                     remoteChordDetectionEnabled[(size_t)i].store(true, std::memory_order_relaxed);
-                    auto& analyzer = remoteChordAnalyzers[(size_t)i];
-                    if (analyzer && analyzer->isPrepared())
-                        analyzer->markNoInput();
+                    if (chordAnalyzer && chordAnalyzer->isPrepared())
+                        chordAnalyzer->resetTrack(BatchedChordAnalyzer::remoteTrackIndexForUser(i));
                 }
 
-                auto& analyzer = remoteChordAnalyzers[(size_t)i];
-                if (analyzer && !analyzer->isPrepared())
-                    analyzer->prepare(processingSampleRate);
+                if (chordAnalyzer && !chordAnalyzer->isPrepared())
+                    chordAnalyzer->prepare(processingSampleRate);
             }
 
             users.push_back(u);
@@ -9687,9 +9996,8 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
     {
         remoteChordUserKeys[(size_t)i].clear();
         remoteChordDetectionEnabled[(size_t)i].store(true, std::memory_order_relaxed);
-        auto& analyzer = remoteChordAnalyzers[(size_t)i];
-        if (analyzer && analyzer->isPrepared())
-            analyzer->markNoInput();
+        if (chordAnalyzer && chordAnalyzer->isPrepared())
+            chordAnalyzer->resetTrack(BatchedChordAnalyzer::remoteTrackIndexForUser(i));
     }
 
     for (auto it = remoteUserNameByIndex.begin(); it != remoteUserNameByIndex.end();)
@@ -9742,9 +10050,8 @@ void NinjamVst3AudioProcessor::resetRemoteUserIndexState(int userIndex, const ju
     {
         remoteChordDetectionEnabled[(size_t)userIndex].store(true, std::memory_order_relaxed);
         remoteChordUserKeys[(size_t)userIndex].clear();
-        auto& analyzer = remoteChordAnalyzers[(size_t)userIndex];
-        if (analyzer && analyzer->isPrepared())
-            analyzer->markNoInput();
+        if (chordAnalyzer && chordAnalyzer->isPrepared())
+            chordAnalyzer->resetTrack(BatchedChordAnalyzer::remoteTrackIndexForUser(userIndex));
     }
 
     float baseVol = 1.0f;
@@ -10226,7 +10533,7 @@ juce::String NinjamVst3AudioProcessor::getLocalChordLabel() const
     if (!isChordDetectionEnabled())
         return "Off";
 
-    return localChordAnalyzer ? localChordAnalyzer->getLabel() : "--";
+    return chordAnalyzer ? chordAnalyzer->getLabel(BatchedChordAnalyzer::localTrackIndex) : "--";
 }
 
 double NinjamVst3AudioProcessor::getLocalChordCpuPercent() const
@@ -10234,12 +10541,39 @@ double NinjamVst3AudioProcessor::getLocalChordCpuPercent() const
     if (!isChordDetectionEnabled())
         return 0.0;
 
-    return localChordAnalyzer ? localChordAnalyzer->getCpuPercent() : 0.0;
+    return chordAnalyzer ? chordAnalyzer->getCpuPercent(BatchedChordAnalyzer::localTrackIndex) : 0.0;
 }
 
 int NinjamVst3AudioProcessor::getLocalChordMemoryKb() const
 {
-    return localChordAnalyzer ? localChordAnalyzer->getMemoryKb() : 0;
+    return chordAnalyzer ? chordAnalyzer->getMemoryKb(BatchedChordAnalyzer::localTrackIndex) : 0;
+}
+
+juce::String NinjamVst3AudioProcessor::getMasterChordLabel() const
+{
+    if (!isChordDetectionEnabled())
+        return "Off";
+
+    return chordAnalyzer ? chordAnalyzer->getLabel(BatchedChordAnalyzer::masterTrackIndex) : "--";
+}
+
+double NinjamVst3AudioProcessor::getMasterChordCpuPercent() const
+{
+    if (!isChordDetectionEnabled())
+        return 0.0;
+
+    return chordAnalyzer ? chordAnalyzer->getCpuPercent(BatchedChordAnalyzer::masterTrackIndex) : 0.0;
+}
+
+int NinjamVst3AudioProcessor::getMasterChordMemoryKb() const
+{
+    return chordAnalyzer ? chordAnalyzer->getMemoryKb(BatchedChordAnalyzer::masterTrackIndex) : 0;
+}
+
+std::vector<juce::String> NinjamVst3AudioProcessor::getMasterChordTimeline() const
+{
+    const juce::ScopedLock lock(masterChordTimelineLock);
+    return masterChordTimeline;
 }
 
 juce::String NinjamVst3AudioProcessor::getUserChordLabel(int userIndex) const
@@ -10250,8 +10584,7 @@ juce::String NinjamVst3AudioProcessor::getUserChordLabel(int userIndex) const
     if (!isChordDetectionEnabled() || !isUserChordDetectionEnabled(userIndex))
         return "Off";
 
-    const auto& analyzer = remoteChordAnalyzers[(size_t)userIndex];
-    return analyzer ? analyzer->getLabel() : "--";
+    return chordAnalyzer ? chordAnalyzer->getLabel(BatchedChordAnalyzer::remoteTrackIndexForUser(userIndex)) : "--";
 }
 
 double NinjamVst3AudioProcessor::getUserChordCpuPercent(int userIndex) const
@@ -10262,22 +10595,25 @@ double NinjamVst3AudioProcessor::getUserChordCpuPercent(int userIndex) const
     if (!isChordDetectionEnabled() || !isUserChordDetectionEnabled(userIndex))
         return 0.0;
 
-    const auto& analyzer = remoteChordAnalyzers[(size_t)userIndex];
-    return analyzer ? analyzer->getCpuPercent() : 0.0;
+    return chordAnalyzer ? chordAnalyzer->getCpuPercent(BatchedChordAnalyzer::remoteTrackIndexForUser(userIndex)) : 0.0;
 }
 
 void NinjamVst3AudioProcessor::setChordDetectionEnabled(bool enabled)
 {
     chordDetectionEnabled.store(enabled, std::memory_order_relaxed);
 
+    if (!enabled && chordAnalyzer)
+    {
+        chordAnalyzer->markAllNoInput();
+        chordAnalyzer->resetAllTracks();
+    }
+
     if (!enabled)
     {
-        if (localChordAnalyzer)
-            localChordAnalyzer->markNoInput();
-
-        for (auto& analyzer : remoteChordAnalyzers)
-            if (analyzer && analyzer->isPrepared())
-                analyzer->markNoInput();
+        const juce::ScopedLock lock(masterChordTimelineLock);
+        masterChordTimeline.clear();
+        masterChordTimelineInterval = -1;
+        masterChordTimelineBpi = 0;
     }
 }
 
@@ -10293,9 +10629,8 @@ void NinjamVst3AudioProcessor::setUserChordDetectionEnabled(int userIndex, bool 
 
     remoteChordDetectionEnabled[(size_t)userIndex].store(enabled, std::memory_order_relaxed);
 
-    const auto& analyzer = remoteChordAnalyzers[(size_t)userIndex];
-    if (analyzer && analyzer->isPrepared())
-        analyzer->markNoInput();
+    if (chordAnalyzer && chordAnalyzer->isPrepared())
+        chordAnalyzer->resetTrack(BatchedChordAnalyzer::remoteTrackIndexForUser(userIndex));
 }
 
 bool NinjamVst3AudioProcessor::isUserChordDetectionEnabled(int userIndex) const
@@ -10306,15 +10641,52 @@ bool NinjamVst3AudioProcessor::isUserChordDetectionEnabled(int userIndex) const
     return remoteChordDetectionEnabled[(size_t)userIndex].load(std::memory_order_relaxed);
 }
 
+void NinjamVst3AudioProcessor::updateMasterChordTimeline()
+{
+    const int bpi = juce::jlimit(1, 256, cachedNinjamBpi.load(std::memory_order_relaxed));
+    const int interval = getDisplayIntervalIndex();
+    const int transportLength = cachedNinjamTransportLen.load(std::memory_order_relaxed);
+    const int transportPosition = cachedNinjamTransportPos.load(std::memory_order_relaxed);
+    int beatIndex = 0;
+
+    if (transportLength > 0)
+    {
+        const double progress = juce::jlimit(0.0, 0.999999, (double)juce::jlimit(0, transportLength - 1, transportPosition) / (double)transportLength);
+        beatIndex = juce::jlimit(0, bpi - 1, (int)std::floor(progress * (double)bpi));
+    }
+    else
+    {
+        const double progress = juce::jlimit(0.0, 0.999999, (double)getIntervalProgress());
+        beatIndex = juce::jlimit(0, bpi - 1, (int)std::floor(progress * (double)bpi));
+    }
+
+    const juce::String label = getMasterChordLabel();
+    const bool hasChord = isChordDetectionEnabled()
+                       && label.isNotEmpty()
+                       && label != "--"
+                       && label != "Off"
+                       && label != "Noise";
+
+    const juce::ScopedLock lock(masterChordTimelineLock);
+    if (masterChordTimelineInterval != interval
+        || masterChordTimelineBpi != bpi
+        || (int)masterChordTimeline.size() != bpi)
+    {
+        masterChordTimeline.assign((size_t)bpi, "--");
+        masterChordTimelineInterval = interval;
+        masterChordTimelineBpi = bpi;
+    }
+
+    if (hasChord)
+        masterChordTimeline[(size_t)beatIndex] = label;
+}
 int NinjamVst3AudioProcessor::getUserChordMemoryKb(int userIndex) const
 {
     if (userIndex < 0 || userIndex >= maxRemoteChordUsers)
         return 0;
 
-    const auto& analyzer = remoteChordAnalyzers[(size_t)userIndex];
-    return analyzer ? analyzer->getMemoryKb() : 0;
+    return chordAnalyzer ? chordAnalyzer->getMemoryKb(BatchedChordAnalyzer::remoteTrackIndexForUser(userIndex)) : 0;
 }
-
 void NinjamVst3AudioProcessor::clearRemoteAudioTapBuffers()
 {
     const juce::SpinLock::ScopedLockType lock(remoteAudioTapLock);
@@ -10418,17 +10790,17 @@ void NinjamVst3AudioProcessor::RemoteChannelAudioTap_Callback(void* userData,
                        self->remoteAudioTapAvailableSamples[(size_t)useridx] + framesToCopy);
     }
 
-    auto& analyzer = self->remoteChordAnalyzers[(size_t)useridx];
-    if (analyzer == nullptr)
+    if (self->chordAnalyzer == nullptr)
         return;
 
+    const int trackIndex = BatchedChordAnalyzer::remoteTrackIndexForUser(useridx);
     if (!self->isChordDetectionEnabled() || !self->isUserChordDetectionEnabled(useridx))
     {
-        analyzer->markNoInput();
+        self->chordAnalyzer->markNoInput(trackIndex);
         return;
     }
 
-    analyzer->processInterleavedBlock(interleaved, numFrames, numChannels, sampleRate);
+    self->chordAnalyzer->processInterleavedBlock(trackIndex, interleaved, numFrames, numChannels, sampleRate);
 }
 
 void NinjamVst3AudioProcessor::setLocalMonitorEnabled(bool enabled)
@@ -11172,9 +11544,7 @@ void NinjamVst3AudioProcessor::refreshPublicServers()
 NinjamVst3AudioProcessor::~NinjamVst3AudioProcessor()
 {
     beginStandaloneShutdown();
-    localChordAnalyzer.reset();
-    for (auto& analyzer : remoteChordAnalyzers)
-        analyzer.reset();
+    chordAnalyzer.reset();
     asyncChatTranslationWorker.reset();
     {
         const juce::ScopedLock launchLock(videoLaunchWorkerLock);
@@ -11294,11 +11664,8 @@ void NinjamVst3AudioProcessor::prepareToPlay (double sampleRate, int samplesPerB
     resetMetronomeClickVoices();
     if (linkTimingState != nullptr)
         linkTimingState->reset();
-    if (localChordAnalyzer)
-        localChordAnalyzer->prepare(processingSampleRate);
-    for (auto& analyzer : remoteChordAnalyzers)
-        if (analyzer && analyzer->isPrepared())
-            analyzer->prepare(processingSampleRate);
+    if (chordAnalyzer)
+        chordAnalyzer->prepare(processingSampleRate);
 
     juce::dsp::ProcessSpec spec;
     spec.sampleRate = sampleRate;
@@ -15902,7 +16269,7 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         actualLocal = 1;
 
     bool samplePadsActiveThisBlock = false;
-    bool fedLocalChordAnalyzer = false;
+    bool fedChordAnalyzer = false;
     float globalLocalMax = 0.0f;
     float globalLocalMaxL = 0.0f;
     float globalLocalMaxR = 0.0f;
@@ -16008,10 +16375,12 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
             }
         }
 
-        if (ch == 0 && localChordAnalyzer && isChordDetectionEnabled())
+        if (ch == 0 && chordAnalyzer && isChordDetectionEnabled())
         {
-            localChordAnalyzer->processBlock(localChannelBuffer.getReadPointer(ch), numSamples);
-            fedLocalChordAnalyzer = true;
+            chordAnalyzer->processBlock(BatchedChordAnalyzer::localTrackIndex,
+                                        localChannelBuffer.getReadPointer(ch),
+                                        numSamples);
+            fedChordAnalyzer = true;
         }
 
         const float* data = localChannelBuffer.getReadPointer(ch);
@@ -16160,8 +16529,8 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     localPeakL.store(globalLocalMaxL);
     localPeakR.store(globalLocalMaxR);
 
-    if (localChordAnalyzer && !fedLocalChordAnalyzer)
-        localChordAnalyzer->markNoInput();
+    if (chordAnalyzer && !fedChordAnalyzer)
+        chordAnalyzer->markNoInput(BatchedChordAnalyzer::localTrackIndex);
 
     const bool reverbOn = fxReverbEnabled.load();
     const bool delayOn = fxDelayEnabled.load();
@@ -16897,6 +17266,46 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     {
         maxSampleL = maxSample;
         maxSampleR = maxSample;
+    }
+
+    if (chordAnalyzer != nullptr && chordAnalyzer->isPrepared())
+    {
+        if (isChordDetectionEnabled() && numOutputBusesOut > 0 && numSamples > 0)
+        {
+            auto mainBus = getBusBuffer(buffer, false, 0);
+            const int mainChannels = mainBus.getNumChannels();
+            if (mainChannels > 0)
+            {
+                if (masterChordScratchBuffer.getNumChannels() < 1 || masterChordScratchBuffer.getNumSamples() < numSamples)
+                    masterChordScratchBuffer.setSize(1, numSamples, false, false, true);
+
+                float* mixed = masterChordScratchBuffer.getWritePointer(0);
+                const float* left = mainBus.getReadPointer(0);
+                if (mainChannels > 1)
+                {
+                    const float* right = mainBus.getReadPointer(1);
+                    for (int i = 0; i < numSamples; ++i)
+                        mixed[i] = 0.5f * (left[i] + right[i]);
+                }
+                else
+                {
+                    std::memcpy(mixed, left, (size_t)numSamples * sizeof(float));
+                }
+
+                chordAnalyzer->processBlock(BatchedChordAnalyzer::masterTrackIndex,
+                                            mixed,
+                                            numSamples,
+                                            juce::roundToInt(getSampleRate()));
+            }
+            else
+            {
+                chordAnalyzer->markNoInput(BatchedChordAnalyzer::masterTrackIndex);
+            }
+        }
+        else
+        {
+            chordAnalyzer->markNoInput(BatchedChordAnalyzer::masterTrackIndex);
+        }
     }
 
     if (linkSessionState.has_value() && isLinkAudioEnabled() && isLinkAudioSendEnabled() && numOutputBusesOut > 0)
@@ -18444,6 +18853,7 @@ void NinjamVst3AudioProcessor::timerCallback()
                                                  std::memory_order_release);
     }
     noteSlowIntervalStep("clientRun", juce::Time::getMillisecondCounterHiRes() - stepStartMs);
+    updateMasterChordTimeline();
 
     if (disconnectAfterLicenseRejected.exchange(false, std::memory_order_acq_rel))
     {
