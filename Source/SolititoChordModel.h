@@ -35,7 +35,9 @@ public:
     explicit SolititoChordModel(int numTracks);
     ~SolititoChordModel();
 
-    bool load(const juce::File& modelFile, const juce::File& weightsFile);
+    bool load(const juce::File& runtimeFile,
+              const juce::File& modelFile,
+              const juce::File& weightsFile);
     bool isAvailable() const;
     juce::String getStatus() const;
     int getMemoryKb() const;

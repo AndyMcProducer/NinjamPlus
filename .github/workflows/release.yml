@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - "**"
     tags:
       - "v*"
       - "V*"
@@ -23,12 +25,37 @@ env:
 permissions:
   contents: write
 
+concurrency:
+  group: ninjamplus-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  tests:
+    name: Functional tests
+    if: github.repository == 'steveseguin/NinjamPlus' || github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Test embedded helper
+        run: npm test
+
   windows:
     name: Windows (Standalone, VST3)
+    if: github.repository == 'steveseguin/NinjamPlus' || github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    needs: tests
     runs-on: windows-latest
     env:
-      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_type == 'tag' && github.ref_name || format('v0.9.{0}.{1}', github.run_number, github.run_attempt) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -89,6 +116,31 @@ jobs:
         run: >
           cmake --build build --config Release
           --target NINJAM_VST3_Standalone NINJAM_VST3_VST3
+
+      - name: Validate VST3 with pluginval
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Join-Path $env:RUNNER_TEMP "pluginval_Windows.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "pluginval"
+          Invoke-WebRequest -Uri "https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_Windows.zip" -OutFile $zip
+          $expectedHash = "C08E61CE3B96DB41636F8EC7E76F4C7E2C13EBDAC7FA1B5A1F52B4F32EC715AB"
+          $actualHash = (Get-FileHash -Path $zip -Algorithm SHA256).Hash
+          if ($actualHash -ne $expectedHash) { throw "pluginval checksum mismatch: $actualHash" }
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $plugin = Resolve-Path "build\NINJAMplus\Release\VST3\NINJAMplus.vst3"
+          New-Item -ItemType Directory -Path "pluginval-logs" -Force | Out-Null
+          & (Join-Path $dir "pluginval.exe") --strictness-level 5 --random-seed 0x4e494e4a --timeout-ms 60000 --skip-gui-tests --output-dir "pluginval-logs" --output-filename "NINJAMplus-pluginval.txt" --verbose $plugin.Path 2>&1 | Tee-Object -FilePath "pluginval-logs\pluginval-console.txt"
+          $pluginvalExitCode = $LASTEXITCODE
+          if ($pluginvalExitCode -ne 0) { throw "pluginval failed with exit code $pluginvalExitCode" }
+
+      - name: Upload pluginval log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pluginval-release-windows
+          path: pluginval-logs
+          if-no-files-found: warn
 
       - name: Package
         shell: pwsh
@@ -225,9 +277,11 @@ jobs:
 
   linux:
     name: Linux (Standalone, VST3, LV2)
+    if: github.repository == 'steveseguin/NinjamPlus' || github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    needs: tests
     runs-on: ubuntu-latest
     env:
-      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_type == 'tag' && github.ref_name || format('v0.9.{0}.{1}', github.run_number, github.run_attempt) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -363,15 +417,48 @@ jobs:
 
   mac:
     name: macOS (Standalone, AU, VST3)
+    if: github.repository == 'steveseguin/NinjamPlus' || github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    needs: tests
     runs-on: macos-14
     env:
-      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_type == 'tag' && github.ref_name || format('v0.9.{0}.{1}', github.run_number, github.run_attempt) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
+
+      - name: Import Apple Developer ID certificates
+        shell: bash
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          REQUIRE_SIGNING: ${{ github.repository == 'steveseguin/NinjamPlus' && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MACOS_CERTIFICATE:-}" ] || [ -z "${MACOS_CERTIFICATE_PASSWORD:-}" ] || [ -z "${KEYCHAIN_PASSWORD:-}" ]; then
+            if [ "${REQUIRE_SIGNING}" = "1" ]; then
+              echo "macOS certificate secrets are required for steveseguin/NinjamPlus"
+              exit 1
+            fi
+            echo "macOS certificate secrets are not configured; using ad-hoc signing."
+            exit 0
+          fi
+
+          CERTIFICATE_PATH="${RUNNER_TEMP}/developer-id.p12"
+          KEYCHAIN_PATH="${RUNNER_TEMP}/ninjamplus-signing.keychain-db"
+          printf '%s' "${MACOS_CERTIFICATE}" | base64 --decode > "${CERTIFICATE_PATH}"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security import "${CERTIFICATE_PATH}" -P "${MACOS_CERTIFICATE_PASSWORD}" -A -t cert -f pkcs12 -k "${KEYCHAIN_PATH}"
+          security list-keychains -d user -s "${KEYCHAIN_PATH}" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security find-identity -v -p codesigning "${KEYCHAIN_PATH}"
+          rm -f "${CERTIFICATE_PATH}"
+          echo "MACOS_CERTIFICATE_IMPORTED=1" >> "${GITHUB_ENV}"
 
       - name: Detect project root
         shell: bash
@@ -416,6 +503,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          REQUIRE_SIGNING: ${{ github.repository == 'steveseguin/NinjamPlus' && '1' || '0' }}
         run: |
           set -euo pipefail
           mkdir -p out
@@ -427,19 +515,25 @@ jobs:
           NOTICE_FILES=("LEGAL_NOTICES.txt" "THIRD_PARTY_NOTICES.md")
 
           SIGN_ENABLED=0
-          if [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
+          if [ "${MACOS_CERTIFICATE_IMPORTED:-0}" = "1" ] && [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
             SIGN_ENABLED=1
             echo "Using Developer ID Application signing."
+          elif [ "${REQUIRE_SIGNING}" = "1" ]; then
+            echo "MACOS_SIGN_IDENTITY and an imported certificate are required for steveseguin/NinjamPlus"
+            exit 1
           else
-            echo "MACOS_SIGN_IDENTITY not set; using ad-hoc signing."
+            echo "Using ad-hoc signing."
           fi
 
           NOTARY_ENABLED=0
-          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+          if [ "${SIGN_ENABLED}" -eq 1 ] && [ -n "${MACOS_INSTALLER_IDENTITY:-}" ] && [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
             NOTARY_ENABLED=1
             echo "Notarization is enabled."
+          elif [ "${REQUIRE_SIGNING}" = "1" ]; then
+            echo "Installer signing and notarization secrets are required for steveseguin/NinjamPlus"
+            exit 1
           else
-            echo "Notarization secrets missing; skipping notarization."
+            echo "Notarization secrets are not configured; publishing an unsigned installer."
           fi
 
           sign_bundle() {
@@ -447,6 +541,7 @@ jobs:
             xattr -cr "${target}" || true
             if [ "${SIGN_ENABLED}" -eq 1 ]; then
               codesign --force --deep --options runtime --timestamp --sign "${MACOS_SIGN_IDENTITY}" "${target}"
+              codesign --verify --deep --strict --verbose=2 "${target}"
             else
               codesign --force --deep --sign - "${target}"
             fi
@@ -548,6 +643,7 @@ jobs:
           if [ "${SIGN_ENABLED}" -eq 1 ] && [ -n "${MACOS_INSTALLER_IDENTITY:-}" ]; then
             productsign --sign "${MACOS_INSTALLER_IDENTITY}" "out/NINJAMplus-macOS-unsigned.pkg" "out/NINJAMplus-macOS.pkg"
             rm -f "out/NINJAMplus-macOS-unsigned.pkg"
+            pkgutil --check-signature "out/NINJAMplus-macOS.pkg"
           else
             mv "out/NINJAMplus-macOS-unsigned.pkg" "out/NINJAMplus-macOS.pkg"
           fi
@@ -559,10 +655,14 @@ jobs:
               --team-id "${APPLE_TEAM_ID}" \
               --wait
             xcrun stapler staple "out/NINJAMplus-macOS.pkg"
-            xcrun stapler staple "${APP_PATH}" || true
-            xcrun stapler staple "${COMP_PATH}" || true
-            xcrun stapler staple "${VST3_PATH}" || true
           fi
+
+      - name: Remove signing keychain
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "${RUNNER_TEMP}/ninjamplus-signing.keychain-db" 2>/dev/null || true
+          rm -f "${RUNNER_TEMP}/developer-id.p12"
 
       - name: Upload
         uses: actions/upload-artifact@v4
@@ -572,6 +672,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
+    if: github.repository == 'steveseguin/NinjamPlus' || github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     needs: [windows, linux, mac]
     steps:
@@ -593,9 +694,18 @@ jobs:
           name: macos-release
           path: out
 
+      - name: Generate SHA-256 checksums
+        working-directory: out
+        run: sha256sum * > SHA256SUMS.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          prerelease: ${{ github.event.inputs.prerelease || contains(github.ref_name, '-') }}
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_type == 'tag' && github.ref_name || format('build-{0}-{1}', github.run_number, github.run_attempt) }}
+          name: "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_type == 'tag' && github.ref_name || format('Automatic build #{0} from {1}', github.run_number, github.ref_name) }}"
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ (github.event_name == 'workflow_dispatch' && inputs.prerelease) || (github.event_name != 'workflow_dispatch' && (github.ref_type != 'tag' || contains(github.ref_name, '-'))) }}
+          make_latest: ${{ (github.event_name == 'workflow_dispatch' && !inputs.prerelease) || (github.event_name != 'workflow_dispatch' && github.ref_type == 'tag' && !contains(github.ref_name, '-')) }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
           files: out/*

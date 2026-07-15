@@ -6,6 +6,7 @@
 #endif
 
 #if NINJAMPLUS_HAS_ONNX_CHORDS
+#define ORT_API_MANUAL_INIT
 #include <onnxruntime_cxx_api.h>
 #endif
 
@@ -113,10 +114,19 @@ struct SolititoChordModel::Impl
         }
     }
 
-    bool load(const juce::File& modelFile, const juce::File& weightsFile)
+    bool load(const juce::File& runtimeFile,
+              const juce::File& modelFile,
+              const juce::File& weightsFile)
     {
         available = false;
         status = {};
+
+#if NINJAMPLUS_HAS_ONNX_CHORDS
+        session.reset();
+        sessionOptions.reset();
+        env.reset();
+        onnxRuntime.close();
+#endif
 
         if (!weightsFile.existsAsFile())
         {
@@ -128,21 +138,40 @@ struct SolititoChordModel::Impl
             return false;
 
 #if NINJAMPLUS_HAS_ONNX_CHORDS
+        if (!runtimeFile.existsAsFile())
+        {
+            status = "Missing bundled ONNX runtime: " + runtimeFile.getFullPathName();
+            return false;
+        }
+
         if (!modelFile.existsAsFile())
         {
             status = "Missing Solitito ONNX model: " + modelFile.getFullPathName();
             return false;
         }
 
-        const OrtApiBase* apiBase = OrtGetApiBase();
-        if (apiBase == nullptr || apiBase->GetApi == nullptr || apiBase->GetApi(ORT_API_VERSION) == nullptr)
+        if (!onnxRuntime.open(runtimeFile.getFullPathName()))
         {
-            status = "Solitito ONNX runtime API is unavailable";
+            status = "Could not load bundled ONNX runtime: " + runtimeFile.getFullPathName();
+            return false;
+        }
+
+        using GetApiBaseFunction = const OrtApiBase* (ORT_API_CALL*)();
+        auto getApiBase = reinterpret_cast<GetApiBaseFunction>(onnxRuntime.getFunction("OrtGetApiBase"));
+        const OrtApiBase* apiBase = getApiBase != nullptr ? getApiBase() : nullptr;
+        const OrtApi* api = apiBase != nullptr && apiBase->GetApi != nullptr
+            ? apiBase->GetApi(ORT_API_VERSION)
+            : nullptr;
+        if (api == nullptr)
+        {
+            status = "Bundled ONNX runtime API is unavailable";
+            onnxRuntime.close();
             return false;
         }
 
         try
         {
+            Ort::InitApi(api);
             env = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "NINJAMplusSolititoChord");
             sessionOptions = std::make_unique<Ort::SessionOptions>();
             sessionOptions->SetIntraOpNumThreads(1);
@@ -162,6 +191,7 @@ struct SolititoChordModel::Impl
             session.reset();
             sessionOptions.reset();
             env.reset();
+            onnxRuntime.close();
             return false;
         }
 #else
@@ -520,6 +550,7 @@ struct SolititoChordModel::Impl
     juce::String status;
 
 #if NINJAMPLUS_HAS_ONNX_CHORDS
+    juce::DynamicLibrary onnxRuntime;
     std::unique_ptr<Ort::Env> env;
     std::unique_ptr<Ort::SessionOptions> sessionOptions;
     std::unique_ptr<Ort::Session> session;
@@ -533,9 +564,11 @@ SolititoChordModel::SolititoChordModel(int numTracks)
 
 SolititoChordModel::~SolititoChordModel() = default;
 
-bool SolititoChordModel::load(const juce::File& modelFile, const juce::File& weightsFile)
+bool SolititoChordModel::load(const juce::File& runtimeFile,
+                              const juce::File& modelFile,
+                              const juce::File& weightsFile)
 {
-    return impl->load(modelFile, weightsFile);
+    return impl->load(runtimeFile, modelFile, weightsFile);
 }
 
 bool SolititoChordModel::isAvailable() const

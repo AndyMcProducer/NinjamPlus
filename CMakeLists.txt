@@ -174,7 +174,6 @@ target_sources(NINJAM_VST3 PRIVATE
     Source/StandaloneApp.cpp
     Source/ZapVideoCodec.cpp
     Source/ZapVideoCodec.h
-    # ProVideoCodec is optional (FFmpeg-based). Do not add unconditionally.
     
     # NINJAM Core
     ${NINJAM_ROOT}/ninjam/njclient.cpp
@@ -315,13 +314,11 @@ set(NINJAMPLUS_SOLITITO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/solitito-a
 set(NINJAMPLUS_ONNX_CHORDS_AVAILABLE FALSE)
 if (WIN32
     AND EXISTS "${NINJAMPLUS_ONNXRUNTIME_ROOT}/include/onnxruntime_cxx_api.h"
-    AND EXISTS "${NINJAMPLUS_ONNXRUNTIME_ROOT}/lib/win-x64/onnxruntime.lib"
     AND EXISTS "${NINJAMPLUS_ONNXRUNTIME_ROOT}/bin/win-x64/onnxruntime.dll"
     AND EXISTS "${NINJAMPLUS_SOLITITO_ROOT}/chord_model_v31_16k.onnx"
     AND EXISTS "${NINJAMPLUS_SOLITITO_ROOT}/dsp_weights_v31_16k.bin")
     set(NINJAMPLUS_ONNX_CHORDS_AVAILABLE TRUE)
     target_include_directories(NINJAM_VST3 PRIVATE "${NINJAMPLUS_ONNXRUNTIME_ROOT}/include")
-    target_link_libraries(NINJAM_VST3 PRIVATE "${NINJAMPLUS_ONNXRUNTIME_ROOT}/lib/win-x64/onnxruntime.lib")
     target_compile_definitions(NINJAM_VST3 PRIVATE
         NINJAMPLUS_HAS_ONNX_CHORDS=1
         NINJAMPLUS_SOLITITO_ASSET_DIR="${NINJAMPLUS_SOLITITO_ROOT}")
@@ -404,7 +401,7 @@ if (NINJAMPLUS_ONNX_CHORDS_AVAILABLE)
 
     if (TARGET juce_vst3_helper)
         add_custom_command(TARGET juce_vst3_helper POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_ONNXRUNTIME_DLL}" "$<TARGET_FILE_DIR:juce_vst3_helper>/onnxruntime.dll"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_ONNXRUNTIME_DLL}" "$<TARGET_FILE_DIR:juce_vst3_helper>/ninjamplus_onnxruntime.dll"
             VERBATIM)
     endif()
 
@@ -413,7 +410,7 @@ if (NINJAMPLUS_ONNX_CHORDS_AVAILABLE)
             add_custom_command(TARGET ${_ninjam_runtime_target} PRE_LINK
                 COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai"
                 COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai"
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_ONNXRUNTIME_DLL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/onnxruntime.dll"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_ONNXRUNTIME_DLL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/ninjamplus_onnxruntime.dll"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_MODEL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai/chord_model_v31_16k.onnx"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_WEIGHTS}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai/dsp_weights_v31_16k.bin"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_MODEL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai/chord_model_v31_16k.onnx"
@@ -422,7 +419,7 @@ if (NINJAMPLUS_ONNX_CHORDS_AVAILABLE)
             add_custom_command(TARGET ${_ninjam_runtime_target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai"
                 COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai"
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_ONNXRUNTIME_DLL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/onnxruntime.dll"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_ONNXRUNTIME_DLL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/ninjamplus_onnxruntime.dll"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_MODEL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai/chord_model_v31_16k.onnx"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_WEIGHTS}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai/dsp_weights_v31_16k.bin"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_MODEL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai/chord_model_v31_16k.onnx"

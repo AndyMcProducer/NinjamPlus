@@ -74,6 +74,10 @@
             background: #3ed06e;
             box-shadow: 0 0 7px rgba(62,208,110,0.75);
         }
+        .peer-light.degraded {
+            background: #e6a23c;
+            box-shadow: 0 0 7px rgba(230,162,60,0.75);
+        }
         .peer-light:focus-visible {
             outline: 2px solid #8fb7ff;
             outline-offset: 2px;
@@ -442,7 +446,7 @@
             intervalSource: query.get('intervalSource') || '',
             intervalPollMs: parseInt(query.get('intervalPollMs') || '', 10) || 500,
             requestedBufferMs: Math.max(minimumBufferMs, parseInt(query.get('buffer') || '', 10) || minimumBufferMs),
-            chunkedMs: queryInteger(['chunkbitrate', 'chunked', 'bitrate'], 900, 60, 100000),
+            chunkedMs: queryInteger(['chunkbitrate', 'chunked', 'bitrate'], 2500, 60, 100000),
             ninjamServer: ninjamServer,
             initialBufferMode: normalizeBufferMode(query.get('bufferMode')),
             obsMode: obsMode,
@@ -1410,6 +1414,8 @@
                     scheduler: typeof chunkStats.scheduler === 'string' ? chunkStats.scheduler : '',
                     audioContextState: typeof chunkStats.audio_context_state === 'string' ? chunkStats.audio_context_state : '',
                     rebuffering: chunkStats.rebuffering === true,
+                    awaitingKeyframe: chunkStats.awaiting_keyframe === true,
+                    decoderErrors: getNumericProperty(chunkStats, ['decoder_errors']),
                     updatedAt: Date.now()
                 };
                 const prior = vdoState.chunkStatsByUser[userKey] || {};
@@ -1419,7 +1425,9 @@
                     || Math.round(prior.levelMs || -1) !== Math.round(nextStats.levelMs || -1)
                     || prior.scheduler !== nextStats.scheduler
                     || prior.audioContextState !== nextStats.audioContextState
-                    || prior.rebuffering !== nextStats.rebuffering;
+                    || prior.rebuffering !== nextStats.rebuffering
+                    || prior.awaitingKeyframe !== nextStats.awaitingKeyframe
+                    || Math.round(prior.decoderErrors || 0) !== Math.round(nextStats.decoderErrors || 0);
                 vdoState.chunkStatsByUser[userKey] = nextStats;
             }
             return changed;
@@ -1882,11 +1890,14 @@
             for (let i = 0; i < users.length; i++) {
                 const userKey = users[i];
                 const diagnostics = ninjamSync.remoteDiagnostics[userKey] || { ok: false, text: 'interval pending' };
+                const chunkStats = vdoState.chunkStatsByUser[userKey] || {};
+                const chunkStatsFresh = typeof chunkStats.updatedAt === 'number' && (Date.now() - chunkStats.updatedAt) < 8000;
+                const videoDegraded = chunkStatsFresh && (chunkStats.rebuffering || chunkStats.awaitingKeyframe);
                 const wrap = document.createElement('span');
                 wrap.className = 'peer-light-wrap';
                 const light = document.createElement('button');
                 light.type = 'button';
-                light.className = diagnostics.ok ? 'peer-light ok' : 'peer-light';
+                light.className = diagnostics.ok ? (videoDegraded ? 'peer-light degraded' : 'peer-light ok') : 'peer-light';
                 const vdoLatencyMs = getEstimatedVdoLatencyMs(userKey);
                 const targetLatencyMs = vdoState.latencyTargetMsByUser[userKey];
                 const targetText = (typeof targetLatencyMs === 'number'
@@ -1895,14 +1906,15 @@
                         ? (' -> ' + Math.round(targetLatencyMs) + 'ms')
                         : '';
                 const vdoText = vdoLatencyMs > 0 ? (' | vdo comp ' + vdoLatencyMs + 'ms' + targetText) : '';
-                const chunkStats = vdoState.chunkStatsByUser[userKey] || {};
-                const chunkText = (typeof chunkStats.updatedAt === 'number' && (Date.now() - chunkStats.updatedAt) < 8000)
+                const chunkText = chunkStatsFresh
                     ? (' | chunk target ' + formatMaybeMs(chunkStats.targetMs)
                         + ' delta ' + formatMaybeMs(chunkStats.deltaMs)
                         + ' level ' + formatMaybeMs(chunkStats.levelMs)
                         + (chunkStats.scheduler ? (' scheduler ' + chunkStats.scheduler) : '')
                         + (chunkStats.audioContextState ? (' ctx ' + chunkStats.audioContextState) : '')
-                        + (chunkStats.rebuffering ? ' rebuffering' : ''))
+                        + (chunkStats.rebuffering ? ' rebuffering' : '')
+                        + (chunkStats.awaitingKeyframe ? ' awaiting keyframe' : '')
+                        + (chunkStats.decoderErrors > 0 ? (' decoder errors ' + Math.round(chunkStats.decoderErrors)) : ''))
                     : '';
                 const mappingSource = vdoState.mappingSourceByUser[userKey] || 'unmapped';
                 const mappingDiagnostic = vdoState.mappingDiagnosticsByUser[userKey]
@@ -2277,14 +2289,28 @@
                 'try{' +
                 'session.quality=' + JSON.stringify(config.quality) + ';' +
                 'if(cfg.fps){session.frameRate=cfg.fps;session.maxframeRate=cfg.fps;}else if(cfg.mfr){delete session.frameRate;session.maxframeRate=cfg.mfr;}' +
-                'session.bitrate=cfg.bitrate;' +
+                'session.bitrate=cfg.bitrate;session.chunkbitrate=cfg.bitrate;session.maxvideobitrate=cfg.bitrate;session.chunkadaptceil=cfg.bitrate;' +
+                'function updateProfile(width,height){' +
+                'var recorder=session.chunkedRecorder||null;' +
+                'if(recorder&&recorder.adaptation){recorder.adaptation.target=cfg.bitrate;recorder.adaptation.lastChange=Date.now();recorder.adaptation.forceKeyFrame=true;if(session.stats){session.stats.adjustBitrate=cfg.bitrate;}}' +
+                'if(recorder&&typeof recorder.updateVideoProfile==="function"){recorder.updateVideoProfile(width||cfg.width,height||cfg.height,cfg.bitrate,cfg.fps||cfg.mfr||0);return;}' +
+                'if(recorder){recorder.adaptiveBaseVideoWidth=width||cfg.width;recorder.adaptiveBaseVideoHeight=height||cfg.height;recorder.needKeyFrame=true;' +
+                'if(recorder.adaptation){recorder.adaptation.ceiling=cfg.bitrate;recorder.adaptation.target=Math.min(recorder.adaptation.target,cfg.bitrate);recorder.adaptation.forceKeyFrame=true;}' +
+                'var target=recorder.adaptation?recorder.adaptation.target:((session.stats&&session.stats.adjustBitrate)||session.chunkbitrate||2500);' +
+                'var pixelRatio=Math.max(0.25,(recorder.adaptiveBaseVideoWidth*recorder.adaptiveBaseVideoHeight)/(1280*720));var fullDown=Math.max(350,Math.min(4000,Math.round(700*pixelRatio)));' +
+                'var tier=target<220?2:(target<fullDown?1:0);var maxEdge=tier===2?320:(tier===1?640:Math.max(recorder.adaptiveBaseVideoWidth,recorder.adaptiveBaseVideoHeight));' +
+                'var scale=Math.min(1,maxEdge/Math.max(recorder.adaptiveBaseVideoWidth,recorder.adaptiveBaseVideoHeight));var outWidth=Math.max(2,Math.floor(recorder.adaptiveBaseVideoWidth*scale/2)*2);var outHeight=Math.max(2,Math.floor(recorder.adaptiveBaseVideoHeight*scale/2)*2);' +
+                'recorder.adaptiveResolutionTier=tier;if(recorder.configVideo){recorder.configVideo.width=outWidth;recorder.configVideo.height=outHeight;if(cfg.fps||cfg.mfr)recorder.configVideo.frameRate=cfg.fps||cfg.mfr;}' +
+                'if(recorder.videoEncoder&&recorder.videoEncoder.state!=="closed"&&recorder.videoEncoder.config){recorder.videoEncoder.config.width=outWidth;recorder.videoEncoder.config.height=outHeight;if(cfg.fps||cfg.mfr)recorder.videoEncoder.config.frameRate=cfg.fps||cfg.mfr;recorder.videoEncoder.config.bitrate=Math.min(target,cfg.bitrate)*1000;recorder.videoEncoder.configure(recorder.videoEncoder.config);}' +
+                '}' +
+                '}' +
                 'var stream=session.streamSrc||null;' +
                 'var track=stream&&stream.getVideoTracks?stream.getVideoTracks()[0]:null;' +
                 'if(track&&track.readyState==="live"&&track.applyConstraints){' +
                 'var c={width:{ideal:cfg.width},height:{ideal:cfg.height}};if(cfg.fps)c.frameRate={ideal:cfg.fps,max:cfg.fps};else if(cfg.mfr)c.frameRate={max:cfg.mfr};track.applyConstraints(c)' +
-                '.then(function(){try{session.currentCameraConstraints=track.getSettings();}catch(e){}})' +
+                '.then(function(){try{var settings=track.getSettings();session.currentCameraConstraints=settings;updateProfile(settings.width,settings.height);}catch(e){updateProfile(cfg.width,cfg.height);}})' +
                 '.catch(function(e){try{errorlog(e&&e.message?e.message:e);}catch(_){}});' +
-                '}' +
+                '}else{updateProfile(cfg.width,cfg.height);}' +
                 '}catch(e){try{errorlog(e&&e.message?e.message:e);}catch(_){}}' +
                 '})();';
             return postEvalToVdo(script);
@@ -2367,11 +2393,11 @@
              * - chunkcache is a resend cache window, not the playout delay. Keep
              *   it bounded; NACKs are useful only before the receiver gives up on
              *   a frame, even when the musical/video delay is much longer.
-             * - chunkedbuffer is the sender pacing/adaptation window. Raising it
-             *   can tolerate bursty SCTP delivery but also delays down-adaptation.
-             * - chunkadapt=bitrate is conservative for music sessions. hybrid or
-             *   framerate may recover harder under cellular congestion, but can
-             *   make motion less even for all viewers because the encoder is shared.
+             * - chunkedbuffer is the sender pacing/adaptation window. The sync
+             *   profile tolerates short bursts before reducing quality.
+             * - chunkadapt=bitrate preserves source timestamps and frame cadence.
+             *   chunkadaptresolution adds 360p and emergency 180p encoder tiers,
+             *   so weak links can shed pixels without moving the musical timeline.
              * - relay/tcp/speedtest/turn/stun/wss2 are optional test/deployment
              *   pass-throughs. For far TURN/TCP testing, prefer relay=<region>&tcp.
              *   speedtest=<region>&tcp can filter out all TURN entries when the
@@ -2380,11 +2406,17 @@
              *   handshake websocket as an app-level command/control channel.
              * - vdoBase/vdoUrl can override the VDO deployment. Until the required
              *   chunked-mode fixes are promoted, sync mode defaults to alpha.
-             */
-            iframeParams.set('chunked', String(Math.max(60, appState.chunkedMs || 900)));
-            iframeParams.set('chunkbitrate', String(Math.max(60, appState.chunkedMs || 900)));
-            iframeParams.set('bitrate', String(Math.max(60, appState.chunkedMs || 900)));
-            iframeParams.set('maxvideobitrate', String(Math.max(60, appState.chunkedMs || 900)));
+            */
+            const initialVideoBitrate = Math.max(60, appState.chunkedMs || 2500);
+            const qualityConfig = vdoQualityPresetConfig(appState.cameraQuality);
+            const configuredVideoCeiling = queryInteger(['chunkadaptceil'], Math.max(2500, initialVideoBitrate), 60, 100000);
+            const maximumVideoBitrate = qualityConfig
+                ? Math.max(configuredVideoCeiling, qualityConfig.bitrate)
+                : configuredVideoCeiling;
+            iframeParams.set('chunked', String(initialVideoBitrate));
+            iframeParams.set('chunkbitrate', String(initialVideoBitrate));
+            iframeParams.set('bitrate', String(initialVideoBitrate));
+            iframeParams.set('maxvideobitrate', String(maximumVideoBitrate));
             iframeParams.set('chunkindex', query.get('chunkindex') || '1');
             iframeParams.set('chunknack', query.get('chunknack') || '1');
             iframeParams.set('chunknackattempts', String(queryInteger(['chunknackattempts'], 8, 1, 20)));
@@ -2394,12 +2426,14 @@
             iframeParams.set('chunkbufferadaptive', '0');
             iframeParams.set('chunkbufferfloor', '0');
             iframeParams.set('chunkbufferceil', '180000');
-            iframeParams.set('chunkedbuffer', String(queryInteger(['chunkedbuffer', 'sendingbuffer'], 1500, 100, 60000)));
+            iframeParams.set('chunkedbuffer', String(queryInteger(['chunkedbuffer', 'sendingbuffer'], 500, 100, 60000)));
             iframeParams.set('chunkadapt', query.get('chunkadapt') || 'bitrate');
-            iframeParams.set('chunkadaptfloor', String(queryInteger(['chunkadaptfloor'], 300, 0, 10000)));
-            iframeParams.set('chunkadaptceil', String(queryInteger(['chunkadaptceil'], Math.max(60, appState.chunkedMs || 900), 0, 100000)));
+            iframeParams.set('chunkadaptfloor', String(queryInteger(['chunkadaptfloor'], 60, 0, 10000)));
+            iframeParams.set('chunkadaptceil', String(maximumVideoBitrate));
             iframeParams.set('chunkadaptthreshold', String(queryInteger(['chunkadaptthreshold'], 500, 0, 10000)));
+            iframeParams.set('chunkadaptmaxdrop', String(queryInteger(['chunkadaptmaxdrop'], 0, 0, 120)));
             iframeParams.set('chunkadaptinterval', String(queryInteger(['chunkadaptinterval'], 1200, 100, 60000)));
+            iframeParams.set('chunkadaptresolution', query.has('chunkadaptresolution') ? (query.get('chunkadaptresolution') || '1') : '1');
             iframeParams.set('noaudio', '1');
             iframeParams.set('buffer2', '0');
             // Keep the initial room join buffer minimal; the sync layer applies the

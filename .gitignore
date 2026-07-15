@@ -8,6 +8,9 @@
 Thumbs.db
 .vscode/
 .vs/
+node_modules/
+playwright-report/
+test-results/
 *.user
 *.suo
 *.opensdf
@@ -16,6 +19,7 @@ Thumbs.db
 # Build artefacts (CMake/MSBuild)
 build/
 build_*/
+Source - Copy/
 local_deps/
 CMakeFiles/
 cmake_install.cmake
