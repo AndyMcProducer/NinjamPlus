@@ -134,14 +134,23 @@ struct SolititoChordModel::Impl
             return false;
         }
 
+        const OrtApiBase* apiBase = OrtGetApiBase();
+        if (apiBase == nullptr || apiBase->GetApi == nullptr || apiBase->GetApi(ORT_API_VERSION) == nullptr)
+        {
+            status = "Solitito ONNX runtime API is unavailable";
+            return false;
+        }
+
         try
         {
-            sessionOptions.SetIntraOpNumThreads(1);
-            sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+            env = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "NINJAMplusSolititoChord");
+            sessionOptions = std::make_unique<Ort::SessionOptions>();
+            sessionOptions->SetIntraOpNumThreads(1);
+            sessionOptions->SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
            #if JUCE_WINDOWS
-            session = std::make_unique<Ort::Session>(env, modelFile.getFullPathName().toWideCharPointer(), sessionOptions);
+            session = std::make_unique<Ort::Session>(*env, modelFile.getFullPathName().toWideCharPointer(), *sessionOptions);
            #else
-            session = std::make_unique<Ort::Session>(env, modelFile.getFullPathName().toRawUTF8(), sessionOptions);
+            session = std::make_unique<Ort::Session>(*env, modelFile.getFullPathName().toRawUTF8(), *sessionOptions);
            #endif
             available = true;
             status = "Solitito ONNX chord model loaded";
@@ -151,6 +160,8 @@ struct SolititoChordModel::Impl
         {
             status = "Solitito ONNX load failed: " + juce::String(e.what());
             session.reset();
+            sessionOptions.reset();
+            env.reset();
             return false;
         }
 #else
@@ -509,8 +520,8 @@ struct SolititoChordModel::Impl
     juce::String status;
 
 #if NINJAMPLUS_HAS_ONNX_CHORDS
-    Ort::Env env { ORT_LOGGING_LEVEL_WARNING, "NINJAMplusSolititoChord" };
-    Ort::SessionOptions sessionOptions;
+    std::unique_ptr<Ort::Env> env;
+    std::unique_ptr<Ort::SessionOptions> sessionOptions;
     std::unique_ptr<Ort::Session> session;
 #endif
 };

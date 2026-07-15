@@ -702,6 +702,7 @@ private:
     std::array<juce::String, maxRemoteChordUsers> remoteChordUserKeys;
     mutable juce::CriticalSection masterChordTimelineLock;
     std::vector<juce::String> masterChordTimeline;
+    juce::String lastMasterTimelineChordLabel;
     int masterChordTimelineInterval = -1;
     int masterChordTimelineBpi = 0;
     std::atomic<float> masterOutputGain { 1.0f };

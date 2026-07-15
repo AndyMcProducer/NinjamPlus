@@ -10678,7 +10678,17 @@ void NinjamVst3AudioProcessor::updateMasterChordTimeline()
     }
 
     if (hasChord)
-        masterChordTimeline[(size_t)beatIndex] = label;
+    {
+        if (label != lastMasterTimelineChordLabel)
+        {
+            masterChordTimeline[(size_t)beatIndex] = label;
+            lastMasterTimelineChordLabel = label;
+        }
+    }
+    else
+    {
+        lastMasterTimelineChordLabel.clear();
+    }
 }
 int NinjamVst3AudioProcessor::getUserChordMemoryKb(int userIndex) const
 {
@@ -11543,6 +11553,9 @@ void NinjamVst3AudioProcessor::refreshPublicServers()
 
 NinjamVst3AudioProcessor::~NinjamVst3AudioProcessor()
 {
+    if (chordAnalyzer != nullptr)
+        chordAnalyzer->stop();
+
     beginStandaloneShutdown();
     chordAnalyzer.reset();
     asyncChatTranslationWorker.reset();
@@ -11666,6 +11679,8 @@ void NinjamVst3AudioProcessor::prepareToPlay (double sampleRate, int samplesPerB
         linkTimingState->reset();
     if (chordAnalyzer)
         chordAnalyzer->prepare(processingSampleRate);
+    masterChordScratchBuffer.setSize(1, juce::jmax(1, samplesPerBlock), false, true, true);
+    masterChordScratchBuffer.clear();
 
     juce::dsp::ProcessSpec spec;
     spec.sampleRate = sampleRate;
@@ -11795,6 +11810,12 @@ void NinjamVst3AudioProcessor::releaseResources()
 {
     if (linkTimingState != nullptr)
         linkTimingState->reset();
+
+    if (chordAnalyzer != nullptr)
+    {
+        chordAnalyzer->markAllNoInput();
+        chordAnalyzer->stop();
+    }
 }
 
 bool NinjamVst3AudioProcessor::loadSamplePad(int padIndex, const juce::File& file)

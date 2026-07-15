@@ -412,15 +412,21 @@ if (NINJAMPLUS_ONNX_CHORDS_AVAILABLE)
         if (TARGET ${_ninjam_runtime_target})
             add_custom_command(TARGET ${_ninjam_runtime_target} PRE_LINK
                 COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_ONNXRUNTIME_DLL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/onnxruntime.dll"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_MODEL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai/chord_model_v31_16k.onnx"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_WEIGHTS}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai/dsp_weights_v31_16k.bin"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_MODEL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai/chord_model_v31_16k.onnx"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_WEIGHTS}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai/dsp_weights_v31_16k.bin"
                 VERBATIM)
             add_custom_command(TARGET ${_ninjam_runtime_target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_ONNXRUNTIME_DLL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/onnxruntime.dll"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_MODEL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai/chord_model_v31_16k.onnx"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_WEIGHTS}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai/dsp_weights_v31_16k.bin"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_MODEL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai/chord_model_v31_16k.onnx"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_WEIGHTS}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai/dsp_weights_v31_16k.bin"
                 VERBATIM)
         endif()
     endforeach()
