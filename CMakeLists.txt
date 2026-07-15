@@ -169,6 +169,8 @@ target_sources(NINJAM_VST3 PRIVATE
     Source/PluginProcessor.h
     Source/PluginEditor.cpp
     Source/PluginEditor.h
+    Source/SolititoChordModel.cpp
+    Source/SolititoChordModel.h
     Source/StandaloneApp.cpp
     Source/ZapVideoCodec.cpp
     Source/ZapVideoCodec.h
@@ -307,8 +309,24 @@ else()
     target_compile_definitions(NINJAM_VST3 PRIVATE NINJAMPLUS_HAS_AUBIO=0)
 endif()
 
+set(NINJAMPLUS_ONNXRUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime")
+set(NINJAMPLUS_SOLITITO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/solitito-ai")
+set(NINJAMPLUS_ONNX_CHORDS_AVAILABLE FALSE)
+if (WIN32
+    AND EXISTS "${NINJAMPLUS_ONNXRUNTIME_ROOT}/include/onnxruntime_cxx_api.h"
+    AND EXISTS "${NINJAMPLUS_ONNXRUNTIME_ROOT}/bin/win-x64/onnxruntime.dll"
+    AND EXISTS "${NINJAMPLUS_SOLITITO_ROOT}/chord_model_v31_16k.onnx"
+    AND EXISTS "${NINJAMPLUS_SOLITITO_ROOT}/dsp_weights_v31_16k.bin")
+    set(NINJAMPLUS_ONNX_CHORDS_AVAILABLE TRUE)
+    target_include_directories(NINJAM_VST3 PRIVATE "${NINJAMPLUS_ONNXRUNTIME_ROOT}/include")
+    target_compile_definitions(NINJAM_VST3 PRIVATE
+        NINJAMPLUS_HAS_ONNX_CHORDS=1
+        NINJAMPLUS_SOLITITO_ASSET_DIR="${NINJAMPLUS_SOLITITO_ROOT}")
+else()
+    target_compile_definitions(NINJAM_VST3 PRIVATE NINJAMPLUS_HAS_ONNX_CHORDS=0)
+endif()
 if (MSVC)
-    target_compile_options(NINJAM_VST3 PRIVATE /bigobj)
+    target_compile_options(NINJAM_VST3 PRIVATE /bigobj /FS)
 endif()
 
 # Link libraries
@@ -374,4 +392,39 @@ if (TARGET NINJAM_VST3_LV2)
         VERBATIM
     )
     add_dependencies(NINJAM_VST3_LV2 NINJAM_VST3_RemoveLv2LegacyWebAssets)
+endif()
+
+if (NINJAMPLUS_ONNX_CHORDS_AVAILABLE)
+    set(NINJAMPLUS_ONNXRUNTIME_DLL "${NINJAMPLUS_ONNXRUNTIME_ROOT}/bin/win-x64/onnxruntime.dll")
+    set(NINJAMPLUS_SOLITITO_MODEL "${NINJAMPLUS_SOLITITO_ROOT}/chord_model_v31_16k.onnx")
+    set(NINJAMPLUS_SOLITITO_WEIGHTS "${NINJAMPLUS_SOLITITO_ROOT}/dsp_weights_v31_16k.bin")
+
+    if (TARGET juce_vst3_helper)
+        add_custom_command(TARGET juce_vst3_helper POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_ONNXRUNTIME_DLL}" "$<TARGET_FILE_DIR:juce_vst3_helper>/ninjamplus_onnxruntime.dll"
+            VERBATIM)
+    endif()
+
+    foreach(_ninjam_runtime_target NINJAM_VST3_Standalone NINJAM_VST3_VST3 NINJAM_VST3_LV2 NINJAM_VST3_AU)
+        if (TARGET ${_ninjam_runtime_target})
+            add_custom_command(TARGET ${_ninjam_runtime_target} PRE_LINK
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_ONNXRUNTIME_DLL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/ninjamplus_onnxruntime.dll"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_MODEL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai/chord_model_v31_16k.onnx"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_WEIGHTS}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai/dsp_weights_v31_16k.bin"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_MODEL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai/chord_model_v31_16k.onnx"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_WEIGHTS}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai/dsp_weights_v31_16k.bin"
+                VERBATIM)
+            add_custom_command(TARGET ${_ninjam_runtime_target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_ONNXRUNTIME_DLL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/ninjamplus_onnxruntime.dll"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_MODEL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai/chord_model_v31_16k.onnx"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_WEIGHTS}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/solitito-ai/dsp_weights_v31_16k.bin"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_MODEL}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai/chord_model_v31_16k.onnx"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NINJAMPLUS_SOLITITO_WEIGHTS}" "$<TARGET_FILE_DIR:${_ninjam_runtime_target}>/../Resources/solitito-ai/dsp_weights_v31_16k.bin"
+                VERBATIM)
+        endif()
+    endforeach()
 endif()

@@ -13,7 +13,6 @@ env:
 jobs:
   windows:
     name: Windows (Standalone, VST3)
-    if: github.repository == 'steveseguin/NinjamPlus'
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -177,7 +176,6 @@ jobs:
 
   linux:
     name: Linux (Standalone, VST3, LV2)
-    if: github.repository == 'steveseguin/NinjamPlus'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -314,7 +312,6 @@ jobs:
 
   mac:
     name: macOS (Standalone, AU, VST3)
-    if: github.repository == 'steveseguin/NinjamPlus'
     runs-on: macos-14
     steps:
       - name: Checkout

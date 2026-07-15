@@ -14,6 +14,7 @@
 #include <memory>
 #include <deque>
 #include <array>
+#include <vector>
 
 #include "ninjam/njclient.h"
 #include "ZapVideoCodec.h"
@@ -33,7 +34,7 @@ class LocalVideoHttpServer;
 class ZapVideoDecodeWorker;
 class ZapCameraSender;
 class AsyncChatTranslationWorker;
-class LocalChordAnalyzer;
+class BatchedChordAnalyzer;
 
 namespace ableton
 {
@@ -120,6 +121,13 @@ public:
     int getLocalBitrate() const;
     void setVoiceChatMode(bool enabled);
     bool isVoiceChatMode() const;
+    void setVoiceChannelGain(float gain);
+    float getVoiceChannelGain() const;
+    void setVoiceChannelInput(int inputIndex);
+    int getVoiceChannelInput() const;
+    float getVoiceChannelPeak() const;
+    float getVoiceChannelPeakLeft() const;
+    float getVoiceChannelPeakRight() const;
 
     // Chat
     juce::StringArray getChatMessages();
@@ -173,6 +181,10 @@ public:
     juce::String getUserChordLabel(int userIndex) const;
     double getUserChordCpuPercent(int userIndex) const;
     int getUserChordMemoryKb(int userIndex) const;
+    juce::String getMasterChordLabel() const;
+    double getMasterChordCpuPercent() const;
+    int getMasterChordMemoryKb() const;
+    std::vector<juce::String> getMasterChordTimeline() const;
     void setChordDetectionEnabled(bool enabled);
     bool isChordDetectionEnabled() const;
     void setUserChordDetectionEnabled(int userIndex, bool enabled);
@@ -693,24 +705,35 @@ private:
     juce::AudioBuffer<float> tempInputBuffer;
     juce::AudioBuffer<float> localChannelBuffer;
     juce::AudioBuffer<float> localMixBuffer;   // 1-ch mix used by multiChanAuto Vorbis slot
-    std::unique_ptr<LocalChordAnalyzer> localChordAnalyzer;
-    std::array<std::unique_ptr<LocalChordAnalyzer>, maxRemoteChordUsers> remoteChordAnalyzers;
+    juce::AudioBuffer<float> voiceChannelBuffer;
+    juce::AudioBuffer<float> masterChordScratchBuffer;
+    std::unique_ptr<BatchedChordAnalyzer> chordAnalyzer;
     std::atomic<bool> chordDetectionEnabled { true };
     std::array<std::atomic<bool>, maxRemoteChordUsers> remoteChordDetectionEnabled;
     std::array<juce::String, maxRemoteChordUsers> remoteChordUserKeys;
+    mutable juce::CriticalSection masterChordTimelineLock;
+    std::vector<juce::String> masterChordTimeline;
+    juce::String lastMasterTimelineChordLabel;
+    int masterChordTimelineInterval = -1;
+    int masterChordTimelineBpi = 0;
     std::atomic<float> masterOutputGain { 1.0f };
     std::atomic<float> localInputGain { 1.0f };
+    std::atomic<float> voiceChannelGain { 1.0f };
     std::atomic<float> masterPeak { 0.0f };
     std::atomic<float> masterPeakL { 0.0f };
     std::atomic<float> masterPeakR { 0.0f };
     std::atomic<float> localPeak { 0.0f };
     std::atomic<float> localPeakL { 0.0f };
     std::atomic<float> localPeakR { 0.0f };
+    std::atomic<float> voiceChannelPeak { 0.0f };
+    std::atomic<float> voiceChannelPeakL { 0.0f };
+    std::atomic<float> voiceChannelPeakR { 0.0f };
     std::array<std::atomic<float>, maxLocalChannels> localChannelGains;
     std::array<std::atomic<float>, maxLocalChannels> localChannelPeaks;
     std::array<std::atomic<float>, maxLocalChannels> localChannelPeaksL;
     std::array<std::atomic<float>, maxLocalChannels> localChannelPeaksR;
     std::array<std::atomic<int>, maxLocalChannels> localChannelInputs;
+    std::atomic<int> voiceChannelInput { 0 };
     std::array<std::atomic<float>, maxLocalChannels> localChannelReverbSends;
     std::array<std::atomic<float>, maxLocalChannels> localChannelDelaySends;
     juce::CriticalSection localChannelNamesLock;
@@ -1216,6 +1239,7 @@ private:
     int getDisplayIntervalIndex() const;
     void emitMidiTimecode(juce::MidiBuffer& midiMessages, int numSamples, int pos, int length);
     void updateMetronomeEngineVolume();
+    void updateMasterChordTimeline();
     bool loadCustomMetronomeSoundFile(const juce::File& file);
     void clearCustomMetronomeSoundFile();
     void resetMetronomeClickVoices();
@@ -1281,7 +1305,9 @@ private:
     void clearZapVideoFrameState();
     void stopNinjamZapVideoTransportForDisconnect();
     void syncLocalIntervalChannelConfig();
+    int getVoiceChatNinjamChannelIndex() const;
     bool isNinjamRemoteChannelVideoOnly(int userIndex, int channelIndex);
+    bool isRemoteUserVoiceChatMode(int userIndex);
     int syncNinjamZapVideoSubscriptions(bool subscribe);
     int ensureRawIntervalSyncFallbackSubscriptions();
     void addSystemChatLine(const juce::String& message);

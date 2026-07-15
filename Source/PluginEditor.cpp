@@ -7979,6 +7979,8 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     updateMonitorButtonColor();
 
     addAndMakeVisible(voiceChatButton);
+    voiceChatButton.setButtonText("On");
+    voiceChatButton.setTooltip("Enable voice channel");
     voiceChatButton.setClickingTogglesState(true);
     voiceChatButton.setToggleState(false, juce::dontSendNotification);
     voiceChatButton.onClick = [this]
@@ -8365,6 +8367,45 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         modeSelector.setSelectedId(audioProcessor.isLocalChannelUsingLinkAudioInput(i) || currentInput < 0 ? 2 : 1,
                                    juce::dontSendNotification);
     }
+
+    addAndMakeVisible(voiceChannelNameLabel);
+    voiceChannelNameLabel.setText("Voice", juce::dontSendNotification);
+    voiceChannelNameLabel.setJustificationType(juce::Justification::centred);
+    voiceChannelNameLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+    voiceChannelNameLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0xff1a1a1a));
+    voiceChannelNameLabel.setColour(juce::Label::outlineColourId, juce::Colour(0xff333333));
+    voiceChannelNameLabel.setTooltip("Voice channel");
+
+    addAndMakeVisible(voiceFader);
+    voiceFader.setSliderStyle(juce::Slider::LinearVertical);
+    voiceFader.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+    voiceFader.setRange(0.0, 2.0);
+    voiceFader.setSkewFactorFromMidPoint(0.25);
+    voiceFader.setSliderSnapsToMousePosition(false);
+    voiceFader.setValue(audioProcessor.getVoiceChannelGain(), juce::dontSendNotification);
+    voiceFader.setDoubleClickReturnValue(true, 1.0);
+    voiceFader.setLookAndFeel(&mixerFaderLookAndFeel);
+    voiceFader.onValueChange = [this]
+    {
+        audioProcessor.setVoiceChannelGain((float)voiceFader.getValue());
+    };
+    registerMidiLearnTarget(voiceFader, "voice.fader", false);
+
+    addAndMakeVisible(voicePeakMeter);
+    addAndMakeVisible(voiceInputSelector);
+    voiceInputSelector.setTooltip("Voice input");
+    voiceInputSelector.onChange = [this]
+    {
+        const int id = voiceInputSelector.getSelectedId();
+        if (id > 0)
+            audioProcessor.setVoiceChannelInput(id - 1);
+    };
+    refreshVoiceInputSelector();
+
+    addAndMakeVisible(voiceDbLabel);
+    voiceDbLabel.setFont(juce::Font(9.0f));
+    voiceDbLabel.setJustificationType(juce::Justification::centred);
+    voiceDbLabel.setText("-60.0 dB", juce::dontSendNotification);
 
     addAndMakeVisible(masterFaderLabel);
     masterFaderLabel.setJustificationType(juce::Justification::centred);
@@ -9013,6 +9054,7 @@ void NinjamVst3AudioProcessorEditor::paintOverChildren(juce::Graphics& g)
         g.drawRoundedRectangle(r.expanded(2.0f), 7.0f, 1.0f);
     };
 
+    drawClipPulse(voiceChannelPulseBounds, voiceClipPulsing);
     for (int i = 0; i < NinjamVst3AudioProcessor::maxLocalChannels; ++i)
         drawClipPulse(localChannelPulseBounds[(size_t)i], localClipPulsing[(size_t)i]);
     drawClipPulse(masterChannelPulseBounds, masterClipPulsing);
@@ -9073,7 +9115,7 @@ void NinjamVst3AudioProcessorEditor::resized()
     auto area = getLocalBounds().reduced(10);
 
     // Bottom: Interval Display
-    auto bottomRow = area.removeFromBottom(40);
+    auto bottomRow = area.removeFromBottom(62);
     intervalDisplay.setBounds(bottomRow);
     area.removeFromBottom(10);
 
@@ -9162,7 +9204,8 @@ void NinjamVst3AudioProcessorEditor::resized()
 
     int baseLocalWidth = 110;
     int extraPerTrack = 40;
-    int localWidth = baseLocalWidth + (numLocal - 1) * extraPerTrack;
+    int voiceColumnWidth = 62;
+    int localWidth = baseLocalWidth + voiceColumnWidth + (numLocal - 1) * extraPerTrack;
     int maxLocalWidth = area.getWidth() / 2;
     if (localWidth > maxLocalWidth)
         localWidth = maxLocalWidth;
@@ -9191,9 +9234,8 @@ void NinjamVst3AudioProcessorEditor::resized()
     localArea.removeFromTop(3);
     {
         auto row = localArea.removeFromTop(26);
-        auto third = row.getWidth() / 3;
-        voiceChatButton.setBounds(row.removeFromLeft(third));
-        bitrateSelector.setBounds(row.removeFromLeft(third));
+        auto half = row.getWidth() / 2;
+        bitrateSelector.setBounds(row.removeFromLeft(half));
         midiRelayTargetSelector.setBounds(row);
     }
     localArea.removeFromTop(3);
@@ -9213,7 +9255,15 @@ void NinjamVst3AudioProcessorEditor::resized()
 
     int meterWidth = 18;
     int totalWidth = localInner.getWidth();
-    int columnWidth = totalWidth / numLocal;
+    int totalColumns = numLocal + 1;
+    int columnWidth = totalWidth / totalColumns;
+
+    voiceChannelNameLabel.setVisible(true);
+    voiceChatButton.setVisible(true);
+    voiceFader.setVisible(true);
+    voicePeakMeter.setVisible(true);
+    voiceInputSelector.setVisible(true);
+    voiceDbLabel.setVisible(true);
 
     for (int i = 0; i < NinjamVst3AudioProcessor::maxLocalChannels; ++i)
     {
@@ -9230,6 +9280,25 @@ void NinjamVst3AudioProcessorEditor::resized()
         localDelaySendLabels[(size_t)i].setVisible(visible);
         if (!visible)
             localChannelPulseBounds[(size_t)i] = {};
+    }
+
+    {
+        juce::Rectangle<int> col = localInner.removeFromLeft(columnWidth);
+        const auto pulseBounds = col;
+        auto meterArea = col.removeFromLeft(meterWidth);
+        auto nameArea = col.removeFromTop(18);
+        auto buttonArea = col.removeFromTop(22);
+        col.removeFromTop(2);
+        auto dbArea = col.removeFromBottom(16);
+        auto inputArea = col.removeFromBottom(20);
+
+        voiceChannelNameLabel.setBounds(nameArea);
+        voiceChatButton.setBounds(buttonArea.reduced(1, 0));
+        voiceFader.setBounds(col);
+        voicePeakMeter.setBounds(meterArea);
+        voiceInputSelector.setBounds(inputArea);
+        voiceDbLabel.setBounds(dbArea);
+        voiceChannelPulseBounds = pulseBounds.expanded(1);
     }
 
     for (int i = 0; i < numLocal; ++i)
@@ -9536,6 +9605,18 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         localDbLabels[(size_t)i].setText(juce::String(db, 1) + " dB", juce::dontSendNotification);
     }
 
+    const float voicePeakL = audioProcessor.getVoiceChannelPeakLeft();
+    const float voicePeakR = audioProcessor.getVoiceChannelPeakRight();
+    const float voicePeak = juce::jmax(voicePeakL, voicePeakR);
+    voicePeakMeter.setPeak(voicePeakL, voicePeakR);
+    clipPulseNeedsRepaint |= updateClipPulseState(voicePeak, voiceClipStartMs, voiceClipPulsing);
+    {
+        float db = -60.0f;
+        if (voicePeak > 1.0e-6f)
+            db = juce::jlimit(-60.0f, 6.0f, 20.0f * std::log10(voicePeak));
+        voiceDbLabel.setText(juce::String(db, 1) + " dB", juce::dontSendNotification);
+    }
+
     const auto localChord = audioProcessor.getLocalChordLabel();
     const auto localChordStats = "CPU " + juce::String(audioProcessor.getLocalChordCpuPercent(), 2)
                                + "%  MEM ~" + juce::String(audioProcessor.getLocalChordMemoryKb()) + " KB";
@@ -9562,13 +9643,15 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         masterDbLabel.setText(juce::String((int)std::round(db)) + " dB", juce::dontSendNotification);
     }
 
-    bool anyClipPulsing = masterClipPulsing;
+    bool anyClipPulsing = masterClipPulsing || voiceClipPulsing;
     for (int i = 0; i < numLocal; ++i)
         anyClipPulsing = anyClipPulsing || localClipPulsing[(size_t)i];
 
     if (clipPulseNeedsRepaint || (anyClipPulsing && nowMs - lastClipPulseRepaintMs >= transmitPulseRepaintMs))
     {
         lastClipPulseRepaintMs = nowMs;
+        if (!voiceChannelPulseBounds.isEmpty())
+            repaint(voiceChannelPulseBounds.expanded(4));
         for (int i = 0; i < numLocal; ++i)
             if (!localChannelPulseBounds[(size_t)i].isEmpty())
                 repaint(localChannelPulseBounds[(size_t)i].expanded(4));
@@ -10592,6 +10675,8 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
     updateMonitorButtonColor();
 
     voiceChatButton.setToggleState(audioProcessor.isVoiceChatMode(), juce::dontSendNotification);
+    voiceFader.setValue(audioProcessor.getVoiceChannelGain(), juce::dontSendNotification);
+    refreshVoiceInputSelector();
     updateVoiceChatButtonColor();
 
     const int bitrates[] = { 64, 96, 128, 160, 192, 256, 320 };
@@ -11286,6 +11371,28 @@ void NinjamVst3AudioProcessorEditor::refreshLocalInputSelectors()
 {
     for (int i = 0; i < NinjamVst3AudioProcessor::maxLocalChannels; ++i)
         refreshLocalInputSelector(i);
+    refreshVoiceInputSelector();
+}
+
+void NinjamVst3AudioProcessorEditor::refreshVoiceInputSelector()
+{
+    voiceInputSelector.clear(juce::dontSendNotification);
+
+    int total = audioProcessor.getTotalNumInputChannels();
+    if (total <= 0)
+        total = 2;
+
+    for (int ch = 0; ch < total; ++ch)
+        voiceInputSelector.addItem("In " + juce::String(ch + 1), ch + 1);
+
+    int currentInput = audioProcessor.getVoiceChannelInput();
+    if (currentInput < 0 || currentInput >= total)
+    {
+        currentInput = 0;
+        audioProcessor.setVoiceChannelInput(currentInput);
+    }
+
+    voiceInputSelector.setSelectedId(currentInput + 1, juce::dontSendNotification);
 }
 
 void NinjamVst3AudioProcessorEditor::refreshMidiRelayTargetSelector()
