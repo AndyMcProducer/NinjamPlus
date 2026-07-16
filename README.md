@@ -2,9 +2,9 @@
 
 **Interval-based online music collaboration with a resilient, synchronized VDO.Ninja video room.**
 
-[![Latest release](https://img.shields.io/github/v/release/steveseguin/NinjamPlus?include_prereleases&label=release)](https://github.com/steveseguin/NinjamPlus/releases)
+[![Latest release](https://img.shields.io/github/v/release/AndyMcProducer/NinjamPlus?include_prereleases&label=release)](https://github.com/AndyMcProducer/NinjamPlus/releases)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-35d0ba)](#downloads-and-formats)
-[![Functional tests](https://github.com/steveseguin/NinjamPlus/actions/workflows/release.yml/badge.svg)](https://github.com/steveseguin/NinjamPlus/actions/workflows/release.yml)
+[![Build and tests](https://github.com/AndyMcProducer/NinjamPlus/actions/workflows/build.yml/badge.svg)](https://github.com/AndyMcProducer/NinjamPlus/actions/workflows/build.yml)
 
 NINJAMplus is a standalone application and audio plug-in for musicians who want to play together over the Internet. It uses the NINJAM protocol for musically aligned audio, then adds an optional browser-based VDO.Ninja room whose video delay follows the NINJAM interval timing.
 
@@ -26,7 +26,7 @@ The browser room uses `noaudio=1`: NINJAM remains the audio clock and audio tran
 
 ## Quick start
 
-1. Download the package for your operating system from [Releases](https://github.com/steveseguin/NinjamPlus/releases).
+1. Download the package for your operating system from [Releases](https://github.com/AndyMcProducer/NinjamPlus/releases).
 2. Launch the standalone app, or load NINJAMplus in a compatible DAW.
 3. Route an input into NINJAMplus and use headphones to avoid feedback.
 4. Enter the NINJAM server address, user name, and password if required. Select **Anonymous** when the server permits anonymous guests.
@@ -146,7 +146,7 @@ The helper normally binds only to `127.0.0.1` and opens the system browser. If i
 | macOS | Standalone, VST3, AU, and `.pkg` |
 | Linux x64 | Standalone, VST3, and LV2 |
 
-Every push to the maintained fork runs functional tests and produces an immutable prerelease with SHA-256 checksums. Normal version tags produce full releases.
+Pull requests run functional tests and native builds on every supported operating system. Version tags and manually dispatched releases publish artifacts with SHA-256 checksums.
 
 macOS artifacts are currently ad-hoc signed when Apple signing/notarization credentials are not configured. Depending on local Gatekeeper policy, users may need to explicitly approve the application. Always compare downloaded files against `SHA256SUMS.txt` from the release.
 
@@ -184,8 +184,8 @@ For manual network validation, test the actual helper in the external browser it
 
 ## Project and legal notes
 
-- Maintained fork: [steveseguin/NinjamPlus](https://github.com/steveseguin/NinjamPlus)
-- Releases: [github.com/steveseguin/NinjamPlus/releases](https://github.com/steveseguin/NinjamPlus/releases)
+- Repository: [AndyMcProducer/NinjamPlus](https://github.com/AndyMcProducer/NinjamPlus)
+- Releases: [github.com/AndyMcProducer/NinjamPlus/releases](https://github.com/AndyMcProducer/NinjamPlus/releases)
 - VDO.Ninja: [vdo.ninja](https://vdo.ninja/)
 - Third-party and upstream notices: [LEGAL_NOTICES.txt](LEGAL_NOTICES.txt) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 
