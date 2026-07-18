@@ -1,6 +1,6 @@
 #!/bin/sh -x
 
-# Simple script to locally build Standalone, VST3, AU on *NIX platforms
+# Simple script to locally build Standalone, VST3, AU on macOS
 
 # Clean out ./build folder
 rm -rf build/*
