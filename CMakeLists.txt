@@ -5,6 +5,17 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 set(NINJAM_VERSION_FALLBACK "0.0.0")
 set(NINJAM_VERSION_TAG "")
+
+# If we are compiling for Mac OS we want to target OS versions down to 10.9
+option(UniversalBinary "Build universal binary for mac" ON)
+
+if (APPLE)
+    set (CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE INTERNAL "")
+    if (UniversalBinary)
+        set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE INTERNAL "")
+    endif()
+endif()
+
 foreach(_ninjam_version_env NINJAM_VERSION_TAG RELEASE_TAG GITHUB_REF_NAME)
     if (NOT NINJAM_VERSION_TAG AND DEFINED ENV{${_ninjam_version_env}} AND NOT "$ENV{${_ninjam_version_env}}" STREQUAL "")
         set(_ninjam_version_candidate "$ENV{${_ninjam_version_env}}")
