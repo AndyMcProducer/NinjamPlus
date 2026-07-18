@@ -6,8 +6,8 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 set(NINJAM_VERSION_FALLBACK "0.0.0")
 set(NINJAM_VERSION_TAG "")
 
-# If we are compiling for Mac OS we want to target OS versions down to 10.9
-option(UniversalBinary "Build universal binary for mac" ON)
+# If we are compiling for macOS we want to target OS versions down to 10.13
+option(UniversalBinary "Build universal binary for macOS" ON)
 
 if (APPLE)
     set (CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE INTERNAL "")
