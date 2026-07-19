@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.9.13.4 - 2026-07-19
 
 ### Integrated from AndyMcProducer/release
 
@@ -34,4 +34,3 @@
 ### Outstanding validation
 
 - Smoke-test the universal build on physical Intel macOS 10.13 hardware and on Apple Silicon. CI proves compilation and architecture contents, but not runtime behavior on the oldest supported OS.
-- Publish a new version after this upstream merge; v0.9.13.3 was built before Andy's build changes were integrated.
