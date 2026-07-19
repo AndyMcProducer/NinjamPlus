@@ -25,8 +25,8 @@
 ### Validation performed
 
 - Six deterministic helper tests pass.
-- Windows Standalone/VST3 builds and strict pluginval validation pass.
-- Combined Linux and macOS CI builds pass; macOS architecture assertions are added for the next run.
+- Combined functional, Linux, Windows, and macOS CI jobs pass; Windows also passes strict pluginval validation.
+- CI verifies the packaged macOS Standalone, AU, and VST3 executables each contain both `x86_64` and `arm64` slices.
 - Live video started at 1280x720 around 2.1 Mbps without camera constraint errors.
 - Live remote video delay remained stable at approximately one 30 fps frame with no UUID/stream-routing errors.
 - TURN/UDP cellular impairment testing held the fixed NINJAM timing target with 9.2 ms p95 scheduling error overall and 10.2 ms after recovery.
