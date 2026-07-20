@@ -22,8 +22,13 @@ async function vdoFrame(page) {
 
 test("starts with the quality-first sync-safe profile", async ({ page }) => {
 	await page.goto(helperUrl({ cameraQuality: "720p30" }));
+	await expect(page.locator("#vdoCameraQuality")).toHaveValue("720p30");
 	const frame = await vdoFrame(page);
 	const params = new URL(frame.url()).searchParams;
+	expect(params.get("quality")).toBe("1");
+	expect(params.get("mfr")).toBe("30");
+	expect(params.has("fps")).toBe(false);
+	expect(params.get("maxvideobitrate")).toBe("2500");
 	expect(params.get("chunked")).toBe("2500");
 	expect(params.get("chunkadaptceil")).toBe("2500");
 	expect(params.get("chunkadaptfloor")).toBe("60");
@@ -43,7 +48,8 @@ test("honors an explicit high-quality ceiling without lowering startup quality",
 	const params = new URL(frame.url()).searchParams;
 	expect(params.get("chunked")).toBe("2500");
 	expect(params.get("quality")).toBe("0");
-	expect(params.get("fps")).toBe("30");
+	expect(params.get("mfr")).toBe("30");
+	expect(params.has("fps")).toBe(false);
 	expect(params.get("maxvideobitrate")).toBe("10000");
 	expect(params.get("chunkadaptceil")).toBe("10000");
 });
@@ -153,6 +159,9 @@ test("applies the exact NINJAM buffer and compensates measured video pipeline ch
 		const updates = window.received.filter((message) => message && message.setBufferDelay === 15962);
 		return updates.length;
 	})).toBeGreaterThan(0);
+	const initialUpdates = await frame.evaluate(() => window.received.filter((message) => message && message.setBufferDelay === 15962));
+	expect(initialUpdates.every((message) => message.streamID === "remote_stream")).toBe(true);
+	expect(initialUpdates.some((message) => "UUID" in message || "target" in message)).toBe(false);
 
 	await frame.evaluate(() => {
 		parent.postMessage({ streamID: "remote_stream", label: "tester", cameraSendLatencyMs: 218 }, "*");

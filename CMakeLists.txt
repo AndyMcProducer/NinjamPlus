@@ -6,13 +6,18 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 set(NINJAM_VERSION_FALLBACK "0.0.0")
 set(NINJAM_VERSION_TAG "")
 
-# If we are compiling for macOS we want to target OS versions down to 10.13
+# Build Intel and Apple Silicon slices by default. Keep these as normal cache
+# settings so local builds and toolchains can override them explicitly.
 option(UniversalBinary "Build universal binary for macOS" ON)
 
 if (APPLE)
-    set (CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE INTERNAL "")
-    if (UniversalBinary)
-        set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE INTERNAL "")
+    if (NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET AND "$ENV{MACOSX_DEPLOYMENT_TARGET}" STREQUAL "")
+        set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum macOS version for the Intel slice")
+    endif()
+    if (UniversalBinary
+        AND NOT DEFINED CMAKE_OSX_ARCHITECTURES
+        AND "$ENV{CMAKE_OSX_ARCHITECTURES}" STREQUAL "")
+        set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "macOS architectures to build")
     endif()
 endif()
 
@@ -42,6 +47,11 @@ endif()
 set(NINJAM_DISPLAY_VERSION "v${NINJAM_PLUGIN_VERSION}")
 
 project(NINJAM_VST3 VERSION ${NINJAM_PLUGIN_VERSION})
+
+if (APPLE)
+    message(STATUS "macOS deployment target: ${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    message(STATUS "macOS architectures: ${CMAKE_OSX_ARCHITECTURES}")
+endif()
 
 set(NINJAM_BRAND_NAME "NINJAMplus")
 set(NINJAM_VENDOR_NAME "AMP")

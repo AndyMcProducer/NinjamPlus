@@ -1499,18 +1499,10 @@
                 return false;
             }
             const nextBuffer = Math.max(minimumBufferMs, Math.round(bufferMs));
-            let sent = false;
-            if (target.targetId) {
-                sent = postToVdo({ setBufferDelay: nextBuffer, UUID: target.targetId }) || sent;
-                sent = postToVdo({ setBufferDelay: nextBuffer, target: target.targetId }) || sent;
-            }
             if (target.streamId) {
-                sent = postToVdo({ setBufferDelay: nextBuffer, streamID: target.streamId }) || sent;
-                if (!target.targetId) {
-                    sent = postToVdo({ setBufferDelay: nextBuffer, target: target.streamId }) || sent;
-                }
+                return postToVdo({ setBufferDelay: nextBuffer, streamID: target.streamId });
             }
-            return sent;
+            return postToVdo({ setBufferDelay: nextBuffer, UUID: target.targetId });
         }
 
         function sendTargetedBuffer(userKey, bufferMs) {
@@ -2199,11 +2191,11 @@
         function vdoQualityPresetConfig(preset) {
             const quality = normalizeVdoQualityPreset(preset);
             if (quality === '1080p60-10000' || quality === '1080p60') return { quality: '0', width: 1920, height: 1080, mfr: 60, bitrate: 10000 };
-            if (quality === '1080p30-10000') return { quality: '0', width: 1920, height: 1080, fps: 30, bitrate: 10000 };
-            if (quality === '1080p30') return { quality: '0', width: 1920, height: 1080, fps: 30, bitrate: 4500 };
-            if (quality === '720p60') return { quality: '1', width: 1280, height: 720, fps: 60, bitrate: 3500 };
-            if (quality === '720p30') return { quality: '1', width: 1280, height: 720, fps: 30, bitrate: 2500 };
-            if (quality === '360p30') return { quality: '2', width: 640, height: 360, fps: 30, bitrate: 1200 };
+            if (quality === '1080p30-10000') return { quality: '0', width: 1920, height: 1080, mfr: 30, bitrate: 10000 };
+            if (quality === '1080p30') return { quality: '0', width: 1920, height: 1080, mfr: 30, bitrate: 4500 };
+            if (quality === '720p60') return { quality: '1', width: 1280, height: 720, mfr: 60, bitrate: 3500 };
+            if (quality === '720p30') return { quality: '1', width: 1280, height: 720, mfr: 30, bitrate: 2500 };
+            if (quality === '360p30') return { quality: '2', width: 640, height: 360, mfr: 30, bitrate: 1200 };
             return null;
         }
 
@@ -2213,7 +2205,6 @@
                 return;
             }
             params.set('quality', config.quality);
-            if (config.fps) params.set('fps', String(config.fps));
             if (config.mfr) params.set('mfr', String(config.mfr));
             params.set('bitrate', String(config.bitrate));
         }

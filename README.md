@@ -164,6 +164,17 @@ macOS artifacts are currently ad-hoc signed when Apple signing/notarization cred
 
 The project uses CMake 3.22+, C++17, JUCE 8, and fetched/pinned audio dependencies.
 
+Platform helpers build the complete local format set:
+
+```sh
+./build-macos.sh
+./build-linux.sh
+```
+
+`build.sh` remains a compatibility alias for the macOS helper. Linux uses Debian/Ubuntu package installation by default; set `NINJAM_SKIP_SYSTEM_DEPS=1` when dependencies are already installed. Set `NINJAM_BUILD_DIR` to use a build directory outside the checkout.
+
+macOS builds default to universal `x86_64;arm64` output and an Intel deployment target of 10.13. Override these normal CMake cache settings when needed with `-DUniversalBinary=OFF`, `-DCMAKE_OSX_ARCHITECTURES=...`, or `-DCMAKE_OSX_DEPLOYMENT_TARGET=...`.
+
 ```sh
 git submodule update --init --recursive
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

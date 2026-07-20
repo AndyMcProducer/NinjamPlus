@@ -495,6 +495,9 @@ jobs:
           --target NINJAM_VST3_Standalone NINJAM_VST3_AU NINJAM_VST3_VST3
           -- CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY=""
 
+      - name: Validate universal binaries
+        run: scripts/validate-macos-universal.sh build/NINJAMplus/Release
+
       - name: Package
         shell: bash
         env:
