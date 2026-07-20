@@ -12253,6 +12253,7 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
     menu.addItem(48, "Mobile Hotspot Keepalive", true, audioProcessor.isMobileHotspotModeEnabled());
     menu.addItem(49, "Automatically Reconnect", true, audioProcessor.isAutoReconnectEnabled());
     menu.addItem(43, "Ableton Link Audio");
+    menu.addItem(57, "Change VDO Room...", audioProcessor.canChangeVdoRoomName(), false);
     menu.addItem(47, "Check for Updates...");
     menu.addSubMenu("Metronome Sound", metronomeSoundMenu);
     menu.addSubMenu("Metronome Output", metronomeOutputMenu);
@@ -12313,6 +12314,11 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
             {
                 audioProcessor.setAutoReconnectEnabled(!audioProcessor.isAutoReconnectEnabled());
                 markPersistentSettingsDirty();
+                return;
+            }
+            if (result == 57)
+            {
+                audioProcessor.promptToChangeVdoRoomNameAsync();
                 return;
             }
             constexpr int callbackMetronomeOutputMonoMenuIdBase = 8000;

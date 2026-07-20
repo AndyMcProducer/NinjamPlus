@@ -5883,6 +5883,13 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
     }
     currentServer = host;
     currentUser = user;
+    {
+        const juce::ScopedLock lock(vdoRoomLock);
+        announcedVdoRoomServerKey.clear();
+        announcedVdoRoomName.clear();
+        announcedVdoRoomOwnedLocally = false;
+        lastVdoRoomAnnouncementMs = 0.0;
+    }
     refreshAbletonLinkActivation();
 
     // Do NOT reset isTransmitting here — the user may have toggled it before
@@ -5907,6 +5914,13 @@ void NinjamVst3AudioProcessor::disconnectFromServer()
     stopAdvancedVideoClient();
     currentServer = {};
     currentUser = {};
+    {
+        const juce::ScopedLock lock(vdoRoomLock);
+        announcedVdoRoomServerKey.clear();
+        announcedVdoRoomName.clear();
+        announcedVdoRoomOwnedLocally = false;
+        lastVdoRoomAnnouncementMs = 0.0;
+    }
     clearRemoteAudioTapBuffers();
     refreshAbletonLinkActivation();
     {
@@ -7394,17 +7408,28 @@ bool NinjamVst3AudioProcessor::ensureZapVideoClientStarted()
     return ensureAdvancedVideoClientStarted();
 }
 
-void NinjamVst3AudioProcessor::launchVideoSessionAsync()
+namespace
 {
-    bool expected = false;
-    if (!videoLaunchInProgress.compare_exchange_strong(expected, true))
-        return;
+    struct VdoRoomResolution
+    {
+        juce::String serverKey;
+        juce::String room;
+        juce::String suggestedRoom;
+        bool needsPrompt = false;
+    };
 
+    juce::String makeUrlSafeVdoRoomToken(const juce::String& raw);
+    juce::String makeVdoRoomSettingsKey(const juce::String& serverKey);
+    VdoRoomResolution resolveVdoRoomForServer(const juce::String& roomSource);
+}
+
+void NinjamVst3AudioProcessor::beginVideoLaunchWorker(juce::String room)
+{
     const juce::ScopedLock launchLock(videoLaunchWorkerLock);
     if (videoLaunchFuture.valid())
         videoLaunchFuture.wait();
 
-    videoLaunchFuture = std::async(std::launch::async, [this]()
+    videoLaunchFuture = std::async(std::launch::async, [this, room = std::move(room)]()
     {
         struct VideoLaunchScope
         {
@@ -7416,7 +7441,7 @@ void NinjamVst3AudioProcessor::launchVideoSessionAsync()
 
         try
         {
-            launchVideoSession();
+            launchVideoSession(room);
         }
         catch (...)
         {
@@ -7430,6 +7455,256 @@ void NinjamVst3AudioProcessor::launchVideoSessionAsync()
                 chatSenders.removeRange(0, juce::jmax(0, chatSenders.size() - 100));
             }
         }
+    });
+}
+
+juce::String NinjamVst3AudioProcessor::getVdoRoomNameForServer(const juce::String& serverKey) const
+{
+    const juce::String key = serverKey.trim().toLowerCase();
+    if (key.isEmpty())
+        return {};
+
+    const juce::ScopedLock lock(vdoRoomLock);
+    return announcedVdoRoomServerKey == key ? announcedVdoRoomName : juce::String();
+}
+
+bool NinjamVst3AudioProcessor::rememberVdoRoomNameForServer(const juce::String& serverKey, const juce::String& room, bool ownedLocally)
+{
+    const juce::String key = serverKey.trim().toLowerCase();
+    const juce::String cleanRoom = makeUrlSafeVdoRoomToken(room);
+    if (key.isEmpty() || cleanRoom.isEmpty())
+        return false;
+
+    const juce::ScopedLock lock(vdoRoomLock);
+    const bool changed = announcedVdoRoomServerKey != key
+                      || announcedVdoRoomName != cleanRoom
+                      || announcedVdoRoomOwnedLocally != ownedLocally;
+    announcedVdoRoomServerKey = key;
+    announcedVdoRoomName = cleanRoom;
+    announcedVdoRoomOwnedLocally = ownedLocally;
+    if (changed)
+        lastVdoRoomAnnouncementMs = 0.0;
+    return changed;
+}
+
+juce::String NinjamVst3AudioProcessor::loadSavedVdoRoomNameForServer(const juce::String& serverKey) const
+{
+    const juce::String key = makeVdoRoomSettingsKey(serverKey);
+    if (key.isEmpty())
+        return {};
+
+    juce::PropertiesFile settings(makeNinjamplusSettingsOptions());
+    return makeUrlSafeVdoRoomToken(settings.getValue(key, {}));
+}
+
+void NinjamVst3AudioProcessor::saveVdoRoomNameForServer(const juce::String& serverKey, const juce::String& room)
+{
+    const juce::String key = makeVdoRoomSettingsKey(serverKey);
+    const juce::String cleanRoom = makeUrlSafeVdoRoomToken(room);
+    if (key.isEmpty() || cleanRoom.isEmpty())
+        return;
+
+    juce::PropertiesFile settings(makeNinjamplusSettingsOptions());
+    settings.setValue(key, cleanRoom);
+    settings.setValue(key + ".owner", true);
+    settings.saveIfNeeded();
+}
+
+bool NinjamVst3AudioProcessor::canChangeVdoRoomName()
+{
+    if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
+        return false;
+
+    const VdoRoomResolution roomResolution = resolveVdoRoomForServer(currentServer);
+    {
+        const juce::ScopedLock lock(vdoRoomLock);
+        if (announcedVdoRoomServerKey == roomResolution.serverKey
+            && announcedVdoRoomName.isNotEmpty()
+            && announcedVdoRoomOwnedLocally)
+            return true;
+    }
+
+    const juce::String key = makeVdoRoomSettingsKey(roomResolution.serverKey);
+    if (key.isEmpty())
+        return false;
+
+    juce::PropertiesFile settings(makeNinjamplusSettingsOptions());
+    return settings.getBoolValue(key + ".owner", false)
+        && makeUrlSafeVdoRoomToken(settings.getValue(key, {})).isNotEmpty();
+}
+
+void NinjamVst3AudioProcessor::promptToChangeVdoRoomNameAsync()
+{
+    if (!canChangeVdoRoomName())
+        return;
+
+    const VdoRoomResolution roomResolution = resolveVdoRoomForServer(currentServer);
+    juce::String currentRoom = getVdoRoomNameForServer(roomResolution.serverKey);
+    if (currentRoom.isEmpty())
+        currentRoom = loadSavedVdoRoomNameForServer(roomResolution.serverKey);
+    if (currentRoom.isEmpty())
+        currentRoom = roomResolution.suggestedRoom;
+
+    auto* editor = dynamic_cast<juce::Component*>(getActiveEditor());
+    juce::Component::SafePointer<juce::Component> safeEditor(editor);
+    if (safeEditor == nullptr)
+        return;
+
+    juce::MessageManager::callAsync([this, safeEditor, roomResolution, currentRoom]() mutable
+    {
+        if (safeEditor == nullptr)
+            return;
+
+        auto* alert = new juce::AlertWindow("Change VDO Room",
+                                            "Enter the VDO room name everyone on this NINJAM server should use.",
+                                            juce::AlertWindow::QuestionIcon);
+        alert->addTextEditor("room", currentRoom, "Room:");
+        alert->addButton("Save", 1, juce::KeyPress(juce::KeyPress::returnKey));
+        alert->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+
+        alert->enterModalState(true,
+                               juce::ModalCallbackFunction::create(
+                                   [this, safeEditor, alert, roomResolution](int result) mutable
+                                   {
+                                       std::unique_ptr<juce::AlertWindow> alertOwner(alert);
+                                       if (safeEditor == nullptr || result != 1)
+                                           return;
+
+                                       const juce::String selectedRoom = makeUrlSafeVdoRoomToken(alert->getTextEditorContents("room"));
+                                       if (selectedRoom.isEmpty())
+                                       {
+                                           addSystemChatLine("VDO room was not changed: room name was empty.");
+                                           return;
+                                       }
+
+                                       rememberVdoRoomNameForServer(roomResolution.serverKey, selectedRoom, true);
+                                       saveVdoRoomNameForServer(roomResolution.serverKey, selectedRoom);
+                                       announceVdoRoomName(roomResolution.serverKey, selectedRoom);
+                                       addSystemChatLine("VDO room changed to " + selectedRoom + ". Other NINJAMplus users on this server will use it.");
+
+                                       if (vdoVideoSyncEnabled.load(std::memory_order_relaxed)
+                                           && !ninjamZapVideoEnabled.load(std::memory_order_relaxed))
+                                           launchVideoSessionAsync();
+                                   }),
+                               false);
+    });
+}
+
+void NinjamVst3AudioProcessor::announceVdoRoomName(const juce::String& serverKey, const juce::String& room)
+{
+    const juce::String key = serverKey.trim().toLowerCase();
+    const juce::String cleanRoom = makeUrlSafeVdoRoomToken(room);
+    if (key.isEmpty() || cleanRoom.isEmpty())
+        return;
+
+    juce::DynamicObject::Ptr payloadObj = new juce::DynamicObject();
+    payloadObj->setProperty("appFamily", opusSyncAppFamily);
+    payloadObj->setProperty("userId", normaliseOpusPeerId(currentUser));
+    payloadObj->setProperty("serverKey", key);
+    payloadObj->setProperty("room", cleanRoom);
+    const juce::String payload = juce::JSON::toString(juce::var(payloadObj.get()), false);
+
+    sendSideSignal("*", "vdoRoom", payload);
+
+    juce::DynamicObject::Ptr wrapper = new juce::DynamicObject();
+    wrapper->setProperty("type", "vdoRoom");
+    wrapper->setProperty("payload", payload);
+    const juce::String fallbackMessage = juce::String(sideSignalChatPrefix)
+                                       + juce::JSON::toString(juce::var(wrapper.get()), false);
+
+    const juce::ScopedLock clientLock(ninjamClientLock);
+    if (ninjamClient.GetStatus() == NJClient::NJC_STATUS_OK)
+        ninjamClient.ChatMessage_Send("MSG", fallbackMessage.toRawUTF8());
+}
+
+void NinjamVst3AudioProcessor::launchVideoSessionAsync()
+{
+    bool expected = false;
+    if (!videoLaunchInProgress.compare_exchange_strong(expected, true))
+        return;
+
+    if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
+    {
+        beginVideoLaunchWorker({});
+        return;
+    }
+
+    const VdoRoomResolution roomResolution = resolveVdoRoomForServer(currentServer);
+    juce::String room = getVdoRoomNameForServer(roomResolution.serverKey);
+    if (room.isEmpty() && roomResolution.needsPrompt)
+    {
+        room = loadSavedVdoRoomNameForServer(roomResolution.serverKey);
+        if (room.isNotEmpty())
+            rememberVdoRoomNameForServer(roomResolution.serverKey, room, true);
+    }
+    if (room.isEmpty() && !roomResolution.needsPrompt)
+        room = roomResolution.room;
+
+    if (room.isNotEmpty())
+    {
+        beginVideoLaunchWorker(room);
+        return;
+    }
+
+    auto* editor = dynamic_cast<juce::Component*>(getActiveEditor());
+    juce::Component::SafePointer<juce::Component> safeEditor(editor);
+    if (safeEditor == nullptr)
+    {
+        room = roomResolution.suggestedRoom;
+        rememberVdoRoomNameForServer(roomResolution.serverKey, room, true);
+        saveVdoRoomNameForServer(roomResolution.serverKey, room);
+        announceVdoRoomName(roomResolution.serverKey, room);
+        beginVideoLaunchWorker(room);
+        return;
+    }
+
+    juce::MessageManager::callAsync([this, safeEditor, roomResolution]() mutable
+    {
+        if (safeEditor == nullptr)
+        {
+            videoLaunchInProgress.store(false);
+            return;
+        }
+
+        auto* alert = new juce::AlertWindow("VDO Room Name",
+                                            "This server does not provide a public room name. Enter the VDO room name everyone on this NINJAM server should use.",
+                                            juce::AlertWindow::QuestionIcon);
+        alert->addTextEditor("room", roomResolution.suggestedRoom, "Room:");
+        alert->addButton("Join", 1, juce::KeyPress(juce::KeyPress::returnKey));
+        alert->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+
+        alert->enterModalState(true,
+                               juce::ModalCallbackFunction::create(
+                                   [this, safeEditor, alert, roomResolution](int result) mutable
+                                   {
+                                       std::unique_ptr<juce::AlertWindow> alertOwner(alert);
+                                       if (safeEditor == nullptr)
+                                       {
+                                           videoLaunchInProgress.store(false);
+                                           return;
+                                       }
+
+                                       if (result != 1)
+                                       {
+                                           videoLaunchInProgress.store(false);
+                                           return;
+                                       }
+
+                                       const juce::String selectedRoom = makeUrlSafeVdoRoomToken(alert->getTextEditorContents("room"));
+                                       if (selectedRoom.isEmpty())
+                                       {
+                                           addSystemChatLine("VDO launch cancelled: room name was empty.");
+                                           videoLaunchInProgress.store(false);
+                                           return;
+                                       }
+
+                                       rememberVdoRoomNameForServer(roomResolution.serverKey, selectedRoom, true);
+                                       saveVdoRoomNameForServer(roomResolution.serverKey, selectedRoom);
+                                       announceVdoRoomName(roomResolution.serverKey, selectedRoom);
+                                       addSystemChatLine("VDO room set to " + selectedRoom + ". Other NINJAMplus users on this server will use it.");
+                                       beginVideoLaunchWorker(selectedRoom);
+                                   }),
+                               false);
     });
 }
 
@@ -9160,7 +9435,187 @@ void NinjamVst3AudioProcessor::stopAdvancedVideoClient()
 
 
 
-void NinjamVst3AudioProcessor::launchVideoSession()
+namespace
+{
+    juce::String makeUrlSafeVdoRoomToken(const juce::String& raw)
+    {
+        juce::String room;
+        bool lastWasUnderscore = false;
+
+        for (int i = 0; i < raw.length(); ++i)
+        {
+            const juce_wchar ch = raw[i];
+            if (juce::CharacterFunctions::isLetterOrDigit(ch))
+            {
+                room << juce::String::charToString((juce_wchar) juce::CharacterFunctions::toLowerCase(ch));
+                lastWasUnderscore = false;
+            }
+            else if (!lastWasUnderscore)
+            {
+                room << "_";
+                lastWasUnderscore = true;
+            }
+        }
+
+        return room.trimCharactersAtStart("_").trimCharactersAtEnd("_");
+    }
+
+    bool isDigitsOnly(const juce::String& text)
+    {
+        if (text.isEmpty())
+            return false;
+
+        for (int i = 0; i < text.length(); ++i)
+            if (!juce::CharacterFunctions::isDigit(text[i]))
+                return false;
+
+        return true;
+    }
+
+    bool isIpAddressText(const juce::String& host)
+    {
+        bool sawDigit = false;
+        bool sawSeparator = false;
+
+        for (int i = 0; i < host.length(); ++i)
+        {
+            const juce_wchar ch = host[i];
+            if (juce::CharacterFunctions::isDigit(ch))
+            {
+                sawDigit = true;
+            }
+            else if (ch == '.' || ch == ':')
+            {
+                sawSeparator = true;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        return sawDigit && sawSeparator;
+    }
+
+    juce::String makeStableVdoRoomHash(const juce::String& endpoint)
+    {
+        juce::uint64 hash = static_cast<juce::uint64>(1469598103934665603ull);
+        const char* const text = endpoint.toRawUTF8();
+
+        for (const char* p = text; *p != 0; ++p)
+        {
+            hash ^= static_cast<unsigned char>(*p);
+            hash *= static_cast<juce::uint64>(1099511628211ull);
+        }
+
+        static constexpr char hex[] = "0123456789abcdef";
+        juce::String suffix;
+        for (int shift = 60; shift >= 0; shift -= 4)
+            suffix << juce::String::charToString((juce_wchar) hex[static_cast<int>((hash >> shift) & 0xf)]);
+
+        return "ninjam_" + suffix;
+    }
+
+    juce::String makeVdoRoomSettingsKey(const juce::String& serverKey)
+    {
+        return "vdoRoom." + makeStableVdoRoomHash(serverKey.trim().toLowerCase());
+    }
+
+    struct VdoRoomEndpointParts
+    {
+        juce::String serverKey;
+        juce::String hostPart;
+        juce::String portPart;
+    };
+
+    VdoRoomEndpointParts parseVdoRoomEndpoint(juce::String roomSource)
+    {
+        roomSource = roomSource.trim();
+        const int schemePos = roomSource.indexOf("://");
+        if (schemePos >= 0)
+            roomSource = roomSource.substring(schemePos + 3);
+
+        const int slashPos = roomSource.indexOfChar('/');
+        if (slashPos >= 0)
+            roomSource = roomSource.substring(0, slashPos);
+
+        const int atPos = roomSource.lastIndexOfChar('@');
+        if (atPos >= 0 && atPos + 1 < roomSource.length())
+            roomSource = roomSource.substring(atPos + 1);
+
+        juce::String hostPart = roomSource.trim();
+        juce::String portPart;
+
+        if (hostPart.startsWithChar('['))
+        {
+            const int closeBracket = hostPart.indexOfChar(']');
+            if (closeBracket > 0)
+            {
+                const juce::String bracketHost = hostPart.substring(1, closeBracket).trim();
+                const juce::String afterBracket = hostPart.substring(closeBracket + 1).trim();
+                if (afterBracket.startsWithChar(':') && isDigitsOnly(afterBracket.substring(1).trim()))
+                    portPart = afterBracket.substring(1).trim();
+
+                hostPart = bracketHost;
+            }
+        }
+        else
+        {
+            const int firstColonPos = hostPart.indexOfChar(':');
+            const int lastColonPos = hostPart.lastIndexOfChar(':');
+            if (lastColonPos > 0 && firstColonPos == lastColonPos && lastColonPos + 1 < hostPart.length())
+            {
+                const juce::String candidatePort = hostPart.substring(lastColonPos + 1).trim();
+                if (isDigitsOnly(candidatePort))
+                {
+                    hostPart = hostPart.substring(0, lastColonPos);
+                    portPart = candidatePort;
+                }
+            }
+        }
+
+        VdoRoomEndpointParts parts;
+        parts.hostPart = hostPart.trim().trimCharactersAtStart("[").trimCharactersAtEnd("]").toLowerCase();
+        parts.portPart = portPart.trim();
+        parts.serverKey = parts.hostPart;
+        if (parts.portPart.isNotEmpty())
+            parts.serverKey << ":" << parts.portPart;
+        if (parts.serverKey.isEmpty())
+            parts.serverKey = "ninjam";
+        return parts;
+    }
+
+    VdoRoomResolution resolveVdoRoomForServer(const juce::String& roomSource)
+    {
+        const VdoRoomEndpointParts endpoint = parseVdoRoomEndpoint(roomSource);
+        VdoRoomResolution resolution;
+        resolution.serverKey = endpoint.serverKey;
+        resolution.suggestedRoom = makeStableVdoRoomHash(endpoint.serverKey);
+
+        const bool hostHasFriendlyName = endpoint.hostPart.isNotEmpty()
+                                      && !endpoint.hostPart.equalsIgnoreCase("localhost")
+                                      && !isIpAddressText(endpoint.hostPart);
+
+        if (hostHasFriendlyName)
+        {
+            juce::String friendlyHost = endpoint.hostPart;
+            const int firstDotPos = friendlyHost.indexOfChar('.');
+            if (firstDotPos > 0)
+                friendlyHost = friendlyHost.substring(0, firstDotPos);
+
+            juce::String roomRaw = friendlyHost;
+            if (endpoint.portPart.isNotEmpty())
+                roomRaw << "_" << endpoint.portPart;
+
+            resolution.room = makeUrlSafeVdoRoomToken(roomRaw);
+        }
+
+        resolution.needsPrompt = resolution.room.isEmpty();
+        return resolution;
+    }
+}
+
+void NinjamVst3AudioProcessor::launchVideoSession(const juce::String& requestedRoom)
 {
     if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
     {
@@ -9208,60 +9663,12 @@ void NinjamVst3AudioProcessor::launchVideoSession()
     vdoCarrierChannelConfigured.store(carrierConfigured, std::memory_order_release);
 
 
-    juce::String roomSource = currentServer.trim();
-    const int schemePos = roomSource.indexOf("://");
-    if (schemePos >= 0)
-        roomSource = roomSource.substring(schemePos + 3);
-    const int slashPos = roomSource.indexOfChar('/');
-    if (slashPos >= 0)
-        roomSource = roomSource.substring(0, slashPos);
-    const int atPos = roomSource.lastIndexOfChar('@');
-    if (atPos >= 0 && atPos + 1 < roomSource.length())
-        roomSource = roomSource.substring(atPos + 1);
-
-    juce::String hostPart = roomSource.trim();
-    juce::String portPart;
-    const int lastColonPos = hostPart.lastIndexOfChar(':');
-    if (lastColonPos > 0 && lastColonPos + 1 < hostPart.length())
-    {
-        const juce::String candidatePort = hostPart.substring(lastColonPos + 1).trim();
-        bool allDigits = candidatePort.isNotEmpty();
-        for (int i = 0; i < candidatePort.length() && allDigits; ++i)
-            allDigits = juce::CharacterFunctions::isDigit(candidatePort[i]);
-        if (allDigits)
-        {
-            hostPart = hostPart.substring(0, lastColonPos);
-            portPart = candidatePort;
-        }
-    }
-
-    const int firstDotPos = hostPart.indexOfChar('.');
-    if (firstDotPos > 0)
-        hostPart = hostPart.substring(0, firstDotPos);
-
-    juce::String roomRaw = hostPart;
-    if (portPart.isNotEmpty())
-        roomRaw << "_" << portPart;
-
-    juce::String room;
-    bool lastWasUnderscore = false;
-    for (int i = 0; i < roomRaw.length(); ++i)
-    {
-        const juce_wchar ch = roomRaw[i];
-        if (juce::CharacterFunctions::isLetterOrDigit(ch))
-        {
-            room << juce::String::charToString((juce_wchar) juce::CharacterFunctions::toLowerCase(ch));
-            lastWasUnderscore = false;
-        }
-        else if (!lastWasUnderscore)
-        {
-            room << "_";
-            lastWasUnderscore = true;
-        }
-    }
-    room = room.trimCharactersAtStart("_").trimCharactersAtEnd("_");
+    juce::String room = makeUrlSafeVdoRoomToken(requestedRoom);
     if (room.isEmpty())
-        room = "ninjam_room";
+    {
+        const VdoRoomResolution roomResolution = resolveVdoRoomForServer(currentServer);
+        room = roomResolution.room.isNotEmpty() ? roomResolution.room : roomResolution.suggestedRoom;
+    }
     const juce::String cleanUserLabel = normaliseChatTargetNick(currentUser);
     const juce::String label = cleanUserLabel.isNotEmpty() ? cleanUserLabel : "NINJAM";
     const juce::String canonicalCurrentUserKey = canonicalDelayUserKey(currentUser);
@@ -15476,6 +15883,42 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
         }
         return;
     }
+    if (type == "vdoRoom")
+    {
+        juce::String payloadUserId;
+        juce::String appFamily;
+        juce::String serverKey;
+        juce::String room;
+        const juce::var parsed = juce::JSON::parse(payload);
+        if (auto* obj = parsed.getDynamicObject())
+        {
+            payloadUserId = obj->getProperty("userId").toString();
+            appFamily = obj->getProperty("appFamily").toString();
+            serverKey = obj->getProperty("serverKey").toString().trim().toLowerCase();
+            room = makeUrlSafeVdoRoomToken(obj->getProperty("room").toString());
+        }
+
+        if (appFamily.isNotEmpty() && appFamily != opusSyncAppFamily)
+            return;
+
+        const juce::String localUserKey = normaliseOpusPeerId(currentUser);
+        const juce::String senderKey = normaliseOpusPeerId(payloadUserId.isNotEmpty() ? payloadUserId : sender);
+        if (senderKey.isNotEmpty() && senderKey == localUserKey)
+            return;
+
+        const VdoRoomResolution currentResolution = resolveVdoRoomForServer(currentServer);
+        if (serverKey.isEmpty() || serverKey != currentResolution.serverKey || room.isEmpty())
+            return;
+
+        if (rememberVdoRoomNameForServer(serverKey, room, false))
+        {
+            juce::String senderLabel = normaliseChatTargetNick(sender);
+            if (senderLabel.isEmpty())
+                senderLabel = senderKey.isNotEmpty() ? senderKey : "Another NINJAMplus user";
+            addSystemChatLine(senderLabel + " set VDO room to " + room + ".");
+        }
+        return;
+    }
     if (type == "chatStyle")
     {
         juce::String payloadUserId;
@@ -19086,6 +19529,25 @@ void NinjamVst3AudioProcessor::timerCallback()
             ninjamClient.ChatMessage_Send("VIDEO_CAP", "1", nullptr, nullptr, nullptr);
             lastNinjamVideoCapSendMs = nowMs;
         }
+    }
+    if (status == NJClient::NJC_STATUS_OK && vdoSyncActive)
+    {
+        juce::String vdoRoomServerKey;
+        juce::String vdoRoomName;
+        {
+            const juce::ScopedLock lock(vdoRoomLock);
+            if (announcedVdoRoomOwnedLocally
+                && announcedVdoRoomServerKey.isNotEmpty()
+                && announcedVdoRoomName.isNotEmpty()
+                && (lastVdoRoomAnnouncementMs <= 0.0 || (nowMs - lastVdoRoomAnnouncementMs) >= 10000.0))
+            {
+                vdoRoomServerKey = announcedVdoRoomServerKey;
+                vdoRoomName = announcedVdoRoomName;
+                lastVdoRoomAnnouncementMs = nowMs;
+            }
+        }
+        if (vdoRoomServerKey.isNotEmpty() && vdoRoomName.isNotEmpty())
+            announceVdoRoomName(vdoRoomServerKey, vdoRoomName);
     }
     if (status == NJClient::NJC_STATUS_OK && (nowMs - lastRemoteSyncUserPruneMs) >= 350.0)
     {

@@ -427,8 +427,10 @@ public:
     void sendSideSignal(const juce::String& target, const juce::String& type, const juce::String& payload);
     void sendIntervalSignal(const juce::String& type, const juce::String& payload, const juce::String& target = "*");
     void processSyncSignal(const juce::String& sender, const juce::String& type, const juce::String& payload);
-    void launchVideoSession();
+    void launchVideoSession(const juce::String& requestedRoom = {});
     void launchVideoSessionAsync();
+    bool canChangeVdoRoomName();
+    void promptToChangeVdoRoomNameAsync();
     bool isNinjamZapVideoAvailable();
     bool isNinjamZapVideoEnabled() const;
     void launchNinjamZapVideoSession();
@@ -1076,6 +1078,11 @@ private:
     double lastMobileHotspotHeartbeatSendMs = 0.0;
     std::atomic<bool> vdoVideoSyncEnabled { false };
     std::atomic<bool> vdoCarrierChannelConfigured { false };
+    mutable juce::CriticalSection vdoRoomLock;
+    juce::String announcedVdoRoomServerKey;
+    juce::String announcedVdoRoomName;
+    double lastVdoRoomAnnouncementMs = 0.0;
+    bool announcedVdoRoomOwnedLocally = false;
     std::atomic<bool> videoHelperRunning { false };
     std::atomic<int> advancedVideoHelperPort { 0 };
     std::atomic<bool> videoLaunchInProgress { false };
@@ -1267,6 +1274,12 @@ private:
     bool ensureZapVideoClientStarted();
     bool stopVdoVideoSync();
     void stopAdvancedVideoClient();
+    void beginVideoLaunchWorker(juce::String room);
+    juce::String getVdoRoomNameForServer(const juce::String& serverKey) const;
+    bool rememberVdoRoomNameForServer(const juce::String& serverKey, const juce::String& room, bool ownedLocally);
+    juce::String loadSavedVdoRoomNameForServer(const juce::String& serverKey) const;
+    void saveVdoRoomNameForServer(const juce::String& serverKey, const juce::String& room);
+    void announceVdoRoomName(const juce::String& serverKey, const juce::String& room);
     void writeIntervalHelperJson(int pos, int length);
     void startZapVideoDecodeWorker();
     void stopZapVideoDecodeWorker();
