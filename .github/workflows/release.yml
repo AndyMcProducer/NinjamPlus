@@ -435,7 +435,7 @@ jobs:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
-          REQUIRE_SIGNING: ${{ (github.repository == 'steveseguin/NinjamPlus' || github.repository == 'AndyMcProducer/NinjamPlus') && '1' || '0' }}
+          REQUIRE_SIGNING: ${{ github.repository == 'steveseguin/NinjamPlus' && '1' || '0' }}
         run: |
           set -euo pipefail
           if [ -z "${MACOS_CERTIFICATE:-}" ] || [ -z "${MACOS_CERTIFICATE_PASSWORD:-}" ] || [ -z "${KEYCHAIN_PASSWORD:-}" ]; then
@@ -506,7 +506,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          REQUIRE_SIGNING: ${{ (github.repository == 'steveseguin/NinjamPlus' || github.repository == 'AndyMcProducer/NinjamPlus') && '1' || '0' }}
+          REQUIRE_SIGNING: ${{ github.repository == 'steveseguin/NinjamPlus' && '1' || '0' }}
         run: |
           set -euo pipefail
           mkdir -p out
