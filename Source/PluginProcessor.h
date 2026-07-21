@@ -58,6 +58,9 @@ public:
     void releaseResources() override;
 
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
+    bool canAddBus (bool isInput) const override;
+    bool canRemoveBus (bool isInput) const override;
+    bool canApplyBusCountChange (bool isInput, bool isAddingBuses, BusProperties& outNewBusProperties) override;
 
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
@@ -212,6 +215,7 @@ public:
     void setLocalInputGain(float gain);
     float getLocalInputGain() const;
     static constexpr int maxLocalChannels = 8;
+    static constexpr int maxAudioOutputBuses = 16;
     static constexpr int maxRemoteChordUsers = 32;
     void setNumLocalChannels(int num);
     int getNumLocalChannels() const;

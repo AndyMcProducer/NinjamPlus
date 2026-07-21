@@ -15708,6 +15708,32 @@ bool NinjamVst3AudioProcessor::isBusesLayoutSupported (const BusesLayout& layout
     return true;
 }
 
+bool NinjamVst3AudioProcessor::canAddBus (bool isInput) const
+{
+    const int maxBuses = isInput ? maxLocalChannels : maxAudioOutputBuses;
+    return getBusCount (isInput) < maxBuses;
+}
+
+bool NinjamVst3AudioProcessor::canRemoveBus (bool isInput) const
+{
+    return getBusCount (isInput) > 1;
+}
+
+bool NinjamVst3AudioProcessor::canApplyBusCountChange (bool isInput, bool isAddingBuses, BusProperties& outNewBusProperties)
+{
+    if (! isAddingBuses)
+        return canRemoveBus (isInput);
+
+    if (! canAddBus (isInput))
+        return false;
+
+    const int newBusNumber = getBusCount (isInput) + 1;
+    outNewBusProperties.busName = juce::String (isInput ? "Input " : "Output ") + juce::String (newBusNumber);
+    outNewBusProperties.defaultLayout = juce::AudioChannelSet::stereo();
+    outNewBusProperties.isActivatedByDefault = true;
+    return true;
+}
+
 void NinjamVst3AudioProcessor::showServerLicenseAgreementAsync(const juce::String& serverName,
                                                                const juce::String& licenseText,
                                                                const juce::String& settingsKey)

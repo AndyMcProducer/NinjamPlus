@@ -435,12 +435,12 @@ jobs:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
-          REQUIRE_SIGNING: ${{ github.repository == 'steveseguin/NinjamPlus' && '1' || '0' }}
+          REQUIRE_SIGNING: ${{ (github.repository == 'steveseguin/NinjamPlus' || github.repository == 'AndyMcProducer/NinjamPlus') && '1' || '0' }}
         run: |
           set -euo pipefail
           if [ -z "${MACOS_CERTIFICATE:-}" ] || [ -z "${MACOS_CERTIFICATE_PASSWORD:-}" ] || [ -z "${KEYCHAIN_PASSWORD:-}" ]; then
             if [ "${REQUIRE_SIGNING}" = "1" ]; then
-              echo "macOS certificate secrets are required for steveseguin/NinjamPlus"
+              echo "macOS certificate secrets are required for release publishing"
               exit 1
             fi
             echo "macOS certificate secrets are not configured; using ad-hoc signing."
@@ -506,7 +506,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          REQUIRE_SIGNING: ${{ github.repository == 'steveseguin/NinjamPlus' && '1' || '0' }}
+          REQUIRE_SIGNING: ${{ (github.repository == 'steveseguin/NinjamPlus' || github.repository == 'AndyMcProducer/NinjamPlus') && '1' || '0' }}
         run: |
           set -euo pipefail
           mkdir -p out
@@ -522,7 +522,7 @@ jobs:
             SIGN_ENABLED=1
             echo "Using Developer ID Application signing."
           elif [ "${REQUIRE_SIGNING}" = "1" ]; then
-            echo "MACOS_SIGN_IDENTITY and an imported certificate are required for steveseguin/NinjamPlus"
+            echo "MACOS_SIGN_IDENTITY and an imported certificate are required for release publishing"
             exit 1
           else
             echo "Using ad-hoc signing."
@@ -533,7 +533,7 @@ jobs:
             NOTARY_ENABLED=1
             echo "Notarization is enabled."
           elif [ "${REQUIRE_SIGNING}" = "1" ]; then
-            echo "Installer signing and notarization secrets are required for steveseguin/NinjamPlus"
+            echo "Installer signing and notarization secrets are required for release publishing"
             exit 1
           else
             echo "Notarization secrets are not configured; publishing an unsigned installer."
@@ -635,10 +635,15 @@ jobs:
           cp -R "${COMP_PATH}" "${PKGROOT}/Library/Audio/Plug-Ins/Components/"
           cp -R "${VST3_PATH}" "${PKGROOT}/Library/Audio/Plug-Ins/VST3/"
           copy_notice_files "${PKGROOT}/Library/Application Support/NINJAMplus"
+          if [ -f "${SRC_DIR}/scripts/macos/NINJAM-VDO-Fix.command" ]; then
+            cp -f "${SRC_DIR}/scripts/macos/NINJAM-VDO-Fix.command" "${PKGROOT}/Library/Application Support/NINJAMplus/"
+            chmod 755 "${PKGROOT}/Library/Application Support/NINJAMplus/NINJAM-VDO-Fix.command"
+          fi
 
           PKGBUILD_ARGS=(
             --root "${PKGROOT}"
             --install-location "/"
+            --scripts "${PKG_SCRIPTS_DIR}"
             --identifier "com.amp.ninjamplus"
             --version "${VERSION}"
           )

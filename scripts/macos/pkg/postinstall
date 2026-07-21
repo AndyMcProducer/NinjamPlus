@@ -4,13 +4,13 @@ set -u
 log() {
   local message="$1"
   printf '%s\n' "$message"
-  /usr/bin/logger -t "NINJAM VST3 Installer" -- "$message" >/dev/null 2>&1 || true
+  /usr/bin/logger -t "NINJAMplus Installer" -- "$message" >/dev/null 2>&1 || true
 }
 
 display_dialog() {
   local message="$1"
   /usr/bin/osascript >/dev/null 2>&1 <<EOF || true
-display dialog "$message" with title "NINJAM VST3 Installer" buttons {"OK"} default button "OK"
+display dialog "$message" with title "NINJAMplus Installer" buttons {"OK"} default button "OK"
 EOF
 }
 
@@ -82,16 +82,16 @@ fi
 
 INSTALL_REPAIRED=0
 INSTALL_FAILED=0
-SUPPORT_SCRIPT_PATH="$TARGET_ROOT/Library/Application Support/NINJAM VST3/NINJAM-VDO-Fix.command"
+SUPPORT_SCRIPT_PATH="$TARGET_ROOT/Library/Application Support/NINJAMplus/NINJAM-VDO-Fix.command"
 
-repair_bundle "$TARGET_ROOT/Applications/NINJAM VST3.app"
-repair_bundle "$TARGET_ROOT/Library/Audio/Plug-Ins/Components/NINJAM VST3.component"
-repair_bundle "$TARGET_ROOT/Library/Audio/Plug-Ins/VST3/NINJAM VST3.vst3"
+repair_bundle "$TARGET_ROOT/Applications/NINJAMplus.app"
+repair_bundle "$TARGET_ROOT/Library/Audio/Plug-Ins/Components/NINJAMplus.component"
+repair_bundle "$TARGET_ROOT/Library/Audio/Plug-Ins/VST3/NINJAMplus.vst3"
 
 if [ "$INSTALL_FAILED" -ne 0 ]; then
-  display_dialog "NINJAM VST3 installed, but macOS still blocked the video helper in at least one bundle. Run $SUPPORT_SCRIPT_PATH and restart your DAW."
+  display_dialog "NINJAMplus installed, but macOS still blocked the video helper in at least one bundle. Run $SUPPORT_SCRIPT_PATH and restart your DAW."
 elif [ "$INSTALL_REPAIRED" -ne 0 ]; then
-  display_dialog "NINJAM VST3 repaired the bundled video helper during installation. Restart your DAW if it was open before trying Video Room."
+  display_dialog "NINJAMplus repaired the bundled video helper during installation. Restart your DAW if it was open before trying Video Room."
 fi
 
 exit 0
