@@ -3678,6 +3678,47 @@ void NJClient::SetUserChannelState(int useridx, int channelidx,
   }
 }
 
+void NJClient::SetUserChannelSubscriptionRaw(int useridx, int channelidx, bool sub, bool markPresent, int flags, const char *name)
+{
+  WDL_MutexLock lock(&m_remotechannel_rd_mutex);
+
+  if (useridx<0 || useridx>=m_remoteusers.GetSize()||channelidx<0||channelidx>=MAX_USER_CHANNELS) return;
+  RemoteUser *user=m_remoteusers.Get(useridx);
+  RemoteUser_Channel *p=user->channels + channelidx;
+  const int channelBit = 1<<channelidx;
+
+  if (markPresent)
+  {
+    p->flags = flags;
+    if (name) p->name.Set(name);
+    user->chanpresentmask |= channelBit;
+  }
+
+  if (!!(user->submask&channelBit) != sub)
+  {
+    mpb_client_set_usermask su;
+    if (sub)
+      su.build_add_rec(user->name.Get(),(user->submask|=channelBit));
+    else
+      su.build_add_rec(user->name.Get(),(user->submask&=~channelBit));
+    m_netcon->Send(su.build());
+
+    if (!sub)
+    {
+      DecodeState *tmp,*tmp2,*tmp3;
+      m_users_cs.Enter();
+      tmp=p->ds; p->ds=0;
+      tmp2=p->next_ds[0]; p->next_ds[0]=0;
+      tmp3=p->next_ds[1]; p->next_ds[1]=0;
+      m_users_cs.Leave();
+      p->dump_samples=0;
+      delete tmp;
+      delete tmp2;
+      delete tmp3;
+    }
+  }
+}
+
 
 double NJClient::GetUserSessionPos(int useridx, time_t *lastupdatetime, double *maxlen)
 {
@@ -4018,7 +4059,14 @@ void NJClient::NotifyServerOfChannelChange()
       if (!ch && idx > mv) break;
 
       if (ch)
+      {
+        if (ShouldEncodeOpus(ch->channel_idx) && !ShouldEncodeVorbis(ch->channel_idx))
+        {
+          sci.build_add_rec("",0,0,0x80);
+          continue;
+        }
         sci.build_add_rec(ch->name.Get(),0,0,ch->flags);
+      }
       else
         sci.build_add_rec("",0,0,0x80);
     }

@@ -165,6 +165,7 @@ public:
   double GetUserSessionPos(int useridx, time_t *lastupdatetime, double *maxlen);
   const char *GetUserChannelState(int useridx, int channelidx, bool *sub=0, float *vol=0, float *pan=0, bool *mute=0, bool *solo=0, int *outchannel=0, int *flags=0);
   void SetUserChannelState(int useridx, int channelidx, bool setsub, bool sub, bool setvol, float vol, bool setpan, float pan, bool setmute, bool mute, bool setsolo, bool solo, bool setoutch=false, int outchannel=0);
+  void SetUserChannelSubscriptionRaw(int useridx, int channelidx, bool sub, bool markPresent=false, int flags=0, const char *name=NULL);
   int EnumUserChannels(int useridx, int i); // returns <0 if out of channels. start with i=0, and go upwards
 
   int GetMaxLocalChannels() { return m_max_localch; }
