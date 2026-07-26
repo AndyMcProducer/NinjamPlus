@@ -1856,6 +1856,10 @@ private:
     double lastPersistentSettingsSaveMs = 0.0;
     double lastVideoBackgroundRepaintMs = 0.0;
     double lastTransmitPulseRepaintMs = 0.0;
+    double lastVideoButtonPulseRepaintMs = 0.0;
+    int lastLocalVoiceLayoutServerMaxChannels = -1;
+    int lastLocalVoiceLayoutNumLocalChannels = -1;
+    bool lastLocalVoiceLayoutCanUseDedicatedVoice = false;
     double lastClipPulseRepaintMs = 0.0;
     std::array<juce::Rectangle<int>, NinjamVst3AudioProcessor::maxLocalChannels> localChannelPulseBounds;
     juce::Rectangle<int> voiceChannelPulseBounds;

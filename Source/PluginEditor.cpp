@@ -2068,7 +2068,17 @@ public:
     {
         addAndMakeVisible(listBox);
         listBox.setModel(this);
-        listBox.setRowHeight(34);
+
+        addAndMakeVisible(showPlayersButton);
+        showPlayersButton.setButtonText("Show players");
+        showPlayersButton.setColour(juce::ToggleButton::textColourId, juce::Colours::white);
+        showPlayersButton.setToggleState(true, juce::dontSendNotification);
+        showPlayersButton.onClick = [this]
+        {
+            updateRowHeight();
+            listBox.repaint();
+        };
+        updateRowHeight();
 
         addAndMakeVisible(statusLabel);
         statusLabel.setJustificationType(juce::Justification::centred);
@@ -2103,6 +2113,8 @@ public:
         refreshButton.setBounds(controls.removeFromLeft(100));
         controls.removeFromLeft(8);
         connectButton.setBounds(controls.removeFromLeft(120));
+        controls.removeFromLeft(12);
+        showPlayersButton.setBounds(controls.removeFromLeft(140));
         listBox.setBounds(area);
         statusLabel.setBounds(area);
     }
@@ -2116,12 +2128,13 @@ public:
 
         auto& s = servers[(size_t)rowNumber];
 
+        const bool showPlayers = showPlayersButton.getToggleState();
+        const bool hasPlayerNames = !s.userNames.isEmpty();
+
         if (rowIsSelected)
             g.fillAll(juce::Colours::darkblue.withAlpha(0.6f));
         else
             g.fillAll(juce::Colours::darkgrey);
-
-        g.setColour(juce::Colours::white);
 
         juce::String text;
         text << s.name << "  "
@@ -2130,12 +2143,13 @@ public:
              << " / " << s.bpi << " BPI";
 
         auto row = juce::Rectangle<int>(4, 0, width - 8, height);
-        auto top = row.removeFromTop(s.userNames.isEmpty() ? height : 18);
+        auto top = row.removeFromTop(showPlayers && hasPlayerNames ? 18 : height);
+        g.setColour(hasPlayerNames ? juce::Colour(0xffb8f5c5) : juce::Colours::white);
         g.drawText(text, top, juce::Justification::centredLeft, true);
-        if (!s.userNames.isEmpty())
+        if (showPlayers && hasPlayerNames)
         {
-            g.setColour(juce::Colours::lightgrey);
-            g.drawText("Users: " + s.userNames.joinIntoString(", "),
+            g.setColour(juce::Colour(0xff6fcf84));
+            g.drawText("Players: " + s.userNames.joinIntoString(", "),
                        row,
                        juce::Justification::centredLeft,
                        true);
@@ -2150,10 +2164,17 @@ private:
     juce::Label statusLabel;
     juce::TextButton refreshButton;
     juce::TextButton connectButton;
+    juce::ToggleButton showPlayersButton { "Show players" };
     std::vector<NinjamVst3AudioProcessor::PublicServerInfo> servers;
     std::function<void(const juce::String&)> onServerChosen;
     std::function<void(const juce::String&)> onServerConnect;
     std::atomic<bool> refreshInProgress { false };
+
+    void updateRowHeight()
+    {
+        listBox.setRowHeight(34);
+        listBox.updateContent();
+    }
 
     void refreshServers()
     {
@@ -7991,19 +8012,18 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     };
     updateVoiceChatButtonColor();
 
-    bitrateSelector.addItem("64 kbps",  1);
-    bitrateSelector.addItem("96 kbps",  2);
-    bitrateSelector.addItem("128 kbps", 3);
-    bitrateSelector.addItem("160 kbps", 4);
-    bitrateSelector.addItem("192 kbps", 5);
-    bitrateSelector.addItem("256 kbps", 6);
-    bitrateSelector.addItem("320 kbps", 7);
-    bitrateSelector.setSelectedId(3, juce::dontSendNotification); // 128 kbps default
+    bitrateSelector.addItem("Extra Low - approx 32kbps", 1);
+    bitrateSelector.addItem("Default - approx 64kbps", 2);
+    bitrateSelector.addItem("Better - approx 96kbps", 3);
+    bitrateSelector.addItem("High - approx 128kbps", 4);
+    bitrateSelector.addItem("Very High - approx 200kbps", 5);
+    bitrateSelector.addItem("Extra High - approx 300kbps", 6);
+    bitrateSelector.setSelectedId(2, juce::dontSendNotification); // ReaNINJAM default: approx 64 kbps
     bitrateSelector.onChange = [this]
     {
-        const int bitrateValues[] = { 64, 96, 128, 160, 192, 256, 320 };
+        const int bitrateValues[] = { 32, 64, 96, 128, 192, 256 };
         int idx = bitrateSelector.getSelectedId() - 1;
-        if (idx >= 0 && idx < 7)
+        if (idx >= 0 && idx < 6)
             audioProcessor.setLocalBitrate(bitrateValues[idx]);
     };
     addAndMakeVisible(bitrateSelector);
@@ -8142,8 +8162,10 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     addAndMakeVisible(userList);
 
     addAndMakeVisible(addLocalChannelButton);
+    addLocalChannelButton.setButtonText("+");
     addLocalChannelButton.setTooltip("Add Channel");
     addAndMakeVisible(removeLocalChannelButton);
+    removeLocalChannelButton.setButtonText("-");
     removeLocalChannelButton.setTooltip("Remove Channel");
     addAndMakeVisible(localFaderLabel);
     localFaderLabel.setJustificationType(juce::Justification::centred);
@@ -8164,7 +8186,12 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     addLocalChannelButton.onClick = [this]
     {
         int current = audioProcessor.getNumLocalChannels();
-        if (current < NinjamVst3AudioProcessor::maxLocalChannels)
+        int serverMaxLocalChannels = audioProcessor.getServerMaxLocalChannels();
+        if (audioProcessor.getClient().GetStatus() == NJClient::NJC_STATUS_OK)
+            serverMaxLocalChannels = juce::jmax(1, audioProcessor.getClient().GetMaxLocalChannels());
+        const int maxUiLocalChannels = juce::jlimit(1, NinjamVst3AudioProcessor::maxLocalChannels,
+                                                    serverMaxLocalChannels > 2 ? serverMaxLocalChannels - 2 : 1);
+        if (current < maxUiLocalChannels)
         {
             audioProcessor.setNumLocalChannels(current + 1);
             for (int i = 0; i < NinjamVst3AudioProcessor::maxLocalChannels; ++i)
@@ -9059,6 +9086,21 @@ void NinjamVst3AudioProcessorEditor::paintOverChildren(juce::Graphics& g)
         drawClipPulse(localChannelPulseBounds[(size_t)i], localClipPulsing[(size_t)i]);
     drawClipPulse(masterChannelPulseBounds, masterClipPulsing);
 
+    const bool pulseVideoRoomButton = videoButton.isVisible() && audioProcessor.shouldPulseVideoRoomButton();
+    if (pulseVideoRoomButton)
+    {
+        const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
+        const double phase = nowSeconds * (juce::MathConstants<double>::twoPi * 0.72);
+        const float pulse = 0.5f + 0.5f * (float)std::sin(phase);
+        const float alpha = juce::jmap(pulse, 0.24f, 0.84f);
+        const auto r = videoButton.getBounds().toFloat().expanded(3.0f);
+
+        g.setColour(juce::Colour(0xff54d978).withAlpha(alpha));
+        g.drawRoundedRectangle(r, 6.0f, 2.0f);
+        g.setColour(juce::Colour(0xff2fb86f).withAlpha(alpha * 0.48f));
+        g.drawRoundedRectangle(r.expanded(1.5f), 7.0f, 1.0f);
+    }
+
     if (transmitButton.isVisible() && !transmitButton.getToggleState())
     {
         const double nowSeconds = juce::Time::getMillisecondCounterHiRes() * 0.001;
@@ -9200,11 +9242,19 @@ void NinjamVst3AudioProcessorEditor::resized()
     }
 
     int numLocal = audioProcessor.getNumLocalChannels();
-    numLocal = juce::jlimit(1, NinjamVst3AudioProcessor::maxLocalChannels, numLocal);
+    int serverMaxLocalChannels = audioProcessor.getServerMaxLocalChannels();
+    if (audioProcessor.getClient().GetStatus() == NJClient::NJC_STATUS_OK)
+        serverMaxLocalChannels = juce::jmax(1, audioProcessor.getClient().GetMaxLocalChannels());
+    const int maxVisibleLocalChannels = juce::jlimit(1, NinjamVst3AudioProcessor::maxLocalChannels,
+                                                     serverMaxLocalChannels > 2 ? serverMaxLocalChannels - 2 : 1);
+    numLocal = juce::jlimit(1, maxVisibleLocalChannels, numLocal);
 
-    int baseLocalWidth = 110;
+    const bool showSeparateVoiceChannel = serverMaxLocalChannels > 2 && audioProcessor.canUseDedicatedVoiceChatChannel();
+    addLocalChannelButton.setEnabled(maxVisibleLocalChannels > 1 && audioProcessor.getNumLocalChannels() < maxVisibleLocalChannels);
+    removeLocalChannelButton.setEnabled(audioProcessor.getNumLocalChannels() > 1);
+    int baseLocalWidth = showSeparateVoiceChannel ? 110 : 154;
     int extraPerTrack = 40;
-    int voiceColumnWidth = 62;
+    int voiceColumnWidth = showSeparateVoiceChannel ? 62 : 0;
     int localWidth = baseLocalWidth + voiceColumnWidth + (numLocal - 1) * extraPerTrack;
     int maxLocalWidth = area.getWidth() / 2;
     if (localWidth > maxLocalWidth)
@@ -9244,8 +9294,15 @@ void NinjamVst3AudioProcessorEditor::resized()
     localArea.removeFromTop(3);
 
     auto localHeader = localArea.removeFromTop(20);
-    addLocalChannelButton.setBounds(localHeader.removeFromLeft(20));
-    removeLocalChannelButton.setBounds(localHeader.removeFromLeft(20));
+    juce::Rectangle<int> voiceToggleArea;
+    if (!showSeparateVoiceChannel)
+        voiceToggleArea = localHeader.removeFromRight(44);
+    auto addButtonArea = localHeader.removeFromRight(20);
+    auto removeButtonArea = localHeader.removeFromRight(20);
+    removeLocalChannelButton.setBounds(removeButtonArea);
+    addLocalChannelButton.setBounds(addButtonArea);
+    if (!showSeparateVoiceChannel)
+        voiceChatButton.setBounds(voiceToggleArea.reduced(1, 0));
     localFaderLabel.setVisible(true);
     const bool showChordStats = localHeader.getWidth() >= 160;
     localChordStatsLabel.setVisible(showChordStats);
@@ -9255,15 +9312,15 @@ void NinjamVst3AudioProcessorEditor::resized()
 
     int meterWidth = 18;
     int totalWidth = localInner.getWidth();
-    int totalColumns = numLocal + 1;
-    int columnWidth = totalWidth / totalColumns;
+    int totalColumns = numLocal + (showSeparateVoiceChannel ? 1 : 0);
+    int columnWidth = totalWidth / juce::jmax(1, totalColumns);
 
-    voiceChannelNameLabel.setVisible(true);
+    voiceChannelNameLabel.setVisible(showSeparateVoiceChannel);
     voiceChatButton.setVisible(true);
-    voiceFader.setVisible(true);
-    voicePeakMeter.setVisible(true);
-    voiceInputSelector.setVisible(true);
-    voiceDbLabel.setVisible(true);
+    voiceFader.setVisible(showSeparateVoiceChannel);
+    voicePeakMeter.setVisible(showSeparateVoiceChannel);
+    voiceInputSelector.setVisible(showSeparateVoiceChannel);
+    voiceDbLabel.setVisible(showSeparateVoiceChannel);
 
     for (int i = 0; i < NinjamVst3AudioProcessor::maxLocalChannels; ++i)
     {
@@ -9282,6 +9339,7 @@ void NinjamVst3AudioProcessorEditor::resized()
             localChannelPulseBounds[(size_t)i] = {};
     }
 
+    if (showSeparateVoiceChannel)
     {
         juce::Rectangle<int> col = localInner.removeFromLeft(columnWidth);
         const auto pulseBounds = col;
@@ -9299,6 +9357,10 @@ void NinjamVst3AudioProcessorEditor::resized()
         voiceInputSelector.setBounds(inputArea);
         voiceDbLabel.setBounds(dbArea);
         voiceChannelPulseBounds = pulseBounds.expanded(1);
+    }
+    else
+    {
+        voiceChannelPulseBounds = {};
     }
 
     for (int i = 0; i < numLocal; ++i)
@@ -9439,6 +9501,26 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         if (!ninjamAutomaticUpdateCheckStarted.exchange(true))
             beginUpdateCheck(false);
     }
+    int currentServerMaxLocalChannels = audioProcessor.getServerMaxLocalChannels();
+    if (audioProcessor.getClient().GetStatus() == NJClient::NJC_STATUS_OK)
+        currentServerMaxLocalChannels = juce::jmax(1, audioProcessor.getClient().GetMaxLocalChannels());
+    const bool currentCanUseDedicatedVoice = audioProcessor.canUseDedicatedVoiceChatChannel();
+    const int currentNumLocalChannels = audioProcessor.getNumLocalChannels();
+    if (currentServerMaxLocalChannels != lastLocalVoiceLayoutServerMaxChannels
+        || currentNumLocalChannels != lastLocalVoiceLayoutNumLocalChannels
+        || currentCanUseDedicatedVoice != lastLocalVoiceLayoutCanUseDedicatedVoice)
+    {
+        lastLocalVoiceLayoutServerMaxChannels = currentServerMaxLocalChannels;
+        lastLocalVoiceLayoutNumLocalChannels = currentNumLocalChannels;
+        lastLocalVoiceLayoutCanUseDedicatedVoice = currentCanUseDedicatedVoice;
+        const bool bypassAbletonEarlyReturn = !audioProcessor.isStandaloneWrapper() && isAbletonLiveHost();
+        if (bypassAbletonEarlyReturn)
+            applyingDeferredResizeLayout = true;
+        resized();
+        if (bypassAbletonEarlyReturn)
+            applyingDeferredResizeLayout = false;
+        repaint();
+    }
 
     const double transmitPulseRepaintMs = abletonHostEditor ? 250.0 : 33.0;
     if (transmitButton.isVisible()
@@ -9448,6 +9530,15 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
     {
         lastTransmitPulseRepaintMs = nowMs;
         repaint(transmitButton.getBounds().expanded(8));
+    }
+
+    const double videoButtonPulseRepaintMs = 33.0;
+    if (videoButton.isVisible()
+        && audioProcessor.shouldPulseVideoRoomButton()
+        && nowMs - lastVideoButtonPulseRepaintMs >= videoButtonPulseRepaintMs)
+    {
+        lastVideoButtonPulseRepaintMs = nowMs;
+        repaint(videoButton.getBounds().expanded(8));
     }
 
     if (persistentSettingsDirty && nowMs - lastPersistentSettingsSaveMs >= 1500.0)
@@ -9590,7 +9681,12 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
 
     bool clipPulseNeedsRepaint = false;
     int numLocal = audioProcessor.getNumLocalChannels();
-    numLocal = juce::jlimit(1, NinjamVst3AudioProcessor::maxLocalChannels, numLocal);
+    int serverMaxLocalChannels = audioProcessor.getServerMaxLocalChannels();
+    if (audioProcessor.getClient().GetStatus() == NJClient::NJC_STATUS_OK)
+        serverMaxLocalChannels = juce::jmax(1, audioProcessor.getClient().GetMaxLocalChannels());
+    const int maxVisibleLocalChannels = juce::jlimit(1, NinjamVst3AudioProcessor::maxLocalChannels,
+                                                     serverMaxLocalChannels > 2 ? serverMaxLocalChannels - 2 : 1);
+    numLocal = juce::jlimit(1, maxVisibleLocalChannels, numLocal);
     for (int i = 0; i < numLocal; ++i)
     {
         const float peakL = audioProcessor.getLocalChannelPeakLeft(i);
@@ -10679,10 +10775,10 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
     refreshVoiceInputSelector();
     updateVoiceChatButtonColor();
 
-    const int bitrates[] = { 64, 96, 128, 160, 192, 256, 320 };
+    const int bitrates[] = { 32, 64, 96, 128, 192, 256 };
     const int savedBitrate = audioProcessor.getLocalBitrate();
-    int selectedBitrateId = 3;
-    for (int i = 0; i < 7; ++i)
+    int selectedBitrateId = 2;
+    for (int i = 0; i < 6; ++i)
         if (bitrates[i] == savedBitrate)
             selectedBitrateId = i + 1;
     bitrateSelector.setSelectedId(selectedBitrateId, juce::dontSendNotification);
@@ -10690,8 +10786,7 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
     const auto restoredSyncMode = audioProcessor.getSyncMode();
     if (restoredSyncMode != NinjamVst3AudioProcessor::SyncMode::off)
         preferredSyncMode = restoredSyncMode;
-    audioProcessor.setSyncMode(NinjamVst3AudioProcessor::SyncMode::off);
-    syncButton.setToggleState(false, juce::dontSendNotification);
+    syncButton.setToggleState(restoredSyncMode != NinjamVst3AudioProcessor::SyncMode::off, juce::dontSendNotification);
     updateSyncButtonColor();
     updateSyncButtonTooltip();
 

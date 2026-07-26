@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.9.13.6 - 2026-07-26
+
+### ReaNINJAM and GUI Close/Open Fix
+
+- Keep NINJAMplus control and Opus lanes hidden from legacy/ReaNINJAM channel lists while preserving raw sync subscriptions for NINJAMplus peers.
+- Restore ReaNINJAM-compatible Vorbis audio routing, including voice fallback when a server only allows two channels.
+- Re-layout the local mixer when the connected server channel limit changes so unavailable Voice strips are not shown.
+- Reduce master chord timeline spam by requiring stronger confidence before publishing detected chords.
+- Keep VDO room and timing sync on hidden control transport where available, and add a low-cost Video Room activity pulse.
+- Preserve DAW sync state across GUI close/open paths and avoid the recent CPU-spike regression.
+
 ## v0.9.13.4 - 2026-07-19
 
 ### Integrated from AndyMcProducer/release

@@ -131,6 +131,8 @@ public:
     float getVoiceChannelPeak() const;
     float getVoiceChannelPeakLeft() const;
     float getVoiceChannelPeakRight() const;
+    int getServerMaxLocalChannels() const;
+    bool canUseDedicatedVoiceChatChannel() const;
 
     // Chat
     juce::StringArray getChatMessages();
@@ -437,6 +439,7 @@ public:
     void promptToChangeVdoRoomNameAsync();
     bool isNinjamZapVideoAvailable();
     bool isNinjamZapVideoEnabled() const;
+    bool shouldPulseVideoRoomButton() const;
     void launchNinjamZapVideoSession();
     juce::StringArray getNinjamZapCameraDevices() const;
     ninjamplus::zap::CameraCodecPreference getNinjamZapCameraCodecPreference() const;
@@ -674,7 +677,7 @@ private:
     
     // Local state
     bool isTransmitting = false;
-    int localBitrate = 128;
+    int localBitrate = 64;
     bool voiceChatMode = false;
     int lastStatus = 0;
     std::atomic<bool> metronomeMuted { false };
@@ -1095,6 +1098,7 @@ private:
     double lastNinjamVideoCapSendMs = 0.0;
     std::atomic<bool> ninjamZapVideoEnabled { false };
     std::atomic<bool> ninjamZapVideoReceivedNotice { false };
+    std::atomic<double> lastRemoteVideoRoomActivityMs { 0.0 };
     juce::CriticalSection ninjamZapVideoChunkLock;
     std::map<juce::String, ninjamplus::zap::ChunkReassembler> ninjamZapVideoChunkReassemblers;
     std::map<juce::String, juce::String> ninjamZapVideoAudioGuidByReassemblyKey;
@@ -1145,6 +1149,7 @@ private:
     std::atomic<bool> opusSyncAvailable { false };
     std::atomic<bool> opusSyncHasLegacyClients { false };
     std::atomic<bool> opusSyncServerSupported { false };
+    std::atomic<int> serverMaxLocalChannelsCached { 32 };
     mutable juce::CriticalSection intervalSyncStatusLock;
     juce::String intervalSyncStatusText;
     std::atomic<long long> lastBroadcastIntervalTag { -1 };
@@ -1179,6 +1184,7 @@ private:
     double lastServerLatencyProbeAttemptMs = 0.0;
     double lastRemoteSyncUserPruneMs = 0.0;
     double lastIntervalSyncFallbackSubscriptionMs = 0.0;
+    double lastNinjamPlusControlSubscriptionMs = 0.0;
     struct RemoteLatencyAverageState
     {
         int sampleCount = 0;
@@ -1198,6 +1204,7 @@ private:
         bool supportsOpus = false;
         bool multiChanEnabled = false;
         int numChannels = 1;           // number of local channels the peer is sending
+        int opusBaseChannel = 1;       // first NINJAM channel index carrying Opus lanes
         juce::String appFamily;
         int handshakeVersion = 0;
         juce::String runtimeFormat;
@@ -1205,9 +1212,9 @@ private:
         double lastSeenMs = 0.0;
     };
     std::map<juce::String, OpusSyncPeerState> opusSyncPeers;
-    // Simple username→{isMultiChan, numChannels} snapshot updated by refreshOpusSyncAvailabilityFromUsers().
+    // Simple username snapshot updated by refreshOpusSyncAvailabilityFromUsers().
     // Keyed by normalised username (no @host, lowercase). Read without holding opusSyncPeerLock.
-    struct PeerMultiChanInfo { bool isMultiChan = false; int numChannels = 1; };
+    struct PeerMultiChanInfo { bool isMultiChan = false; int numChannels = 1; int opusBaseChannel = 1; };
     std::map<juce::String, PeerMultiChanInfo> peerMultiChanByName;
     juce::CriticalSection peerMultiChanLock;
     juce::String opusSyncInstanceId;
@@ -1284,6 +1291,7 @@ private:
     juce::String loadSavedVdoRoomNameForServer(const juce::String& serverKey) const;
     void saveVdoRoomNameForServer(const juce::String& serverKey, const juce::String& room);
     void announceVdoRoomName(const juce::String& serverKey, const juce::String& room);
+    void noteRemoteVideoRoomActivity(double nowMs = 0.0);
     void writeIntervalHelperJson(int pos, int length);
     void startZapVideoDecodeWorker();
     void stopZapVideoDecodeWorker();
@@ -1323,6 +1331,7 @@ private:
     void stopNinjamZapVideoTransportForDisconnect();
     void syncLocalIntervalChannelConfig();
     int getVoiceChatNinjamChannelIndex() const;
+    bool isKnownOpusMultichannelLane(int userIndex, int channelIndex);
     bool isNinjamRemoteChannelVideoOnly(int userIndex, int channelIndex);
     bool isRemoteUserVoiceChatMode(int userIndex);
     int syncNinjamZapVideoSubscriptions(bool subscribe);
