@@ -3866,6 +3866,20 @@ void ClickableChatTextEditor::mouseUp(const juce::MouseEvent& e)
     juce::TextEditor::mouseUp(e);
 }
 
+static void focusTextEditorForTyping(juce::TextEditor& editor)
+{
+    editor.setWantsKeyboardFocus(true);
+    editor.setMouseClickGrabsKeyboardFocus(true);
+    editor.grabKeyboardFocus();
+
+    juce::Component::SafePointer<juce::TextEditor> safeEditor(&editor);
+    juce::MessageManager::callAsync([safeEditor]
+    {
+        if (safeEditor != nullptr && safeEditor->isShowing())
+            safeEditor->grabKeyboardFocus();
+    });
+}
+
 class ChatPopupComponent : public juce::Component
 {
 public:
@@ -3917,6 +3931,8 @@ public:
         setChatWindowColourKey(initialChatWindowColourKey);
 
         addAndMakeVisible(chatInput);
+        chatInput.setWantsKeyboardFocus(true);
+        chatInput.setMouseClickGrabsKeyboardFocus(true);
         chatInput.onReturnKey = [this] { sendClicked(); };
 
         addAndMakeVisible(chatEmojiButton);
@@ -4042,6 +4058,11 @@ public:
     juce::String getDraftText() const
     {
         return chatInput.getText();
+    }
+
+    void focusInputForTyping()
+    {
+        focusTextEditorForTyping(chatInput);
     }
 
     void refreshTranslateButtonState()
@@ -8147,7 +8168,13 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     chatButton.setToggleState(true, juce::dontSendNotification);
     chatButton.setTooltip("Open Chat");
     chatButton.setLookAndFeel(&chatBtnLAF);
-    chatButton.onClick = [this] { chatToggled(); markPersistentSettingsDirty(); };
+    chatButton.onClick = [this]
+    {
+        chatToggled();
+        if (chatButton.getToggleState() && !chatPoppedOut)
+            focusDockedChatInputForTyping();
+        markPersistentSettingsDirty();
+    };
     updateChatButtonColor();
 
     addAndMakeVisible(usersLabel);
@@ -8538,6 +8565,8 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     });
 
     addAndMakeVisible(chatInput);
+    chatInput.setWantsKeyboardFocus(true);
+    chatInput.setMouseClickGrabsKeyboardFocus(true);
     chatInput.onReturnKey = [this] { sendClicked(); };
 
     addAndMakeVisible(chatEmojiButton);
@@ -10871,6 +10900,14 @@ void NinjamVst3AudioProcessorEditor::sendClicked()
     }
 }
 
+void NinjamVst3AudioProcessorEditor::focusDockedChatInputForTyping()
+{
+    if (!chatButton.getToggleState() || chatPoppedOut || !chatInput.isVisible())
+        return;
+
+    focusTextEditorForTyping(chatInput);
+}
+
 void NinjamVst3AudioProcessorEditor::transmitToggled()
 {
     audioProcessor.setTransmitLocal(transmitButton.getToggleState());
@@ -11033,6 +11070,7 @@ void NinjamVst3AudioProcessorEditor::openChatPopoutWindow(const juce::StringArra
         popup->setChatWindowColourKey(chatWindowColourKey);
         popup->setChatText(history, senders);
         popup->setDraftText(draftText);
+        popup->focusInputForTyping();
     }
 
     updateChatButtonColor();

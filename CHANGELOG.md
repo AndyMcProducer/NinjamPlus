@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.9.13.7 - 2026-07-28
+
+### Ableton Chat Focus Fix
+
+- Give docked and popout chat inputs explicit keyboard focus when opened so Ableton Live users can type after one click.
+
 ## v0.9.13.6 - 2026-07-26
 
 ### ReaNINJAM and GUI Close/Open Fix

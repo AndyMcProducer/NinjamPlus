@@ -1688,6 +1688,7 @@ private:
     void updateMetronomeButtonColor();
     void updateSyncButtonColor();
     void updateSyncButtonTooltip();
+    void focusDockedChatInputForTyping();
     void updateFxButtonLabel();
     void updateSamplePadsFeatureVisibility();
     void showFxMenu();
