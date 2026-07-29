@@ -4032,10 +4032,20 @@ public:
 
     void mouseDown(const juce::MouseEvent& e) override
     {
+        auto* start = e.originalComponent != nullptr ? e.originalComponent : e.eventComponent;
+        for (auto* c = start; c != nullptr; c = c->getParentComponent())
+        {
+            if (c == &chatInput)
+            {
+                if (e.mods.isLeftButtonDown())
+                    focusTextEditorForTyping(chatInput);
+                break;
+            }
+        }
+
         if (!gifPickerPanel.isVisible())
             return;
 
-        auto* start = e.originalComponent != nullptr ? e.originalComponent : e.eventComponent;
         for (auto* c = start; c != nullptr; c = c->getParentComponent())
         {
             if (c == &gifPickerPanel || c == &chatEmojiButton)
@@ -10049,6 +10059,16 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
 void NinjamVst3AudioProcessorEditor::mouseDown(const juce::MouseEvent& event)
 {
     juce::Component* start = event.originalComponent != nullptr ? event.originalComponent : event.eventComponent;
+    for (auto* c = start; c != nullptr; c = c->getParentComponent())
+    {
+        if (c == &chatInput)
+        {
+            if (event.mods.isLeftButtonDown())
+                focusDockedChatInputForTyping();
+            break;
+        }
+    }
+
     if (gifPickerPanel != nullptr && gifPickerPanel->isVisible())
     {
         bool keepGifPickerOpen = false;

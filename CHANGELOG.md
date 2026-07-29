@@ -1,10 +1,10 @@
 # Changelog
 
-## v0.9.13.7 - 2026-07-28
+## v0.9.13.8 - 2026-07-29
 
 ### Ableton Chat Focus Fix
 
-- Give docked and popout chat inputs explicit keyboard focus when opened so Ableton Live users can type after one click.
+- Restore keyboard focus after Ableton activates the plug-in window so the first click into docked or pop-out chat is ready for typing.
 
 ## v0.9.13.6 - 2026-07-26
 
