@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.9.13.9 - 2026-07-30
+
+### Jamtaba Audio Glitch Fix
+
+- Only subscribe to the hidden control carrier (ch1) for known NINJAMplus peers. Previously the subscription was applied unconditionally to all remote users, causing server-side stream resets that glitched audio from legacy clients like Jamtaba and ReaNINJAM.
+
 ## v0.9.13.8 - 2026-07-29
 
 ### Ableton Chat Focus Fix

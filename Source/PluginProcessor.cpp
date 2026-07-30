@@ -8004,24 +8004,29 @@ int NinjamVst3AudioProcessor::ensureRawIntervalSyncFallbackSubscriptions()
             }
         };
 
-        // Hidden private control carrier. If a legacy peer has a real visible channel here, leave it alone.
-        ensureSubscription(kNinjamPlusControlChannelIndex, kNinjamZapVideoOnlyChannelFlag, "", false);
-
         const char* userNameRaw = ninjamClient.GetUserState(userIndex);
         if (userNameRaw != nullptr)
         {
             const juce::String normName = canonicalDelayUserKey(juce::String::fromUTF8(userNameRaw));
+            bool isKnownNjPlusUser = false;
             PeerMultiChanInfo peerInfo;
             bool hasPeerInfo = false;
             {
                 const juce::ScopedLock mcLock(peerMultiChanLock);
                 auto it = peerMultiChanByName.find(normName);
+                isKnownNjPlusUser = (it != peerMultiChanByName.end());
                 if (it != peerMultiChanByName.end() && it->second.isMultiChan)
                 {
                     peerInfo = it->second;
                     hasPeerInfo = true;
                 }
             }
+
+            // Hidden private control carrier. Only subscribe for known NJ+ VST3 users;
+            // legacy clients (Jamtaba, ReaNINJAM) have no data on this channel and
+            // subscribing can cause server-side stream resets that manifest as glitches.
+            if (isKnownNjPlusUser)
+                ensureSubscription(kNinjamPlusControlChannelIndex, kNinjamZapVideoOnlyChannelFlag, "", false);
 
             if (hasPeerInfo)
             {
