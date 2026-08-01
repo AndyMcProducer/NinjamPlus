@@ -4396,10 +4396,10 @@ namespace
     constexpr int kNinjamZapVideoOnlyChannelFlag = NJClient::NJCLIENT_CHANNEL_FLAG_VIDEO_ONLY;
     constexpr const char* sideSignalChatPrefix = "__NINJAM_VST3_SIDESIGNAL__ ";
     constexpr int remoteLatencyUpdateCadenceIntervals = 1;
-    // Internal indices: 0=legacy audio, 1=hidden control plus first Opus lane, 2+=extra Opus/voice.
+    // Fixed indices: 0=legacy audio, 1=hidden NJ+ control, 2=voice, 3+=Opus/video.
     constexpr int kNinjamPlusControlChannelIndex = 1;
     constexpr int kVoiceChatChannelIndex = 2;
-    constexpr int kOpusMultichannelBaseIndex = kNinjamPlusControlChannelIndex;
+    constexpr int kOpusMultichannelBaseIndex = kVoiceChatChannelIndex + 1;
     constexpr int kSyncSignalChannelIndex = kNinjamPlusControlChannelIndex;
     constexpr double intervalHelperPayloadMinWriteMs = 500.0;
     constexpr long long intervalSyncMarkerKeyBeatStride = 1024;
@@ -6882,8 +6882,8 @@ void NinjamVst3AudioProcessor::broadcastOpusSyncSupport(const juce::String& targ
     obj->setProperty("pluginVersion", getVersionString());
     const int serverMaxLocalChannels = juce::jmax(1, serverMaxLocalChannelsCached.load(std::memory_order_relaxed));
     const int maxFittedLocalChannels = juce::jlimit(1, maxLocalChannels,
-                                                    serverMaxLocalChannels > kVoiceChatChannelIndex
-                                                        ? serverMaxLocalChannels - kVoiceChatChannelIndex
+                                                    serverMaxLocalChannels > kOpusMultichannelBaseIndex
+                                                        ? serverMaxLocalChannels - kOpusMultichannelBaseIndex
                                                         : 1);
     const int advertisedNumChannels = juce::jlimit(1, maxFittedLocalChannels, numLocalChannels.load());
     const bool opusLanesFit = (kOpusMultichannelBaseIndex + advertisedNumChannels) <= serverMaxLocalChannels;
@@ -6894,10 +6894,10 @@ void NinjamVst3AudioProcessor::broadcastOpusSyncSupport(const juce::String& targ
     obj->setProperty("eventId", "opusSupport:" + (userId.isNotEmpty() ? userId : currentUser) + ":" + juce::String(++sideSignalEventCounter));
     const juce::String payload = juce::JSON::toString(juce::var(obj.get()));
 
-    // Bootstrap discovery without creating a visible NINJAM channel row in legacy clients.
+    // Prefer the server side-signal path when it is available.
     sendSideSignal(target.isNotEmpty() ? target : "*", "opusSyncSupport", payload);
 
-    // Also send on the hidden raw carrier for peers already subscribed to it.
+    // Raw NJ+ discovery and metadata stay exclusively on the hidden control carrier.
     if (kNinjamPlusControlChannelIndex < serverMaxLocalChannels)
         ninjamClient.SendRawIntervalItem(kNinjamPlusControlChannelIndex, kOpusSyncFourcc, payload.toRawUTF8(), (int)payload.getNumBytesAsUTF8());
 }
@@ -6977,12 +6977,13 @@ void NinjamVst3AudioProcessor::syncLocalIntervalChannelConfig()
     const bool shouldTransmitVoice = voiceChatMode;
     const int serverMaxLocalChannels = juce::jmax(1, serverMaxLocalChannelsCached.load(std::memory_order_relaxed));
     const int maxFittedLocalChannels = juce::jlimit(1, maxLocalChannels,
-                                                    serverMaxLocalChannels > kVoiceChatChannelIndex
-                                                        ? serverMaxLocalChannels - kVoiceChatChannelIndex
+                                                    serverMaxLocalChannels > kOpusMultichannelBaseIndex
+                                                        ? serverMaxLocalChannels - kOpusMultichannelBaseIndex
                                                         : 1);
     const int numCh = juce::jlimit(1, maxFittedLocalChannels, numLocalChannels.load());
     const bool opusLanesFit = (kOpusMultichannelBaseIndex + numCh) <= serverMaxLocalChannels;
     const bool multiChanAuto = numCh > 1 && opusSyncAvailable.load() && shouldTransmit && opusLanesFit;
+    const bool controlChannelAvailable = kNinjamPlusControlChannelIndex < serverMaxLocalChannels;
     const bool singleStereoLocal = numCh == 1 && getLocalChannelInput(0) < 0;
     const int voiceChannel = voiceChatMode ? getVoiceChatNinjamChannelIndex() : -1;
     const bool voiceChannelAvailable = canUseDedicatedVoiceChatChannel()
@@ -6992,6 +6993,16 @@ void NinjamVst3AudioProcessor::syncLocalIntervalChannelConfig()
     const bool cameraVideoEnabled = ninjamZapCameraSendEnabled.load(std::memory_order_relaxed);
     const int videoChannel = cameraVideoEnabled ? getNinjamZapVideoChannelIndex() : -1;
     const int maxManagedChannel = kOpusMultichannelBaseIndex + maxLocalChannels + 3;
+
+    auto configureControlChannel = [&]
+    {
+        if (!controlChannelAvailable)
+            return;
+
+        ninjamClient.SetLocalChannelInfo(kNinjamPlusControlChannelIndex, "",
+            true, 1023, true, 24, true, true, false, 0, true, kNinjamZapVideoOnlyChannelFlag);
+        ninjamClient.SetLocalChannelMonitoring(kNinjamPlusControlChannelIndex, false, 0.f, false, 0.f, true, true, false, false);
+    };
 
     auto configureVoiceChannel = [&](int sourceChannel)
     {
@@ -7007,6 +7018,8 @@ void NinjamVst3AudioProcessor::syncLocalIntervalChannelConfig()
     auto shouldKeepManagedChannel = [&](int channelIndex)
     {
         if (channelIndex == 0)
+            return true;
+        if (controlChannelAvailable && channelIndex == kNinjamPlusControlChannelIndex)
             return true;
         if (voiceChannelAvailable && channelIndex == voiceChannel)
             return true;
@@ -7026,9 +7039,11 @@ void NinjamVst3AudioProcessor::syncLocalIntervalChannelConfig()
                 ninjamClient.DeleteLocalChannel(i);
     };
 
+    configureControlChannel();
+
     if (multiChanAuto)
     {
-        // ch0: Vorbis mixdown. ch1: hidden control plus first Opus lane. ch2+: extra Opus lanes, then voice.
+        // ch0: Vorbis mixdown. ch1: hidden NJ+ control. ch2: voice. ch3+: Opus lanes.
         juce::String ch0Name = getLocalChannelName(0);
         if (ch0Name.isEmpty()) ch0Name = "Mix";
         if (voiceFallsBackToMainChannel) ch0Name = "Voice";
@@ -7110,24 +7125,15 @@ bool NinjamVst3AudioProcessor::isVoiceChatMode() const
 
 int NinjamVst3AudioProcessor::getVoiceChatNinjamChannelIndex() const
 {
-    const int serverMaxLocalChannels = juce::jmax(1, serverMaxLocalChannelsCached.load(std::memory_order_relaxed));
-    const int maxFittedLocalChannels = juce::jlimit(1, maxLocalChannels,
-                                                    serverMaxLocalChannels > kVoiceChatChannelIndex
-                                                        ? serverMaxLocalChannels - kVoiceChatChannelIndex
-                                                        : 1);
-    const int numCh = juce::jlimit(1, maxFittedLocalChannels, numLocalChannels.load());
-    const bool opusLanesFit = (kOpusMultichannelBaseIndex + numCh) <= serverMaxLocalChannels;
-    const bool multiChanAuto = numCh > 1 && opusSyncAvailable.load() && isTransmittingLocal() && opusLanesFit;
-    return multiChanAuto ? (kOpusMultichannelBaseIndex + numCh)
-                         : kVoiceChatChannelIndex;
+    return kVoiceChatChannelIndex;
 }
 
 void NinjamVst3AudioProcessor::applyCodecPreference()
 {
     const int serverMaxLocalChannels = juce::jmax(1, serverMaxLocalChannelsCached.load(std::memory_order_relaxed));
     const int maxFittedLocalChannels = juce::jlimit(1, maxLocalChannels,
-                                                    serverMaxLocalChannels > kVoiceChatChannelIndex
-                                                        ? serverMaxLocalChannels - kVoiceChatChannelIndex
+                                                    serverMaxLocalChannels > kOpusMultichannelBaseIndex
+                                                        ? serverMaxLocalChannels - kOpusMultichannelBaseIndex
                                                         : 1);
     const int numCh = juce::jlimit(1, maxFittedLocalChannels, numLocalChannels.load());
     const bool opusLanesFit = (kOpusMultichannelBaseIndex + numCh) <= serverMaxLocalChannels;
@@ -7141,7 +7147,7 @@ void NinjamVst3AudioProcessor::applyCodecPreference()
 
     if (multiChanAuto)
     {
-        // ch 0: Vorbis mixdown. ch 1: hidden control plus first Opus lane. ch 2+: extra Opus lanes, then voice.
+        // ch0: Vorbis mixdown. ch1: hidden NJ+ control. ch2: voice. ch3+: Opus lanes.
         unsigned int opusMask = 0u;
         for (int i = 0; i < numCh; ++i)
         {
@@ -7722,7 +7728,7 @@ void NinjamVst3AudioProcessor::announceVdoRoomName(const juce::String& serverKey
     juce::DynamicObject::Ptr payloadObj = new juce::DynamicObject();
     payloadObj->setProperty("appFamily", opusSyncAppFamily);
     payloadObj->setProperty("userId", normaliseOpusPeerId(currentUser));
-    payloadObj->setProperty("serverKey", key);
+    payloadObj->setProperty("scope", "currentNinjamSession");
     payloadObj->setProperty("room", cleanRoom);
     const juce::String payload = juce::JSON::toString(juce::var(payloadObj.get()), false);
 
@@ -8007,6 +8013,18 @@ int NinjamVst3AudioProcessor::ensureRawIntervalSyncFallbackSubscriptions()
         const char* userNameRaw = ninjamClient.GetUserState(userIndex);
         if (userNameRaw != nullptr)
         {
+            int advertisedControlFlags = 0;
+            const char* advertisedControlName = nullptr;
+            if (kNinjamPlusControlChannelIndex < serverMaxLocalChannels)
+            {
+                advertisedControlName = ninjamClient.GetUserChannelState(userIndex,
+                                                                          kNinjamPlusControlChannelIndex,
+                                                                          nullptr, nullptr, nullptr,
+                                                                          nullptr, nullptr, nullptr,
+                                                                          &advertisedControlFlags);
+            }
+            const bool hasAdvertisedControlCarrier = advertisedControlName != nullptr
+                && ((advertisedControlFlags & kNinjamZapVideoOnlyChannelFlag) != 0);
             const juce::String normName = canonicalDelayUserKey(juce::String::fromUTF8(userNameRaw));
             bool isKnownNjPlusUser = false;
             PeerMultiChanInfo peerInfo;
@@ -8022,10 +8040,10 @@ int NinjamVst3AudioProcessor::ensureRawIntervalSyncFallbackSubscriptions()
                 }
             }
 
-            // Hidden private control carrier. Only subscribe for known NJ+ VST3 users;
-            // legacy clients (Jamtaba, ReaNINJAM) have no data on this channel and
-            // subscribing can cause server-side stream resets that manifest as glitches.
-            if (isKnownNjPlusUser)
+            // Subscribe only when the peer actually advertised the hidden control flag
+            // (or was already identified as NJ+). Legacy clients never advertise this
+            // carrier, so their channel state is left untouched.
+            if (hasAdvertisedControlCarrier || isKnownNjPlusUser)
                 ensureSubscription(kNinjamPlusControlChannelIndex, kNinjamZapVideoOnlyChannelFlag, "", false);
 
             if (hasPeerInfo)
@@ -8157,15 +8175,14 @@ int NinjamVst3AudioProcessor::getNinjamZapVideoChannelIndex() const
 {
     const int serverMaxLocalChannels = juce::jmax(1, serverMaxLocalChannelsCached.load(std::memory_order_relaxed));
     const int maxFittedLocalChannels = juce::jlimit(1, maxLocalChannels,
-                                                    serverMaxLocalChannels > kVoiceChatChannelIndex
-                                                        ? serverMaxLocalChannels - kVoiceChatChannelIndex
+                                                    serverMaxLocalChannels > kOpusMultichannelBaseIndex
+                                                        ? serverMaxLocalChannels - kOpusMultichannelBaseIndex
                                                         : 1);
     const int numCh = juce::jlimit(1, maxFittedLocalChannels, numLocalChannels.load());
     const bool opusLanesFit = (kOpusMultichannelBaseIndex + numCh) <= serverMaxLocalChannels;
     const bool multiChanAuto = numCh > 1 && opusSyncAvailable.load() && isTransmittingLocal() && opusLanesFit;
-    if (multiChanAuto)
-        return kOpusMultichannelBaseIndex + numCh + (voiceChatMode ? 1 : 0);
-    return kVoiceChatChannelIndex + (voiceChatMode ? 1 : 0);
+    return multiChanAuto ? (kOpusMultichannelBaseIndex + numCh)
+                         : kOpusMultichannelBaseIndex;
 }
 
 void NinjamVst3AudioProcessor::configureNinjamZapVideoLocalChannel()
@@ -11899,7 +11916,7 @@ void NinjamVst3AudioProcessor::sendIntervalSignal(const juce::String& type, cons
     wrapper->setProperty("data", payload);
     const juce::String msg = juce::JSON::toString(juce::var(wrapper.get()));
 
-    // Custom FOURCC interval items stay hidden from normal chat clients and off channel 0.
+    // All NJ+ raw metadata stays on the hidden control channel; channel 0 is audio-only.
     if (kSyncSignalChannelIndex >= serverMaxLocalChannelsCached.load(std::memory_order_relaxed))
         return;
     const int result = ninjamClient.SendRawIntervalItem(kSyncSignalChannelIndex, kSyncSignalFourcc, msg.toRawUTF8(), (int)msg.getNumBytesAsUTF8());
@@ -11959,15 +11976,15 @@ int NinjamVst3AudioProcessor::getCodecMode() const
 {
     const int serverMaxLocalChannels = juce::jmax(1, serverMaxLocalChannelsCached.load(std::memory_order_relaxed));
     const int maxFittedLocalChannels = juce::jlimit(1, maxLocalChannels,
-                                                    serverMaxLocalChannels > kVoiceChatChannelIndex
-                                                        ? serverMaxLocalChannels - kVoiceChatChannelIndex
+                                                    serverMaxLocalChannels > kOpusMultichannelBaseIndex
+                                                        ? serverMaxLocalChannels - kOpusMultichannelBaseIndex
                                                         : 1);
     const int numCh = juce::jlimit(1, maxFittedLocalChannels, numLocalChannels.load());
     const bool opusLanesFit = (kOpusMultichannelBaseIndex + numCh) <= serverMaxLocalChannels;
     const bool multiChanAuto = numCh > 1 && opusSyncAvailable.load() && opusLanesFit;
     if (!multiChanAuto)
         return 0;
-    // multiChanAuto: always mixed mode (Vorbis ch0 + hidden Opus ch1..N)
+    // Mixed mode: Vorbis ch0, hidden control ch1, voice ch2, Opus lanes ch3+.
     return 1;
 }
 
@@ -16161,6 +16178,7 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
     {
         juce::String payloadUserId;
         juce::String appFamily;
+        juce::String scope;
         juce::String serverKey;
         juce::String room;
         const juce::var parsed = juce::JSON::parse(payload);
@@ -16168,6 +16186,7 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
         {
             payloadUserId = obj->getProperty("userId").toString();
             appFamily = obj->getProperty("appFamily").toString();
+            scope = obj->getProperty("scope").toString();
             serverKey = obj->getProperty("serverKey").toString().trim().toLowerCase();
             room = makeUrlSafeVdoRoomToken(obj->getProperty("room").toString());
         }
@@ -16181,12 +16200,16 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
             return;
 
         const VdoRoomResolution currentResolution = resolveVdoRoomForServer(currentServer);
-        if (serverKey.isEmpty() || serverKey != currentResolution.serverKey || room.isEmpty())
+        const bool isCurrentSessionPayload = scope == "currentNinjamSession";
+        if ((!isCurrentSessionPayload && serverKey.isEmpty()) || currentResolution.serverKey.isEmpty() || room.isEmpty())
             return;
 
+        // This signal arrived through the server to which we are currently connected.
+        // Apply it to the local endpoint key even when peers used different aliases for
+        // that server, such as localhost/127.0.0.1 and its LAN IP address.
         noteRemoteVideoRoomActivity();
 
-        if (rememberVdoRoomNameForServer(serverKey, room, false))
+        if (rememberVdoRoomNameForServer(currentResolution.serverKey, room, false))
         {
             juce::String senderLabel = normaliseChatTargetNick(sender);
             if (senderLabel.isEmpty())
@@ -17092,8 +17115,8 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     int requestedLocal = numLocalChannels.load();
     const int serverMaxLocalChannelsForBlock = juce::jmax(1, serverMaxLocalChannelsCached.load(std::memory_order_relaxed));
     const int maxEffectiveLocalChannels = juce::jlimit(1, maxLocalChannels,
-                                                       serverMaxLocalChannelsForBlock > kVoiceChatChannelIndex
-                                                           ? serverMaxLocalChannelsForBlock - kVoiceChatChannelIndex
+                                                       serverMaxLocalChannelsForBlock > kOpusMultichannelBaseIndex
+                                                           ? serverMaxLocalChannelsForBlock - kOpusMultichannelBaseIndex
                                                            : 1);
     int actualLocal = juce::jlimit(1, maxEffectiveLocalChannels, requestedLocal);
     actualLocal = totalAvailableInputChannels > 0 ? juce::jmin(actualLocal, totalAvailableInputChannels) : 0;
@@ -17604,7 +17627,7 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     }
 
     // Determine active encoding mode:
-    // - multiChanAuto: >1 local channels + VST3 peers -> Vorbis mix on ch0, hidden Opus per-ch on ch1..N
+    // - multiChanAuto: >1 local channels + NJ+ peers -> Vorbis ch0, control ch1, voice ch2, Opus ch3+
     // - otherwise:     Vorbis only, single channel (mix folded into ch0 above)
     const int serverMaxLocalChannelsForAudio = serverMaxLocalChannelsForBlock;
     const int configuredLocalChannelsForAudio = juce::jmax(1, actualLocal);
@@ -19946,11 +19969,11 @@ void NinjamVst3AudioProcessor::timerCallback()
             serverMaxLocalChannelsCached.store(serverMaxLocalChannels, std::memory_order_relaxed);
             juce::String serverChannelMessage = "Server allows " + juce::String(serverMaxLocalChannels)
                 + " local channel" + (serverMaxLocalChannels == 1 ? "" : "s")
-                + ". NINJAMplus layout: audio ch1, hidden control/Opus ch2, voice uses the next spare channel or falls back to audio ch1.";
+                + ". NINJAMplus indices: audio 0, hidden control 1, voice 2, Opus 3+.";
             if (serverMaxLocalChannels <= kNinjamPlusControlChannelIndex)
-                serverChannelMessage << " Hidden control and Opus cannot fit on this server; voice can only replace audio ch1 while voice mode is enabled.";
+                serverChannelMessage << " Hidden control and Opus cannot fit on this server; voice can only replace audio index 0 while voice mode is enabled.";
             else if (serverMaxLocalChannels <= kVoiceChatChannelIndex)
-                serverChannelMessage << " Dedicated voice may not fit; voice falls back to audio ch1 while voice mode is enabled.";
+                serverChannelMessage << " Dedicated voice may not fit; voice falls back to audio index 0 while voice mode is enabled.";
             addSystemChatLine(serverChannelMessage);
             pendingConnectNameAttempt = 0;
             opusSyncServerSupported.store(false);

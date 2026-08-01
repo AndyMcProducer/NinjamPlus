@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.10.0.1 - 2026-08-01
+
+### Dedicated Control Transport and VDO Sync Fixes
+
+- Reserve NINJAM channel index 0 for legacy Vorbis audio so NJ+ metadata cannot interrupt audio playback in ReaNINJAM or Jamtaba.
+- Advertise a hidden NJ+ control carrier on channel index 1 and subscribe only to peers that advertise that carrier, restoring multichannel discovery without touching legacy-client channel state.
+- Keep voice on channel index 2 and start hidden Opus multichannel lanes at channel index 3.
+- Route VDO room announcements, interval timing tags, transport probes, timing changes, and other NJ+ sync data through the dedicated control carrier.
+- Share VDO rooms across localhost, loopback, LAN, hostname, and public-address aliases without publishing a sender's local or server IP address.
+
 ## v0.9.13.9 - 2026-07-30
 
 ### Jamtaba Audio Glitch Fix
