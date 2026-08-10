@@ -432,6 +432,14 @@ public:
 
         appProperties.setStorageParameters (options);
 
+        // Allow per-instance settings (e.g. a second test client with its own username).
+        const String overrideDir = SystemStats::getEnvironmentVariable ("NINJAMPLUS_SETTINGS_DIR", {});
+        if (overrideDir.isNotEmpty())
+        {
+            options.folderName = overrideDir;
+            appProperties.setStorageParameters (options);
+        }
+
         // Migrate audio-device settings from old Roaming location to Documents/NINJAMplus.
         // Only runs once: if the new file already exists we skip.
        #if JUCE_WINDOWS

@@ -541,6 +541,9 @@ static juce::PropertiesFile::Options makeSettingsOptions()
 #else
     options.folderName = JucePlugin_Name;
 #endif
+    const juce::String overrideDir = juce::SystemStats::getEnvironmentVariable("NINJAMPLUS_SETTINGS_DIR", {});
+    if (overrideDir.isNotEmpty())
+        options.folderName = overrideDir;
     return options;
 }
 
@@ -12952,8 +12955,7 @@ UserChannelStrip::UserChannelStrip(NinjamVst3AudioProcessor& p, int userIdx)
         {
             perChannelGain[ch] = (float)channelSliders[ch].getValue();
             float master = (float)volumeSlider.getValue();
-            // NINJAM ch0 = Vorbis mixdown; individual channels start at ch1
-            processor.setUserNjChannelVolume(userIndex, ch + 1, master * perChannelGain[ch]);
+            processor.setUserNjChannelVolume(userIndex, ch, master * perChannelGain[ch]);
         };
         addChildComponent(channelSliders[i]);
 
@@ -13084,7 +13086,7 @@ void UserChannelStrip::paint(juce::Graphics& g)
 
     const int remotePeakCount = juce::jlimit(0, kMaxRemoteCh, numRemoteChannels);
     const bool multiChan = isMultiChanPeer && remotePeakCount > 1;
-    const bool showMultiMeter = multiChan && !isExpanded;
+    const bool showMultiMeter = false;
 
     if (isHorizontalLayout)
     {
@@ -13491,8 +13493,7 @@ void UserChannelStrip::timerCallback()
     {
         for (int ch = 0; ch < remoteChannelCount; ++ch)
         {
-            // NINJAM ch0 = Vorbis mixdown; individual channels start at ch1
-            float chPeak = processor.getUserChannelPeak(userIndex, ch + 1, -1); // -1 = both/max
+            float chPeak = processor.getUserChannelPeak(userIndex, ch, -1);
             displayedPeak = juce::jmax(displayedPeak, chPeak);
             if (std::abs(chPeak - channelPeaks[ch]) > 0.001f)
             {
@@ -13657,8 +13658,7 @@ void UserChannelStrip::applyVolumesToProcessor()
     if (isMultiChanPeer && remoteChannelCount > 1)
     {
         for (int ch = 0; ch < remoteChannelCount; ++ch)
-            // NINJAM ch0 = Vorbis mixdown; individual channels start at ch1
-            processor.setUserNjChannelVolume(userIndex, ch + 1, mv * perChannelGain[ch]);
+            processor.setUserNjChannelVolume(userIndex, ch, mv * perChannelGain[ch]);
     }
 }
 

@@ -230,6 +230,8 @@ public:
     int getLocalChannelInput(int channel) const;
     void setLocalChannelUsesLinkAudioInput(int channel, bool shouldUse);
     bool isLocalChannelUsingLinkAudioInput(int channel) const;
+    int getConfiguredLocalOpusWidth(int channel) const;
+    int getConfiguredLocalOpusPackedChannelCount(int numVirtualChannels) const;
     float getLocalChannelPeak(int channel) const;
     float getLocalChannelPeakLeft(int channel) const;
     float getLocalChannelPeakRight(int channel) const;
@@ -748,6 +750,11 @@ private:
     juce::CriticalSection localChannelNamesLock;
     std::array<juce::String, maxLocalChannels> localChannelNames; // user-defined channel names
     std::atomic<int> numLocalChannels { 1 };
+    // Device-capped local channel count, updated per block by the audio thread and
+    // used for the Opus lane layout and peer advertisement so the advertised/transmitted
+    // channel count matches the packed payload actually being sent.
+    std::atomic<int> effectiveLocalChannelCount { 0 };
+    int getEffectiveLocalChannelCount() const;
     std::atomic<bool> localMonitorEnabled { true };
     std::atomic<bool> fxReverbEnabled { true };
     std::atomic<bool> fxDelayEnabled { true };
@@ -1205,6 +1212,9 @@ private:
         bool multiChanEnabled = false;
         int numChannels = 1;           // number of local channels the peer is sending
         int opusBaseChannel = 1;       // first NINJAM channel index carrying Opus lanes
+        int packedChannelCount = 0;
+        std::array<int, maxLocalChannels> channelWidths {};
+        juce::StringArray channelNames;
         juce::String appFamily;
         int handshakeVersion = 0;
         juce::String runtimeFormat;
@@ -1214,9 +1224,35 @@ private:
     std::map<juce::String, OpusSyncPeerState> opusSyncPeers;
     // Simple username snapshot updated by refreshOpusSyncAvailabilityFromUsers().
     // Keyed by normalised username (no @host, lowercase). Read without holding opusSyncPeerLock.
-    struct PeerMultiChanInfo { bool isMultiChan = false; int numChannels = 1; int opusBaseChannel = 1; };
+    struct PeerMultiChanInfo
+    {
+        bool isMultiChan = false;
+        int numChannels = 1;
+        int opusBaseChannel = 1;
+        int packedChannelCount = 0;
+        std::array<int, maxLocalChannels> channelWidths {};
+        juce::StringArray channelNames;
+    };
     std::map<juce::String, PeerMultiChanInfo> peerMultiChanByName;
     juce::CriticalSection peerMultiChanLock;
+    std::array<std::atomic<bool>, maxRemoteChordUsers> remoteOpusPeerActive;
+    std::array<std::atomic<int>, maxRemoteChordUsers> remoteOpusCarrierChannel;
+    std::array<std::atomic<int>, maxRemoteChordUsers> remoteOpusVirtualChannelCount;
+    std::array<std::atomic<int>, maxRemoteChordUsers> remoteOpusPackedChannelCount;
+    std::array<std::array<std::atomic<int>, maxLocalChannels>, maxRemoteChordUsers> remoteOpusChannelWidths;
+    std::array<std::array<std::atomic<float>, maxLocalChannels>, maxRemoteChordUsers> remoteOpusChannelGains;
+    std::array<std::array<std::atomic<float>, maxLocalChannels>, maxRemoteChordUsers> remoteOpusChannelPeaks;
+    std::array<std::atomic<float>, maxRemoteChordUsers> remoteOpusCombinedPeakL;
+    std::array<std::atomic<float>, maxRemoteChordUsers> remoteOpusCombinedPeakR;
+    std::array<std::atomic<float>, maxRemoteChordUsers> remoteOpusUserVolume;
+    std::array<std::atomic<float>, maxRemoteChordUsers> remoteOpusUserPan;
+    std::array<std::atomic<int>, maxRemoteChordUsers> remoteOpusUserOutput;
+    std::array<std::atomic<bool>, maxRemoteChordUsers> remoteOpusUserMute;
+    std::array<std::atomic<bool>, maxRemoteChordUsers> remoteOpusUserSolo;
+    float** remoteOpusMixOutputs = nullptr;
+    int remoteOpusMixOutputChannels = 0;
+    bool remoteOpusSoloActiveThisBlock = false;
+    juce::AudioBuffer<float> localOpusPackedBuffer;
     juce::String opusSyncInstanceId;
     double lastOpusSupportBroadcastMs = 0.0;
     std::atomic<juce::uint64> transportProbeCounter { 0 };
@@ -1330,6 +1366,8 @@ private:
     void clearZapVideoFrameState();
     void stopNinjamZapVideoTransportForDisconnect();
     void syncLocalIntervalChannelConfig();
+    bool isRemoteOpusMultichannelPeer(int userIndex) const;
+    void refreshRemoteOpusUserSnapshots();
     int getVoiceChatNinjamChannelIndex() const;
     bool isKnownOpusMultichannelLane(int userIndex, int channelIndex);
     bool isNinjamRemoteChannelVideoOnly(int userIndex, int channelIndex);
@@ -1379,6 +1417,14 @@ private:
                                                int numChannels,
                                                int numFrames,
                                                int sampleRate);
+    static int RemoteMultichannelTap_Callback(void* userData,
+                                              int useridx,
+                                              const char* username,
+                                              int channelidx,
+                                              const float* interleaved,
+                                              int numChannels,
+                                              int numFrames,
+                                              int sampleRate);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NinjamVst3AudioProcessor)
 };
