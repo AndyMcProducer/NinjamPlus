@@ -34,6 +34,9 @@
 
 #include <ctype.h>
 
+#include <stdio.h>
+#include <stdarg.h>
+
 #include "usercon.h"
 #include "../mpb.h"
 
@@ -46,6 +49,28 @@
 #define strncasecmp strnicmp
 #define strcasecmp stricmp
 #endif
+
+static void njplus_srv_log(const char* fmt, ...)
+{
+  static char s_path[1024] = {0};
+  if (!s_path[0])
+  {
+    const char* tmp = getenv("TEMP");
+#ifdef _WIN32
+    _snprintf(s_path, sizeof(s_path), "%s\\ninjamplus_srv_debug.log", (tmp && *tmp) ? tmp : "C:\\Windows\\Temp");
+#else
+    snprintf(s_path, sizeof(s_path), "%s/ninjamplus_srv_debug.log", (tmp && *tmp) ? tmp : "/tmp");
+#endif
+  }
+  FILE* f = fopen(s_path, "ab");
+  if (!f) return;
+  va_list args;
+  va_start(args, fmt);
+  vfprintf(f, fmt, args);
+  va_end(args);
+  fputc('\n', f);
+  fclose(f);
+}
 
 static void guidtostr(unsigned char *guid, char *str)
 {
@@ -740,6 +765,7 @@ int User_Connection::Run(User_Group *group, int *wantsleep)
               {
                 int x;
                 for (x = 0; x < m_sublist.GetSize() && strcasecmp(unp,m_sublist.Get(x)->username.Get()); x ++);
+                njplus_srv_log("SRV USERMASK user='%s' me='%s' mask=%08x idx=%d", unp, m_username.Get(), fla, x);
                 if (x == m_sublist.GetSize()) // add new
                 {
                   if (fla) // only add if we need to subscribe
@@ -774,6 +800,8 @@ int User_Connection::Run(User_Group *group, int *wantsleep)
           if (!mp.parse(msg) && mp.chidx < m_max_channels)
           {
             char *myusername=m_username.Get();
+            static unsigned char zero_guid[16];
+            njplus_srv_log("SRV BEGIN chidx=%d fourcc=%08x guidZero=%d maxch=%d", mp.chidx, mp.fourcc, !memcmp(mp.guid,zero_guid,sizeof(zero_guid))?1:0, m_max_channels);
 
             mpb_server_download_interval_begin nmb;
             nmb.chidx=mp.chidx;
@@ -785,9 +813,6 @@ int User_Connection::Run(User_Group *group, int *wantsleep)
             Net_Message *newmsg=nmb.build();
             newmsg->addRef();
                     
-            static unsigned char zero_guid[16];
-
-
             if (mp.fourcc && memcmp(mp.guid,zero_guid,sizeof(zero_guid))) // zero = silence, so simply rebroadcast
             {
               User_TransferState *newrecv=new User_TransferState;
@@ -835,6 +860,7 @@ int User_Connection::Run(User_Group *group, int *wantsleep)
                   User_SubscribeMask *sm=u->m_sublist.Get(i);
                   if (!strcasecmp(sm->username.Get(),myusername))
                   {
+                    njplus_srv_log("SRV BEGIN candidate recv='%s' mask=%08x chbit=%d", u->m_username.Get(), sm->channelmask, (sm->channelmask>>mp.chidx)&1);
                     if (sm->channelmask & (1<<mp.chidx))
                     {
                       if (memcmp(mp.guid,zero_guid,sizeof(zero_guid))) // zero = silence, so simply rebroadcast
@@ -871,6 +897,9 @@ int User_Connection::Run(User_Group *group, int *wantsleep)
                                                                    // though we may need to update this at a later date if we change things.
 
             int user,x;
+
+            static unsigned char zero_guid2[16];
+            njplus_srv_log("SRV WRITE guidZero=%d len=%d recvfiles=%d", !memcmp(mp.guid,zero_guid2,sizeof(zero_guid2))?1:0, mp.audio_data_len, m_recvfiles.GetSize());
 
 
             for (x = 0; x < m_recvfiles.GetSize(); x ++)
@@ -909,6 +938,7 @@ int User_Connection::Run(User_Group *group, int *wantsleep)
                   User_TransferState *t=u->m_sendfiles.Get(i);
                   if (t && !memcmp(t->guid,mp.guid,sizeof(t->guid)))
                   {
+                    njplus_srv_log("SRV WRITE forward recv='%s' sendfiles=%d", u->m_username.Get(), u->m_sendfiles.GetSize());
                     t->last_acttime=now;
                     t->bytes_sofar += mp.audio_data_len;
                     u->Send(msg);

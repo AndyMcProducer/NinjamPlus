@@ -25,7 +25,13 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include "njclient.h"
 #include "mpb.h"
 #include "../WDL/pcmfmtcvt.h"
@@ -35,9 +41,74 @@
 
 #include "../WDL/win32_utf8.h"
 #include "opus.h"
+#include "opus_multistream.h"
 
 #define NJ_ENCODER_FMT_TYPE MAKE_NJ_FOURCC('O','G','G','v')
+
+void njplus_debug_log(const char* fmt, ...)
+{
+  static char s_path[1024] = {0};
+  if (!s_path[0])
+  {
+    const char* tmp = getenv("TEMP");
+#ifdef _WIN32
+    _snprintf(s_path, sizeof(s_path), "%s\\ninjamplus_mc_debug.log", (tmp && *tmp) ? tmp : "C:\\Windows\\Temp");
+#else
+    snprintf(s_path, sizeof(s_path), "%s/ninjamplus_mc_debug.log", (tmp && *tmp) ? tmp : "/tmp");
+#endif
+  }
+  FILE* f = fopen(s_path, "ab");
+  if (!f) return;
+  va_list args;
+  va_start(args, fmt);
+#ifdef _WIN32
+  fprintf(f, "[%u] ", (unsigned) _getpid());
+#else
+  fprintf(f, "[%u] ", (unsigned) getpid());
+#endif
+  vfprintf(f, fmt, args);
+  va_end(args);
+  fputc('\n', f);
+  fclose(f);
+}
 #define NJ_ENCODER_FMT_TYPE_OPUS MAKE_NJ_FOURCC('O','P','U','S')
+
+enum
+{
+  OPUS_STREAM_CONFIG_MARKER = 0xffff,
+  OPUS_STREAM_CONFIG_PAYLOAD_SIZE = 5,
+  OPUS_STREAM_PACKET_MAX = 16384
+};
+
+static void build_opus_stream_config(unsigned char payload[OPUS_STREAM_CONFIG_PAYLOAD_SIZE], int channels)
+{
+  payload[0] = 'N';
+  payload[1] = 'J';
+  payload[2] = 'O';
+  payload[3] = '1';
+  payload[4] = (unsigned char)(channels < 1 ? 1 : channels > 255 ? 255 : channels);
+}
+
+static bool parse_opus_stream_config(const unsigned char *payload, int *channels)
+{
+  if (!payload ||
+      payload[0] != 'N' ||
+      payload[1] != 'J' ||
+      payload[2] != 'O' ||
+      payload[3] != '1')
+    return false;
+
+  const int nch = payload[4] > 0 ? (int)payload[4] : 1;
+  if (channels) *channels = nch;
+  return true;
+}
+
+static bool build_opus_identity_mapping(int channels, unsigned char *mapping)
+{
+  if (!mapping || channels < 1 || channels > 255) return false;
+  for (int i = 0; i < channels; ++i) mapping[i] = (unsigned char)i;
+  return true;
+}
 
 static inline unsigned int make_ninjamzap_fourcc(char a, char b, char c, char d)
 {
@@ -85,13 +156,21 @@ public:
       pcmWritePos(0),
       errFlag(0),
       inputSampleRate(srate > 0 ? srate : kOpusSampleRate),
-      resamplerActive(false)
+      resamplerActive(false),
+      streamHeaderPending(true)
   {
     if (channels < 1) channels = 1;
-    if (channels > 2) channels = 2;
+    if (channels > 255) channels = 255;
+
+    unsigned char mapping[255];
+    if (!build_opus_identity_mapping(channels, mapping))
+    {
+      errFlag = 1;
+      return;
+    }
 
     int err = 0;
-    enc = opus_encoder_create(kOpusSampleRate, channels, OPUS_APPLICATION_AUDIO, &err);
+    enc = opus_multistream_encoder_create(kOpusSampleRate, channels, channels, 0, mapping, OPUS_APPLICATION_AUDIO, &err);
     if (err != OPUS_OK || !enc)
     {
       enc = NULL;
@@ -110,12 +189,12 @@ public:
       resampler.Reset();
     }
 
-    opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrate * 1000));
+    opus_multistream_encoder_ctl(enc, OPUS_SET_BITRATE(bitrate * 1000));
   }
 
   ~OpusEncoderCodec()
   {
-    if (enc) opus_encoder_destroy(enc);
+    if (enc) opus_multistream_encoder_destroy(enc);
   }
 
   void Encode(float *in, int inlen, int advance=1, int spacing=1)
@@ -162,12 +241,26 @@ public:
     outQueue.Advance(outQueue.Available());
     outQueue.Compact();
     pcmWritePos = 0;
-    if (resamplerActive)
-      resampler.Reset();
+    streamHeaderPending = true;
+    if (resamplerActive) resampler.Reset();
   }
 
 private:
   enum { kOpusSampleRate = 48000 };
+
+  void emitStreamHeader()
+  {
+    if (!streamHeaderPending) return;
+    const unsigned char marker[2] = {
+      (unsigned char)(OPUS_STREAM_CONFIG_MARKER & 0xff),
+      (unsigned char)((OPUS_STREAM_CONFIG_MARKER >> 8) & 0xff)
+    };
+    unsigned char payload[OPUS_STREAM_CONFIG_PAYLOAD_SIZE];
+    build_opus_stream_config(payload, channels);
+    outQueue.Add(marker, 2);
+    outQueue.Add(payload, OPUS_STREAM_CONFIG_PAYLOAD_SIZE);
+    streamHeaderPending = false;
+  }
 
   void encodeSourceFrames(const float *in, int inlen, int advance, int spacing)
   {
@@ -180,33 +273,10 @@ private:
       if (toCopy > space) toCopy = space;
 
       float *dst = (float *)pcmBuf.Get() + pcmWritePos * channels;
-      if (channels == 1)
+      for (int i = 0; i < toCopy; ++i)
       {
-        for (int i = 0; i < toCopy; ++i)
-        {
-          dst[i] = in[pos];
-          pos += advance;
-        }
-      }
-      else if (channels == 2)
-      {
-        for (int i = 0; i < toCopy; ++i)
-        {
-          dst[i*2] = in[pos];
-          dst[i*2+1] = in[pos + spacing];
-          pos += advance;
-        }
-      }
-      else
-      {
-        for (int i = 0; i < toCopy; ++i)
-        {
-          for (int c = 0; c < channels; ++c)
-          {
-            dst[i*channels + c] = in[pos + c*spacing];
-          }
-          pos += advance;
-        }
+        for (int c = 0; c < channels; ++c) dst[i*channels + c] = in[pos + c*spacing];
+        pos += advance;
       }
 
       pcmWritePos += toCopy;
@@ -233,8 +303,7 @@ private:
       if (toCopy > space) toCopy = space;
 
       float *dst = (float *)pcmBuf.Get() + pcmWritePos * channels;
-      for (int i = 0; i < toCopy * channels; ++i)
-        dst[i] = (float)in[pos * channels + i];
+      for (int i = 0; i < toCopy * channels; ++i) dst[i] = (float)in[pos * channels + i];
 
       pcmWritePos += toCopy;
       pos += toCopy;
@@ -262,19 +331,10 @@ private:
       int framesToCopy = requested;
       if (framesToCopy > remaining) framesToCopy = remaining;
 
-      if (channels == 1)
+      for (int i = 0; i < framesToCopy; ++i)
       {
-        for (int i = 0; i < framesToCopy; ++i)
-          rsIn[i] = (WDL_ResampleSample)in[(sourceFrame + i) * advance];
-      }
-      else
-      {
-        for (int i = 0; i < framesToCopy; ++i)
-        {
-          const int src = (sourceFrame + i) * advance;
-          rsIn[i*2] = (WDL_ResampleSample)in[src];
-          rsIn[i*2+1] = (WDL_ResampleSample)in[src + spacing];
-        }
+        const int src = (sourceFrame + i) * advance;
+        for (int c = 0; c < channels; ++c) rsIn[i*channels + c] = (WDL_ResampleSample)in[src + c * spacing];
       }
 
       const int maxOutputFrames = (int)(((long long)framesToCopy * kOpusSampleRate + inputSampleRate - 1) / inputSampleRate) + 512;
@@ -292,8 +352,9 @@ private:
   void encodeFrame()
   {
     if (!enc) return;
-    unsigned char packet[4096];
-    int bytes = opus_encode_float(enc, (const float *)pcmBuf.Get(), frameSize, packet, (opus_int32)sizeof(packet));
+    emitStreamHeader();
+    unsigned char packet[OPUS_STREAM_PACKET_MAX];
+    int bytes = opus_multistream_encode_float(enc, (const float *)pcmBuf.Get(), frameSize, packet, (opus_int32)sizeof(packet));
     if (bytes <= 0) return;
     unsigned char header[2];
     header[0] = (unsigned char)(bytes & 0xff);
@@ -302,13 +363,14 @@ private:
     outQueue.Add(packet, bytes);
   }
 
-  OpusEncoder *enc;
+  OpusMSEncoder *enc;
   int channels;
   int frameSize;
   int pcmWritePos;
   int errFlag;
   int inputSampleRate;
   bool resamplerActive;
+  bool streamHeaderPending;
   WDL_Resampler resampler;
   WDL_TypedBuf<WDL_ResampleSample> resampleOut;
   WDL_HeapBuf pcmBuf;
@@ -321,16 +383,20 @@ public:
   OpusDecoderCodec()
   {
     dec = NULL;
+    msDec = NULL;
     channels = 0;
     srate = 48000;
     srcLen = 0;
     errFlag = 0;
+    streamConfigured = false;
+    useMultistream = false;
+    m_resyncSkip = 0;
     srcBuf.Resize(4096);
   }
 
   ~OpusDecoderCodec()
   {
-    if (dec) opus_decoder_destroy(dec);
+    destroyDecoder();
   }
 
   int GetSampleRate()
@@ -355,19 +421,6 @@ public:
   {
     if (srcLen <= 0) return;
 
-    if (!dec)
-    {
-      int err = 0;
-      dec = opus_decoder_create(srate, 2, &err);
-      if (err != OPUS_OK || !dec)
-      {
-        dec = NULL;
-        errFlag = 1;
-        return;
-      }
-      channels = 2;
-    }
-
     packetQueue.Add(srcBuf.Get(), srcLen);
 
     while (packetQueue.Available() >= 2)
@@ -376,19 +429,66 @@ public:
       if (!raw) break;
 
       const int packetLen = (int)raw[0] | ((int)raw[1] << 8);
-      if (packetLen <= 0 || packetLen > 4000)
+      if (packetLen == OPUS_STREAM_CONFIG_MARKER)
       {
-        const int avail = packetQueue.Available();
-        if (avail <= 0) break;
-        decodePacket(raw, wdl_min(avail, 4000));
-        packetQueue.Advance(wdl_min(avail, 4000));
+        if (packetQueue.Available() < OPUS_STREAM_CONFIG_PAYLOAD_SIZE + 2) break;
+        int configChannels = 0;
+        if (!parse_opus_stream_config(raw + 2, &configChannels) || !configureStream(configChannels, true))
+        {
+          errFlag = 1;
+          break;
+        }
+        m_resyncSkip = 0;
+        packetQueue.Advance(OPUS_STREAM_CONFIG_PAYLOAD_SIZE + 2);
+        continue;
+      }
+
+      if (packetLen <= 0 || packetLen > OPUS_STREAM_PACKET_MAX)
+      {
+        if (!streamConfigured)
+        {
+          const int detectedChannels = wdl_max(1, opus_packet_get_nb_channels(raw));
+          if (detectedChannels > 0 && configureStream(detectedChannels, false))
+            continue;
+          errFlag = 1;
+          break;
+        }
+        // Stream desynced (e.g. a lost UDP chunk). Never decode garbage as
+        // audio: skip one byte and re-frame. Opus's error detection rejects
+        // any false frame we hit, so we recover silently with no garble.
+        // Bounded by m_resyncSkip so we always make forward progress.
+        if (++m_resyncSkip > 4 * OPUS_STREAM_PACKET_MAX)
+        {
+          packetQueue.Advance(packetQueue.Available());
+          m_resyncSkip = 0;
+          continue;
+        }
+        packetQueue.Advance(1);
         continue;
       }
 
       if (packetQueue.Available() < packetLen + 2)
+      {
+        if (m_resyncSkip > 0)
+        {
+          // While resyncing, a plausible-but-incomplete length is usually a
+          // false sync. Skip what we have and keep scanning rather than wait.
+          packetQueue.Advance(packetQueue.Available());
+          continue;
+        }
         break;
+      }
+      if (!streamConfigured)
+      {
+        const int detectedChannels = wdl_max(1, opus_packet_get_nb_channels(raw + 2));
+        if (!configureStream(detectedChannels, false))
+        {
+          errFlag = 1;
+          break;
+        }
+      }
 
-      decodePacket(raw + 2, packetLen);
+      if (decodePacket(raw + 2, packetLen) > 0) m_resyncSkip = 0;
       packetQueue.Advance(packetLen + 2);
     }
 
@@ -397,9 +497,13 @@ public:
 
   void Reset()
   {
+    destroyDecoder();
     pcmQueue.Clear();
     packetQueue.Clear();
     srcLen = 0;
+    streamConfigured = false;
+    useMultistream = false;
+    channels = 0;
   }
 
   int Available()
@@ -424,32 +528,84 @@ public:
   }
 
 private:
-  void decodePacket(const unsigned char *data, int len)
+  void destroyDecoder()
   {
-    if (!dec || !data || len <= 0) return;
+    if (dec) { opus_decoder_destroy(dec); dec = NULL; }
+    if (msDec) { opus_multistream_decoder_destroy(msDec); msDec = NULL; }
+  }
+
+  bool configureStream(int newChannels, bool preferMultistream)
+  {
+    if (newChannels < 1) newChannels = 1;
+    if (newChannels > 255) newChannels = 255;
+    if (streamConfigured && channels == newChannels && useMultistream == preferMultistream) return true;
+
+    destroyDecoder();
+
+    int err = OPUS_OK;
+    if (preferMultistream)
+    {
+      unsigned char mapping[255];
+      if (!build_opus_identity_mapping(newChannels, mapping)) return false;
+      msDec = opus_multistream_decoder_create(srate, newChannels, newChannels, 0, mapping, &err);
+      if (err != OPUS_OK || !msDec)
+      {
+        msDec = NULL;
+        return false;
+      }
+      useMultistream = true;
+    }
+    else
+    {
+      dec = opus_decoder_create(srate, newChannels, &err);
+      if (err != OPUS_OK || !dec)
+      {
+        dec = NULL;
+        return false;
+      }
+      useMultistream = false;
+    }
+
+    channels = newChannels;
+    streamConfigured = true;
+    if (preferMultistream) njplus_debug_log("DECODER opus-multistream configured channels=%d srate=%d", newChannels, srate);
+    return true;
+  }
+
+  int decodePacket(const unsigned char *data, int len)
+  {
+    if ((!dec && !msDec) || !data || len <= 0) return 0;
 
     int maxSamples = srate / 50;
     if (maxSamples <= 0) maxSamples = 960;
 
     float *buf = pcmQueue.Add(NULL, maxSamples * channels);
-    if (!buf) return;
+    if (!buf) return 0;
 
-    int decoded = opus_decode_float(dec, data, len, buf, maxSamples, 0);
+    const int decoded = useMultistream
+      ? opus_multistream_decode_float(msDec, data, len, buf, maxSamples, 0)
+      : opus_decode_float(dec, data, len, buf, maxSamples, 0);
     if (decoded <= 0)
     {
+      if (useMultistream) njplus_debug_log("DECODE ms FAIL len=%d decoded=%d", len, decoded);
       pcmQueue.Advance(-maxSamples * channels);
-      return;
+      return decoded;
     }
+    if (useMultistream && (decoded % 100) == 0) njplus_debug_log("DECODE ms ok decoded=%d channels=%d", decoded, channels);
 
-    if (decoded < maxSamples)
-      pcmQueue.Advance(-(maxSamples - decoded) * channels);
+    if (decoded < maxSamples) pcmQueue.Advance(-(maxSamples - decoded) * channels);
+    return decoded;
   }
 
   OpusDecoder *dec;
+  OpusMSDecoder *msDec;
   int channels;
   int srate;
   int srcLen;
   int errFlag;
+  bool streamConfigured;
+  bool useMultistream;
+  int m_resyncSkip;
   WDL_HeapBuf srcBuf;
   WDL_Queue packetQueue;
   WDL_TypedQueue<float> pcmQueue;
@@ -918,6 +1074,8 @@ public:
   int channel_idx;
 
   int src_channel; // 0 or 1 etc.. &1024 = stereo!
+  int opus_src_channel;
+  int opus_src_nch;
   int bitrate;
 
   float volume;
@@ -1119,6 +1277,8 @@ NJClient::NJClient()
   ChannelMixer_User=0;
   RemoteChannelAudioTap=0;
   RemoteChannelAudioTap_User=0;
+  RemoteMultichannelTap=0;
+  RemoteMultichannelTap_User=0;
 
   waveWrite=0;
 #ifndef NJCLIENT_NO_XMIT_SUPPORT
@@ -1817,6 +1977,10 @@ int NJClient::Run() // nonzero if sleep ok
               int x;
               RemoteUser *theuser;
               for (x = 0; x < m_remoteusers.GetSize() && strcmp((theuser=m_remoteusers.Get(x))->name.Get(),dib.username); x ++);
+              {
+                const int guidZero = !memcmp(dib.guid,zero_guid,sizeof(zero_guid));
+                njplus_debug_log("DL BEGIN user='%s' chidx=%d fourcc=%08x guidZero=%d remoteusers=%d found=%d", dib.username, dib.chidx, (unsigned int)dib.fourcc, guidZero, m_remoteusers.GetSize(), x < m_remoteusers.GetSize());
+              }
               if (x < m_remoteusers.GetSize() && dib.chidx >= 0 && dib.chidx < MAX_USER_CHANNELS)
               {
                 //printf("Getting interval for %s, channel %d\n",dib.username,dib.chidx);
@@ -1869,6 +2033,7 @@ int NJClient::Run() // nonzero if sleep ok
                     ds->playtime=(theuser->channels[dib.chidx].flags&2)?LIVE_PREBUFFER:config_play_prebuffer;
                     ds->chidx=dib.chidx;
                     ds->username.Set(dib.username);
+                    njplus_debug_log("DL CREATE chidx=%d fourcc=%08x guid=%08x%08x%08x%08x", dib.chidx, (unsigned int)dib.fourcc, ((unsigned int*)ds->guid)[0], ((unsigned int*)ds->guid)[1], ((unsigned int*)ds->guid)[2], ((unsigned int*)ds->guid)[3]);
 
                     m_downloads.Add(ds);
                   }
@@ -1943,6 +2108,7 @@ int NJClient::Run() // nonzero if sleep ok
                   m_customIntervalDownloads.Delete(x--);
                 }
               }
+              bool audioMatched = false;
               for (x = 0; x < m_downloads.GetSize(); x ++)
               {
                 RemoteDownload *ds=m_downloads.Get(x);
@@ -1950,6 +2116,8 @@ int NJClient::Run() // nonzero if sleep ok
                 {
                   if (!memcmp(ds->guid,diw.guid,sizeof(ds->guid)))
                   {
+                    audioMatched = true;
+                    njplus_debug_log("DL WRITE chidx=%d len=%d flags=%d", ds->chidx, (int)diw.audio_data_len, (int)diw.flags);
                     if (config_debug_level>1) printf("RECV BLOCK DATA %s%s %d bytes\n",guidtostr_tmp(diw.guid),diw.flags&1?":end":"",diw.audio_data_len);
 
                     ds->last_time=now;
@@ -1973,6 +2141,7 @@ int NJClient::Run() // nonzero if sleep ok
                   }
                 }
               }
+              if (!audioMatched) njplus_debug_log("DL WRITE DROPPED len=%d flags=%d downloads=%d", (int)diw.audio_data_len, (int)diw.flags, m_downloads.GetSize());
             }
           }
         break;
@@ -2097,9 +2266,16 @@ int NJClient::Run() // nonzero if sleep ok
     double blockstarttime=0.0;
     while (!lc->m_bq.GetBlock(&p,&block_nch,&blockstarttime))
     {
+      if (lc->channel_idx == 2)
+      {
+        static int s_upGotLog = 0;
+        if ((++s_upGotLog & 31) == 0)
+          njplus_debug_log("UP ch2 GOT p=%p sz=%d nch=%d", (void*)p, (p && p != (WDL_HeapBuf*)-1) ? p->GetSize() : -1, block_nch);
+      }
       wantsleep=0;
       if (lc->channel_idx >= m_max_localch)
       {
+        if (lc->channel_idx == 2) njplus_debug_log("UPLOAD ch2 BAIL max_localch m_max_localch=%d", m_max_localch);
         if (p && p != (WDL_HeapBuf*)-1)
           lc->m_bq.DisposeBlock(p);
         p=0;
@@ -2108,6 +2284,7 @@ int NJClient::Run() // nonzero if sleep ok
 
       if (!ShouldEncodeVorbis(lc->channel_idx) && !ShouldEncodeOpus(lc->channel_idx))
       {
+        if (lc->channel_idx == 2) njplus_debug_log("UPLOAD ch2 BAIL codec vorbisMask=%08x opusMask=%08x capsEncode=%08x", m_codec_vorbis_mask, m_codec_opus_mask, m_codec_caps_encode);
         if (p && p != (WDL_HeapBuf*)-1)
           lc->m_bq.DisposeBlock(p);
         p=0;
@@ -2134,7 +2311,11 @@ int NJClient::Run() // nonzero if sleep ok
         // encode data
         if (!lc->m_enc)
         {
-          lc->m_enc = createEncoderForChannel(lc->channel_idx, m_srate, lc->m_enc_nch_used=block_nch, lc->m_enc_bitrate_used = lc->bitrate+(block_nch>1?lc->bitrate/3:0), WDL_RNG_int32(), &lc->m_enc_fourcc_used);
+          int encoderBitrate = lc->bitrate;
+          if (block_nch > 2) encoderBitrate = lc->bitrate * block_nch;
+          else if (block_nch > 1) encoderBitrate = lc->bitrate + lc->bitrate/3;
+          lc->m_enc = createEncoderForChannel(lc->channel_idx, m_srate, lc->m_enc_nch_used=block_nch, lc->m_enc_bitrate_used = encoderBitrate, WDL_RNG_int32(), &lc->m_enc_fourcc_used);
+          if (lc->channel_idx == 0 || lc->channel_idx == 2) njplus_debug_log("UPLOAD ch%d encoder fourcc=%08x nch=%d bitrate=%d", lc->channel_idx, lc->m_enc_fourcc_used, block_nch, encoderBitrate);
         }
 
         if (lc->m_need_header)
@@ -2183,7 +2364,7 @@ int NJClient::Run() // nonzero if sleep ok
         {
           {
             int sz=p->GetSize()/sizeof(float);
-            if (block_nch>1)  sz/=2;
+            if (block_nch>1)  sz/=block_nch;
 
             if (lc->m_wavewritefile)
             {
@@ -2226,6 +2407,8 @@ int NJClient::Run() // nonzero if sleep ok
               }
 
               if (config_debug_level>1) printf("SEND BLOCK %s%s %d bytes\n",guidtostr_tmp(wh.guid),wh.flags&1?"end":"",wh.audio_data_len);
+
+              if (lc->channel_idx == 0 || lc->channel_idx == 2) njplus_debug_log("UPLOAD ch%d SEND BLOCK %d bytes end=%d", lc->channel_idx, wh.audio_data_len, wh.flags&1);
 
               m_netcon->Send(wh.build());
             }
@@ -2313,14 +2496,18 @@ int NJClient::Run() // nonzero if sleep ok
             lc->m_enc=0;
             lc->m_enc_fourcc_used=0;
           }
-          else if (lc->m_enc_nch_used != ((lc->src_channel&1024)?2:1))
-          {
-            delete lc->m_enc;
-            lc->m_enc=0;
-            lc->m_enc_fourcc_used=0;
-          }
           else
-            lc->m_enc->reinit();
+          {
+            const int desiredNch = lc->opus_src_nch > 0 ? lc->opus_src_nch : ((lc->src_channel&1024)?2:1);
+            if (lc->m_enc_nch_used != desiredNch)
+            {
+              delete lc->m_enc;
+              lc->m_enc=0;
+              lc->m_enc_fourcc_used=0;
+            }
+            else
+              lc->m_enc->reinit();
+          }
 
         }
 
@@ -2334,6 +2521,18 @@ int NJClient::Run() // nonzero if sleep ok
         lc->m_curwritefile_writelen=0.0;
 
         // end the last encode
+      }
+    }
+    if (lc->channel_idx == 2)
+    {
+      static int s_upEmptyLog = 0;
+      if ((++s_upEmptyLog & 31) == 0)
+      {
+        int qsz=0;
+        lc->m_bq.m_cs.Enter();
+        qsz=lc->m_bq.m_samplequeue.GetSize();
+        lc->m_bq.m_cs.Leave();
+        njplus_debug_log("UP ch2 EMPTY qsize=%d", qsz);
       }
     }
   }
@@ -2637,20 +2836,44 @@ void NJClient::process_samples(float **inbuf, int innch, float **outbuf, int out
   {
     Local_Channel *lc=m_locchannels.Get(u);
     if (lc->flags & NJCLIENT_CHANNEL_FLAG_VIDEO_ONLY) continue;
-    if (!justmonitor && lc->channel_idx >= m_max_localch) continue; // server does not allow this channel index
+    if (!justmonitor && lc->channel_idx >= m_max_localch) // server does not allow this channel index
+    {
+      if (lc->channel_idx == 2) njplus_debug_log("PROC ch2 SKIPPED m_max_localch=%d", m_max_localch);
+      continue;
+    }
 
     int sc=lc->src_channel&1023;
     int sc_nch=(lc->src_channel&1024)?2:1;
+    const bool useOpusPackedInputs = lc->opus_src_nch > 0;
 
     float *src=NULL,*src2=NULL;
-    if (sc >= 0 && sc < innch) src=inbuf[sc]+offset;
-    if (sc_nch>1)
+    if (useOpusPackedInputs)
+    {
+      sc = lc->opus_src_channel;
+      sc_nch = lc->opus_src_nch;
+      const int bytelen = len * sc_nch * (int)sizeof(float);
+      if (tmpblock.GetSize() < bytelen) tmpblock.Resize(bytelen);
+
+      float *packed = (float *)tmpblock.Get();
+      for (int ch = 0; ch < sc_nch; ++ch)
+      {
+        float *dst = packed + ch * len;
+        const int srcIndex = sc + ch;
+        if (srcIndex >= 0 && srcIndex < innch) memcpy(dst, inbuf[srcIndex] + offset, len * sizeof(float));
+        else memset(dst, 0, len * sizeof(float));
+      }
+
+      src = packed;
+      src2 = sc_nch > 1 ? (packed + len) : packed;
+    }
+    else if (sc >= 0 && sc < innch) src=inbuf[sc]+offset;
+    if (!useOpusPackedInputs && sc_nch>1)
     {
       if (sc+1 >= 0 && sc+1 < innch) src2=inbuf[sc+1]+offset;
       if (!src2) src2=src;
     }
 
-    if (lc->cbf || !src || ChannelMixer)
+    if (!useOpusPackedInputs && (lc->cbf || !src || ChannelMixer))
     {
       // todo: support stereo on chanmixer, silent, and effect processing stuff
       int bytelen=len*(int)sizeof(float);
@@ -2716,7 +2939,16 @@ void NJClient::process_samples(float **inbuf, int innch, float **outbuf, int out
 
       if (lc->bcast_active)
       {
-        lc->m_bq.AddBlock(sc_nch,0.0,src,len,src2);
+        if (lc->channel_idx == 2)
+        {
+          static int s_ch2LogCounter = 0;
+          if ((++s_ch2LogCounter & 255) == 0 || !isPlaying || !lc->broadcasting)
+            njplus_debug_log("PROC ch2 AddBlock sc_nch=%d len=%d useOpus=%d broadcast=%d isPlaying=%d", sc_nch, len, useOpusPackedInputs, lc->broadcasting, isPlaying);
+        }
+        // For the packed Opus multichannel lane, src already holds the full
+        // planar N-channel block; passing NULL for samples2 lets AddBlock's
+        // attr>1 branch store all N channels instead of truncating to 2.
+        lc->m_bq.AddBlock(sc_nch,0.0,src,len,useOpusPackedInputs ? NULL : src2);
         lc->m_curwritefile_curbuflen += len;
       }
     }
@@ -3007,6 +3239,31 @@ static int mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // lengths
         ls=rsout[t];
         rs=rsout[t+1];
       }
+      else if (src_nch > 2)
+      {
+        ls=0.0;
+        rs=0.0;
+        int lcount=0;
+        int rcount=0;
+        const int base = x*src_nch;
+        for (int c = 0; c < src_nch; ++c)
+        {
+          const double v = rsout[base + c];
+          if ((c & 1) == 0)
+          {
+            ls += v;
+            ++lcount;
+          }
+          else
+          {
+            rs += v;
+            ++rcount;
+          }
+        }
+        if (lcount > 0) ls /= (double)lcount;
+        if (rcount > 0) rs /= (double)rcount;
+        else rs = ls;
+      }
       else
       {
         ls=rs=rsout[x*src_nch];
@@ -3070,6 +3327,32 @@ static int mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // lengths
         ls=src[ipos]*(1.0-fracpos) + src[ipos2]*fracpos;
         rs=src[ipos+1]*(1.0-fracpos) + src[ipos2+1]*fracpos;
       }
+        else if (src_nch > 2)
+        {
+          ls=0.0;
+          rs=0.0;
+          int lcount=0;
+          int rcount=0;
+          const int base1 = ipos * src_nch;
+          const int base2 = ipos2 * src_nch;
+          for (int c = 0; c < src_nch; ++c)
+          {
+            const double v = src[base1 + c]*(1.0-fracpos) + src[base2 + c]*fracpos;
+            if ((c & 1) == 0)
+            {
+              ls += v;
+              ++lcount;
+            }
+            else
+            {
+              rs += v;
+              ++rcount;
+            }
+          }
+          if (lcount > 0) ls /= (double)lcount;
+          if (rcount > 0) rs /= (double)rcount;
+          else rs = ls;
+        }
       else
       {
         rs=ls=src[ipos]*(1.0-fracpos) + src[ipos2]*fracpos;
@@ -3084,6 +3367,31 @@ static int mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // lengths
         int t=x+x;
         ls=src[t];
         rs=src[t+1];
+      }
+      else if (src_nch > 2)
+      {
+        ls=0.0;
+        rs=0.0;
+        int lcount=0;
+        int rcount=0;
+        const int base = x*src_nch;
+        for (int c = 0; c < src_nch; ++c)
+        {
+          const double v = src[base + c];
+          if ((c & 1) == 0)
+          {
+            ls += v;
+            ++lcount;
+          }
+          else
+          {
+            rs += v;
+            ++rcount;
+          }
+        }
+        if (lcount > 0) ls /= (double)lcount;
+        if (rcount > 0) rs /= (double)rcount;
+        else rs = ls;
       }
       else
       {
@@ -3124,6 +3432,76 @@ static int mixFloatsNIOutput(float *src, int src_srate, int src_nch,  // lengths
   frames_mixed=dest_len;
   if (src_consumed) *src_consumed=input_frames_used;
   return frames_mixed;
+}
+
+static int copyFloatsInterleavedOutput(float *src, int src_srate, int src_nch,
+                                      int dest_srate, int dest_len, double *state, int src_len,
+                                      DecodeState *decode_state, int *src_consumed,
+                                      float *dest_interleaved)
+{
+  if (!dest_interleaved || !src || src_nch < 1 || src_len < 1 || dest_len < 1)
+  {
+    if (src_consumed) *src_consumed = 0;
+    return 0;
+  }
+
+  if (!src_srate) src_srate = 48000;
+  if (!dest_srate) dest_srate = 48000;
+
+  if (src_srate != dest_srate && decode_state)
+  {
+    decode_state->configureResampler(src_srate, dest_srate, src_nch);
+    WDL_ResampleSample *inbuf = 0;
+    int input_frames = decode_state->resampler.ResamplePrepare(dest_len, src_nch, &inbuf);
+    if (input_frames > src_len) input_frames = src_len;
+    if (input_frames < 0) input_frames = 0;
+
+    if (input_frames > 0 && inbuf)
+    {
+      const int input_items = input_frames * src_nch;
+      for (int i = 0; i < input_items; ++i) inbuf[i] = (WDL_ResampleSample)src[i];
+    }
+
+    WDL_ResampleSample *rsout = decode_state->resample_outbuf.Resize(dest_len * src_nch, false);
+    const int produced = rsout ? decode_state->resampler.ResampleOut(rsout, input_frames, dest_len, src_nch) : 0;
+    const int outframes = produced > dest_len ? dest_len : produced;
+    for (int i = 0; i < outframes * src_nch; ++i) dest_interleaved[i] = (float)rsout[i];
+    decode_state->resample_state = decode_state->resampler.GetCurrentLatency() * (double)src_srate;
+    if (src_consumed) *src_consumed = input_frames;
+    return outframes;
+  }
+
+  if (decode_state) decode_state->configureResampler(src_srate, dest_srate, src_nch);
+
+  double rspos = *state;
+  double drspos = src_srate != dest_srate ? (double)src_srate / (double)dest_srate : 1.0;
+  int frames_written = 0;
+  for (int x = 0; x < dest_len; ++x)
+  {
+    if (src_srate != dest_srate)
+    {
+      int ipos = (int)rspos;
+      int ipos2 = ipos + 1;
+      if (ipos >= src_len) ipos = src_len - 1;
+      if (ipos2 >= src_len) ipos2 = src_len - 1;
+      const double fracpos = rspos - ipos;
+      const int base1 = ipos * src_nch;
+      const int base2 = ipos2 * src_nch;
+      for (int c = 0; c < src_nch; ++c)
+        dest_interleaved[x * src_nch + c] = (float)(src[base1 + c] * (1.0 - fracpos) + src[base2 + c] * fracpos);
+      rspos += drspos;
+    }
+    else
+    {
+      const int base = x * src_nch;
+      for (int c = 0; c < src_nch; ++c) dest_interleaved[base + c] = src[base + c];
+    }
+    ++frames_written;
+  }
+
+  if (src_consumed) *src_consumed = src_srate != dest_srate ? (int)rspos : dest_len;
+  *state = rspos - (int)rspos;
+  return frames_written;
 }
 
 
@@ -3361,6 +3739,67 @@ void NJClient::mixInChannel(int useridx, RemoteUser *user, int chanidx,
 
       float lvol=vol;
       float *tmpbuf[2]={outbuf[idx]+offs,use_nch > 1 ? (outbuf[idx+1]+offs) : 0};
+      bool handledByMultichannelTap = false;
+      const bool wantsMultichannelTap = RemoteMultichannelTap
+        && RemoteMultichannelTap(RemoteMultichannelTap_User,
+                                 useridx,
+                                 user ? user->name.Get() : NULL,
+                                 chanidx,
+                                 NULL,
+                                 srcnch,
+                                 0,
+                                 srate) != 0;
+      if (RemoteMultichannelTap) njplus_debug_log("QUEUE user=%d chan=%d srcnch=%d query->wants=%d", useridx, chanidx, srcnch, wantsMultichannelTap);
+      if (wantsMultichannelTap)
+      {
+        float *rawInterleaved = chan->tap_outbuf.ResizeOK(len_out * srcnch, false);
+        if (rawInterleaved)
+        {
+          const int rendered = copyFloatsInterleavedOutput(sptr,
+                                                           chan->decode_codec->GetSampleRate(),
+                                                           srcnch,
+                                                           srate,
+                                                           len_out,
+                                                           &chan->resample_state,
+                                                           chan->decode_codec->Available() / srcnch,
+                                                           chan,
+                                                           &source_frames_consumed,
+                                                           rawInterleaved);
+          if (rendered > 0)
+          {
+            float combinedPeak = 0.0f;
+            for (int i = 0; i < rendered * srcnch; ++i)
+            {
+              const float f = softclip_to_minus2db(rawInterleaved[i]);
+              rawInterleaved[i] = f;
+              const float a = f < 0.0f ? -f : f;
+              if (a > combinedPeak) combinedPeak = a;
+            }
+            userchan->decode_peak_vol[0] = combinedPeak * vol;
+            userchan->decode_peak_vol[1] = combinedPeak * vol;
+            handledByMultichannelTap = RemoteMultichannelTap(RemoteMultichannelTap_User,
+                                                             useridx,
+                                                             user ? user->name.Get() : NULL,
+                                                             chanidx,
+                                                             rawInterleaved,
+                                                             srcnch,
+                                                             rendered,
+                                                             srate) != 0;
+            if (RemoteMultichannelTap) njplus_debug_log("QUEUE user=%d chan=%d data rendered=%d srcnch=%d handled=%d", useridx, chanidx, rendered, srcnch, handledByMultichannelTap);
+            if (handledByMultichannelTap)
+            {
+              len_out = rendered;
+              if (source_frames_consumed < 0) source_frames_consumed = 0;
+              if (source_frames_consumed > chan->decode_codec->Available() / srcnch)
+                source_frames_consumed = chan->decode_codec->Available() / srcnch;
+              needed = source_frames_consumed;
+            }
+          }
+        }
+      }
+
+      if (!handledByMultichannelTap)
+      {
       if (use_nch==1 && srcnch>1)
       {
         tmpbuf[1]=tmpbuf[0];
@@ -3388,10 +3827,12 @@ void NJClient::mixInChannel(int useridx, RemoteUser *user, int chanidx,
       if (source_frames_consumed > chan->decode_codec->Available() / srcnch)
         source_frames_consumed=chan->decode_codec->Available() / srcnch;
       needed=source_frames_consumed;
+      }
     }
 
     if (RemoteChannelAudioTap && tap_interleaved && tap_frames > 0)
     {
+      if (chanidx == 2) njplus_debug_log("TAPFALLBACK user=%d chan=%d frames=%d", useridx, chanidx, tap_frames);
       RemoteChannelAudioTap(RemoteChannelAudioTap_User,
                             useridx,
                             user ? user->name.Get() : NULL,
@@ -3853,11 +4294,32 @@ void NJClient::SetLocalChannelInfo(int ch, const char *name, bool setsrcch, int 
   Local_Channel *c=m_locchannels.Get(x);
   c->channel_idx=ch;
   if (name) c->name.Set(name);
-  if (setsrcch) c->src_channel=srcch;
+  if (setsrcch)
+  {
+    c->src_channel=srcch;
+    c->opus_src_nch=0;
+  }
   if (setbitrate) c->bitrate=bitrate;
   if (setbcast) c->broadcasting=broadcast;
   if (setoutch) c->out_chan_index=outch;
   if (setflags) c->flags=flags;
+  m_locchan_cs.Leave();
+}
+
+void NJClient::SetLocalChannelOpusSourceChannels(int ch, int srcStartChannel, int srcChannelCount)
+{
+  m_locchan_cs.Enter();
+  int x;
+  for (x = 0; x < m_locchannels.GetSize() && m_locchannels.Get(x)->channel_idx!=ch; x ++);
+  if (x == m_locchannels.GetSize())
+  {
+    m_locchannels.Add(new Local_Channel);
+  }
+
+  Local_Channel *c=m_locchannels.Get(x);
+  c->channel_idx=ch;
+  c->opus_src_channel=srcStartChannel;
+  c->opus_src_nch=srcChannelCount > 0 ? srcChannelCount : 0;
   m_locchan_cs.Leave();
 }
 
@@ -4236,7 +4698,7 @@ next_again:
 
 
 
-RemoteDownload::RemoteDownload() : chidx(-1), playtime(0), m_fp(0), m_decbuf(0)
+RemoteDownload::RemoteDownload() : chidx(-1), playtime(0), m_fp(0), m_decbuf(0), m_fourcc(0)
 {
   memset(&guid,0,sizeof(guid));
   time(&last_time);
@@ -4263,6 +4725,7 @@ void RemoteDownload::Close()
 void RemoteDownload::Open(NJClient *parent, unsigned int fourcc, bool forceToDisk)
 {
   m_parent=parent;
+  m_fourcc=fourcc;
   Close();
   m_fp=0;
   m_decbuf=new DecodeMediaBuffer;
@@ -4345,7 +4808,7 @@ void RemoteDownload::Write(const void *buf, int len)
 }
 
 
-Local_Channel::Local_Channel() : channel_idx(0), src_channel(0), volume(1.0f), pan(0.0f),
+Local_Channel::Local_Channel() : channel_idx(0), src_channel(0), opus_src_channel(0), opus_src_nch(0), bitrate(64), volume(1.0f), pan(0.0f),
                 muted(false), solo(false), broadcasting(false),
 #ifndef NJCLIENT_NO_XMIT_SUPPORT
                 m_enc(NULL),
@@ -4355,7 +4818,7 @@ Local_Channel::Local_Channel() : channel_idx(0), src_channel(0), volume(1.0f), p
                 m_enc_header_needsend(NULL),
 #endif
                 bcast_active(false), cbf(NULL), cbf_inst(NULL),
-                bitrate(64), m_need_header(true), out_chan_index(0), flags(0),
+                m_need_header(true), out_chan_index(0), flags(0),
                 m_curwritefile_starttime(0.0),
                 m_curwritefile_writelen(0.0),
                 m_curwritefile_curbuflen(0.0),
@@ -4411,7 +4874,9 @@ void BufferQueue::AddBlock(int attr, double startpos, float *samples, int len, f
 
     if (m_samplequeue.GetSize() > 512*2)
     {
+      int qsz = m_samplequeue.GetSize();
       m_cs.Leave();
+      njplus_debug_log("BUFFERQ DROP qsize=%d", qsz);
       return;
     }
     int tmp;
@@ -4424,14 +4889,12 @@ void BufferQueue::AddBlock(int attr, double startpos, float *samples, int len, f
     if (!mybuf) mybuf=new WDL_HeapBuf;
 
     int uselen=len*sizeof(float);
-    if (samples2)
-    {
-      uselen+=uselen;
-    }
+    if (samples2) uselen+=uselen;
+    else if (attr > 1) uselen*=attr;
 
     mybuf->Resize(uselen);
 
-    memcpy(mybuf->Get(),samples,len*sizeof(float));
+    memcpy(mybuf->Get(),samples,samples2 ? len*sizeof(float) : uselen);
     if (samples2)
       memcpy((float*)mybuf->Get()+len,samples2,len*sizeof(float));
   }

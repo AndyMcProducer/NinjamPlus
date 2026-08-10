@@ -92,6 +92,9 @@ class CustomIntervalDownload;
 // #define NJCLIENT_NO_XMIT_SUPPORT // might want to do this for njcast :)
 //  it also removes mixed ogg writing support
 
+// Diagnostics: appends one formatted line to %TEMP%/ninjamplus_mc_debug.log (or /tmp).
+void njplus_debug_log(const char* fmt, ...);
+
 class NJClient
 {
   friend class RemoteDownload;
@@ -175,6 +178,7 @@ public:
   void SetLocalChannelProcessor(int ch, void (*cbf)(float *, int ns, void *), void *inst);
   void GetLocalChannelProcessor(int ch, void **func, void **inst);
   void SetLocalChannelInfo(int ch, const char *name, bool setsrcch, int srcch, bool setbitrate, int bitrate, bool setbcast, bool broadcast, bool setoutch=false, int outch=0, bool setflags=false, int flags=0);
+  void SetLocalChannelOpusSourceChannels(int ch, int srcStartChannel, int srcChannelCount);
   const char *GetLocalChannelInfo(int ch, int *srcch, int *bitrate, bool *broadcast, int *outch=0, int *flags=0);
   void SetLocalChannelMonitoring(int ch, bool setvol, float vol, bool setpan, float pan, bool setmute, bool mute, bool setsolo, bool solo);
   int GetLocalChannelMonitoring(int ch, float *vol, float *pan, bool *mute, bool *solo); // 0 on success
@@ -264,6 +268,15 @@ public:
   void (*RemoteChannelAudioTap)(void *userData, int useridx, const char *username, int channelidx,
                                 const float *interleaved, int numChannels, int numFrames, int sampleRate);
   void *RemoteChannelAudioTap_User;
+
+  // Optional pre-mix tap for decoded remote audio. Called from the audio thread
+  // with output-rate interleaved PCM before default stereo mixing. Return nonzero
+  // to mark the channel as handled and skip NJClient's built-in mix path. When
+  // interleaved is NULL and numFrames is 0, this is a query asking whether the
+  // caller wants to intercept that channel.
+  int (*RemoteMultichannelTap)(void *userData, int useridx, const char *username, int channelidx,
+                               const float *interleaved, int numChannels, int numFrames, int sampleRate);
+  void *RemoteMultichannelTap_User;
 
   WDL_Mutex m_remotechannel_rd_mutex;
 
