@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <string.h>
 #ifdef _WIN32
 #include <process.h>
 #else
@@ -47,6 +48,14 @@
 
 void njplus_debug_log(const char* fmt, ...)
 {
+  static int s_enabled = -1;
+  if (s_enabled < 0)
+  {
+    const char* enabled = getenv("NINJAMPLUS_MC_DEBUG");
+    s_enabled = (enabled && *enabled && strcmp(enabled, "0")) ? 1 : 0;
+  }
+  if (!s_enabled) return;
+
   static char s_path[1024] = {0};
   if (!s_path[0])
   {
