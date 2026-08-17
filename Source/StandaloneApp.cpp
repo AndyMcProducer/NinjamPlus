@@ -23,7 +23,7 @@ public:
                                   int maxAudioOutputChannels)
         : owner (pluginHolder),
           deviceSelector (deviceManagerToUse,
-                          0, maxAudioInputChannels,
+                          1, maxAudioInputChannels,
                           0, maxAudioOutputChannels,
                           true,
                           (pluginHolder.processor.get() != nullptr && pluginHolder.processor->producesMidi()),

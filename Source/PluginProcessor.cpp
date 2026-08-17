@@ -16213,8 +16213,9 @@ bool NinjamVst3AudioProcessor::isBusesLayoutSupported (const BusesLayout& layout
         return false;
 
     auto mainIn = layouts.getMainInputChannelSet();
-    if (!mainIn.isDisabled()
-        && mainIn != juce::AudioChannelSet::stereo()
+    if (mainIn.isDisabled())
+        return false;
+    if (mainIn != juce::AudioChannelSet::stereo()
         && mainIn != juce::AudioChannelSet::mono())
         return false;
 
