@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <!-- Microphone permission required for audio input -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>NINJAMplus needs access to the microphone to capture audio input for sessions.</string>
+
+    <!-- Optional: camera permission if your app uses video rooms -->
+    <key>NSCameraUsageDescription</key>
+    <string>NINJAMplus needs access to the camera for video rooms.</string>
+
+    <!-- Keep bundle identifier consistent with CMake juce_add_plugin BUNDLE_ID -->
+    <key>CFBundleIdentifier</key>
+    <string>com.AMP.NINJAMplus</string>
+  </dict>
+</plist>

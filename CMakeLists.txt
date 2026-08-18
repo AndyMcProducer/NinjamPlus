@@ -392,6 +392,17 @@ if (WIN32)
 endif()
 
 if (TARGET NINJAM_VST3_Standalone)
+    # Use a custom Info.plist for the Standalone app so macOS privacy keys are present.
+    # This ensures the built .app contains NSMicrophoneUsageDescription and macOS will
+    # prompt for microphone access when the app opens audio input.
+    set(INFOPLIST_FILE "${CMAKE_CURRENT_SOURCE_DIR}/Source/Info-Standalone.plist")
+    if (EXISTS "${INFOPLIST_FILE}")
+        set_target_properties(NINJAM_VST3_Standalone PROPERTIES
+            MACOSX_BUNDLE TRUE
+            MACOSX_BUNDLE_INFO_PLIST "${INFOPLIST_FILE}")
+    else()
+        message(STATUS "Info-Standalone.plist not found at ${INFOPLIST_FILE}; not setting bundle plist")
+    endif()
     add_custom_target(NINJAM_VST3_RemoveStandaloneLegacyWebAssets
         COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:NINJAM_VST3_Standalone>/advanced-vdo-client"
         VERBATIM
