@@ -10630,12 +10630,11 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
             else
                 u.name = fullName;
 
-            const juce::String userIdentityKey = canonicalDelayUserKey(u.name);
             auto identityIt = remoteUserNameByIndex.find(i);
-            if (identityIt == remoteUserNameByIndex.end() || identityIt->second != userIdentityKey)
+            if (identityIt == remoteUserNameByIndex.end() || identityIt->second != fullName)
             {
                 resetRemoteUserIndexState(i, u.name);
-                remoteUserNameByIndex[i] = userIdentityKey;
+                remoteUserNameByIndex[i] = fullName;
             }
 
             bool sub = false;
@@ -10970,6 +10969,38 @@ void NinjamVst3AudioProcessor::resetRemoteUserIndexState(int userIndex, const ju
                                          true, 0.0f,
                                          true, false,
                                          true, false);
+    }
+
+    const juce::String senderKey = normaliseOpusPeerId(userName);
+    const juce::String canonicalSenderKey = canonicalDelayUserKey(senderKey);
+    {
+        const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+        auto eraseForUser = [&senderKey, &canonicalSenderKey](auto& state)
+        {
+            if (senderKey.isNotEmpty())
+                state.erase(senderKey);
+            if (canonicalSenderKey.isNotEmpty())
+                state.erase(canonicalSenderKey);
+        };
+
+        eraseForUser(lastAnnouncedRemoteIntervalByUser);
+        eraseForUser(lastRemoteServerLatencyMsByUser);
+        eraseForUser(remoteServerRouteLatencyMsByUser);
+        eraseForUser(lastRemoteIntervalSignalSeenMsByUser);
+        eraseForUser(lastRemoteRouteProbeSeenMsByUser);
+        eraseForUser(remoteLatencyLastAppliedIntervalByUser);
+        eraseForUser(remoteLatencyAverageByUser);
+        eraseForUser(remoteLatencyFirmDelayMsByUser);
+        eraseForUser(remoteVideoBufferRefreshIdByUser);
+
+        for (auto it = pendingRemoteIntervalStartsByUser.begin(); it != pendingRemoteIntervalStartsByUser.end();)
+        {
+            const auto& pendingSenderKey = it->second.senderKey;
+            if (pendingSenderKey == senderKey || pendingSenderKey == canonicalSenderKey)
+                it = pendingRemoteIntervalStartsByUser.erase(it);
+            else
+                ++it;
+        }
     }
 }
 
@@ -12171,13 +12202,18 @@ void NinjamVst3AudioProcessor::sendIntervalSignal(const juce::String& type, cons
     if (useSideSignal)
         ninjamSideSignalServerSupported.store(true, std::memory_order_relaxed);
 
-    juce::ignoreUnused(target);
-
     // Wrap in {"sig":type, "data":payload} so the receiver knows the type.
     juce::DynamicObject::Ptr wrapper = new juce::DynamicObject();
     wrapper->setProperty("sig", type);
     wrapper->setProperty("data", payload);
     const juce::String msg = juce::JSON::toString(juce::var(wrapper.get()));
+
+    if (useSideSignal)
+    {
+        const char* tgt = target.isNotEmpty() ? target.toRawUTF8() : "*";
+        ninjamClient.ChatMessage_Send("SIDE_SIGNAL", tgt, type.toRawUTF8(), payload.toRawUTF8());
+        return;
+    }
 
     // All NJ+ raw metadata stays on the hidden control channel; channel 0 is audio-only.
     if (kSyncSignalChannelIndex >= serverMaxLocalChannelsCached.load(std::memory_order_relaxed))
