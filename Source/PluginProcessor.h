@@ -1204,6 +1204,17 @@ private:
         double rejectedSpikeSumMs = 0.0;
     };
     std::map<juce::String, RemoteLatencyAverageState> remoteLatencyAverageByUser;
+
+    struct PendingMediaItem
+    {
+        juce::String sender;
+        unsigned int fourcc = 0;
+        juce::MemoryBlock data;
+    };
+    juce::SpinLock pendingMediaItemLock;
+    std::vector<PendingMediaItem> pendingMediaItems;
+    std::atomic<bool> pendingMediaItemsReady { false };
+
     juce::CriticalSection opusSyncPeerLock;
     struct OpusSyncPeerState
     {
@@ -1328,6 +1339,7 @@ private:
     void saveVdoRoomNameForServer(const juce::String& serverKey, const juce::String& room);
     void announceVdoRoomName(const juce::String& serverKey, const juce::String& room);
     void noteRemoteVideoRoomActivity(double nowMs = 0.0);
+    void processPendingMediaItems();
     void writeIntervalHelperJson(int pos, int length);
     void startZapVideoDecodeWorker();
     void stopZapVideoDecodeWorker();

@@ -10573,7 +10573,8 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
     int numUsers = ninjamClient.GetNumUsers();
     bool spread = spreadOutputsEnabled.load();
 
-    const int maxOutputPairs = 16;
+    const int totalOutputChannels = juce::jmax(2, getTotalNumOutputChannels());
+    const int maxOutputPairs = juce::jmin(16, totalOutputChannels / 2);
     std::set<int> reservedPairs;
     if (spread)
     {
@@ -18817,142 +18818,170 @@ void NinjamVst3AudioProcessor::IntervalMediaItem_Callback(void* userData, NJClie
 {
     if (!username || !data || dataLen <= 0) return;
     if (isNinjamZapVideoFourcc(fourcc)) return;
-    if (fourcc == kSyncSignalFourcc)
+
+    auto* self = static_cast<NinjamVst3AudioProcessor*>(userData);
+    PendingMediaItem item;
+    item.sender = juce::String::fromUTF8(username);
+    item.fourcc = fourcc;
+    item.data.append(data, static_cast<size_t>(dataLen));
     {
-        auto* self = static_cast<NinjamVst3AudioProcessor*>(userData);
-        const juce::String sender = juce::String::fromUTF8(username);
-        const juce::String msg    = juce::String::fromUTF8(static_cast<const char*>(data), dataLen);
-        const juce::var parsed    = juce::JSON::parse(msg);
+        const juce::SpinLock::ScopedLockType lock(self->pendingMediaItemLock);
+        self->pendingMediaItems.push_back(std::move(item));
+    }
+    self->pendingMediaItemsReady.store(true, std::memory_order_release);
+}
+
+void NinjamVst3AudioProcessor::processPendingMediaItems()
+{
+    if (!pendingMediaItemsReady.exchange(false, std::memory_order_acquire))
+        return;
+
+    std::vector<PendingMediaItem> items;
+    {
+        const juce::SpinLock::ScopedLockType lock(pendingMediaItemLock);
+        items.swap(pendingMediaItems);
+    }
+
+    for (auto& item : items)
+    {
+        const juce::String sender = item.sender;
+        const unsigned int fourcc = item.fourcc;
+        const auto* dataPtr = static_cast<const char*>(item.data.getData());
+        const int dataLen = static_cast<int>(item.data.getSize());
+
+        if (fourcc == kSyncSignalFourcc)
+        {
+            const juce::String msg    = juce::String::fromUTF8(dataPtr, dataLen);
+            const juce::var parsed    = juce::JSON::parse(msg);
+            if (auto* obj = parsed.getDynamicObject())
+            {
+                const juce::String type    = obj->getProperty("sig").toString();
+                const juce::String payload = obj->getProperty("data").toString();
+                if (type == "mobileHotspotKeepalive")
+                    continue;
+                if (type.isNotEmpty() && payload.isNotEmpty())
+                    processSyncSignal(sender, type, payload);
+            }
+            continue;
+        }
+        if (fourcc != kOpusSyncFourcc) continue;
+        const juce::String payload = juce::String::fromUTF8(dataPtr, dataLen);
+
+        juce::var parsed = juce::JSON::parse(payload);
+        bool supportsOpus = false;
+        bool multiChanEnabled = false;
+        int peerNumChannels = 1;
+        int peerOpusBaseChannel = 1;
+        int peerPackedChannelCount = 0;
+        std::array<int, maxLocalChannels> peerChannelWidths {};
+        juce::StringArray peerChannelNames;
+        juce::String userId = normaliseOpusPeerId(sender);
+        juce::String clientId;
+        juce::String appFamily;
+        int handshakeVersion = 0;
+        juce::String runtimeFormat;
+        juce::String pluginVersion;
         if (auto* obj = parsed.getDynamicObject())
         {
-            const juce::String type    = obj->getProperty("sig").toString();
-            const juce::String payload = obj->getProperty("data").toString();
-            if (type == "mobileHotspotKeepalive")
-                return;
-            if (type.isNotEmpty() && payload.isNotEmpty())
-                self->processSyncSignal(sender, type, payload);
-        }
-        return;
-    }
-    if (fourcc != kOpusSyncFourcc) return;
-    auto* self = static_cast<NinjamVst3AudioProcessor*>(userData);
-    const juce::String sender = juce::String::fromUTF8(username);
-    const juce::String payload = juce::String::fromUTF8(static_cast<const char*>(data), dataLen);
-
-    juce::var parsed = juce::JSON::parse(payload);
-    bool supportsOpus = false;
-    bool multiChanEnabled = false;
-    int peerNumChannels = 1;
-    int peerOpusBaseChannel = 1;
-    int peerPackedChannelCount = 0;
-    std::array<int, maxLocalChannels> peerChannelWidths {};
-    juce::StringArray peerChannelNames;
-    juce::String userId = normaliseOpusPeerId(sender);
-    juce::String clientId;
-    juce::String appFamily;
-    int handshakeVersion = 0;
-    juce::String runtimeFormat;
-    juce::String pluginVersion;
-    if (auto* obj = parsed.getDynamicObject())
-    {
-        const juce::String supports = obj->getProperty("supportsOpus").toString();
-        supportsOpus = supports == "1" || supports.equalsIgnoreCase("true");
-        const juce::String enabledStr = obj->getProperty("enabled").toString();
-        multiChanEnabled = enabledStr == "1" || enabledStr.equalsIgnoreCase("true");
-        const juce::var numChVar = obj->getProperty("numChannels");
-        if (!numChVar.isVoid()) peerNumChannels = juce::jmax(1, (int)numChVar);
-        const juce::var packedVar = obj->getProperty("packedChannelCount");
-        if (!packedVar.isVoid()) peerPackedChannelCount = juce::jmax(0, (int)packedVar);
-        const juce::var opusBaseVar = obj->getProperty("opusBaseChannel");
-        if (!opusBaseVar.isVoid()) peerOpusBaseChannel = juce::jlimit(1, 31, (int)opusBaseVar);
-        if (auto* widthsArray = obj->getProperty("channelWidths").getArray())
-        {
-            for (int i = 0; i < juce::jmin(maxLocalChannels, widthsArray->size()); ++i)
-                peerChannelWidths[(size_t)i] = juce::jlimit(1, 2, (int)widthsArray->getReference(i));
-        }
-        if (auto* namesArray = obj->getProperty("channelNames").getArray())
-        {
-            for (const auto& item : *namesArray)
-                peerChannelNames.add(item.toString());
-        }
-        juce::String payloadUserId = obj->getProperty("userId").toString();
-        if (payloadUserId.isNotEmpty())
-            userId = normaliseOpusPeerId(payloadUserId);
-        clientId = obj->getProperty("clientId").toString().trim();
-        appFamily = obj->getProperty("appFamily").toString().trim();
-        handshakeVersion = (int)obj->getProperty("handshakeVersion");
-        runtimeFormat = obj->getProperty("runtimeFormat").toString().trim();
-        pluginVersion = obj->getProperty("pluginVersion").toString().trim();
-    }
-    else { return; }
-
-    const bool isLocalClient = clientId.isNotEmpty() ? (clientId == self->opusSyncInstanceId)
-                                                      : (userId == normaliseOpusPeerId(self->currentUser));
-    const bool sameAppFamily = appFamily.isEmpty() || appFamily == opusSyncAppFamily;
-    const bool compatibleHandshake = handshakeVersion <= 0 || handshakeVersion == opusSyncHandshakeVersion;
-    const juce::String peerKey = clientId.isNotEmpty() ? clientId : userId;
-    if (peerKey.isEmpty() || userId.isEmpty() || isLocalClient) return;
-
-    bool recognizedNow = false;
-    juce::String recognizedMessage;
-    {
-        juce::ScopedLock lock(self->opusSyncPeerLock);
-        if (supportsOpus && sameAppFamily && compatibleHandshake)
-        {
-            const bool wasKnown = self->opusSyncPeers.find(peerKey) != self->opusSyncPeers.end();
-            auto& peer = self->opusSyncPeers[peerKey];
-            const bool wasMultiChan = peer.multiChanEnabled;
-            peer.userId = userId;
-            peer.supportsOpus = true;
-            peer.multiChanEnabled = multiChanEnabled;
-            peer.numChannels = peerNumChannels;
-            peer.opusBaseChannel = peerOpusBaseChannel;
-            peer.packedChannelCount = peerPackedChannelCount;
-            peer.channelWidths = peerChannelWidths;
-            peer.channelNames = peerChannelNames;
-            peer.appFamily = appFamily;
-            peer.handshakeVersion = handshakeVersion;
-            peer.runtimeFormat = runtimeFormat;
-            peer.pluginVersion = pluginVersion;
-            peer.lastSeenMs = juce::Time::getMillisecondCounterHiRes();
-            const juce::String peerLabel = sender.isNotEmpty() ? sender : userId;
-            if (!wasKnown)
+            const juce::String supports = obj->getProperty("supportsOpus").toString();
+            supportsOpus = supports == "1" || supports.equalsIgnoreCase("true");
+            const juce::String enabledStr = obj->getProperty("enabled").toString();
+            multiChanEnabled = enabledStr == "1" || enabledStr.equalsIgnoreCase("true");
+            const juce::var numChVar = obj->getProperty("numChannels");
+            if (!numChVar.isVoid()) peerNumChannels = juce::jmax(1, (int)numChVar);
+            const juce::var packedVar = obj->getProperty("packedChannelCount");
+            if (!packedVar.isVoid()) peerPackedChannelCount = juce::jmax(0, (int)packedVar);
+            const juce::var opusBaseVar = obj->getProperty("opusBaseChannel");
+            if (!opusBaseVar.isVoid()) peerOpusBaseChannel = juce::jlimit(1, 31, (int)opusBaseVar);
+            if (auto* widthsArray = obj->getProperty("channelWidths").getArray())
             {
-                juce::String peerInfo = peer.runtimeFormat;
-                if (peer.pluginVersion.isNotEmpty())
+                for (int i = 0; i < juce::jmin(maxLocalChannels, widthsArray->size()); ++i)
+                    peerChannelWidths[(size_t)i] = juce::jlimit(1, 2, (int)widthsArray->getReference(i));
+            }
+            if (auto* namesArray = obj->getProperty("channelNames").getArray())
+            {
+                for (const auto& n : *namesArray)
+                    peerChannelNames.add(n.toString());
+            }
+            juce::String payloadUserId = obj->getProperty("userId").toString();
+            if (payloadUserId.isNotEmpty())
+                userId = normaliseOpusPeerId(payloadUserId);
+            clientId = obj->getProperty("clientId").toString().trim();
+            appFamily = obj->getProperty("appFamily").toString().trim();
+            handshakeVersion = (int)obj->getProperty("handshakeVersion");
+            runtimeFormat = obj->getProperty("runtimeFormat").toString().trim();
+            pluginVersion = obj->getProperty("pluginVersion").toString().trim();
+        }
+        else { continue; }
+
+        const bool isLocalClient = clientId.isNotEmpty() ? (clientId == opusSyncInstanceId)
+                                                           : (userId == normaliseOpusPeerId(currentUser));
+        const bool sameAppFamily = appFamily.isEmpty() || appFamily == opusSyncAppFamily;
+        const bool compatibleHandshake = handshakeVersion <= 0 || handshakeVersion == opusSyncHandshakeVersion;
+        const juce::String peerKey = clientId.isNotEmpty() ? clientId : userId;
+        if (peerKey.isEmpty() || userId.isEmpty() || isLocalClient) continue;
+
+        bool recognizedNow = false;
+        juce::String recognizedMessage;
+        {
+            juce::ScopedLock lock(opusSyncPeerLock);
+            if (supportsOpus && sameAppFamily && compatibleHandshake)
+            {
+                const bool wasKnown = opusSyncPeers.find(peerKey) != opusSyncPeers.end();
+                auto& peer = opusSyncPeers[peerKey];
+                const bool wasMultiChan = peer.multiChanEnabled;
+                peer.userId = userId;
+                peer.supportsOpus = true;
+                peer.multiChanEnabled = multiChanEnabled;
+                peer.numChannels = peerNumChannels;
+                peer.opusBaseChannel = peerOpusBaseChannel;
+                peer.packedChannelCount = peerPackedChannelCount;
+                peer.channelWidths = peerChannelWidths;
+                peer.channelNames = peerChannelNames;
+                peer.appFamily = appFamily;
+                peer.handshakeVersion = handshakeVersion;
+                peer.runtimeFormat = runtimeFormat;
+                peer.pluginVersion = pluginVersion;
+                peer.lastSeenMs = juce::Time::getMillisecondCounterHiRes();
+                const juce::String peerLabel = sender.isNotEmpty() ? sender : userId;
+                if (!wasKnown)
                 {
-                    if (peerInfo.isNotEmpty()) peerInfo << " ";
-                    peerInfo << peer.pluginVersion;
+                    juce::String peerInfo = peer.runtimeFormat;
+                    if (peer.pluginVersion.isNotEmpty())
+                    {
+                        if (peerInfo.isNotEmpty()) peerInfo << " ";
+                        peerInfo << peer.pluginVersion;
+                    }
+                    recognizedMessage = "Multi Client Detected: " + peerLabel;
+                    if (peerInfo.isNotEmpty()) recognizedMessage << " (" << peerInfo << ")";
+                    if (multiChanEnabled) recognizedMessage << " [MultiChannel ON]";
+                    recognizedNow = true;
                 }
-                recognizedMessage = "Multi Client Detected: " + peerLabel;
-                if (peerInfo.isNotEmpty()) recognizedMessage << " (" << peerInfo << ")";
-                if (multiChanEnabled) recognizedMessage << " [MultiChannel ON]";
-                recognizedNow = true;
+                else if (multiChanEnabled && !wasMultiChan)
+                {
+                    recognizedMessage = "MultiChannel Detected: " + peerLabel;
+                    recognizedNow = true;
+                }
+                else if (!multiChanEnabled && wasMultiChan)
+                {
+                    recognizedMessage = "MultiChannel Off: " + peerLabel;
+                    recognizedNow = true;
+                }
             }
-            else if (multiChanEnabled && !wasMultiChan)
-            {
-                recognizedMessage = "MultiChannel Detected: " + peerLabel;
-                recognizedNow = true;
-            }
-            else if (!multiChanEnabled && wasMultiChan)
-            {
-                recognizedMessage = "MultiChannel Off: " + peerLabel;
-                recognizedNow = true;
-            }
+            else
+                opusSyncPeers.erase(peerKey);
         }
-        else
-            self->opusSyncPeers.erase(peerKey);
-    }
-    if (recognizedNow)
-    {
-        juce::ScopedLock lock(self->chatLock);
-        self->chatHistory.add(recognizedMessage);
-        self->chatSenders.add("");
-        self->chatRevision.fetch_add(1);
-        if (self->chatHistory.size() > 100)
+        if (recognizedNow)
         {
-            self->chatHistory.removeRange(0, self->chatHistory.size() - 100);
-            self->chatSenders.removeRange(0, juce::jmax(0, self->chatSenders.size() - 100));
+            juce::ScopedLock lock(chatLock);
+            chatHistory.add(recognizedMessage);
+            chatSenders.add("");
+            chatRevision.fetch_add(1);
+            if (chatHistory.size() > 100)
+            {
+                chatHistory.removeRange(0, chatHistory.size() - 100);
+                chatSenders.removeRange(0, juce::jmax(0, chatSenders.size() - 100));
+            }
         }
     }
 }
@@ -19862,6 +19891,12 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
         state.setProperty("localInput" + juce::String(channel), getLocalChannelInput(channel), nullptr);
     state.setProperty("voiceInput", getVoiceChannelInput(), nullptr);
     state.setProperty("voiceGain", (double)getVoiceChannelGain(), nullptr);
+    state.setProperty("localBitrate", getLocalBitrate(), nullptr);
+    {
+        const juce::ScopedLock lock(localChannelNamesLock);
+        for (int channel = 0; channel < maxLocalChannels; ++channel)
+            state.setProperty("localChannelName" + juce::String(channel), localChannelNames[channel], nullptr);
+    }
 
     if (auto xml = state.createXml())
         copyXmlToBinary(*xml, destData);
@@ -19968,6 +20003,12 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
         setLocalChannelInput(channel, (int)state.getProperty("localInput" + juce::String(channel), -1));
     setVoiceChannelInput((int)state.getProperty("voiceInput", 0));
     setVoiceChannelGain(juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("voiceGain", 1.0)));
+    setLocalBitrate((int)state.getProperty("localBitrate", 64));
+    {
+        const juce::ScopedLock lock(localChannelNamesLock);
+        for (int channel = 0; channel < maxLocalChannels; ++channel)
+            localChannelNames[channel] = state.getProperty("localChannelName" + juce::String(channel), "Ch" + juce::String(channel + 1)).toString();
+    }
 }
 
 void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarkerBeat, long long localMarkerSampleCount, double intervalDurationMs)
@@ -20145,6 +20186,8 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
 
 void NinjamVst3AudioProcessor::timerCallback()
 {
+    processPendingMediaItems();
+
     const double timerStartMs = juce::Time::getMillisecondCounterHiRes();
     juce::String intervalPerfDetails;
     auto noteSlowIntervalStep = [&intervalPerfDetails](const char* name, double elapsedMs)
