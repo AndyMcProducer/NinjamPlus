@@ -9807,21 +9807,11 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         {
             const float timerIntervalMs = abletonHostEditor ? 1200.0f : 180.0f;
             const float noiseFloor = 0.015f;
-            const float targetMasterLevel = 0.630957f; // -4 dBFS
+            const float targetMasterLevel = 0.501187f; // -6 dBFS
             const float targetSoloLevel = 0.45f;
             const float perUserCeiling = 0.56f;
             const float minGain = 0.05f;
             const float maxGain = 2.0f;
-            const float peakAttackCoeff = 1.0f - std::exp(-timerIntervalMs / 700.0f);
-            const float peakReleaseCoeff = 1.0f - std::exp(-timerIntervalMs / 3500.0f);
-            const float gainUpCoeff = 1.0f - std::exp(-timerIntervalMs / 5000.0f);
-            const float gainDownCoeff = 1.0f - std::exp(-timerIntervalMs / 1400.0f);
-            const float emergencyDownCoeff = 1.0f - std::exp(-timerIntervalMs / 450.0f);
-            const float maxUpStep = juce::jmax(0.006f, (timerIntervalMs / 1000.0f) * 0.12f);
-            const float maxDownStep = juce::jmax(0.035f, (timerIntervalMs / 1000.0f) * 0.45f);
-            const float maxEmergencyDownStep = juce::jmax(0.08f, (timerIntervalMs / 1000.0f) * 1.35f);
-            const int highPersistTicks = juce::jmax(2, juce::roundToInt(700.0f / timerIntervalMs));
-            const int lowPersistTicks = juce::jmax(5, juce::roundToInt(1800.0f / timerIntervalMs));
 
             std::map<int, float> observedLevels;
             int audibleUsers = 0;
@@ -9890,7 +9880,21 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                     longTermPeak = sourceLevel;
                 else
                 {
-                    const float peakCoeff = sourceLevel > longTermPeak ? peakAttackCoeff : peakReleaseCoeff;
+                    float peakDb = (longTermPeak > noiseFloor) ? 20.0f * std::log10(longTermPeak) : -60.0f;
+                    float srcDb = (sourceLevel > noiseFloor) ? 20.0f * std::log10(sourceLevel) : -60.0f;
+                    float envDiffDb = std::abs(srcDb - peakDb);
+                    float envAdaptiveScale = 1.0f + envDiffDb * 0.2f;
+                    float peakCoeff;
+                    if (sourceLevel > longTermPeak)
+                    {
+                        float attackMs = 700.0f / juce::jmin(envAdaptiveScale, 6.0f);
+                        peakCoeff = 1.0f - std::exp(-timerIntervalMs / attackMs);
+                    }
+                    else
+                    {
+                        float releaseMs = 3500.0f / juce::jmin(envAdaptiveScale, 4.0f);
+                        peakCoeff = 1.0f - std::exp(-timerIntervalMs / releaseMs);
+                    }
                     longTermPeak += (sourceLevel - longTermPeak) * peakCoeff;
                 }
 
@@ -9909,6 +9913,12 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
 
                 const float currentOutput = sourceLevel * currentGain;
                 const float longTermOutput = longTermPeak * currentGain;
+
+                float outputDb = (longTermOutput > noiseFloor) ? 20.0f * std::log10(longTermOutput) : -60.0f;
+                float targetDbCalc = 20.0f * std::log10(targetPerUserLevel);
+                float diffDb = outputDb - targetDbCalc;
+                float absDiffDb = std::abs(diffDb);
+
                 const bool tooHigh = (longTermOutput > targetPerUserLevel * 1.12f) || (currentOutput > targetMasterLevel);
                 const bool tooLow = longTermPeak >= noiseFloor && longTermOutput < targetPerUserLevel * 0.72f;
 
@@ -9922,8 +9932,12 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                 else
                     autoLevelUnderTargetTicks[id] = 0;
 
-                const bool sustainedHigh = autoLevelOverTargetTicks[id] >= highPersistTicks;
-                const bool sustainedLow = autoLevelUnderTargetTicks[id] >= lowPersistTicks;
+                float hysteresisScale = 1.0f / juce::jmax(1.0f, absDiffDb * 0.3f);
+                int adaptiveHighPersist = juce::jmax(1, juce::roundToInt(3 * hysteresisScale));
+                int adaptiveLowPersist = juce::jmax(2, juce::roundToInt(6 * hysteresisScale));
+
+                const bool sustainedHigh = autoLevelOverTargetTicks[id] >= adaptiveHighPersist;
+                const bool sustainedLow = autoLevelUnderTargetTicks[id] >= adaptiveLowPersist;
 
                 if (targetGain < currentGain && !sustainedHigh)
                     targetGain = currentGain;
@@ -9932,14 +9946,35 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
 
                 const bool reducing = targetGain < currentGain;
                 const bool emergencyReduction = reducing && sustainedHigh && currentOutput > targetMasterLevel;
-                float smoothingCoeff = reducing ? (emergencyReduction ? emergencyDownCoeff : gainDownCoeff)
-                                                : gainUpCoeff;
+
+                float adaptiveScale = 1.0f + absDiffDb * 0.25f;
+                adaptiveScale = juce::jmin(adaptiveScale, 8.0f);
+
+                float smoothingCoeff;
+                if (reducing)
+                {
+                    float effectiveMs = emergencyReduction ? (450.0f / adaptiveScale) : (1400.0f / adaptiveScale);
+                    smoothingCoeff = 1.0f - std::exp(-timerIntervalMs / effectiveMs);
+                }
+                else
+                {
+                    float effectiveMs = 5000.0f / adaptiveScale;
+                    smoothingCoeff = 1.0f - std::exp(-timerIntervalMs / effectiveMs);
+                }
                 if (isNew && !reducing)
                     smoothingCoeff *= 0.35f;
 
                 const float unslewedGain = currentGain + (targetGain - currentGain) * smoothingCoeff;
-                const float maxStep = reducing ? (emergencyReduction ? maxEmergencyDownStep : maxDownStep)
-                                               : maxUpStep;
+
+                float slewScale = 1.0f + absDiffDb * 0.15f;
+                float maxStep;
+                if (reducing)
+                    maxStep = emergencyReduction
+                        ? juce::jmax(0.08f, (timerIntervalMs / 1000.0f) * 1.35f * slewScale)
+                        : juce::jmax(0.035f, (timerIntervalMs / 1000.0f) * 0.45f * slewScale);
+                else
+                    maxStep = juce::jmax(0.006f, (timerIntervalMs / 1000.0f) * 0.12f * slewScale);
+
                 const float slewedDelta = juce::jlimit(-maxStep, maxStep, unslewedGain - currentGain);
                 autoLevelCurrentGains[id] = juce::jlimit(minGain, maxGain, currentGain + slewedDelta);
 
