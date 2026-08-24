@@ -11278,6 +11278,87 @@ float NinjamVst3AudioProcessor::getMasterPeakRight() const
     return masterPeakR.load();
 }
 
+float NinjamVst3AudioProcessor::getMasterLufsAvg() const
+{
+    return masterLufsAvg.load(std::memory_order_relaxed);
+}
+
+float NinjamVst3AudioProcessor::getMasterLufsPeak() const
+{
+    return masterLufsPeak.load(std::memory_order_relaxed);
+}
+
+float NinjamVst3AudioProcessor::getUserLufs(int userIndex) const
+{
+    if (userIndex < 0 || userIndex >= maxRemoteChordUsers) return -70.0f;
+    return userLufsAvg[userIndex].load(std::memory_order_relaxed);
+}
+
+void LufsMeter::prepare(double sampleRate)
+{
+    sr = sampleRate > 0.0 ? sampleRate : 44100.0;
+    alpha = 1.0 - std::exp(-1.0 / (0.3 * sr));
+
+    preFilter.b0 = 1.53512485958697;
+    preFilter.b1 = -2.69169618940638;
+    preFilter.b2 = 1.19839281085285;
+    preFilter.a1 = -1.69065929318241;
+    preFilter.a2 = 0.73248077421585;
+    preFilter.reset();
+
+    rlpFilter.b0 = 1.0;
+    rlpFilter.b1 = -2.0;
+    rlpFilter.b2 = 1.0;
+    rlpFilter.a1 = -1.99004745483398;
+    rlpFilter.a2 = 0.99007225036621;
+    rlpFilter.reset();
+
+    meanSquare = 0.0;
+    samplesProcessed = 0;
+}
+
+void LufsMeter::reset()
+{
+    preFilter.reset();
+    rlpFilter.reset();
+    meanSquare = 0.0;
+    samplesProcessed = 0;
+}
+
+void LufsMeter::processSample(float sample)
+{
+    double x = preFilter.process(static_cast<double>(sample));
+    x = rlpFilter.process(x);
+    meanSquare += (x * x - meanSquare) * alpha;
+    ++samplesProcessed;
+}
+
+void LufsMeter::processBlock(const float* data, int numSamples)
+{
+    for (int i = 0; i < numSamples; ++i)
+        processSample(data[i]);
+}
+
+float LufsMeter::getCurrentLufs() const
+{
+    if (samplesProcessed < 1000 || meanSquare < 1.0e-20)
+        return -70.0f;
+    return static_cast<float>(-0.691 + 10.0 * std::log10(meanSquare + 1.0e-20));
+}
+
+double LufsMeter::Biquad::process(double input)
+{
+    double y = b0 * input + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    x2 = x1; x1 = input;
+    y2 = y1; y1 = y;
+    return y;
+}
+
+void LufsMeter::Biquad::reset()
+{
+    x1 = x2 = y1 = y2 = 0.0;
+}
+
 juce::String NinjamVst3AudioProcessor::getVersionString() const
 {
     return NINJAM_DISPLAY_VERSION;
@@ -11824,7 +11905,19 @@ void NinjamVst3AudioProcessor::RemoteChannelAudioTap_Callback(void* userData,
     }
 
     if (self->chordAnalyzer == nullptr)
+    {
+        auto& meter = self->userLufsMeters[(size_t)useridx];
+        for (int frame = 0; frame < numFrames; ++frame)
+        {
+            const int offset = frame * numChannels;
+            float mono = interleaved[offset];
+            if (numChannels > 1)
+                mono = 0.5f * (mono + interleaved[offset + 1]);
+            meter.processSample(mono);
+        }
+        self->userLufsAvg[(size_t)useridx].store(meter.getCurrentLufs(), std::memory_order_relaxed);
         return;
+    }
 
     const int trackIndex = BatchedChordAnalyzer::remoteTrackIndexForUser(useridx);
     if (!self->isChordDetectionEnabled() || !self->isUserChordDetectionEnabled(useridx))
@@ -11924,6 +12017,19 @@ int NinjamVst3AudioProcessor::RemoteMultichannelTap_Callback(void* userData,
 
     self->remoteOpusCombinedPeakL[(size_t)useridx].store(combinedL, std::memory_order_relaxed);
     self->remoteOpusCombinedPeakR[(size_t)useridx].store(combinedR, std::memory_order_relaxed);
+
+    {
+        auto& meter = self->userLufsMeters[(size_t)useridx];
+        for (int frame = 0; frame < numFrames; ++frame)
+        {
+            const int base = frame * numChannels;
+            float mono = interleaved[base];
+            if (numChannels > 1)
+                mono = 0.5f * (mono + interleaved[base + 1]);
+            meter.processSample(mono);
+        }
+        self->userLufsAvg[(size_t)useridx].store(meter.getCurrentLufs(), std::memory_order_relaxed);
+    }
 
     if (self->chordAnalyzer != nullptr)
     {
@@ -12795,6 +12901,10 @@ void NinjamVst3AudioProcessor::prepareToPlay (double sampleRate, int samplesPerB
     samplePadLastTransportBpi = 0;
     samplePadTransportInterval = 0;
     processingSampleRate = sampleRate > 1.0 ? sampleRate : 44100.0;
+    masterLufsMeter.prepare(processingSampleRate);
+    masterLufsMeterR.prepare(processingSampleRate);
+    for (auto& m : userLufsMeters)
+        m.prepare(processingSampleRate);
     resetMetronomeClickVoices();
     if (linkTimingState != nullptr)
         linkTimingState->reset();
@@ -18662,6 +18772,32 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     masterPeak.store(maxSample);
     masterPeakL.store(maxSampleL);
     masterPeakR.store(maxSampleR);
+
+    {
+        auto busBuffer = getBusBuffer(buffer, false, 0);
+        int busChans = busBuffer.getNumChannels();
+        if (busChans > 0)
+        {
+            const float* ch0 = busBuffer.getReadPointer(0);
+            const float* ch1 = busChans > 1 ? busBuffer.getReadPointer(1) : ch0;
+            float peakLufs = -70.0f;
+            for (int i = 0; i < numSamples; ++i)
+            {
+                float mono = 0.5f * (ch0[i] + ch1[i]);
+                masterLufsMeter.processSample(mono);
+                if (busChans > 1)
+                {
+                    float monoR = 0.5f * (ch0[i] + ch1[i]);
+                    masterLufsMeterR.processSample(monoR);
+                }
+            }
+            float avgL = masterLufsMeter.getCurrentLufs();
+            float avgR = masterLufsMeterR.getCurrentLufs();
+            masterLufsAvg.store(juce::jmax(avgL, avgR), std::memory_order_relaxed);
+            masterLufsPeak.store(juce::jmax(masterLufsPeak.load(std::memory_order_relaxed),
+                                            juce::jmax(avgL, avgR)), std::memory_order_relaxed);
+        }
+    }
 }
 
 // Called from NJClient::on_new_interval() in the AUDIO THREAD at sample-accurate timing.

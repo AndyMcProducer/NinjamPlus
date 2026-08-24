@@ -1619,6 +1619,8 @@ private:
     std::array<juce::Label, NinjamVst3AudioProcessor::maxLocalChannels> localDbLabels;
     std::array<juce::Label, NinjamVst3AudioProcessor::maxLocalChannels> localChannelNameLabels; // editable channel name
     juce::Label masterDbLabel;
+    bool masterLufsMode = false;
+    juce::Label masterLufsPeakLabel;
     LeftClickOnlyTextButton limiterButton{ "Limiter" };
     juce::Label limiterReleaseLabel{ "Release", "Release" };
     class LimiterThresholdLookAndFeel : public juce::LookAndFeel_V4

@@ -8494,6 +8494,12 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     addAndMakeVisible(masterDbLabel);
     masterDbLabel.setFont(juce::Font(9.0f));
     masterDbLabel.setJustificationType(juce::Justification::centred);
+    masterDbLabel.setInterceptsMouseClicks(true, false);
+    masterDbLabel.addMouseListener(this, true);
+    masterDbLabel.setTooltip("Click to toggle dB / LUFS display");
+    addAndMakeVisible(masterLufsPeakLabel);
+    masterLufsPeakLabel.setFont(juce::Font(9.0f));
+    masterLufsPeakLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(limiterButton);
     addAndMakeVisible(limiterReleaseLabel);
     limiterReleaseLabel.setJustificationType(juce::Justification::centred);
@@ -9480,8 +9486,9 @@ void NinjamVst3AudioProcessorEditor::resized()
     fxColumn.removeFromTop(2);
     delayPingPongButton.setBounds(fxColumn.removeFromTop(22));
 
-    masterFader.setBounds(masterInner.removeFromTop(masterInner.getHeight() - 16));
-    masterDbLabel.setBounds(masterInner);
+    masterFader.setBounds(masterInner.removeFromTop(masterInner.getHeight() - 32));
+    masterDbLabel.setBounds(masterInner.removeFromTop(16));
+    masterLufsPeakLabel.setBounds(masterInner);
     masterPeakMeter.setBounds(masterMeterArea);
     masterChannelPulseBounds = masterPulseBounds.expanded(1);
 
@@ -9508,7 +9515,7 @@ void NinjamVst3AudioProcessorEditor::resized()
         chatInputArea.removeFromRight(2);
         chatInput.setBounds(chatInputArea);
 
-        if (gifPickerPanel != nullptr && gifPickerPanel->isVisible())
+    if (gifPickerPanel != nullptr && gifPickerPanel->isVisible())
         {
             auto pickerBounds = chatDisplay.getBounds().reduced(4);
             pickerBounds = pickerBounds.removeFromBottom(juce::jmin(290, juce::jmax(180, pickerBounds.getHeight())));
@@ -9775,10 +9782,21 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
     masterPeakMeter.setPeak(masterPeakL, masterPeakR);
     clipPulseNeedsRepaint |= updateClipPulseState(masterPk, masterClipStartMs, masterClipPulsing);
     {
-        float db = -60.0f;
-        if (masterPk > 1.0e-6f)
-            db = juce::jlimit(-60.0f, 6.0f, 20.0f * std::log10(masterPk));
-        masterDbLabel.setText(juce::String((int)std::round(db)) + " dB", juce::dontSendNotification);
+        if (masterLufsMode)
+        {
+            float lufsAvg = audioProcessor.getMasterLufsAvg();
+            float lufsPeak = audioProcessor.getMasterLufsPeak();
+            masterDbLabel.setText("LUFS Avg: " + juce::String(lufsAvg, 1), juce::dontSendNotification);
+            masterLufsPeakLabel.setText("LUFS Peak: " + juce::String(lufsPeak, 1), juce::dontSendNotification);
+        }
+        else
+        {
+            float db = -60.0f;
+            if (masterPk > 1.0e-6f)
+                db = juce::jlimit(-60.0f, 6.0f, 20.0f * std::log10(masterPk));
+            masterDbLabel.setText(juce::String((int)std::round(db)) + " dB", juce::dontSendNotification);
+            masterLufsPeakLabel.setText("", juce::dontSendNotification);
+        }
     }
 
     bool anyClipPulsing = masterClipPulsing || voiceClipPulsing;
@@ -9806,32 +9824,31 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         if (!users.empty())
         {
             const float timerIntervalMs = abletonHostEditor ? 1200.0f : 180.0f;
-            const float noiseFloor = 0.015f;
-            const float targetMasterLevel = 0.501187f; // -6 dBFS
-            const float targetSoloLevel = 0.45f;
-            const float perUserCeiling = 0.56f;
+            const float noiseFloor = -50.0f; // LUFS
+            const float targetMasterLufs = -6.0f;
+            const float targetSoloLufs = -8.0f;
+            const float perUserCeilingLufs = -4.0f;
             const float minGain = 0.05f;
             const float maxGain = 2.0f;
 
-            std::map<int, float> observedLevels;
+            auto lufsToLinear = [](float lufs) -> float { return std::pow(10.0f, lufs / 20.0f); };
+
+            std::map<int, float> observedLufs;
             int audibleUsers = 0;
             for (const auto& u : users)
             {
-                const float peakL = audioProcessor.getUserPeak(u.index, 0);
-                const float peakR = audioProcessor.getUserPeak(u.index, 1);
-                const float currentLevel = juce::jmax(peakL, peakR);
-                const float sourceEstimate = juce::jlimit(0.0f, 4.0f, currentLevel / juce::jmax(minGain, u.volume));
-                observedLevels[u.index] = currentLevel;
-                if (sourceEstimate >= noiseFloor)
+                const float userLufs = audioProcessor.getUserLufs(u.index);
+                observedLufs[u.index] = userLufs;
+                if (userLufs > noiseFloor)
                     ++audibleUsers;
             }
 
-            const float targetPerUserLevel = juce::jmin(targetSoloLevel,
-                targetMasterLevel / std::sqrt((float)juce::jmax(1, audibleUsers)));
-            const float masterPeak = audioProcessor.getMasterPeak();
+            const float targetPerUserLufs = juce::jmin(targetSoloLufs,
+                targetMasterLufs - 10.0f * std::log10(juce::jmax(1.0f, (float)audibleUsers)));
+            const float masterLufs = audioProcessor.getMasterLufsAvg();
             float masterReduction = 1.0f;
-            if (masterPeak > targetMasterLevel)
-                masterReduction = juce::jlimit(0.25f, 1.0f, targetMasterLevel / masterPeak);
+            if (masterLufs > targetMasterLufs)
+                masterReduction = juce::jlimit(0.25f, 1.0f, lufsToLinear(targetMasterLufs - masterLufs));
 
             std::set<int> activeIds;
 
@@ -9857,35 +9874,31 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                     autoLevelUserNameById[id] = nameKey;
                 }
 
-                const float currentLevel = observedLevels[id];
+                const float currentLevel = observedLufs[id];
                 if (!autoLevelCurrentGains.count(id))
                     autoLevelCurrentGains[id] = juce::jlimit(minGain, maxGain, u.volume);
 
                 const float currentGain = autoLevelCurrentGains[id];
-                const float sourceLevel = currentGain > 1.0e-4f
-                    ? juce::jlimit(0.0f, 4.0f, currentLevel / currentGain)
-                    : currentLevel;
+                const float sourceLufs = currentLevel;
 
-                if (!autoLevelPeakLevels.count(id))         autoLevelPeakLevels[id] = 0.0f;
+                if (!autoLevelPeakLevels.count(id))         autoLevelPeakLevels[id] = noiseFloor;
                 if (!autoLevelChannelActiveTicks.count(id)) autoLevelChannelActiveTicks[id] = 0;
                 else                                         autoLevelChannelActiveTicks[id]++;
 
                 bool isNew = autoLevelChannelActiveTicks[id] < 40;
-                float& longTermPeak = autoLevelPeakLevels[id];
+                float& longTermLufs = autoLevelPeakLevels[id];
                 int& measureTicks = autoLevelMeasureTicks[id];
                 const bool firstMeasurement = measureTicks == 0;
                 ++measureTicks;
 
-                if (firstMeasurement && sourceLevel >= noiseFloor)
-                    longTermPeak = sourceLevel;
+                if (firstMeasurement && sourceLufs > noiseFloor)
+                    longTermLufs = sourceLufs;
                 else
                 {
-                    float peakDb = (longTermPeak > noiseFloor) ? 20.0f * std::log10(longTermPeak) : -60.0f;
-                    float srcDb = (sourceLevel > noiseFloor) ? 20.0f * std::log10(sourceLevel) : -60.0f;
-                    float envDiffDb = std::abs(srcDb - peakDb);
+                    float envDiffDb = std::abs(sourceLufs - longTermLufs);
                     float envAdaptiveScale = 1.0f + envDiffDb * 0.2f;
                     float peakCoeff;
-                    if (sourceLevel > longTermPeak)
+                    if (sourceLufs > longTermLufs)
                     {
                         float attackMs = 700.0f / juce::jmin(envAdaptiveScale, 6.0f);
                         peakCoeff = 1.0f - std::exp(-timerIntervalMs / attackMs);
@@ -9895,32 +9908,30 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                         float releaseMs = 3500.0f / juce::jmin(envAdaptiveScale, 4.0f);
                         peakCoeff = 1.0f - std::exp(-timerIntervalMs / releaseMs);
                     }
-                    longTermPeak += (sourceLevel - longTermPeak) * peakCoeff;
+                    longTermLufs += (sourceLufs - longTermLufs) * peakCoeff;
                 }
 
-                longTermPeak = juce::jlimit(0.0f, 4.0f, longTermPeak);
+                longTermLufs = juce::jlimit(noiseFloor - 10.0f, 0.0f, longTermLufs);
 
                 float targetGain = currentGain;
-                if (longTermPeak >= noiseFloor)
+                if (longTermLufs > noiseFloor)
                 {
-                    const float safePeak = juce::jmax(longTermPeak, noiseFloor);
-                    targetGain = targetPerUserLevel / safePeak;
-                    targetGain = juce::jmin(targetGain, perUserCeiling / safePeak);
+                    float gainDb = targetPerUserLufs - longTermLufs;
+                    targetGain = currentGain * lufsToLinear(gainDb);
+                    targetGain = juce::jmin(targetGain, lufsToLinear(perUserCeilingLufs - longTermLufs));
                     targetGain *= masterReduction;
                 }
 
                 targetGain = juce::jlimit(minGain, maxGain, targetGain);
 
-                const float currentOutput = sourceLevel * currentGain;
-                const float longTermOutput = longTermPeak * currentGain;
+                const float currentOutputLufs = sourceLufs + 20.0f * std::log10(juce::jmax(currentGain, 1.0e-6f));
+                const float longTermOutputLufs = longTermLufs + 20.0f * std::log10(juce::jmax(currentGain, 1.0e-6f));
 
-                float outputDb = (longTermOutput > noiseFloor) ? 20.0f * std::log10(longTermOutput) : -60.0f;
-                float targetDbCalc = 20.0f * std::log10(targetPerUserLevel);
-                float diffDb = outputDb - targetDbCalc;
+                float diffDb = longTermOutputLufs - targetPerUserLufs;
                 float absDiffDb = std::abs(diffDb);
 
-                const bool tooHigh = (longTermOutput > targetPerUserLevel * 1.12f) || (currentOutput > targetMasterLevel);
-                const bool tooLow = longTermPeak >= noiseFloor && longTermOutput < targetPerUserLevel * 0.72f;
+                const bool tooHigh = (longTermOutputLufs > targetPerUserLufs + 1.0f) || (currentOutputLufs > targetMasterLufs + 2.0f);
+                const bool tooLow = longTermLufs > noiseFloor && longTermOutputLufs < targetPerUserLufs - 3.0f;
 
                 if (tooHigh)
                     ++autoLevelOverTargetTicks[id];
@@ -9945,7 +9956,7 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                     targetGain = currentGain;
 
                 const bool reducing = targetGain < currentGain;
-                const bool emergencyReduction = reducing && sustainedHigh && currentOutput > targetMasterLevel;
+                const bool emergencyReduction = reducing && sustainedHigh && currentOutputLufs > targetMasterLufs + 2.0f;
 
                 float adaptiveScale = 1.0f + absDiffDb * 0.25f;
                 adaptiveScale = juce::jmin(adaptiveScale, 8.0f);
@@ -10099,6 +10110,11 @@ void NinjamVst3AudioProcessorEditor::mouseDown(const juce::MouseEvent& event)
     juce::Component* start = event.originalComponent != nullptr ? event.originalComponent : event.eventComponent;
     for (auto* c = start; c != nullptr; c = c->getParentComponent())
     {
+        if (c == &masterDbLabel)
+        {
+            masterLufsMode = !masterLufsMode;
+            return;
+        }
         if (c == &chatInput)
         {
             if (event.mods.isLeftButtonDown())

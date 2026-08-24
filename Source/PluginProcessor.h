@@ -43,6 +43,25 @@ class LinkAudioSink;
 class LinkAudioSource;
 }
 
+struct LufsMeter
+{
+    void prepare(double sampleRate);
+    void processSample(float sample);
+    void processBlock(const float* data, int numSamples);
+    float getCurrentLufs() const;
+    void reset();
+
+private:
+    double sr = 44100.0;
+    double alpha = 0.0;
+    double meanSquare = 0.0;
+    int samplesProcessed = 0;
+
+    struct Biquad { double b0, b1, b2, a1, a2; double x1 = 0, x2 = 0, y1 = 0, y2 = 0; void reset(); double process(double input); };
+    Biquad preFilter;
+    Biquad rlpFilter;
+};
+
 class NinjamVst3AudioProcessor : public juce::AudioProcessor,
                                  public juce::Timer
 {
@@ -200,6 +219,9 @@ public:
     float getMasterPeak() const;
     float getMasterPeakLeft() const;
     float getMasterPeakRight() const;
+    float getMasterLufsAvg() const;
+    float getMasterLufsPeak() const;
+    float getUserLufs(int userIndex) const;
     
     // Version information
     juce::String getVersionString() const;
@@ -733,6 +755,12 @@ private:
     std::atomic<float> masterPeak { 0.0f };
     std::atomic<float> masterPeakL { 0.0f };
     std::atomic<float> masterPeakR { 0.0f };
+    std::atomic<float> masterLufsAvg { -70.0f };
+    std::atomic<float> masterLufsPeak { -70.0f };
+    std::array<LufsMeter, maxRemoteChordUsers> userLufsMeters;
+    std::array<std::atomic<float>, maxRemoteChordUsers> userLufsAvg;
+    LufsMeter masterLufsMeter;
+    LufsMeter masterLufsMeterR;
     std::atomic<float> localPeak { 0.0f };
     std::atomic<float> localPeakL { 0.0f };
     std::atomic<float> localPeakR { 0.0f };
