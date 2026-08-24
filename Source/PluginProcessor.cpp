@@ -10977,6 +10977,8 @@ void NinjamVst3AudioProcessor::resetRemoteUserIndexState(int userIndex, const ju
 
     const juce::String senderKey = normaliseOpusPeerId(userName);
     const juce::String canonicalSenderKey = canonicalDelayUserKey(senderKey);
+    const juce::String senderPrefix = senderKey + ":";
+    const juce::String canonicalSenderPrefix = canonicalSenderKey + ":";
     {
         const juce::ScopedLock lock(intervalSyncAnnouncementLock);
         auto eraseForUser = [&senderKey, &canonicalSenderKey](auto& state)
@@ -11005,6 +11007,29 @@ void NinjamVst3AudioProcessor::resetRemoteUserIndexState(int userIndex, const ju
             else
                 ++it;
         }
+    }
+
+    {
+        const juce::ScopedLock lock(ninjamZapVideoChunkLock);
+        auto eraseBySenderPrefix = [&senderPrefix, &canonicalSenderPrefix](auto& state)
+        {
+            for (auto it = state.begin(); it != state.end();)
+            {
+                const auto& key = it->first;
+                if (key.startsWith(senderPrefix) || key.startsWith(canonicalSenderPrefix))
+                    it = state.erase(it);
+                else
+                    ++it;
+            }
+        };
+        eraseBySenderPrefix(ninjamZapVideoChunkReassemblers);
+        eraseBySenderPrefix(ninjamZapVideoAudioGuidByReassemblyKey);
+        eraseBySenderPrefix(ninjamZapVideoMarkerIntervalByReassemblyKey);
+        eraseBySenderPrefix(ninjamZapVideoMarkerSeenByReassemblyKey);
+        if (senderKey.isNotEmpty())
+            remoteVideoChunkReassemblersByUser.erase(senderKey);
+        if (canonicalSenderKey.isNotEmpty())
+            remoteVideoChunkReassemblersByUser.erase(canonicalSenderKey);
     }
 }
 
