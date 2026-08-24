@@ -8495,7 +8495,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     masterDbLabel.setFont(juce::Font(9.0f));
     masterDbLabel.setJustificationType(juce::Justification::centred);
     masterDbLabel.setInterceptsMouseClicks(true, false);
-    masterDbLabel.addMouseListener(this, true);
+    masterDbLabel.onClick = [this] { masterLufsMode = !masterLufsMode; };
     masterDbLabel.setTooltip("Click to toggle dB / LUFS display");
     addAndMakeVisible(masterLufsPeakLabel);
     masterLufsPeakLabel.setFont(juce::Font(9.0f));
@@ -10110,11 +10110,6 @@ void NinjamVst3AudioProcessorEditor::mouseDown(const juce::MouseEvent& event)
     juce::Component* start = event.originalComponent != nullptr ? event.originalComponent : event.eventComponent;
     for (auto* c = start; c != nullptr; c = c->getParentComponent())
     {
-        if (c == &masterDbLabel)
-        {
-            masterLufsMode = !masterLufsMode;
-            return;
-        }
         if (c == &chatInput)
         {
             if (event.mods.isLeftButtonDown())
@@ -10760,6 +10755,7 @@ void NinjamVst3AudioProcessorEditor::savePersistentSettingsToDisk(bool includePr
     props.setValue("videoBgEnabled", videoBgToggle.getToggleState());
     props.setValue("autoLevelEnabled", autoLevelButton.getToggleState());
     props.setValue("spreadOutputs", spreadOutputsButton.getToggleState());
+    props.setValue("spreadOutputStartPair", audioProcessor.getSpreadOutputStartPair());
     props.setValue("abletonWindowSizePreset", abletonWindowSizePreset);
     props.setValue("abletonChatWindowSizePreset", abletonChatWindowSizePreset);
     props.setValue("abletonSamplerWindowSizePreset", abletonSamplerWindowSizePreset);
@@ -10847,6 +10843,7 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
     const bool spreadOutputs = props.getBoolValue("spreadOutputs", spreadOutputsButton.getToggleState());
     spreadOutputsButton.setToggleState(spreadOutputs, juce::dontSendNotification);
     audioProcessor.setSpreadOutputsEnabled(spreadOutputs);
+    audioProcessor.setSpreadOutputStartPair(props.getIntValue("spreadOutputStartPair", 0));
 
     audioProcessor.setLocalChatColourKey(props.getValue("chatColourKey", audioProcessor.getLocalChatColourKey()));
     setChatWindowColourKey(props.getValue("chatWindowColourKey", chatWindowColourKey), false);
@@ -12461,6 +12458,25 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
     menu.addItem(49, "Automatically Reconnect", true, audioProcessor.isAutoReconnectEnabled());
     menu.addItem(43, "Ableton Link Audio");
     menu.addItem(57, "Change VDO Room...", audioProcessor.canChangeVdoRoomName(), false);
+
+    {
+        constexpr int spreadStartPairMenuIdBase = 60;
+        const int totalOutputChannels = juce::jmax(2, audioProcessor.getTotalNumOutputChannels());
+        const int stereoPairCount = juce::jmin(16, totalOutputChannels / 2);
+        const int currentStartPair = audioProcessor.getSpreadOutputStartPair();
+        juce::PopupMenu spreadStartPairMenu;
+        for (int pair = 0; pair < stereoPairCount; ++pair)
+        {
+            const int leftCh = pair * 2 + 1;
+            const int rightCh = leftCh + 1;
+            const auto label = pair == 0
+                ? juce::String("Out 1/2 (default)")
+                : juce::String("Out ") + juce::String(leftCh) + "/" + juce::String(rightCh);
+            spreadStartPairMenu.addItem(spreadStartPairMenuIdBase + pair, label, true, currentStartPair == pair);
+        }
+        menu.addSubMenu("Spread Output Start Pair", spreadStartPairMenu);
+    }
+
     menu.addItem(47, "Check for Updates...");
     menu.addSubMenu("Metronome Sound", metronomeSoundMenu);
     menu.addSubMenu("Metronome Output", metronomeOutputMenu);
@@ -12526,6 +12542,14 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
             if (result == 57)
             {
                 audioProcessor.promptToChangeVdoRoomNameAsync();
+                return;
+            }
+            constexpr int spreadStartPairMenuIdBase = 60;
+            constexpr int spreadStartPairMenuIdEnd = 75;
+            if (result >= spreadStartPairMenuIdBase && result <= spreadStartPairMenuIdEnd)
+            {
+                audioProcessor.setSpreadOutputStartPair(result - spreadStartPairMenuIdBase);
+                markPersistentSettingsDirty();
                 return;
             }
             constexpr int callbackMetronomeOutputMonoMenuIdBase = 8000;

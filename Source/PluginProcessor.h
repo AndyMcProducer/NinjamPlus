@@ -482,6 +482,8 @@ public:
 
     void setSpreadOutputsEnabled(bool shouldEnable);
     bool isSpreadOutputsEnabled() const;
+    void setSpreadOutputStartPair(int pair);
+    int getSpreadOutputStartPair() const;
     void setMobileHotspotModeEnabled(bool shouldEnable);
     bool isMobileHotspotModeEnabled() const;
 
@@ -967,6 +969,7 @@ private:
     std::atomic<float> cachedNinjamBpm { 120.0f };
 
     std::atomic<bool> spreadOutputsEnabled { false };
+    std::atomic<int> spreadOutputStartPair { 0 };
     std::atomic<bool> softLimiterEnabled { false };
     std::atomic<bool> dspLimiterEnabled { false };
     std::atomic<float> limiterThresholdDb { 0.0f };

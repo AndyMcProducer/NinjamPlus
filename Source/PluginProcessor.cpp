@@ -10736,6 +10736,7 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
                 juce::String shortName = u.name;
                 auto itAssign = userOutputAssignment.find(shortName);
                 int desiredPair = -1;
+                const int startPair = spreadOutputStartPair.load(std::memory_order_relaxed);
 
                 if (itAssign != userOutputAssignment.end())
                 {
@@ -10745,9 +10746,10 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
                 {
                     if ((int)reservedPairs.size() < maxOutputPairs)
                     {
-                        for (int cand = 0; cand < maxOutputPairs; ++cand)
+                        for (int i = 0; i < maxOutputPairs; ++i)
                         {
-                            if (!reservedPairs.count(cand))
+                            int cand = (startPair + i) % maxOutputPairs;
+                            if (cand >= startPair && !reservedPairs.count(cand))
                             {
                                 desiredPair = cand;
                                 reservedPairs.insert(cand);
@@ -10759,16 +10761,17 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
                     {
                         std::set<int> connectedNow = usedPairsThisCall;
                         int fallback = -1;
-                        for (int cand = 0; cand < maxOutputPairs; ++cand)
+                        for (int i = 0; i < maxOutputPairs; ++i)
                         {
-                            if (!connectedNow.count(cand))
+                            int cand = (startPair + i) % maxOutputPairs;
+                            if (cand >= startPair && !connectedNow.count(cand))
                             {
                                 fallback = cand;
                                 break;
                             }
                         }
                         if (fallback < 0)
-                            fallback = 0;
+                            fallback = startPair;
                         desiredPair = fallback;
                     }
 
@@ -12364,6 +12367,17 @@ void NinjamVst3AudioProcessor::setSpreadOutputsEnabled(bool shouldEnable)
 bool NinjamVst3AudioProcessor::isSpreadOutputsEnabled() const
 {
     return spreadOutputsEnabled.load();
+}
+
+void NinjamVst3AudioProcessor::setSpreadOutputStartPair(int pair)
+{
+    spreadOutputStartPair.store(juce::jlimit(0, 15, pair), std::memory_order_relaxed);
+    userOutputAssignment.clear();
+}
+
+int NinjamVst3AudioProcessor::getSpreadOutputStartPair() const
+{
+    return spreadOutputStartPair.load(std::memory_order_relaxed);
 }
 
 void NinjamVst3AudioProcessor::setMobileHotspotModeEnabled(bool shouldEnable)

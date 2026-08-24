@@ -1481,6 +1481,19 @@ public:
     }
 };
 
+class ClickableLabel : public juce::Label
+{
+public:
+    using juce::Label::Label;
+    std::function<void()> onClick;
+    void mouseDown(const juce::MouseEvent& e) override
+    {
+        if (e.mods.isLeftButtonDown() && onClick)
+            onClick();
+        juce::Label::mouseDown(e);
+    }
+};
+
 class NinjamVst3AudioProcessorEditor : public juce::AudioProcessorEditor,
                                        public juce::Timer,
                                        private juce::OSCReceiver,
@@ -1618,7 +1631,7 @@ private:
     MasterPeakMeter masterPeakMeter;
     std::array<juce::Label, NinjamVst3AudioProcessor::maxLocalChannels> localDbLabels;
     std::array<juce::Label, NinjamVst3AudioProcessor::maxLocalChannels> localChannelNameLabels; // editable channel name
-    juce::Label masterDbLabel;
+    ClickableLabel masterDbLabel;
     bool masterLufsMode = false;
     juce::Label masterLufsPeakLabel;
     LeftClickOnlyTextButton limiterButton{ "Limiter" };
