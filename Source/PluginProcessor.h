@@ -18,6 +18,7 @@
 
 #include "ninjam/njclient.h"
 #include "ZapVideoCodec.h"
+#include "AutoTune.h"
 
 #ifndef NINJAMPLUS_HAS_H264_DECODE
 #define NINJAMPLUS_HAS_H264_DECODE 0
@@ -200,6 +201,7 @@ public:
     void setUserLevel(int userIndex, float volume, float pan, bool isMuted, bool isSolo);
     void setUserVolume(int userIndex, float volume);
     float getUserPeak(int userIndex, int channelIndex); // 0=L, 1=R
+    float getUserSourcePeak(int userIndex, int channelIndex); // pre-volume source peak, 0=L, 1=R
     float getUserChannelPeak(int userIndex, int njChanIdx, int lrSide); // per NINJAM channel L/R peak
     void setUserNjChannelVolume(int userIndex, int njChanIdx, float volume); // individual NINJAM channel volume
     juce::String getUserChordLabel(int userIndex) const;
@@ -247,6 +249,18 @@ public:
     juce::String getLocalChannelName(int channel) const;
     void setLocalChannelGain(int channel, float gain);
     float getLocalChannelGain(int channel) const;
+
+    // Auto-tune
+    void setAutoTuneEnabled(bool enabled);
+    bool getAutoTuneEnabled() const { return autoTuneEnabled.load(); }
+    void setAutoTuneQuality(int quality); // 0=Low, 1=High
+    int getAutoTuneQuality() const { return autoTuneQuality.load(); }
+    void setAutoTuneScale(int scale);
+    int getAutoTuneScale() const { return autoTuneScale.load(); }
+    void setAutoTuneKey(int key);
+    int getAutoTuneKey() const { return autoTuneKey.load(); }
+    void setAutoTuneSpeed(float speed);
+    float getAutoTuneSpeed() const { return autoTuneSpeed.load(); }
     NinjamVst3AudioProcessorEditor* getEditor() const { return (NinjamVst3AudioProcessorEditor*)getActiveEditor(); }
     void setLocalChannelInput(int channel, int inputIndex);
     int getLocalChannelInput(int channel) const;
@@ -766,6 +780,14 @@ private:
     std::atomic<float> localPeak { 0.0f };
     std::atomic<float> localPeakL { 0.0f };
     std::atomic<float> localPeakR { 0.0f };
+
+    // Auto-tune (local channel 1 only)
+    std::atomic<bool> autoTuneEnabled { false };
+    std::atomic<int> autoTuneQuality { 0 }; // 0=Low (autocorrelation), 1=High (YIN)
+    std::atomic<int> autoTuneScale { 0 };   // ScaleQuantizer::Scale as int
+    std::atomic<int> autoTuneKey { 0 };     // 0-11
+    std::atomic<float> autoTuneSpeed { 1.0f }; // 0=slow glide, 1=instant snap
+    std::unique_ptr<ninjamplus::AutoTuneProcessor> autoTuneProcessor;
     std::atomic<float> voiceChannelPeak { 0.0f };
     std::atomic<float> voiceChannelPeakL { 0.0f };
     std::atomic<float> voiceChannelPeakR { 0.0f };
@@ -1161,6 +1183,7 @@ private:
     std::array<unsigned char, 16> ninjamZapVideoStreamGuid {};
     std::atomic<juce::uint64> ninjamZapBrowserKeyframeRequestCounter { 0 };
     std::atomic<bool> ninjamZapBrowserAwaitingIntervalKeyframe { false };
+    std::atomic<bool> ninjamZapForceNextKeyframe { false };
     std::atomic<bool> pendingNinjamZapIntervalRotate { false };
     juce::SpinLock ninjamZapCameraChunkQueueLock;
     std::vector<PendingNinjamZapCameraChunk> pendingNinjamZapCameraChunks;
@@ -1286,6 +1309,8 @@ private:
     std::array<std::array<std::atomic<float>, maxLocalChannels>, maxRemoteChordUsers> remoteOpusChannelPeaks;
     std::array<std::atomic<float>, maxRemoteChordUsers> remoteOpusCombinedPeakL;
     std::array<std::atomic<float>, maxRemoteChordUsers> remoteOpusCombinedPeakR;
+    std::array<std::atomic<float>, maxRemoteChordUsers> remoteOpusSourcePeakL;
+    std::array<std::atomic<float>, maxRemoteChordUsers> remoteOpusSourcePeakR;
     std::array<std::atomic<float>, maxRemoteChordUsers> remoteOpusUserVolume;
     std::array<std::atomic<float>, maxRemoteChordUsers> remoteOpusUserPan;
     std::array<std::atomic<int>, maxRemoteChordUsers> remoteOpusUserOutput;

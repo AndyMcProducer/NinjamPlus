@@ -2636,6 +2636,11 @@ private:
 
             if (activeCodec == ninjamplus::zap::VideoCodec::h264)
             {
+                // Force an IDR keyframe at the start of each NINJAM interval,
+                // as required by the NinjamZap receiver spec.
+                if (owner.ninjamZapForceNextKeyframe.exchange(false, std::memory_order_relaxed))
+                    h264Encoder.forceKeyframe();
+
                 ninjamplus::zap::EncodedH264Frame encoded;
                 const double encodeStartMs = juce::Time::getMillisecondCounterHiRes();
                 if (h264Encoder.encodeFrame(frame, encoded))
@@ -5814,6 +5819,8 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
         remoteOpusPackedChannelCount[(size_t)i].store(0, std::memory_order_relaxed);
         remoteOpusCombinedPeakL[(size_t)i].store(0.0f, std::memory_order_relaxed);
         remoteOpusCombinedPeakR[(size_t)i].store(0.0f, std::memory_order_relaxed);
+        remoteOpusSourcePeakL[(size_t)i].store(0.0f, std::memory_order_relaxed);
+        remoteOpusSourcePeakR[(size_t)i].store(0.0f, std::memory_order_relaxed);
         remoteOpusUserVolume[(size_t)i].store(1.0f, std::memory_order_relaxed);
         remoteOpusUserPan[(size_t)i].store(0.0f, std::memory_order_relaxed);
         remoteOpusUserOutput[(size_t)i].store(0, std::memory_order_relaxed);
@@ -8588,6 +8595,11 @@ void NinjamVst3AudioProcessor::beginNinjamZapVideoIntervalStream(const unsigned 
     {
         ninjamZapBrowserKeyframeRequestCounter.fetch_add(1, std::memory_order_relaxed);
         ninjamZapBrowserAwaitingIntervalKeyframe.store(true, std::memory_order_relaxed);
+        // Force the local H.264 encoder to produce an IDR on the next frame,
+        // as required by the NinjamZap receiver (first frame after BEGIN must
+        // be a keyframe so decoders can sync at each interval boundary).
+        if (activeCodec == ninjamplus::zap::VideoCodec::h264)
+            ninjamZapForceNextKeyframe.store(true, std::memory_order_relaxed);
     }
     else
     {
@@ -10895,6 +10907,8 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
         remoteOpusPackedChannelCount[(size_t)i].store(0, std::memory_order_relaxed);
         remoteOpusCombinedPeakL[(size_t)i].store(0.0f, std::memory_order_relaxed);
         remoteOpusCombinedPeakR[(size_t)i].store(0.0f, std::memory_order_relaxed);
+        remoteOpusSourcePeakL[(size_t)i].store(0.0f, std::memory_order_relaxed);
+        remoteOpusSourcePeakR[(size_t)i].store(0.0f, std::memory_order_relaxed);
         if (chordAnalyzer && chordAnalyzer->isPrepared())
             chordAnalyzer->resetTrack(BatchedChordAnalyzer::remoteTrackIndexForUser(i));
     }
@@ -10955,6 +10969,8 @@ void NinjamVst3AudioProcessor::resetRemoteUserIndexState(int userIndex, const ju
         remoteOpusPackedChannelCount[(size_t)userIndex].store(0, std::memory_order_relaxed);
         remoteOpusCombinedPeakL[(size_t)userIndex].store(0.0f, std::memory_order_relaxed);
         remoteOpusCombinedPeakR[(size_t)userIndex].store(0.0f, std::memory_order_relaxed);
+        remoteOpusSourcePeakL[(size_t)userIndex].store(0.0f, std::memory_order_relaxed);
+        remoteOpusSourcePeakR[(size_t)userIndex].store(0.0f, std::memory_order_relaxed);
         if (chordAnalyzer && chordAnalyzer->isPrepared())
             chordAnalyzer->resetTrack(BatchedChordAnalyzer::remoteTrackIndexForUser(userIndex));
     }
@@ -11228,6 +11244,35 @@ float NinjamVst3AudioProcessor::getUserPeak(int userIndex, int channelIndex)
             : remoteOpusCombinedPeakR[(size_t)userIndex].load(std::memory_order_relaxed);
     }
 
+    float maxPeak = 0.0f;
+    for (int i = 0; i < 32; ++i)
+    {
+        if (isNinjamRemoteChannelVideoOnly(userIndex, i))
+            continue;
+        float p = ninjamClient.GetUserChannelPeak(userIndex, i, channelIndex);
+        if (p > maxPeak) maxPeak = p;
+    }
+    return maxPeak;
+}
+
+float NinjamVst3AudioProcessor::getUserSourcePeak(int userIndex, int channelIndex)
+{
+    const int numUsers = ninjamClient.GetNumUsers();
+    if (userIndex < 0 || userIndex >= numUsers)
+        return 0.0f;
+
+    if (isTransportSyncEnabled() && (!hostWasPlaying.load() || syncWaitForInterval.load()))
+        return 0.0f;
+
+    if (userIndex >= 0 && userIndex < maxRemoteChordUsers
+        && remoteOpusPeerActive[(size_t)userIndex].load(std::memory_order_relaxed))
+    {
+        return channelIndex == 0
+            ? remoteOpusSourcePeakL[(size_t)userIndex].load(std::memory_order_relaxed)
+            : remoteOpusSourcePeakR[(size_t)userIndex].load(std::memory_order_relaxed);
+    }
+
+    // For non-Opus (legacy NINJAM) users, the NJClient channel peak is already pre-volume.
     float maxPeak = 0.0f;
     for (int i = 0; i < 32; ++i)
     {
@@ -11600,6 +11645,43 @@ float NinjamVst3AudioProcessor::getLocalChannelGain(int channel) const
     if (channel < 0 || channel >= maxLocalChannels)
         return 1.0f;
     return localChannelGains[(size_t)channel].load();
+}
+
+void NinjamVst3AudioProcessor::setAutoTuneEnabled(bool enabled)
+{
+    autoTuneEnabled.store(enabled);
+    if (autoTuneProcessor)
+        autoTuneProcessor->setEnabled(enabled);
+}
+
+void NinjamVst3AudioProcessor::setAutoTuneQuality(int quality)
+{
+    autoTuneQuality.store(juce::jlimit(0, 1, quality));
+    if (autoTuneProcessor)
+        autoTuneProcessor->setQuality(quality == 1
+            ? ninjamplus::PitchDetector::Quality::High
+            : ninjamplus::PitchDetector::Quality::Low);
+}
+
+void NinjamVst3AudioProcessor::setAutoTuneScale(int scale)
+{
+    autoTuneScale.store(juce::jlimit(0, 6, scale));
+    if (autoTuneProcessor)
+        autoTuneProcessor->setScale((ninjamplus::ScaleQuantizer::Scale)autoTuneScale.load());
+}
+
+void NinjamVst3AudioProcessor::setAutoTuneKey(int key)
+{
+    autoTuneKey.store(juce::jlimit(0, 11, key));
+    if (autoTuneProcessor)
+        autoTuneProcessor->setKey(autoTuneKey.load());
+}
+
+void NinjamVst3AudioProcessor::setAutoTuneSpeed(float speed)
+{
+    autoTuneSpeed.store(juce::jlimit(0.0f, 1.0f, speed));
+    if (autoTuneProcessor)
+        autoTuneProcessor->setCorrectionSpeed(autoTuneSpeed.load());
 }
 
 void NinjamVst3AudioProcessor::setLocalChannelInput(int channel, int inputIndex)
@@ -11987,6 +12069,8 @@ int NinjamVst3AudioProcessor::RemoteMultichannelTap_Callback(void* userData,
     int packedIndex = 0;
     float combinedL = 0.0f;
     float combinedR = 0.0f;
+    float sourceCombinedL = 0.0f;
+    float sourceCombinedR = 0.0f;
 
     const float userVolume = self->remoteOpusUserVolume[(size_t)useridx].load(std::memory_order_relaxed);
     const float userPan = juce::jlimit(-1.0f, 1.0f, self->remoteOpusUserPan[(size_t)useridx].load(std::memory_order_relaxed));
@@ -12013,6 +12097,8 @@ int NinjamVst3AudioProcessor::RemoteMultichannelTap_Callback(void* userData,
             if (monoPeak > peak) peak = monoPeak;
             combinedL = juce::jmax(combinedL, std::abs(left * perGain * userGainL));
             combinedR = juce::jmax(combinedR, std::abs(right * perGain * userGainR));
+            sourceCombinedL = juce::jmax(sourceCombinedL, std::abs(left));
+            sourceCombinedR = juce::jmax(sourceCombinedR, std::abs(right));
 
             if (audible && self->remoteOpusMixOutputs != nullptr && self->remoteOpusMixOutputChannels > 0)
             {
@@ -12045,6 +12131,8 @@ int NinjamVst3AudioProcessor::RemoteMultichannelTap_Callback(void* userData,
 
     self->remoteOpusCombinedPeakL[(size_t)useridx].store(combinedL, std::memory_order_relaxed);
     self->remoteOpusCombinedPeakR[(size_t)useridx].store(combinedR, std::memory_order_relaxed);
+    self->remoteOpusSourcePeakL[(size_t)useridx].store(sourceCombinedL, std::memory_order_relaxed);
+    self->remoteOpusSourcePeakR[(size_t)useridx].store(sourceCombinedR, std::memory_order_relaxed);
 
     {
         auto& meter = self->userLufsMeters[(size_t)useridx];
@@ -12936,6 +13024,17 @@ void NinjamVst3AudioProcessor::prepareToPlay (double sampleRate, int samplesPerB
     cachedNinjamBpm.store(juce::jmax(1.0f, (float)ninjamClient.GetActualBPM()), std::memory_order_relaxed);
     samplePadTransportInitialised = false;
     samplePadLastTransportPosition = 0;
+
+    // Auto-tune processor (local channel 1)
+    autoTuneProcessor = std::make_unique<ninjamplus::AutoTuneProcessor>();
+    autoTuneProcessor->prepare(sampleRate, samplesPerBlock);
+    autoTuneProcessor->setEnabled(autoTuneEnabled.load());
+    autoTuneProcessor->setQuality(autoTuneQuality.load() == 1
+        ? ninjamplus::PitchDetector::Quality::High
+        : ninjamplus::PitchDetector::Quality::Low);
+    autoTuneProcessor->setScale((ninjamplus::ScaleQuantizer::Scale)autoTuneScale.load());
+    autoTuneProcessor->setKey(autoTuneKey.load());
+    autoTuneProcessor->setCorrectionSpeed(autoTuneSpeed.load());
     samplePadLastTransportLength = 0;
     samplePadLastTransportBpi = 0;
     samplePadTransportInterval = 0;
@@ -13086,6 +13185,9 @@ void NinjamVst3AudioProcessor::releaseResources()
         chordAnalyzer->markAllNoInput();
         chordAnalyzer->stop();
     }
+
+    if (autoTuneProcessor)
+        autoTuneProcessor->release();
 }
 
 bool NinjamVst3AudioProcessor::loadSamplePad(int padIndex, const juce::File& file)
@@ -17735,6 +17837,13 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         if (gain != 1.0f)
             localChannelBuffer.applyGain(ch, 0, numSamples, gain);
 
+        // Auto-tune on local channel 1 (ch == 0) — mono processing
+        if (ch == 0 && autoTuneProcessor != nullptr && autoTuneEnabled.load(std::memory_order_relaxed))
+        {
+            float* channelData = localChannelBuffer.getWritePointer(ch);
+            autoTuneProcessor->process(channelData, numSamples);
+        }
+
         if (ch == 0 && samplePadsEnabledAtBlock)
         {
             const bool looperCapturesSamplePads =
@@ -20066,6 +20175,11 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
         state.setProperty("localInput" + juce::String(channel), getLocalChannelInput(channel), nullptr);
     state.setProperty("voiceInput", getVoiceChannelInput(), nullptr);
     state.setProperty("voiceGain", (double)getVoiceChannelGain(), nullptr);
+    state.setProperty("autoTuneEnabled", getAutoTuneEnabled(), nullptr);
+    state.setProperty("autoTuneQuality", getAutoTuneQuality(), nullptr);
+    state.setProperty("autoTuneScale", getAutoTuneScale(), nullptr);
+    state.setProperty("autoTuneKey", getAutoTuneKey(), nullptr);
+    state.setProperty("autoTuneSpeed", (double)getAutoTuneSpeed(), nullptr);
     state.setProperty("localBitrate", getLocalBitrate(), nullptr);
     {
         const juce::ScopedLock lock(localChannelNamesLock);
@@ -20178,6 +20292,11 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
         setLocalChannelInput(channel, (int)state.getProperty("localInput" + juce::String(channel), -1));
     setVoiceChannelInput((int)state.getProperty("voiceInput", 0));
     setVoiceChannelGain(juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("voiceGain", 1.0)));
+    setAutoTuneEnabled((bool)state.getProperty("autoTuneEnabled", false));
+    setAutoTuneQuality((int)state.getProperty("autoTuneQuality", 0));
+    setAutoTuneScale((int)state.getProperty("autoTuneScale", 0));
+    setAutoTuneKey((int)state.getProperty("autoTuneKey", 0));
+    setAutoTuneSpeed(juce::jlimit(0.0f, 1.0f, (float)(double)state.getProperty("autoTuneSpeed", 1.0)));
     setLocalBitrate((int)state.getProperty("localBitrate", 64));
     {
         const juce::ScopedLock lock(localChannelNamesLock);

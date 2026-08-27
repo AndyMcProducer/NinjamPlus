@@ -804,6 +804,12 @@ private:
     bool clipPulsing = false;
     bool isHorizontalLayout = false; // Default List view (strip is horizontal)
 
+    // +6 dB clip protection: auto-reduce to -10 dB when source peaks at +6 dB,
+    // flash red until source drops back below 0 dB, then restore user's volume.
+    bool clipProtectionActive = false;
+    float clipProtectionDesiredVolume = 1.0f;
+    double clipProtectionEnteredMs = 0.0;
+
     // Multi-channel remote support
     static constexpr int kMaxRemoteCh = 8;
     LeftClickOnlyTextButton expandButton{ ">" };
@@ -1093,6 +1099,34 @@ private:
 
         const float fillProportion = dbToMeterProportion(peakToDb(peak));
         const float slotHeight = (float)barBounds.getHeight() / (float)numSegments;
+        const bool overZero = peak > 1.0f;
+
+        // Fire FX: animated flicker glow when peak exceeds 0dB
+        if (overZero)
+        {
+            const double phase = juce::Time::getMillisecondCounterHiRes() * 0.001
+                               * (juce::MathConstants<double>::twoPi * 3.5);
+            const float flicker = 0.6f + 0.4f * (float)std::sin(phase);
+            const float fireAlpha = juce::jmap(flicker, 0.3f, 0.7f);
+            auto fireBounds = barBounds.toFloat();
+            // Fire rises from the top portion (where 0dB+ sits)
+            const float zeroY = (float)yForDb(barBounds, 0.0f);
+            juce::Rectangle<float> fireRect(barBounds.getX() - 2.0f, (float)barBounds.getY() - 2.0f,
+                                            (float)barBounds.getWidth() + 4.0f,
+                                            juce::jmax(4.0f, zeroY - (float)barBounds.getY() + 3.0f));
+            juce::ColourGradient fireGrad(
+                juce::Colour(0xffff6600).withAlpha(fireAlpha), fireRect.getCentreX(), fireRect.getY(),
+                juce::Colour(0xffff2200).withAlpha(fireAlpha * 0.3f), fireRect.getCentreX(), fireRect.getBottom(), false);
+            g.setGradientFill(fireGrad);
+            g.fillRoundedRectangle(fireRect, 2.0f);
+
+            // Inner bright core
+            juce::ColourGradient coreGrad(
+                juce::Colour(0xffffff88).withAlpha(fireAlpha * 0.8f), fireRect.getCentreX(), fireRect.getY(),
+                juce::Colours::transparentBlack, fireRect.getCentreX(), fireRect.getBottom(), false);
+            g.setGradientFill(coreGrad);
+            g.fillRoundedRectangle(fireRect.reduced(1.0f, 1.0f), 1.5f);
+        }
 
         for (int i = 0; i < numSegments; ++i)
         {
@@ -1115,11 +1149,26 @@ private:
                 g.fillRoundedRectangle(segment.toFloat().expanded(1.0f, 0.5f), 1.6f);
             }
 
-            g.setColour(lit ? base.withAlpha(0.96f)
-                            : base.withMultipliedBrightness(0.36f).withAlpha(0.20f));
-            g.fillRoundedRectangle(segment.toFloat(), 1.2f);
+            // Center-lighter gradient: brighter in the horizontal middle, darker at edges
+            if (lit)
+            {
+                const auto segF = segment.toFloat();
+                const float cx = segF.getCentreX();
+                const float edgeAlpha = 0.55f;
+                const float centerAlpha = overZero && redSegment ? 1.0f : 0.96f;
+                juce::ColourGradient grad(
+                    base.withAlpha(centerAlpha), cx, segF.getY(),
+                    base.withAlpha(edgeAlpha), segF.getX(), segF.getY(), false);
+                grad.addColour(segF.getWidth() * 0.5f, base.withAlpha(centerAlpha));
+                g.setGradientFill(grad);
+                g.fillRoundedRectangle(segF, 1.2f);
+            }
+            else
+            {
+                g.setColour(base.withMultipliedBrightness(0.36f).withAlpha(0.20f));
+                g.fillRoundedRectangle(segment.toFloat(), 1.2f);
+            }
         }
-
     }
 
     static void drawHorizontalBar(juce::Graphics& g, juce::Rectangle<int> barBounds, float peak)
@@ -1129,6 +1178,31 @@ private:
 
         const float fillProportion = dbToMeterProportion(peakToDb(peak));
         const float slotWidth = (float)barBounds.getWidth() / (float)numSegments;
+        const bool overZero = peak > 1.0f;
+
+        // Fire FX: animated flicker glow when peak exceeds 0dB
+        if (overZero)
+        {
+            const double phase = juce::Time::getMillisecondCounterHiRes() * 0.001
+                               * (juce::MathConstants<double>::twoPi * 3.5);
+            const float flicker = 0.6f + 0.4f * (float)std::sin(phase);
+            const float fireAlpha = juce::jmap(flicker, 0.3f, 0.7f);
+            const float zeroX = (float)xForDb(barBounds, 0.0f);
+            juce::Rectangle<float> fireRect(zeroX - 2.0f, (float)barBounds.getY() - 2.0f,
+                                            juce::jmax(4.0f, (float)barBounds.getRight() - zeroX + 3.0f),
+                                            (float)barBounds.getHeight() + 4.0f);
+            juce::ColourGradient fireGrad(
+                juce::Colour(0xffff6600).withAlpha(fireAlpha), fireRect.getRight(), fireRect.getCentreY(),
+                juce::Colour(0xffff2200).withAlpha(fireAlpha * 0.3f), fireRect.getX(), fireRect.getCentreY(), false);
+            g.setGradientFill(fireGrad);
+            g.fillRoundedRectangle(fireRect, 2.0f);
+
+            juce::ColourGradient coreGrad(
+                juce::Colour(0xffffff88).withAlpha(fireAlpha * 0.8f), fireRect.getRight(), fireRect.getCentreY(),
+                juce::Colours::transparentBlack, fireRect.getX(), fireRect.getCentreY(), false);
+            g.setGradientFill(coreGrad);
+            g.fillRoundedRectangle(fireRect.reduced(1.0f, 1.0f), 1.5f);
+        }
 
         for (int i = 0; i < numSegments; ++i)
         {
@@ -1151,11 +1225,26 @@ private:
                 g.fillRoundedRectangle(segment.toFloat().expanded(0.5f, 1.0f), 1.4f);
             }
 
-            g.setColour(lit ? base.withAlpha(0.96f)
-                            : base.withMultipliedBrightness(0.36f).withAlpha(0.20f));
-            g.fillRoundedRectangle(segment.toFloat(), 1.0f);
+            // Center-lighter gradient: brighter in the vertical middle, darker at top/bottom edges
+            if (lit)
+            {
+                const auto segF = segment.toFloat();
+                const float cy = segF.getCentreY();
+                const float edgeAlpha = 0.55f;
+                const float centerAlpha = overZero && redSegment ? 1.0f : 0.96f;
+                juce::ColourGradient grad(
+                    base.withAlpha(centerAlpha), segF.getX(), cy,
+                    base.withAlpha(edgeAlpha), segF.getX(), segF.getY(), false);
+                grad.addColour(segF.getHeight() * 0.5f, base.withAlpha(centerAlpha));
+                g.setGradientFill(grad);
+                g.fillRoundedRectangle(segF, 1.0f);
+            }
+            else
+            {
+                g.setColour(base.withMultipliedBrightness(0.36f).withAlpha(0.20f));
+                g.fillRoundedRectangle(segment.toFloat(), 1.0f);
+            }
         }
-
     }
 
     static void drawDbTicks(juce::Graphics& g, juce::Rectangle<int> meterBounds)
@@ -1206,11 +1295,16 @@ public:
 
     void paint(juce::Graphics& g) override;
     void resized() override;
-    
+
     void updateContent();
     void setLayoutMode(bool horizontal); // True = Horizontal Mixer, False = Vertical List
     void setAllClipEnabled(bool enabled);
     std::vector<UserChannelStrip*> getStripPointers() const;
+
+    void setAbletonHostedMode(bool hosted, int currentPreset, std::function<void(int)> onPresetChanged);
+    void setBackgroundImage(juce::Image img);
+    void setPoppedOut(bool poppedOut);
+    bool isPoppedOut() const { return poppedOut; }
 
 private:
     NinjamVst3AudioProcessor& processor;
@@ -1218,6 +1312,16 @@ private:
     juce::Component contentComponent;
     std::vector<std::unique_ptr<UserChannelStrip>> strips;
     bool isHorizontal = false;
+    juce::Image backgroundImage;
+    bool poppedOut = false;
+
+    // Ableton popout size preset buttons (+/-)
+    bool abletonHosted = false;
+    int currentSizePreset = 1;
+    std::function<void(int)> onSizePresetChanged;
+    std::array<LeftClickOnlyTextButton, 2> sizeButtons { LeftClickOnlyTextButton{ "-" },
+                                                          LeftClickOnlyTextButton{ "+" } };
+    void updateSizeButtons();
 };
 
 class CustomKnobLookAndFeel : public juce::LookAndFeel_V4
@@ -1254,47 +1358,35 @@ public:
         g.setColour(rim);
         g.drawRoundedRectangle(bounds, r, 1.5f);
 
-        // --- sync / refresh icon: two circular arrows forming a circle ---
-        float cx = bounds.getCentreX();
-        float cy = bounds.getCentreY();
-        float ir  = bounds.getWidth() * 0.34f;   // arc radius
-        float sw  = juce::jmax(1.4f, bounds.getWidth() * 0.115f);
-        float ahw = sw * 1.5f;   // arrowhead half-width
-        float ahl = sw * 2.0f;   // arrowhead length
-
+        // --- "SYNC" / divider / "HOST" stacked text icon ---
         g.setColour(ic);
 
-        using M = juce::MathConstants<float>;
-        const float deg = M::pi / 180.0f;
+        const float cx = bounds.getCentreX();
+        const float cy = bounds.getCentreY();
+        const float halfH = bounds.getHeight() * 0.5f;
 
-        // Draw arc from startA to endA (clockwise), with filled arrowhead at end
-        auto drawArcArrow = [&](float startA, float endA)
-        {
-            juce::Path arc;
-            arc.addCentredArc(cx, cy, ir, ir, 0.0f, startA, endA, true);
-            g.strokePath(arc, juce::PathStrokeType(sw, juce::PathStrokeType::curved,
-                                                   juce::PathStrokeType::butt));
+        // Top: SYNC
+        auto syncFont = juce::Font(juce::jmax(7.0f, bounds.getHeight() * 0.26f), juce::Font::bold);
+        g.setFont(syncFont);
+        auto syncTextBounds = juce::Rectangle<float>(bounds.getX(), bounds.getY(),
+                                                     bounds.getWidth(), halfH * 0.7f);
+        g.drawText("SYNC", syncTextBounds, juce::Justification::centred);
 
-            // Arrowhead tip at end of arc; base recessed along clockwise tangent
-            float tipX = cx + std::cos(endA) * ir;
-            float tipY = cy + std::sin(endA) * ir;
-            float tanA = endA + M::halfPi;   // clockwise tangent direction at endA
-            float bx1  = tipX - std::cos(tanA) * ahl - std::cos(endA) * ahw;
-            float by1  = tipY - std::sin(tanA) * ahl - std::sin(endA) * ahw;
-            float bx2  = tipX - std::cos(tanA) * ahl + std::cos(endA) * ahw;
-            float by2  = tipY - std::sin(tanA) * ahl + std::sin(endA) * ahw;
-            juce::Path arrowHead;
-            arrowHead.startNewSubPath(tipX, tipY);
-            arrowHead.lineTo(bx1, by1);
-            arrowHead.lineTo(bx2, by2);
-            arrowHead.closeSubPath();
-            g.fillPath(arrowHead);
-        };
+        // Middle: divider line
+        const float lineY = cy;
+        const float lineMargin = bounds.getWidth() * 0.18f;
+        g.setColour(ic.withAlpha(ic.getAlpha() * 0.6f));
+        g.drawLine(bounds.getX() + lineMargin, lineY,
+                   bounds.getRight() - lineMargin, lineY,
+                   juce::jmax(0.8f, bounds.getHeight() * 0.04f));
+        g.setColour(ic);
 
-        // Arc 1: 210° → 370°(=10°), sweeps clockwise over the TOP of the circle
-        drawArcArrow(210.0f * deg, 370.0f * deg);
-        // Arc 2:  30° → 190°,       sweeps clockwise over the BOTTOM of the circle
-        drawArcArrow(30.0f * deg, 190.0f * deg);
+        // Bottom: HOST
+        auto hostFont = juce::Font(juce::jmax(7.0f, bounds.getHeight() * 0.26f), juce::Font::bold);
+        g.setFont(hostFont);
+        auto hostTextBounds = juce::Rectangle<float>(bounds.getX(), cy + halfH * 0.15f,
+                                                     bounds.getWidth(), halfH * 0.7f);
+        g.drawText("HOST", hostTextBounds, juce::Justification::centred);
 
         if (shouldDrawButtonAsHighlighted)
         {
@@ -1494,6 +1586,51 @@ public:
     }
 };
 
+// Custom popup menu item with a speed slider for auto-tune correction speed
+class AutoTuneSpeedMenuItem : public juce::PopupMenu::CustomComponent,
+                              public juce::Slider::Listener
+{
+public:
+    explicit AutoTuneSpeedMenuItem(NinjamVst3AudioProcessor& p)
+        : processor(p), slider(juce::Slider::LinearHorizontal, juce::Slider::TextBoxRight)
+    {
+        slider.setRange(0.0, 1.0, 0.01);
+        slider.setValue((double)processor.getAutoTuneSpeed(), juce::dontSendNotification);
+        slider.setTextValueSuffix("");
+        slider.addListener(this);
+        addAndMakeVisible(label);
+        label.setText("Speed", juce::dontSendNotification);
+        label.setColour(juce::Label::textColourId, juce::Colours::white);
+        label.setFont(juce::Font(13.0f));
+        addAndMakeVisible(slider);
+        setSize(220, 36);
+    }
+
+    void sliderValueChanged(juce::Slider* s) override
+    {
+        processor.setAutoTuneSpeed((float)s->getValue());
+    }
+
+    void getIdealSize(int& idealWidth, int& idealHeight) override
+    {
+        idealWidth = 220;
+        idealHeight = 36;
+    }
+
+private:
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced(6);
+        label.setBounds(area.removeFromLeft(50));
+        area.removeFromLeft(4);
+        slider.setBounds(area);
+    }
+
+    NinjamVst3AudioProcessor& processor;
+    juce::Label label;
+    juce::Slider slider;
+};
+
 class NinjamVst3AudioProcessorEditor : public juce::AudioProcessorEditor,
                                        public juce::Timer,
                                        private juce::OSCReceiver,
@@ -1563,7 +1700,7 @@ private:
     juce::Label serverLabel{ "Server", "Server:" };
     juce::TextEditor serverField;
     LeftClickOnlyTextButton serverListButton;
-    juce::Label userLabel{ "User", "User:" };
+    juce::Label userLabel{ "User", "Name:" };
     juce::TextEditor userField;
     LeftClickOnlyToggleButton anonymousButton{ "Anonymous" };
     juce::Label passLabel{ "Password", "Password:" };
@@ -1605,14 +1742,18 @@ private:
     // Users
     juce::Label usersLabel{ "Users", "Connected Users:" };
     LeftClickOnlyToggleButton spreadOutputsButton{ "Spread Outputs" };
+    LeftClickOnlyTextButton usersPopoutButton{ "Popout" };
     UserListComponent userList;
+    std::unique_ptr<juce::DocumentWindow> remoteUsersWindow;
+    bool usersPoppedOut = false;
 
     FaderLookAndFeel mixerFaderLookAndFeel;
-    juce::Label localFaderLabel{ "Local", "Local" };
+    juce::Label localFaderLabel{ "Local", "You" };
     juce::Label localChordLabel{ "LocalChord", "Chord --" };
     juce::Label localChordStatsLabel{ "LocalChordStats", "CPU 0.00%  MEM -- KB" };
     LeftClickOnlyTextButton addLocalChannelButton{ "+" };
     LeftClickOnlyTextButton removeLocalChannelButton{ "-" };
+    TranslateMenuTextButton autoTuneButton{ "AT" };
     std::array<NonlinearFaderSlider, NinjamVst3AudioProcessor::maxLocalChannels> localFaders;
     std::array<MasterPeakMeter, NinjamVst3AudioProcessor::maxLocalChannels> localPeakMeters;
     std::array<juce::ComboBox, NinjamVst3AudioProcessor::maxLocalChannels> localInputModeSelectors;
@@ -1688,10 +1829,12 @@ private:
     void syncToggled();
     void chatToggled();
     void chatPopoutClicked();
+    void usersPopoutClicked();
     void showSamplePadsWindow();
     void videoClicked();
 
     void serverListClicked();
+    void showAutoTuneMenu();
     void updateAutoLevelButtonColor();
     void updateChatButtonColor();
     void updateTranslateButtonState();
@@ -1739,6 +1882,7 @@ private:
     void enqueueChatTtsForNewLines(const juce::StringArray& history, const juce::StringArray& senders);
     void setAbletonChatWindowSizePreset(int presetIndex);
     void setAbletonSamplerWindowSizePreset(int presetIndex);
+    void setAbletonRemoteUsersWindowSizePreset(int presetIndex);
     void rememberSamplePadsWindowBounds(juce::Rectangle<int> bounds, bool saveNow);
     void openChatPopoutWindow(const juce::StringArray& history,
                               const juce::StringArray& senders,
@@ -1820,6 +1964,7 @@ private:
     int abletonWindowSizePreset = 1;
     int abletonChatWindowSizePreset = 1;
     int abletonSamplerWindowSizePreset = 1;
+    int abletonRemoteUsersWindowSizePreset = 1;
     juce::Rectangle<int> samplePadsWindowBounds { 0, 0, 980, 600 };
     bool samplePadsWindowBoundsValid = false;
     std::unique_ptr<juce::DialogWindow> aboutWindow;

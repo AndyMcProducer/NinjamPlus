@@ -444,6 +444,23 @@ namespace ninjamplus::zap
             }
         }
 
+        void forceKeyframe()
+        {
+            if (!encoder)
+                return;
+
+            ComPtr<ICodecAPI> codecApi;
+            if (FAILED(encoder->QueryInterface(IID_PPV_ARGS(codecApi.put()))) || !codecApi)
+                return;
+
+            VARIANT var;
+            VariantInit(&var);
+            var.vt = VT_UI4;
+            var.ulVal = 1;
+            codecApi->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &var);
+            VariantClear(&var);
+        }
+
         static void unlockAsyncTransformIfNeeded(IMFTransform* transform)
         {
             if (transform == nullptr)
@@ -809,6 +826,14 @@ namespace ninjamplus::zap
        #else
         juce::ignoreUnused(source, outFrame);
         return false;
+       #endif
+    }
+
+    void H264Encoder::forceKeyframe()
+    {
+       #if defined(_WIN32)
+        if (impl)
+            impl->forceKeyframe();
        #endif
     }
 

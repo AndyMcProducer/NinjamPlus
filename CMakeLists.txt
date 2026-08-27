@@ -195,6 +195,7 @@ target_sources(NINJAM_VST3 PRIVATE
     Source/StandaloneApp.cpp
     Source/ZapVideoCodec.cpp
     Source/ZapVideoCodec.h
+    Source/AutoTune.h
     
     # NINJAM Core
     ${NINJAM_ROOT}/ninjam/njclient.cpp
@@ -221,7 +222,18 @@ target_sources(NINJAM_VST3 PRIVATE
     third_party/chord-detector/src/Chromagram.cpp
     third_party/chord-detector/src/ChordDetector.cpp
     third_party/chord-detector/libs/kiss_fft130/kiss_fft.c
+
+    # Rubber Band Library (single-file compilation unit for pitch shifting / auto-tune)
+    third_party/rubberband/single/RubberBandSingle.cpp
 )
+
+# Rubber Band needs NOMINMAX on Windows to avoid std::min/max macro conflicts
+if (WIN32)
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rubberband/single/RubberBandSingle.cpp"
+        PROPERTIES COMPILE_DEFINITIONS NOMINMAX
+    )
+endif()
 
 # Include directories
 target_include_directories(NINJAM_VST3 PRIVATE
@@ -238,6 +250,7 @@ target_include_directories(NINJAM_VST3 PRIVATE
     third_party/chord-detector
     ${signalsmith_stretch_SOURCE_DIR}/include
     third_party/signalsmith-linear/include
+    third_party/rubberband
     $<$<BOOL:${WIN32}>:${asiosdk_SOURCE_DIR}/common>
     $<$<BOOL:${WIN32}>:${asiosdk_SOURCE_DIR}/host>
 )

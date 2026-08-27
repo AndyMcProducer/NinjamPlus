@@ -4169,6 +4169,16 @@ static juce::Rectangle<int> abletonEditorWindowSizeForPreset(int presetIndex)
     return { 0, 0, 1240, 600 };
 }
 
+static juce::Rectangle<int> remoteUsersWindowSizeForPreset(int presetIndex)
+{
+    presetIndex = juce::jlimit(0, 2, presetIndex);
+    if (presetIndex == 0)
+        return { 0, 0, 600, 360 };
+    if (presetIndex == 2)
+        return { 0, 0, 1000, 640 };
+    return { 0, 0, 800, 500 };
+}
+
 class ChatWindow : public juce::DocumentWindow
 {
 public:
@@ -6723,6 +6733,66 @@ private:
     double lastQuickSelectorRefreshMs = 0.0;
 };
 
+class RemoteUsersWindow : public juce::DocumentWindow
+{
+public:
+    RemoteUsersWindow(juce::Component& content,
+                      bool abletonHostedWindow,
+                      int abletonSizePreset,
+                      std::function<void()> onClosedCallback)
+        : DocumentWindow("NINJAM Remote Users", juce::Colours::black, DocumentWindow::closeButton),
+          onClosed(std::move(onClosedCallback)),
+          abletonHosted(abletonHostedWindow)
+    {
+        setUsingNativeTitleBar(true);
+        setContentNonOwned(&content, true);
+
+        if (abletonHosted)
+        {
+            const auto initialSize = remoteUsersWindowSizeForPreset(abletonSizePreset);
+            setResizable(false, false);
+            setResizeLimits(initialSize.getWidth(), initialSize.getHeight(),
+                            initialSize.getWidth(), initialSize.getHeight());
+            centreWithSize(initialSize.getWidth(), initialSize.getHeight());
+        }
+        else
+        {
+            setResizable(true, true);
+            setResizeLimits(400, 300, 2400, 1800);
+            centreWithSize(800, 500);
+        }
+        setVisible(true);
+    }
+
+    void applyAbletonSizePreset(int presetIndex)
+    {
+        if (!abletonHosted)
+            return;
+
+        const auto size = remoteUsersWindowSizeForPreset(presetIndex);
+        const auto centre = getBounds().getCentre();
+        setResizeLimits(size.getWidth(), size.getHeight(), size.getWidth(), size.getHeight());
+        setSize(size.getWidth(), size.getHeight());
+        if (centre.x != 0 || centre.y != 0)
+            setCentrePosition(centre.x, centre.y);
+    }
+
+    void closeButtonPressed() override
+    {
+        setVisible(false);
+        auto callback = onClosed;
+        juce::MessageManager::callAsync([callback = std::move(callback)]
+        {
+            if (callback)
+                callback();
+        });
+    }
+
+private:
+    std::function<void()> onClosed;
+    bool abletonHosted = false;
+};
+
 class SamplePadsWindow : public juce::DocumentWindow,
                          private juce::Timer
 {
@@ -7975,7 +8045,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     : AudioProcessorEditor (&p), audioProcessor (p), intervalDisplay(p), userList(p)
 {
     setResizable(true, true);
-    setResizeLimits(900, 500, 2200, 1500);
+    setResizeLimits(1024, 600, 2200, 1500);
     customKnobLookAndFeel.setExplicitEditor(this);
     const bool settingsFileReady = renewSettingsFileIfCorrupt(makeSettingsOptions(), this);
 
@@ -7997,6 +8067,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     serverListButton.onClick = [this] { serverListClicked(); };
 
     userLabel.setJustificationType(juce::Justification::centredRight);
+    userLabel.setFont(juce::Font(13.0f));
     addAndMakeVisible(userLabel);
     userField.setText("user" + juce::String(juce::Random::getSystemRandom().nextInt(100)));
     userField.setIndents(4, 8);
@@ -8034,13 +8105,14 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     updateMonitorButtonColor();
 
     addAndMakeVisible(voiceChatButton);
-    voiceChatButton.setButtonText("On");
+    voiceChatButton.setButtonText("Off");
     voiceChatButton.setTooltip("Enable voice channel");
     voiceChatButton.setClickingTogglesState(true);
     voiceChatButton.setToggleState(false, juce::dontSendNotification);
     voiceChatButton.onClick = [this]
     {
         audioProcessor.setVoiceChatMode(voiceChatButton.getToggleState());
+        voiceChatButton.setButtonText(voiceChatButton.getToggleState() ? "On" : "Off");
         voiceChatGlowPhase = 0.0f;
         updateVoiceChatButtonColor();
     };
@@ -8201,17 +8273,40 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     };
     addAndMakeVisible(userList);
 
+    addAndMakeVisible(usersPopoutButton);
+    usersPopoutButton.setButtonText("Popout");
+    usersPopoutButton.setTooltip("Open remote users in a separate floating window");
+    usersPopoutButton.onClick = [this] { usersPopoutClicked(); };
+
     addAndMakeVisible(addLocalChannelButton);
     addLocalChannelButton.setButtonText("+");
     addLocalChannelButton.setTooltip("Add Channel");
     addAndMakeVisible(removeLocalChannelButton);
     removeLocalChannelButton.setButtonText("-");
     removeLocalChannelButton.setTooltip("Remove Channel");
+    addAndMakeVisible(autoTuneButton);
+    autoTuneButton.setButtonText("AT");
+    autoTuneButton.setTooltip("Auto-Tune (right-click for scale/key/quality)");
+    autoTuneButton.setClickingTogglesState(true);
+    autoTuneButton.setToggleState(audioProcessor.getAutoTuneEnabled(), juce::dontSendNotification);
+    autoTuneButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff2a2e33));
+    autoTuneButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xffe8d030));
+    autoTuneButton.setColour(juce::TextButton::textColourOffId, juce::Colours::lightgrey);
+    autoTuneButton.setColour(juce::TextButton::textColourOnId, juce::Colours::black);
+    autoTuneButton.onClick = [this]
+    {
+        audioProcessor.setAutoTuneEnabled(autoTuneButton.getToggleState());
+    };
+    autoTuneButton.onPopupMenuRequest = [this]
+    {
+        showAutoTuneMenu();
+    };
     addAndMakeVisible(localFaderLabel);
     localFaderLabel.setJustificationType(juce::Justification::centred);
+    localFaderLabel.setFont(juce::Font(11.0f, juce::Font::bold));
     addAndMakeVisible(localChordLabel);
     localChordLabel.setJustificationType(juce::Justification::centred);
-    localChordLabel.setFont(juce::Font(14.0f, juce::Font::bold));
+    localChordLabel.setFont(juce::Font(11.0f, juce::Font::bold));
     localChordLabel.setColour(juce::Label::textColourId, juce::Colours::white);
     localChordLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0xff202428));
     localChordLabel.setColour(juce::Label::outlineColourId, juce::Colour(0xff48515a));
@@ -8816,6 +8911,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         {
             backgroundImage  = juce::Image();
             backgroundComponent.setBackgroundImage({});
+            userList.setBackgroundImage({});
             radioKnobImage   = juce::Image();
             faderKnobImage   = juce::Image();
             metronomeThemeColour = juce::Colour::fromRGB(80, 185, 255);
@@ -8916,8 +9012,8 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     }
     else
     {
-        setSize(getWidth() > 0 ? getWidth() : 1080,
-                getHeight() > 0 ? getHeight() : 600);
+        setSize(getWidth() > 0 ? getWidth() : 1280,
+                getHeight() > 0 ? getHeight() : 720);
     }
 }
 
@@ -8955,6 +9051,7 @@ NinjamVst3AudioProcessorEditor::~NinjamVst3AudioProcessorEditor()
     openedMidiRelayInputDeviceId.clear();
     openedSamplePadsMidiInputDeviceId.clear();
     samplePadsWindow.reset();
+    remoteUsersWindow.reset();
     aboutWindow.reset();
     disconnect();
     atButton.setLookAndFeel(nullptr);
@@ -9078,21 +9175,23 @@ void NinjamVst3AudioProcessorEditor::paintOverChildren(juce::Graphics& g)
 {
     const bool abletonHostEditor = !audioProcessor.isStandaloneWrapper() && isAbletonLiveHost();
 
-    // Helper: draw a small tight radial glow around any toggle button
+    // Helper: draw a glow shaped to the button's rounded rectangle
     auto drawGlow = [&](juce::Button& btn, juce::Colour onColour, juce::Colour offColour)
     {
         if (!btn.isVisible()) return;
         bool isOn = btn.getToggleState();
         auto bc   = btn.getBounds().toFloat();
         auto centre = bc.getCentre();
-        // Glow starts a few px outside the button edge
-        float gap = 5.0f;
-        float r   = bc.getWidth() * 0.55f + gap;   // compact radius
+        // Glow extends a few px outside the button, shaped as a rounded rect
+        float gap = 4.0f;
+        float r   = juce::jmax(bc.getWidth(), bc.getHeight()) * 0.5f + gap;
         juce::Colour col = isOn ? onColour : offColour;
         juce::ColourGradient grad(col, centre.x, centre.y,
                                   juce::Colours::transparentBlack, centre.x + r, centre.y, true);
         g.setGradientFill(grad);
-        g.fillEllipse(centre.x - r, centre.y - r, r * 2.0f, r * 2.0f);
+        // Draw a rounded rectangle matching the button shape, slightly expanded
+        float cornerR = 4.0f;
+        g.fillRoundedRectangle(bc.expanded(gap * 0.5f), cornerR + gap * 0.5f);
     };
 
     if (!(abletonHostEditor && !transmitButton.getToggleState()))
@@ -9216,24 +9315,24 @@ void NinjamVst3AudioProcessorEditor::resized()
     videoBgToggle.setBounds(topRow.removeFromRight(90));
     topRow.removeFromRight(10);
     // Left side: server fields
-    serverLabel.setBounds(topRow.removeFromLeft(75));
-    serverField.setBounds(topRow.removeFromLeft(160));
-    topRow.removeFromLeft(6);
+    serverLabel.setBounds(topRow.removeFromLeft(60));
+    serverField.setBounds(topRow.removeFromLeft(150));
+    topRow.removeFromLeft(4);
     serverListButton.setBounds(topRow.removeFromLeft(72));
-    topRow.removeFromLeft(6);
-    userLabel.setBounds(topRow.removeFromLeft(55));
+    topRow.removeFromLeft(4);
+    userLabel.setBounds(topRow.removeFromLeft(50));
     userField.setBounds(topRow.removeFromLeft(90));
-    topRow.removeFromLeft(6);
-    anonymousButton.setBounds(topRow.removeFromLeft(110));
+    topRow.removeFromLeft(4);
+    anonymousButton.setBounds(topRow.removeFromLeft(100));
     if (!anonymousButton.getToggleState())
     {
-        topRow.removeFromLeft(6);
-        passLabel.setBounds(topRow.removeFromLeft(76));
+        topRow.removeFromLeft(4);
+        passLabel.setBounds(topRow.removeFromLeft(66));
         passField.setBounds(topRow.removeFromLeft(96));
-        topRow.removeFromLeft(6);
+        topRow.removeFromLeft(4);
     }
-    connectButton.setBounds(topRow.removeFromLeft(80));
-    topRow.removeFromLeft(10);
+    connectButton.setBounds(topRow.removeFromLeft(90));
+    topRow.removeFromLeft(8);
     statusLabel.setBounds(topRow);
 
     area.removeFromTop(4);
@@ -9259,11 +9358,11 @@ void NinjamVst3AudioProcessorEditor::resized()
     controlsRow.removeFromLeft(10);
     metronomeLabel.setBounds(controlsRow.removeFromLeft(90));
     metronomeSlider.setBounds(controlsRow.removeFromLeft(80));
-    auto metBtn = controlsRow.removeFromLeft(24);
-    metronomeMuteButton.setBounds(metBtn.reduced(0, 3));
+    auto metBtn = controlsRow.removeFromLeft(30);
+    metronomeMuteButton.setBounds(metBtn.reduced(0, 2));
     controlsRow.removeFromLeft(6);
-    auto syncBtn = controlsRow.removeFromLeft(24);
-    syncButton.setBounds(syncBtn.reduced(0, 3));
+    auto syncBtn = controlsRow.removeFromLeft(40);
+    syncButton.setBounds(syncBtn.reduced(0, 2));
     controlsRow.removeFromLeft(10);
     fxButton.setBounds(controlsRow.removeFromLeft(70));
     controlsRow.removeFromLeft(8);
@@ -9300,62 +9399,85 @@ void NinjamVst3AudioProcessorEditor::resized()
     const bool showSeparateVoiceChannel = serverMaxLocalChannels > 2 && audioProcessor.canUseDedicatedVoiceChatChannel();
     addLocalChannelButton.setEnabled(maxVisibleLocalChannels > 1 && audioProcessor.getNumLocalChannels() < maxVisibleLocalChannels);
     removeLocalChannelButton.setEnabled(audioProcessor.getNumLocalChannels() > 1);
-    int baseLocalWidth = showSeparateVoiceChannel ? 110 : 154;
-    int extraPerTrack = 40;
+    // When popped out, make local channel columns the same width as remote strips (80px).
+    // Otherwise use the normal narrower layout.
+    const int localColWidth = usersPoppedOut ? 80 : 40;
+    int baseLocalWidth = showSeparateVoiceChannel ? 120 : (usersPoppedOut ? 80 : 140);
+    int extraPerTrack = localColWidth;
     int voiceColumnWidth = showSeparateVoiceChannel ? 62 : 0;
     int localWidth = baseLocalWidth + voiceColumnWidth + (numLocal - 1) * extraPerTrack;
-    int maxLocalWidth = area.getWidth() / 2;
+
+    // Take the users header from the FULL width before splitting into local/master/user.
+    // This keeps Transmit, Monitor, bitrate, MIDI/OSC, Spread Outputs, and Popout controls
+    // at fixed positions regardless of how many local channels are added.
+    auto usersHeader = area.removeFromTop(26);
+    usersHeader.removeFromLeft(8);
+    // Left to right: Transmit, Monitor, Bitrate (quality), MIDI/OSC, Spread Outputs, Popout
+    transmitButton.setBounds(usersHeader.removeFromLeft(70).withTrimmedTop(2));
+    usersHeader.removeFromLeft(4);
+    localMonitorButton.setBounds(usersHeader.removeFromLeft(80).withTrimmedTop(2));
+    usersHeader.removeFromLeft(10);
+    bitrateSelector.setBounds(usersHeader.removeFromLeft(120).withTrimmedTop(1));
+    usersHeader.removeFromLeft(6);
+    midiRelayTargetSelector.setBounds(usersHeader.removeFromLeft(130).withTrimmedTop(1));
+    usersHeader.removeFromLeft(10);
+    spreadOutputsButton.setBounds(usersHeader.removeFromLeft(118).withTrimmedTop(2));
+    usersHeader.removeFromLeft(6);
+    usersPopoutButton.setBounds(usersHeader.removeFromLeft(60).withTrimmedTop(2));
+    // Hide the Connected Users label — no longer used
+    usersLabel.setBounds(juce::Rectangle<int>());
+
+    // Now split the remaining area into local / user / master
+    int masterWidth = 190;
+    int maxLocalWidth;
+    if (usersPoppedOut)
+        maxLocalWidth = area.getWidth() - masterWidth;
+    else
+        maxLocalWidth = area.getWidth() - masterWidth - 200; // leave some room for user area
+    if (maxLocalWidth < 200) maxLocalWidth = 200;
     if (localWidth > maxLocalWidth)
         localWidth = maxLocalWidth;
-
-    int masterWidth = 190;
 
     auto localArea = area.removeFromLeft(localWidth);
     auto masterArea = area.removeFromRight(masterWidth);
     auto masterPulseBounds = masterArea;
     auto userArea = area;
 
-    auto usersHeader = userArea.removeFromTop(22);
-    // Keep a clear visual gap from the local/transmit area while anchoring
-    // Spread Outputs to the right above the remote-user pane.
-    usersHeader.removeFromLeft(12);
-    auto spreadArea = usersHeader.removeFromRight(118);
-    spreadOutputsButton.setBounds(spreadArea.withTrimmedTop(1));
-    usersHeader.removeFromRight(14);
-    usersLabel.setBounds(usersHeader.removeFromLeft(170));
-    userList.setBounds(userArea);
+    if (!usersPoppedOut)
+        userList.setBounds(userArea);
+    else
+        userList.setBounds(juce::Rectangle<int>()); // hide while popped out
 
-    // Transmit above local channels, monitor below it
-    transmitButton.setBounds(localArea.removeFromTop(26));
-    localArea.removeFromTop(3);
-    localMonitorButton.setBounds(localArea.removeFromTop(26));
-    localArea.removeFromTop(3);
-    {
-        auto row = localArea.removeFromTop(26);
-        auto half = row.getWidth() / 2;
-        bitrateSelector.setBounds(row.removeFromLeft(half));
-        midiRelayTargetSelector.setBounds(row);
-    }
-    localArea.removeFromTop(3);
-
-    localChordLabel.setBounds(localArea.removeFromTop(24));
-    localArea.removeFromTop(3);
-
-    auto localHeader = localArea.removeFromTop(20);
+    // Combined header row: "You" label on the left, "Chord:" after it,
+    // then +/- buttons and voice toggle at fixed positions so they don't move
+    // when local channels are added. The local area grows to fit channels,
+    // but these controls stay anchored.
+    auto localHeader = localArea.removeFromTop(22);
+    // "Local" and "Chord" labels anchored to the left
+    localFaderLabel.setVisible(true);
+    localChordLabel.setVisible(true);
+    localFaderLabel.setBounds(localHeader.removeFromLeft(32));
+    localHeader.removeFromLeft(2);
+    localChordLabel.setBounds(localHeader.removeFromLeft(64));
+    // Voice toggle on the far right (when no separate voice channel)
     juce::Rectangle<int> voiceToggleArea;
     if (!showSeparateVoiceChannel)
         voiceToggleArea = localHeader.removeFromRight(44);
-    auto addButtonArea = localHeader.removeFromRight(20);
-    auto removeButtonArea = localHeader.removeFromRight(20);
+    // -/+ buttons anchored to the RIGHT edge, just left of voice toggle
+    auto addButtonArea = localHeader.removeFromRight(24);
+    auto removeButtonArea = localHeader.removeFromRight(24);
+    // Auto-tune button to the left of -/+ buttons
+    localHeader.removeFromRight(2);
+    auto autoTuneArea = localHeader.removeFromRight(28);
     removeLocalChannelButton.setBounds(removeButtonArea);
     addLocalChannelButton.setBounds(addButtonArea);
+    autoTuneButton.setBounds(autoTuneArea);
     if (!showSeparateVoiceChannel)
         voiceChatButton.setBounds(voiceToggleArea.reduced(1, 0));
-    localFaderLabel.setVisible(true);
-    const bool showChordStats = localHeader.getWidth() >= 160;
+    // Chord stats fills any remaining space between chord label and -/+ buttons
+    const bool showChordStats = localHeader.getWidth() >= 90;
     localChordStatsLabel.setVisible(showChordStats);
-    localChordStatsLabel.setBounds(showChordStats ? localHeader.removeFromRight(84) : juce::Rectangle<int>());
-    localFaderLabel.setBounds(localHeader);
+    localChordStatsLabel.setBounds(showChordStats ? localHeader : juce::Rectangle<int>());
     auto localInner = localArea.reduced(4);
 
     int meterWidth = 18;
@@ -9420,11 +9542,12 @@ void NinjamVst3AudioProcessorEditor::resized()
         auto dbArea = col.removeFromBottom(16);
         auto inputArea = col.removeFromBottom(20);
         auto inputModeArea = col.removeFromBottom(20);
-        auto sendArea = col.removeFromBottom(44);
+        auto sendArea = col.removeFromBottom(34);
+        sendArea = sendArea.reduced(6, 0); // inset sides so knobs are closer together
         auto revArea = sendArea.removeFromLeft(sendArea.getWidth() / 2);
         auto dlyArea = sendArea;
-        auto revLabelArea = revArea.removeFromTop(9);
-        auto dlyLabelArea = dlyArea.removeFromTop(9);
+        auto revLabelArea = revArea.removeFromTop(7);
+        auto dlyLabelArea = dlyArea.removeFromTop(7);
         localFaders[(size_t)i].setBounds(col);
         localPeakMeters[(size_t)i].setBounds(meterArea);
         localInputSelectors[(size_t)i].setBounds(inputArea);
@@ -9438,13 +9561,13 @@ void NinjamVst3AudioProcessorEditor::resized()
         auto revKnobArea = revArea.expanded(1);
         auto dlyKnobArea = dlyArea.expanded(1);
 
-        int revKnobSize = juce::jmin(revKnobArea.getWidth(), revKnobArea.getHeight());
-        int dlyKnobSize = juce::jmin(dlyKnobArea.getWidth(), dlyKnobArea.getHeight());
+        int revKnobSize = juce::jmin(24, juce::jmin(revKnobArea.getWidth(), revKnobArea.getHeight()));
+        int dlyKnobSize = juce::jmin(24, juce::jmin(dlyKnobArea.getWidth(), dlyKnobArea.getHeight()));
 
         juce::Rectangle<int> revKnobRect(0, 0, revKnobSize, revKnobSize);
         juce::Rectangle<int> dlyKnobRect(0, 0, dlyKnobSize, dlyKnobSize);
-        revKnobRect = revKnobRect.withCentre(revKnobArea.getCentre());
-        dlyKnobRect = dlyKnobRect.withCentre(dlyKnobArea.getCentre());
+        revKnobRect = revKnobRect.withCentre(revKnobArea.getCentre().translated(0, -2));
+        dlyKnobRect = dlyKnobRect.withCentre(dlyKnobArea.getCentre().translated(0, -2));
 
         localReverbSendKnobs[(size_t)i].setBounds(revKnobRect);
         localDelaySendKnobs[(size_t)i].setBounds(dlyKnobRect);
@@ -10050,6 +10173,7 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
             backgroundImage = std::move(frame);
             lastVideoBackgroundRepaintMs = nowMs;
             backgroundComponent.setBackgroundImage(backgroundImage);
+            userList.setBackgroundImage(backgroundImage);
         }
     }
 #endif
@@ -10711,6 +10835,7 @@ juce::String NinjamVst3AudioProcessorEditor::buildPersistentSettingsFingerprint(
     parts.add(juce::String(abletonWindowSizePreset));
     parts.add(juce::String(abletonChatWindowSizePreset));
     parts.add(juce::String(abletonSamplerWindowSizePreset));
+    parts.add(juce::String(abletonRemoteUsersWindowSizePreset));
     parts.add(samplePadsWindowBoundsValid ? samplePadsWindowBounds.toString() : juce::String());
     parts.add(audioProcessor.getLocalChatColourKey());
     parts.add(chatWindowColourKey);
@@ -10759,6 +10884,7 @@ void NinjamVst3AudioProcessorEditor::savePersistentSettingsToDisk(bool includePr
     props.setValue("abletonWindowSizePreset", abletonWindowSizePreset);
     props.setValue("abletonChatWindowSizePreset", abletonChatWindowSizePreset);
     props.setValue("abletonSamplerWindowSizePreset", abletonSamplerWindowSizePreset);
+    props.setValue("abletonRemoteUsersWindowSizePreset", abletonRemoteUsersWindowSizePreset);
     props.setValue("samplePadsWindowBoundsValid", samplePadsWindowBoundsValid);
     if (samplePadsWindowBoundsValid)
     {
@@ -10855,6 +10981,7 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
     abletonWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonWindowSizePreset", abletonWindowSizePreset));
     abletonChatWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonChatWindowSizePreset", abletonChatWindowSizePreset));
     abletonSamplerWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonSamplerWindowSizePreset", abletonSamplerWindowSizePreset));
+    abletonRemoteUsersWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonRemoteUsersWindowSizePreset", abletonRemoteUsersWindowSizePreset));
     samplePadsWindowBoundsValid = props.getBoolValue("samplePadsWindowBoundsValid", false);
     if (samplePadsWindowBoundsValid)
     {
@@ -11200,6 +11327,65 @@ void NinjamVst3AudioProcessorEditor::chatPopoutClicked()
     resized();
 }
 
+void NinjamVst3AudioProcessorEditor::usersPopoutClicked()
+{
+    if (usersPoppedOut)
+    {
+        // Already popped out — close the popout and dock back into the editor
+        if (remoteUsersWindow)
+            remoteUsersWindow.reset();
+        usersPoppedOut = false;
+        usersPopoutButton.setButtonText("Popout");
+        userList.setAbletonHostedMode(false, 1, {});
+        userList.setPoppedOut(false);
+        addAndMakeVisible(userList);
+        resized();
+        return;
+    }
+
+    usersPoppedOut = true;
+    usersPopoutButton.setButtonText("Pop-in");
+
+    const bool abletonHostedWindow = !audioProcessor.isStandaloneWrapper() && isAbletonLiveHost();
+
+    // Configure the user list for Ableton hosted mode (shows +/- size buttons)
+    juce::Component::SafePointer<NinjamVst3AudioProcessorEditor> safeThis(this);
+    userList.setAbletonHostedMode(abletonHostedWindow,
+                                  abletonRemoteUsersWindowSizePreset,
+                                  [safeThis](int preset)
+                                  {
+                                      if (safeThis != nullptr)
+                                          safeThis->setAbletonRemoteUsersWindowSizePreset(preset);
+                                  });
+
+    // Apply the same background texture as the main editor
+    userList.setBackgroundImage(backgroundImage);
+    userList.setPoppedOut(true);
+
+    remoteUsersWindow.reset(new RemoteUsersWindow(
+        userList,
+        abletonHostedWindow,
+        abletonRemoteUsersWindowSizePreset,
+        [safeThis]()
+        {
+            if (safeThis == nullptr)
+                return;
+
+            // Window closed — move userList back into the editor
+            safeThis->remoteUsersWindow.reset();
+            safeThis->usersPoppedOut = false;
+            safeThis->usersPopoutButton.setButtonText("Popout");
+            // Restore non-Ableton inline mode
+            safeThis->userList.setAbletonHostedMode(false, 1, {});
+            safeThis->userList.setPoppedOut(false);
+            safeThis->addAndMakeVisible(safeThis->userList);
+            safeThis->resized();
+        }));
+
+    // userList is now displayed inside the popout window; trigger layout
+    resized();
+}
+
 void NinjamVst3AudioProcessorEditor::updateSamplePadsFeatureVisibility()
 {
     const bool enabled = audioProcessor.isSamplePadsFeatureEnabled();
@@ -11534,6 +11720,62 @@ void NinjamVst3AudioProcessorEditor::videoClicked()
                        });
 }
 
+void NinjamVst3AudioProcessorEditor::showAutoTuneMenu()
+{
+    juce::PopupMenu menu;
+
+    // Speed slider as a custom component
+    menu.addCustomItem(1, std::make_unique<AutoTuneSpeedMenuItem>(audioProcessor), nullptr, "Correction Speed");
+
+    menu.addSeparator();
+
+    // Scale submenu
+    juce::PopupMenu scaleMenu;
+    const int currentScale = audioProcessor.getAutoTuneScale();
+    const char* scaleNames[] = {
+        "Chromatic", "Major", "Minor", "Dorian",
+        "Mixolydian", "Pentatonic Major", "Pentatonic Minor"
+    };
+    for (int i = 0; i < 7; ++i)
+    {
+        scaleMenu.addItem(juce::String(scaleNames[i]), true, (i == currentScale), [this, i]
+        {
+            audioProcessor.setAutoTuneScale(i);
+        });
+    }
+    menu.addSubMenu("Scale", scaleMenu);
+
+    // Key submenu
+    juce::PopupMenu keyMenu;
+    const int currentKey = audioProcessor.getAutoTuneKey();
+    const char* keyNames[] = { "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B" };
+    for (int i = 0; i < 12; ++i)
+    {
+        keyMenu.addItem(juce::String(keyNames[i]), true, (i == currentKey), [this, i]
+        {
+            audioProcessor.setAutoTuneKey(i);
+        });
+    }
+    menu.addSubMenu("Key", keyMenu);
+
+    menu.addSeparator();
+
+    // Quality options
+    const int currentQuality = audioProcessor.getAutoTuneQuality();
+    menu.addItem("Low Quality (Fast)", true, (currentQuality == 0), [this]
+    {
+        audioProcessor.setAutoTuneQuality(0);
+    });
+    menu.addItem("High Quality (YIN)", true, (currentQuality == 1), [this]
+    {
+        audioProcessor.setAutoTuneQuality(1);
+    });
+
+    menu.showMenuAsync(juce::PopupMenu::Options()
+                           .withTargetComponent(&autoTuneButton)
+                           .withMinimumWidth(220));
+}
+
 void NinjamVst3AudioProcessorEditor::serverListClicked()
 {
     if (serverListWindow == nullptr)
@@ -11817,6 +12059,7 @@ void NinjamVst3AudioProcessorEditor::loadControlImages(const juce::File& themeDi
 {
     backgroundImage = juce::Image();
     backgroundComponent.setBackgroundImage({});
+    userList.setBackgroundImage({});
     lastVideoBackgroundRepaintMs = 0.0;
 
     // Try bg.mp4 when the Video BG toggle is on (Windows only)
@@ -11847,6 +12090,7 @@ void NinjamVst3AudioProcessorEditor::loadControlImages(const juce::File& themeDi
         {
             backgroundImage = juce::ImageFileFormat::loadFrom(bgFiles[0]);
             backgroundComponent.setBackgroundImage(backgroundImage);
+            userList.setBackgroundImage(backgroundImage);
         }
     }
 
@@ -12129,6 +12373,22 @@ void NinjamVst3AudioProcessorEditor::setAbletonSamplerWindowSizePreset(int prese
     props.saveIfNeeded();
 }
 
+void NinjamVst3AudioProcessorEditor::setAbletonRemoteUsersWindowSizePreset(int presetIndex)
+{
+    if (audioProcessor.isStandaloneWrapper() || !isAbletonLiveHost())
+        return;
+
+    abletonRemoteUsersWindowSizePreset = juce::jlimit(0, 2, presetIndex);
+
+    if (auto* usersWindow = dynamic_cast<RemoteUsersWindow*>(remoteUsersWindow.get()))
+        usersWindow->applyAbletonSizePreset(abletonRemoteUsersWindowSizePreset);
+
+    auto popts = makeSettingsOptions();
+    juce::PropertiesFile props(popts);
+    props.setValue("abletonRemoteUsersWindowSizePreset", abletonRemoteUsersWindowSizePreset);
+    props.saveIfNeeded();
+}
+
 void NinjamVst3AudioProcessorEditor::rememberSamplePadsWindowBounds(juce::Rectangle<int> bounds, bool saveNow)
 {
     if (bounds.getWidth() < 100 || bounds.getHeight() < 100)
@@ -12170,7 +12430,7 @@ void NinjamVst3AudioProcessorEditor::updateHostResizeModeForConnectionStatus(int
     else
     {
         setResizable(true, true);
-        setResizeLimits(900, 500, 2200, 1500);
+        setResizeLimits(1024, 600, 2200, 1500);
     }
 
     hostResizeLockedForConnection = shouldLock;
@@ -12293,6 +12553,7 @@ void NinjamVst3AudioProcessorEditor::updateVoiceChatButtonColor()
 {
     if (voiceChatButton.getToggleState())
     {
+        voiceChatButton.setButtonText("On");
         // Pulse between dim amber and bright amber (~1 s cycle)
         voiceChatGlowPhase += juce::MathConstants<float>::twoPi * 30.0f / 1000.0f;
         float t = (std::sin(voiceChatGlowPhase) + 1.0f) * 0.5f; // 0..1
@@ -12306,6 +12567,7 @@ void NinjamVst3AudioProcessorEditor::updateVoiceChatButtonColor()
     }
     else
     {
+        voiceChatButton.setButtonText("Off");
         voiceChatGlowPhase = 0.0f;
         juce::Colour off = juce::Colour::fromRGB(50, 30, 0);
         voiceChatButton.setColour(juce::TextButton::buttonColourId,   off);
@@ -12494,6 +12756,12 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
         chatSizeMenu.addItem(55, "Medium", true, abletonChatWindowSizePreset == 1);
         chatSizeMenu.addItem(56, "Large", true, abletonChatWindowSizePreset == 2);
         menu.addSubMenu("Chat Popout Size", chatSizeMenu);
+
+        juce::PopupMenu remoteUsersSizeMenu;
+        remoteUsersSizeMenu.addItem(57, "Small", true, abletonRemoteUsersWindowSizePreset == 0);
+        remoteUsersSizeMenu.addItem(58, "Medium", true, abletonRemoteUsersWindowSizePreset == 1);
+        remoteUsersSizeMenu.addItem(59, "Large", true, abletonRemoteUsersWindowSizePreset == 2);
+        menu.addSubMenu("Remote Users Popout Size", remoteUsersSizeMenu);
     }
 
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&optionsButton),
@@ -12630,6 +12898,9 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
             if (result == 54) setAbletonChatWindowSizePreset(0);
             if (result == 55) setAbletonChatWindowSizePreset(1);
             if (result == 56) setAbletonChatWindowSizePreset(2);
+            if (result == 57) setAbletonRemoteUsersWindowSizePreset(0);
+            if (result == 58) setAbletonRemoteUsersWindowSizePreset(1);
+            if (result == 59) setAbletonRemoteUsersWindowSizePreset(2);
         });
 }
 
@@ -13409,6 +13680,9 @@ void UserChannelStrip::updateInfo(const NinjamVst3AudioProcessor::UserInfo& info
         currentPeakR = 0.0f;
         clipStartMs = 0.0;
         clipPulsing = false;
+        clipProtectionActive = false;
+        clipProtectionDesiredVolume = 1.0f;
+        clipProtectionEnteredMs = 0.0;
         chordToggleArmed = false;
         isExpanded = false;
         expandButton.setButtonText(isHorizontalLayout ? ">" : "v");
@@ -13429,7 +13703,10 @@ void UserChannelStrip::updateInfo(const NinjamVst3AudioProcessor::UserInfo& info
 
     if (!volumeSlider.isMouseOverOrDragging())
     {
-        const double targetVolume = juce::jmin(info.volume, 2.0f);
+        // While clip protection is active, keep the slider at the -10 dB safety value.
+        const double targetVolume = clipProtectionActive
+            ? 0.316f
+            : juce::jmin(info.volume, 2.0f);
         if (std::abs(volumeSlider.getValue() - targetVolume) > 0.001)
             volumeSlider.setValue(targetVolume, juce::dontSendNotification);
     }
@@ -13579,13 +13856,51 @@ void UserChannelStrip::timerCallback()
     }
 
     const double nowMs = juce::Time::getMillisecondCounterHiRes();
+
+    // ---- +6 dB clip protection ----
+    // When the pre-volume source peak hits +6 dB (~2.0 linear), auto-reduce the
+    // user's volume to -10 dB (~0.316 linear) and flash red.  When the source
+    // peak drops back below 0 dB (1.0 linear), restore the user's original volume.
+    constexpr float kClipProtectionTriggerDb = 6.0f;   // +6 dB
+    constexpr float kClipProtectionTriggerLin = 1.995f; // 10^(6/20)
+    constexpr float kClipProtectionReduceLin  = 0.316f; // 10^(-10/20) ≈ -10 dB
+    constexpr float kClipProtectionReleaseDb  = 0.0f;
+    constexpr float kClipProtectionReleaseLin = 1.0f;   // 0 dB
+    constexpr double kClipProtectionMinHoldMs = 300.0;  // avoid rapid on/off oscillation
+
+    auto sourcePeakL = processor.getUserSourcePeak(userIndex, 0);
+    auto sourcePeakR = processor.getUserSourcePeak(userIndex, 1);
+    const float sourcePeak = juce::jmax(sourcePeakL, sourcePeakR);
+
+    if (!clipProtectionActive && sourcePeak >= kClipProtectionTriggerLin)
+    {
+        clipProtectionDesiredVolume = (float)volumeSlider.getValue();
+        clipProtectionActive = true;
+        clipProtectionEnteredMs = nowMs;
+        const float clampedVol = kClipProtectionReduceLin;
+        volumeSlider.setValue(clampedVol, juce::dontSendNotification);
+        processor.setUserVolume(userIndex, clampedVol);
+        needRepaint = true;
+    }
+    else if (clipProtectionActive
+             && sourcePeak < kClipProtectionReleaseLin
+             && (nowMs - clipProtectionEnteredMs) >= kClipProtectionMinHoldMs)
+    {
+        const float restoreVol = clipProtectionDesiredVolume;
+        clipProtectionActive = false;
+        volumeSlider.setValue(restoreVol, juce::dontSendNotification);
+        processor.setUserVolume(userIndex, restoreVol);
+        needRepaint = true;
+    }
+
     const bool clipping = displayedPeak >= 1.0f;
     const bool wasPulsing = clipPulsing;
-    if (clipping)
+    if (clipping || clipProtectionActive)
     {
         if (clipStartMs <= 0.0)
             clipStartMs = nowMs;
-        clipPulsing = (nowMs - clipStartMs) >= 500.0;
+        // Flash immediately when protection is active; otherwise use the 500 ms hold
+        clipPulsing = clipProtectionActive || (nowMs - clipStartMs) >= 500.0;
     }
     else
     {
@@ -13727,6 +14042,16 @@ void UserChannelStrip::applyVolumesToProcessor()
     float pan  = (float)panSlider.getValue();
     bool mute  = muteButton.getToggleState();
     bool solo  = soloButton.getToggleState();
+
+    // While clip protection is active, remember the user's desired volume but
+    // force the actual level to the -10 dB safety value.
+    if (clipProtectionActive)
+    {
+        clipProtectionDesiredVolume = mv;
+        constexpr float kClipProtectionReduceLin = 0.316f; // -10 dB
+        mv = kClipProtectionReduceLin;
+    }
+
     processor.setUserLevel(userIndex, mv, pan, mute, solo);
     // Re-apply per-channel gain overrides for multichan peers
     const int remoteChannelCount = juce::jlimit(0, kMaxRemoteCh, numRemoteChannels);
@@ -13749,6 +14074,22 @@ UserListComponent::UserListComponent(NinjamVst3AudioProcessor& p)
     viewport.setViewedComponent(&contentComponent, false);
     viewport.setScrollBarsShown(true, true);
     contentComponent.setOpaque(false);
+
+    for (int i = 0; i < 2; ++i)
+    {
+        auto& button = sizeButtons[(size_t)i];
+        button.setButtonText(i == 0 ? "-" : "+");
+        button.setTooltip(i == 0 ? "Smaller remote users window" : "Larger remote users window");
+        button.setVisible(false);
+        button.onClick = [this, i]
+        {
+            currentSizePreset = juce::jlimit(0, 2, currentSizePreset + (i == 0 ? -1 : 1));
+            updateSizeButtons();
+            if (onSizePresetChanged)
+                onSizePresetChanged(currentSizePreset);
+        };
+        addAndMakeVisible(button);
+    }
 }
 
 UserListComponent::~UserListComponent()
@@ -13758,15 +14099,53 @@ UserListComponent::~UserListComponent()
 
 void UserListComponent::paint(juce::Graphics& g)
 {
+    if (backgroundImage.isValid())
+        g.drawImageWithin(backgroundImage, 0, 0, getWidth(), getHeight(), juce::RectanglePlacement::fillDestination);
+    else
+        g.fillAll(juce::Colours::black.withAlpha(0.30f));
+
+    // Transparent black tint over the mixer area (both main window and popout)
     g.fillAll(juce::Colours::black.withAlpha(0.30f));
 }
 
 void UserListComponent::resized()
 {
-    viewport.setBounds(getLocalBounds());
+    auto bounds = getLocalBounds();
 
-    int stripWidth  = isHorizontal ? 80 : viewport.getWidth() - 15;
-    int defHeight   = isHorizontal ? viewport.getHeight() - 20 : 40;
+    // In Ableton popout mode, reserve a small toolbar at the top for +/- size buttons
+    if (abletonHosted)
+    {
+        auto header = bounds.removeFromTop(24);
+        header.removeFromLeft(8);
+        for (int i = 1; i >= 0; --i)
+            sizeButtons[(size_t)i].setBounds(header.removeFromRight(28).reduced(2, 1));
+    }
+
+    viewport.setBounds(bounds);
+
+    // When popped out and the local user has multiple channels enabled, allow
+    // strips to use more of the available width so multichannel peers can spread out.
+    const int numLocalCh = processor.getNumLocalChannels();
+    const bool allowWideStrips = poppedOut && numLocalCh > 1;
+
+    int baseStripWidth = 80;
+    if (allowWideStrips && isHorizontal)
+    {
+        // Scale strip width based on available space and number of local channels.
+        // More local channels → wider strips so expanded multichan peers have room.
+        const int minStripW = 80;
+        const int maxStripW = 120 + (numLocalCh - 2) * 20;
+        const int availW = viewport.getWidth() - 20;
+        const int numStrips = juce::jmax(1, (int) strips.size());
+        baseStripWidth = juce::jlimit(minStripW, maxStripW, availW / numStrips);
+    }
+
+    int stripWidth  = isHorizontal ? baseStripWidth : viewport.getWidth() - 15;
+    // In list layout, use taller strips when popped out with multichannel to use more height
+    int listStripHeight = 40;
+    if (poppedOut && numLocalCh > 1 && !isHorizontal)
+        listStripHeight = 56;
+    int defHeight   = isHorizontal ? viewport.getHeight() - 20 : listStripHeight;
     if (stripWidth < 10) stripWidth = 10;
     if (defHeight  < 10) defHeight  = 10;
 
@@ -13774,7 +14153,10 @@ void UserListComponent::resized()
     for (auto& strip : strips)
     {
         int sw = isHorizontal ? strip->getPreferredWidth() : stripWidth;
-        int sh = isHorizontal ? defHeight : strip->getPreferredHeight();
+        // When popped out with multichan, use the wider base width for non-expanded strips
+        if (allowWideStrips && isHorizontal && sw <= 80)
+            sw = baseStripWidth;
+        int sh = isHorizontal ? defHeight : (strip->getPreferredHeight() > 40 ? strip->getPreferredHeight() : listStripHeight);
         strip->setBounds(x, y, sw, sh);
         if (isHorizontal) x += sw;
         else              y += sh;
@@ -13834,4 +14216,44 @@ std::vector<UserChannelStrip*> UserListComponent::getStripPointers() const
     for (const auto& strip : strips)
         pointers.push_back(strip.get());
     return pointers;
+}
+
+void UserListComponent::setAbletonHostedMode(bool hosted, int currentPreset, std::function<void(int)> onPresetChanged)
+{
+    abletonHosted = hosted;
+    currentSizePreset = juce::jlimit(0, 2, currentPreset);
+    onSizePresetChanged = std::move(onPresetChanged);
+
+    for (int i = 0; i < 2; ++i)
+        sizeButtons[(size_t)i].setVisible(hosted);
+
+    updateSizeButtons();
+    resized();
+    repaint();
+}
+
+void UserListComponent::updateSizeButtons()
+{
+    for (int i = 0; i < 2; ++i)
+    {
+        auto& button = sizeButtons[(size_t)i];
+        const bool canStep = i == 0 ? currentSizePreset > 0 : currentSizePreset < 2;
+        const auto colour = canStep ? juce::Colour(0xff49d5ff) : juce::Colour(0xff2f3337);
+        button.setEnabled(canStep);
+        button.setColour(juce::TextButton::buttonColourId, colour);
+        button.setColour(juce::TextButton::buttonOnColourId, colour);
+        button.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
+    }
+}
+
+void UserListComponent::setBackgroundImage(juce::Image img)
+{
+    backgroundImage = std::move(img);
+    repaint();
+}
+
+void UserListComponent::setPoppedOut(bool popped)
+{
+    poppedOut = popped;
+    resized();
 }

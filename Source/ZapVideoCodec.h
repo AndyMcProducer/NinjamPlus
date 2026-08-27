@@ -81,6 +81,7 @@ namespace ninjamplus::zap
         bool isOpen() const;
         juce::String getBackendName() const;
         bool encodeFrame(const juce::Image& source, EncodedH264Frame& outFrame);
+        void forceKeyframe();
 
         static bool isAvailable();
         static bool isHardwareAvailable();
