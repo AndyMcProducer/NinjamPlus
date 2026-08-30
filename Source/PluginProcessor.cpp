@@ -5,23 +5,20 @@
 #include "ChordDetector.h"
 #include "SolititoChordModel.h"
 #include "EmbeddedVdoHtml.h"
-#include "signalsmith-stretch/signalsmith-stretch.h"
 #include <juce_video/juce_video.h>
 
-#ifndef NINJAMPLUS_HAS_AUBIO
- #define NINJAMPLUS_HAS_AUBIO 0
+#ifndef NINJAMPLUS_HAS_LIBROSA
+ #define NINJAMPLUS_HAS_LIBROSA 0
 #endif
 
 #ifndef NINJAMPLUS_HAS_ONNX_CHORDS
  #define NINJAMPLUS_HAS_ONNX_CHORDS 0
 #endif
 
-#if NINJAMPLUS_HAS_AUBIO
- #if __has_include(<aubio/aubio.h>)
-  #include <aubio/aubio.h>
- #else
-  #include <aubio.h>
- #endif
+#if NINJAMPLUS_HAS_LIBROSA
+ #include <librosa/beat.hpp>
+ #include <librosa/onset.hpp>
+ #include <librosa/effects.hpp>
 #endif
 
 #ifdef interface
@@ -34,11 +31,15 @@
 #include <ableton/util/FloatIntConversion.hpp>
 #include <array>
 #include <atomic>
+#include <thread>
+#include <memory>
 #include <cmath>
 #include <cstring>
+#include <rubberband/RubberBandStretcher.h>
 #include <deque>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <vector>
@@ -48,11 +49,27 @@ static juce::File getThisModuleFile();
 static void writeDiagnosticLogLine(const char* fileName, const juce::String& msg)
 {
     static juce::CriticalSection logLock;
+    const juce::String line = juce::Time::getCurrentTime().toString(true, true, true, true)
+        + "  " + msg + "\n";
+
+    // If we're on the audio thread (not the message thread), defer the file I/O
+    // to avoid blocking audio with synchronous disk writes.
+    auto* mm = juce::MessageManager::getInstanceWithoutCreating();
+    if (mm != nullptr && !mm->isThisTheMessageThread())
+    {
+        juce::MessageManager::callAsync([fileName, line]()
+        {
+            const juce::ScopedLock lock(logLock);
+            juce::File f = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                               .getChildFile(fileName);
+            f.appendText(line, false, false);
+        });
+        return;
+    }
+
     const juce::ScopedLock lock(logLock);
     juce::File f = juce::File::getSpecialLocation(juce::File::tempDirectory)
                        .getChildFile(fileName);
-    const juce::String line = juce::Time::getCurrentTime().toString(true, true, true, true)
-        + "  " + msg + "\n";
     f.appendText(line, false, false);
 }
 
@@ -5152,9 +5169,12 @@ namespace
         }
     }
 
-    static float getSamplePadDuckGainForBeat(double beat,
-                                             NinjamVst3AudioProcessor::SamplePadDuckShape shape,
-                                             NinjamVst3AudioProcessor::SamplePadDuckLength length)
+    // Compute a target duck gain envelope value for a given beat phase.
+    // This returns the *target* gain (0=ducked, 1=full volume) at this phase position.
+    // The actual gain is smoothed per-sample in the render loop to avoid artifacts.
+    static float getSamplePadDuckTargetForBeat(double beat,
+                                               NinjamVst3AudioProcessor::SamplePadDuckShape shape,
+                                               NinjamVst3AudioProcessor::SamplePadDuckLength length)
     {
         const double cycleBeats = getSamplePadDuckLengthBeats(length);
         double phase = beat / cycleBeats;
@@ -5162,13 +5182,14 @@ namespace
         if (phase < 0.0)
             phase += 1.0;
 
-        constexpr float duckAmount = 0.82f;
+        constexpr float duckAmount = 0.88f;
         double shaped = 1.0;
 
         using DuckShape = NinjamVst3AudioProcessor::SamplePadDuckShape;
         switch (shape)
         {
             case DuckShape::tightPump:
+                // Quick dip then recover: dip at start, back to full by 30% of cycle
                 shaped = phase < 0.30 ? smoothDuckStep(phase / 0.30) : 1.0;
                 break;
 
@@ -5177,10 +5198,12 @@ namespace
                 break;
 
             case DuckShape::hardGate:
+                // Hard cut then fast recovery
                 shaped = phase < 0.38 ? 0.03 : phase < 0.47 ? smoothDuckStep((phase - 0.38) / 0.09) : 1.0;
                 break;
 
             case DuckShape::reverseSwell:
+                // Start full, swell down then back
                 shaped = phase < 0.16 ? 1.0 : 1.0 - smoothDuckStep((phase - 0.16) / 0.84);
                 break;
 
@@ -5194,6 +5217,7 @@ namespace
 
             case DuckShape::smoothPump:
             default:
+                // Classic sidechain pump: dip at beat start, smooth recovery
                 shaped = phase < 0.62 ? smoothDuckStep(phase / 0.62) : 1.0;
                 break;
         }
@@ -5579,64 +5603,172 @@ namespace
         return (bpm >= minUsefulBpm && bpm <= maxUsefulBpm) ? bpm : 0.0;
     }
 
-    static double detectSampleBpmWithAubio(const juce::AudioBuffer<float>& buffer, double sampleRate)
+    // Given a raw detected BPM and the sample duration in seconds, try the BPM
+    // at half, normal, and double speed. Pick the one where the resulting loop
+    // length in beats is closest to a whole number. This fixes octave errors
+    // where e.g. 80 BPM is detected as 161.5.
+    // Returns the corrected raw BPM and the corresponding loop length in beats.
+    static void correctTempoOctave(double rawBpm, double durationSeconds,
+                                   double& outBpm, int& outLoopBeats)
     {
-#if NINJAMPLUS_HAS_AUBIO
+        outBpm = rawBpm;
+        outLoopBeats = 0;
+
+        if (rawBpm <= 1.0 || durationSeconds <= 0.0 || !std::isfinite(rawBpm))
+            return;
+
+        struct Candidate
+        {
+            double bpm;
+            double beats;
+            double fractionalDist;  // distance to nearest integer
+            int roundedBeats;
+        };
+
+        std::array<Candidate, 3> candidates;
+        const double multipliers[3] = { 0.5, 1.0, 2.0 };
+
+        for (int i = 0; i < 3; ++i)
+        {
+            const double candidateBpm = rawBpm * multipliers[i];
+            if (candidateBpm <= 1.0)
+            {
+                candidates[i] = { candidateBpm, 0.0, 1.0, 0 };
+                continue;
+            }
+            const double beats = durationSeconds * candidateBpm / 60.0;
+            const double rounded = std::round(beats);
+            const double fracDist = std::abs(beats - rounded);
+            candidates[i] = { candidateBpm, beats, fracDist, (int)rounded };
+        }
+
+        // Pick the candidate with the smallest fractional distance (closest to whole beats)
+        int bestIdx = 1;  // default to normal
+        double bestFrac = candidates[1].fractionalDist;
+        for (int i = 0; i < 3; ++i)
+        {
+            if (candidates[i].roundedBeats >= 1 && candidates[i].fractionalDist < bestFrac)
+            {
+                bestFrac = candidates[i].fractionalDist;
+                bestIdx = i;
+            }
+        }
+
+        outBpm = candidates[bestIdx].bpm;
+        outLoopBeats = juce::jmax(1, candidates[bestIdx].roundedBeats);
+
+        // Snap the BPM so that the loop length is exactly whole beats
+        // e.g. if duration=6s and we chose 8 beats, bpm = 8*60/6 = 80.0
+        if (outLoopBeats > 0 && durationSeconds > 0.0)
+            outBpm = (double)outLoopBeats * 60.0 / durationSeconds;
+    }
+
+    struct SampleBpmDetection
+    {
+        double rawBpm = 0.0;
+        double normalisedBpm = 0.0;
+        int loopLengthBeats = 0;
+    };
+
+    static SampleBpmDetection detectSampleBpmWithLibrosa(const juce::AudioBuffer<float>& buffer, double sampleRate);
+
+    static SampleBpmDetection detectSampleBpmDetailed(const juce::AudioBuffer<float>& buffer, double sampleRate)
+    {
+        // Try librosa first (better tempo detection with beat tracking)
+#if NINJAMPLUS_HAS_LIBROSA
+        {
+            SampleBpmDetection librosaResult = detectSampleBpmWithLibrosa(buffer, sampleRate);
+            if (librosaResult.normalisedBpm > 1.0 && librosaResult.loopLengthBeats > 0)
+                return librosaResult;
+        }
+#endif
+
+        juce::ignoreUnused(buffer, sampleRate);
+        return {};
+    }
+
+    static SampleBpmDetection detectSampleBpmWithLibrosa(const juce::AudioBuffer<float>& buffer, double sampleRate)
+    {
+        SampleBpmDetection result;
+#if NINJAMPLUS_HAS_LIBROSA
         const int numSamples = buffer.getNumSamples();
         if (numSamples <= 0 || sampleRate <= 1.0)
-            return 0.0;
+            return result;
 
-        constexpr uint_t windowSize = 1024;
-        constexpr uint_t hopSize = 512;
-        auto* tempo = new_aubio_tempo((const char_t*)"default",
-                                      windowSize,
-                                      hopSize,
-                                      (uint_t)juce::jmax(1, (int)std::llround(sampleRate)));
-        auto* input = new_fvec(hopSize);
-        auto* output = new_fvec(1);
-        if (tempo == nullptr || input == nullptr || output == nullptr)
-        {
-            if (tempo != nullptr) del_aubio_tempo(tempo);
-            if (input != nullptr) del_fvec(input);
-            if (output != nullptr) del_fvec(output);
-            return 0.0;
-        }
-
+        // Convert to mono float vector for librosa
         const float* left = buffer.getReadPointer(0);
         const float* right = buffer.getNumChannels() > 1 ? buffer.getReadPointer(1) : left;
-        int detectedBeats = 0;
-        for (int pos = 0; pos < numSamples; pos += (int)hopSize)
+
+        // librosa works best at 22050 Hz — downsample if needed
+        const int targetSr = 22050;
+        std::vector<float> audio;
+        if (sampleRate > targetSr)
         {
-            for (uint_t i = 0; i < hopSize; ++i)
+            const int ratio = (int)(sampleRate / targetSr);
+            const int outLen = numSamples / ratio;
+            audio.reserve(outLen);
+            for (int i = 0; i < outLen; ++i)
             {
-                const int index = pos + (int)i;
-                const float sample = index < numSamples ? 0.5f * (left[index] + right[index]) : 0.0f;
-                fvec_set_sample(input, (smpl_t)sample, i);
+                double sum = 0.0;
+                for (int j = 0; j < ratio; ++j)
+                {
+                    const int idx = i * ratio + j;
+                    if (idx < numSamples)
+                        sum += 0.5 * (left[idx] + right[idx]);
+                }
+                audio.push_back((float)(sum / ratio));
             }
-            aubio_tempo_do(tempo, input, output);
-            if (fvec_get_sample(output, 0) != 0.0f)
-                ++detectedBeats;
+        }
+        else
+        {
+            audio.reserve(numSamples);
+            for (int i = 0; i < numSamples; ++i)
+                audio.push_back(0.5f * (left[i] + right[i]));
         }
 
-        const double bpm = (double)aubio_tempo_get_bpm(tempo);
-        const double confidence = (double)aubio_tempo_get_confidence(tempo);
-        del_aubio_tempo(tempo);
-        del_fvec(input);
-        del_fvec(output);
+        const double effectiveSr = (sampleRate > targetSr) ? (double)targetSr : sampleRate;
 
-        const double normalisedBpm = normaliseDetectedTempoBpm(bpm);
-        const double durationSeconds = (double)numSamples / sampleRate;
-        if (normalisedBpm <= 1.0
-            || !std::isfinite(confidence)
-            || confidence < 0.10
-            || (durationSeconds >= 3.0 && detectedBeats < 2))
-            return 0.0;
+        try
+        {
+            librosa::ArrayXr y(audio.size());
+            for (Eigen::Index i = 0; i < (Eigen::Index)audio.size(); ++i)
+                y(i) = (librosa::Real)audio[(size_t)i];
 
-        return normalisedBpm;
+            // Use librosa beat_track_audio for tempo estimation
+            // This uses onset detection + dynamic programming beat tracking
+            const int hopLength = 512;
+            auto [tempo, beats] = librosa::beat::beat_track_audio(
+                y, effectiveSr, hopLength, 120.0, 100.0, true);
+
+            if (tempo > 1.0 && std::isfinite(tempo))
+            {
+                const double durationSeconds = (double)numSamples / sampleRate;
+                double correctedBpm = tempo;
+                int correctedLoopBeats = 0;
+                correctTempoOctave(tempo, durationSeconds, correctedBpm, correctedLoopBeats);
+
+                result.rawBpm = correctedBpm;
+                result.normalisedBpm = normaliseDetectedTempoBpm(correctedBpm);
+                result.loopLengthBeats = correctedLoopBeats;
+            }
+        }
+        catch (...)
+        {
+            // librosa can throw on edge cases (empty signal, etc.)
+            return result;
+        }
+
+        return result;
 #else
         juce::ignoreUnused(buffer, sampleRate);
-        return 0.0;
+        return result;
 #endif
+    }
+
+    static double detectSampleBpmWithAubio(const juce::AudioBuffer<float>& buffer, double sampleRate)
+    {
+        const auto detection = detectSampleBpmDetailed(buffer, sampleRate);
+        return detection.normalisedBpm;
     }
 
     static juce::AudioBuffer<float> stretchLoopWithSignalsmith(const juce::AudioBuffer<float>& source,
@@ -5647,36 +5779,87 @@ namespace
         if (inputSamples <= 0 || targetSamples <= 0)
             return {};
 
-        juce::AudioBuffer<float> output(2, targetSamples);
-        output.clear();
-
         if (targetSamples == inputSamples)
         {
+            juce::AudioBuffer<float> output(2, targetSamples);
+            output.clear();
             output.copyFrom(0, 0, source, 0, 0, inputSamples);
             output.copyFrom(1, 0, source, source.getNumChannels() > 1 ? 1 : 0, 0, inputSamples);
             return output;
         }
 
+        // Use Rubber Band Library in offline mode with the R3 (Finer) engine
+        // and percussive transient detection — ideal for drum loops.
+        // Offline mode does two passes (study + process) and handles delay
+        // compensation internally, so the output starts at sample 0.
+        const double timeRatio = (double)targetSamples / (double)inputSamples;
+        const int channels = 2;
+
+        using RBS = RubberBand::RubberBandStretcher;
+        const RBS::Options options = RBS::OptionProcessOffline
+                                   | RBS::OptionEngineFiner
+                                   | RBS::OptionDetectorPercussive
+                                   | RBS::OptionTransientsCrisp
+                                   | RBS::OptionThreadingNever;
+
+        RBS stretcher((size_t)(int)std::round(sampleRate),
+                      (size_t)channels,
+                      options,
+                      timeRatio,
+                      1.0); // pitch scale = 1.0 (no pitch change)
+        stretcher.setDebugLevel(0);
+
+        // Prepare de-interleaved input pointers
         const float* inL = source.getReadPointer(0);
         const float* inR = source.getNumChannels() > 1 ? source.getReadPointer(1) : inL;
+
+        // Pass 1: study (let Rubber Band analyze the stretch profile)
+        {
+            const float* inPtrs[2] = { inL, inR };
+            stretcher.study(inPtrs, (size_t)inputSamples, true);
+        }
+
+        // Pass 2: process and retrieve
+        juce::AudioBuffer<float> output(2, targetSamples);
+        output.clear();
+
+        {
+            const float* inPtrs[2] = { inL, inR };
+            stretcher.process(inPtrs, (size_t)inputSamples, true);
+        }
+
+        // Retrieve all available output
         float* outL = output.getWritePointer(0);
         float* outR = output.getWritePointer(1);
-        std::array<const float*, 2> inputs { inL, inR };
-        std::array<float*, 2> outputs { outL, outR };
+        int retrieved = 0;
 
-        signalsmith::stretch::SignalsmithStretch<float> stretcher;
-        stretcher.presetDefault(2, (float)juce::jmax(1.0, sampleRate), false);
-        stretcher.reset();
-        stretcher.process(inputs, inputSamples, outputs, targetSamples);
+        for (;;)
+        {
+            int avail = stretcher.available();
+            if (avail <= 0)
+                break;
 
-        for (int ch = 0; ch < output.getNumChannels(); ++ch)
+            float* outPtrs[2] = { outL + retrieved, outR + retrieved };
+            const int toRetrieve = juce::jmin(avail, targetSamples - retrieved);
+            if (toRetrieve <= 0)
+                break;
+
+            const size_t got = stretcher.retrieve(outPtrs, (size_t)toRetrieve);
+            retrieved += (int)got;
+            if (got == 0)
+                break;
+        }
+
+        // If Rubber Band produced fewer samples than requested, pad with silence
+        for (int ch = 0; ch < 2; ++ch)
         {
             auto* data = output.getWritePointer(ch);
+            for (int i = retrieved; i < targetSamples; ++i)
+                data[i] = 0.0f;
+            // Sanitize
             for (int i = 0; i < targetSamples; ++i)
-            {
                 if (!std::isfinite(data[i]))
                     data[i] = 0.0f;
-            }
         }
 
         return output;
@@ -5705,6 +5888,8 @@ namespace
         juce::String defaultName;
         double sourceRate = 44100.0;
         double detectedBpm = 0.0;
+        double rawDetectedBpm = 0.0;
+        int loopLengthBeats = 0;
     };
 
     bool prepareSamplePadLoadData(const juce::File& file,
@@ -5742,7 +5927,10 @@ namespace
         outData.file = file;
         outData.defaultName = file.getFileNameWithoutExtension();
         outData.sourceRate = sourceRate;
-        outData.detectedBpm = detectSampleBpmWithAubio(outData.sample, sourceRate);
+        const auto bpmDetection = detectSampleBpmDetailed(outData.sample, sourceRate);
+        outData.detectedBpm = bpmDetection.normalisedBpm;
+        outData.rawDetectedBpm = bpmDetection.rawBpm;
+        outData.loopLengthBeats = bpmDetection.loopLengthBeats;
         return true;
     }
 
@@ -5765,6 +5953,27 @@ namespace
         RunFunction runFunction;
     };
 }
+
+class ZapChunkProcessingThread : public juce::Thread
+{
+public:
+    explicit ZapChunkProcessingThread(NinjamVst3AudioProcessor& p)
+        : juce::Thread("ZapChunkProcessor"), processor(p) {}
+
+    void run() override
+    {
+        while (!threadShouldExit())
+        {
+            processor.processPendingZapChunks();
+            wait(5); // 5ms poll — fast enough for video, gentle on CPU
+        }
+        // Drain any remaining chunks on exit
+        processor.processPendingZapChunks();
+    }
+
+private:
+    NinjamVst3AudioProcessor& processor;
+};
 
 NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
      : AudioProcessor (BusesProperties()
@@ -5852,6 +6061,9 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
     setLatencySamples(0);
     startTimer(20); // Run NINJAM client loop every 20ms
 
+    zapChunkProcessingThread = std::make_unique<ZapChunkProcessingThread>(*this);
+    zapChunkProcessingThread->startThread();
+
     // Set callbacks
     ninjamClient.LicenseAgreementCallback = LicenseAgreementCallback;
     ninjamClient.LicenseAgreement_User = this;
@@ -5912,7 +6124,79 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
         pass = "anon";
     }
 
-    pendingConnectHost = host;
+    // Parse the NINJAM host and port from the host string
+    juce::String ninjamHost = host;
+    int ninjamPort = 2049;
+    {
+        juce::String parsedHost;
+        int parsedPort = 2049;
+        if (tryParseServerEndpoint(host, parsedHost, parsedPort))
+        {
+            ninjamHost = parsedHost;
+            ninjamPort = parsedPort;
+        }
+    }
+
+    // SSH tunnel: if enabled, start the tunnel on a background thread and defer
+    // the actual NINJAM connection until the tunnel is ready (or fails).
+    juce::String connectHost = host;
+    if (sshTunnelEnabled.load(std::memory_order_relaxed) && sshTunnelHost.trim().isNotEmpty())
+    {
+        sshTunnel.stop();
+
+        ninjamplus::SshTunnel::Config tunnelConfig;
+        tunnelConfig.enabled = true;
+        tunnelConfig.sshHost = sshTunnelHost.trim();
+        tunnelConfig.sshPort = sshTunnelPort.load(std::memory_order_relaxed);
+        tunnelConfig.sshUser = sshTunnelUser.trim();
+        tunnelConfig.keyFile = sshTunnelKeyFile.trim();
+        tunnelConfig.remoteHost = ninjamHost;
+        tunnelConfig.remotePort = ninjamPort;
+        tunnelConfig.localPort = 0; // auto-pick
+
+        addSystemChatLine("Starting SSH tunnel to " + tunnelConfig.sshHost + ":" + juce::String(tunnelConfig.sshPort)
+                          + " for " + ninjamHost + ":" + juce::String(ninjamPort) + "...");
+
+        // Start tunnel on a background thread to avoid blocking the message thread
+        std::shared_ptr<std::atomic<int>> tunnelLocalPort = std::make_shared<std::atomic<int>>(0);
+        std::shared_ptr<juce::String> tunnelError = std::make_shared<juce::String>();
+
+        std::thread tunnelThread([this, tunnelConfig, tunnelLocalPort, tunnelError]()
+        {
+            const int localPort = sshTunnel.start(tunnelConfig);
+            tunnelLocalPort->store(localPort);
+            if (localPort <= 0)
+                *tunnelError = sshTunnel.getLastError();
+        });
+        tunnelThread.detach();
+
+        // Wait for the tunnel to finish starting (with a timeout) without blocking
+        // the message thread — use short sleeps so the UI stays responsive.
+        const double tunnelTimeoutMs = 15000.0;
+        const double tunnelStartMs = juce::Time::getMillisecondCounterHiRes();
+        while (tunnelLocalPort->load() == 0
+               && tunnelError->isEmpty()
+               && juce::Time::getMillisecondCounterHiRes() - tunnelStartMs < tunnelTimeoutMs)
+        {
+            juce::Thread::sleep(50);
+        }
+
+        const int localPort = tunnelLocalPort->load();
+        if (localPort > 0)
+        {
+            connectHost = "127.0.0.1:" + juce::String(localPort);
+            addSystemChatLine("SSH tunnel established on local port " + juce::String(localPort));
+        }
+        else
+        {
+            if (tunnelError->isNotEmpty())
+                addSystemChatLine("SSH tunnel failed: " + *tunnelError);
+            else
+                addSystemChatLine("SSH tunnel timed out.");
+        }
+    }
+
+    pendingConnectHost = host; // Store original host for reconnect logic
     pendingConnectOriginalUser = user;
     pendingConnectPass = pass;
     pendingConnectNameAttempt = 0;
@@ -5965,7 +6249,7 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
         const juce::ScopedLock lifecycleLock(ninjamAudioLifecycleLock);
         const juce::ScopedLock clientLock(ninjamClientLock);
         applyCodecPreference();
-        ninjamClient.Connect(host.toRawUTF8(), user.toRawUTF8(), pass.toRawUTF8());
+        ninjamClient.Connect(connectHost.toRawUTF8(), user.toRawUTF8(), pass.toRawUTF8());
     }
     currentServer = host;
     currentUser = user;
@@ -5997,6 +6281,12 @@ void NinjamVst3AudioProcessor::disconnectFromServer()
         const juce::ScopedLock clientLock(ninjamClientLock);
         stopNinjamZapVideoTransportForDisconnect();
         ninjamClient.Disconnect();
+    }
+    // Stop SSH tunnel if active
+    if (sshTunnel.isActive())
+    {
+        sshTunnel.stop();
+        addSystemChatLine("SSH tunnel closed.");
     }
     stopAdvancedVideoClient();
     currentServer = {};
@@ -6121,12 +6411,79 @@ bool NinjamVst3AudioProcessor::attemptAutoReconnect(double nowMs, int status)
     pendingConnectNameAttempt = 0;
     duplicateNameRetryEnabled = true;
     addSystemChatLine("Reconnecting to " + reconnectHost + "...");
+
+    // Re-establish SSH tunnel if enabled
+    juce::String reconnectConnectHost = reconnectHost;
+    if (sshTunnelEnabled.load(std::memory_order_relaxed) && sshTunnelHost.trim().isNotEmpty())
+    {
+        // Parse host/port from the original host
+        juce::String ninjamHost = reconnectHost;
+        int ninjamPort = 2049;
+        {
+            juce::String parsedHost;
+            int parsedPort = 2049;
+            if (tryParseServerEndpoint(reconnectHost, parsedHost, parsedPort))
+            {
+                ninjamHost = parsedHost;
+                ninjamPort = parsedPort;
+            }
+        }
+
+        sshTunnel.stop();
+        ninjamplus::SshTunnel::Config tunnelConfig;
+        tunnelConfig.enabled = true;
+        tunnelConfig.sshHost = sshTunnelHost.trim();
+        tunnelConfig.sshPort = sshTunnelPort.load(std::memory_order_relaxed);
+        tunnelConfig.sshUser = sshTunnelUser.trim();
+        tunnelConfig.keyFile = sshTunnelKeyFile.trim();
+        tunnelConfig.remoteHost = ninjamHost;
+        tunnelConfig.remotePort = ninjamPort;
+        tunnelConfig.localPort = 0;
+
+        // Start tunnel on a background thread to avoid blocking the message thread
+        std::shared_ptr<std::atomic<int>> tunnelLocalPort = std::make_shared<std::atomic<int>>(0);
+        std::shared_ptr<juce::String> tunnelError = std::make_shared<juce::String>();
+
+        std::thread tunnelThread([this, tunnelConfig, tunnelLocalPort, tunnelError]()
+        {
+            const int localPort = sshTunnel.start(tunnelConfig);
+            tunnelLocalPort->store(localPort);
+            if (localPort <= 0)
+                *tunnelError = sshTunnel.getLastError();
+        });
+        tunnelThread.detach();
+
+        // Wait for the tunnel with a timeout, using short sleeps so UI stays responsive
+        const double tunnelTimeoutMs = 15000.0;
+        const double tunnelStartMs = juce::Time::getMillisecondCounterHiRes();
+        while (tunnelLocalPort->load() == 0
+               && tunnelError->isEmpty()
+               && juce::Time::getMillisecondCounterHiRes() - tunnelStartMs < tunnelTimeoutMs)
+        {
+            juce::Thread::sleep(50);
+        }
+
+        const int localPort = tunnelLocalPort->load();
+        if (localPort > 0)
+        {
+            reconnectConnectHost = "127.0.0.1:" + juce::String(localPort);
+            addSystemChatLine("SSH tunnel re-established on local port " + juce::String(localPort));
+        }
+        else
+        {
+            if (tunnelError->isNotEmpty())
+                addSystemChatLine("SSH tunnel failed: " + *tunnelError);
+            else
+                addSystemChatLine("SSH tunnel timed out.");
+        }
+    }
+
     {
         const juce::ScopedLock lifecycleLock(ninjamAudioLifecycleLock);
         const juce::ScopedLock clientLock(ninjamClientLock);
         ninjamClient.Disconnect();
         applyCodecPreference();
-        ninjamClient.Connect(reconnectHost.toRawUTF8(), reconnectUser.toRawUTF8(), reconnectPass.toRawUTF8());
+        ninjamClient.Connect(reconnectConnectHost.toRawUTF8(), reconnectUser.toRawUTF8(), reconnectPass.toRawUTF8());
     }
     currentServer = reconnectHost;
     currentUser = reconnectUser;
@@ -6840,23 +7197,64 @@ void NinjamVst3AudioProcessor::broadcastIntervalSyncTag(const juce::String& targ
     const int beatIndex = markerBeatIndex >= 0 ? juce::jlimit(0, bpi - 1, markerBeatIndex) : currentBeatIndex;
     const juce::String userId = normaliseOpusPeerId(currentUser);
     const juce::String tag = buildIntervalSyncTag(displayInterval, bpi);
-
-    juce::DynamicObject::Ptr obj = new juce::DynamicObject();
-    obj->setProperty("type", "intervalSyncTag");
-    obj->setProperty("userId", userId.isNotEmpty() ? userId : currentUser);
-    obj->setProperty("tag", tag);
-    obj->setProperty("intervalIndex", displayInterval);
-    obj->setProperty("intervalAbsolute", intervalIndex.load());
-    obj->setProperty("bpi", bpi);
-    obj->setProperty("beatIndex", beatIndex);
-    obj->setProperty("intervalProgress", intervalProgress);
-    obj->setProperty("eventId", "intervalTag:" + (userId.isNotEmpty() ? userId : currentUser) + ":" + juce::String(++sideSignalEventCounter));
-    const juce::String payload = juce::JSON::toString(juce::var(obj.get()));
     const juce::String safeTarget = target.isNotEmpty() ? target : "*";
+
+    // Build the sync tag payload. The "sendOffsetMs" field tells the receiver
+    // how many ms after the interval boundary this particular transmission was
+    // sent, so the receiver can deduct it from the buffer calculation.
+    // The first send has offset 0; redundant retransmissions (mobile hotspot
+    // mode) carry their actual offset so the timing math stays correct.
+    auto buildPayload = [&](double sendOffsetMs) -> juce::String
+    {
+        juce::DynamicObject::Ptr obj = new juce::DynamicObject();
+        obj->setProperty("type", "intervalSyncTag");
+        obj->setProperty("userId", userId.isNotEmpty() ? userId : currentUser);
+        obj->setProperty("tag", tag);
+        obj->setProperty("intervalIndex", displayInterval);
+        obj->setProperty("intervalAbsolute", intervalIndex.load());
+        obj->setProperty("bpi", bpi);
+        obj->setProperty("beatIndex", beatIndex);
+        obj->setProperty("intervalProgress", intervalProgress);
+        obj->setProperty("sendOffsetMs", sendOffsetMs);
+        obj->setProperty("eventId", "intervalTag:" + (userId.isNotEmpty() ? userId : currentUser) + ":" + juce::String(++sideSignalEventCounter));
+        return juce::JSON::toString(juce::var(obj.get()));
+    };
+
+    // Primary transmission (offset 0)
+    const juce::String payload = buildPayload(0.0);
     if (mobileHotspotModeEnabled.load(std::memory_order_relaxed))
         sendSideSignal(safeTarget, "intervalSyncTag", payload);
     sendIntervalSignal("intervalSyncTag", payload, safeTarget);
-    return;
+
+    // Mobile hotspot mode: send redundant copies with increasing offsets.
+    // The receiver deducts sendOffsetMs from the buffer calculation, so
+    // these duplicates are timing-accurate, not stale.
+    // We use short offsets (150ms, 300ms) to stay well within the interval
+    // even at low BPI/fast BPM.
+    if (mobileHotspotModeEnabled.load(std::memory_order_relaxed))
+    {
+        const double sendTimeMs = juce::Time::getMillisecondCounterHiRes();
+
+        // Schedule retransmission at +150ms
+        juce::Timer::callAfterDelay(150, [this, safeTarget, buildPayload, sendTimeMs]() mutable
+        {
+            if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK) return;
+            const double offsetMs = juce::Time::getMillisecondCounterHiRes() - sendTimeMs;
+            const juce::String p1 = buildPayload(offsetMs);
+            sendSideSignal(safeTarget, "intervalSyncTag", p1);
+            sendIntervalSignal("intervalSyncTag", p1, safeTarget);
+        });
+
+        // Schedule retransmission at +300ms
+        juce::Timer::callAfterDelay(300, [this, safeTarget, buildPayload, sendTimeMs]() mutable
+        {
+            if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK) return;
+            const double offsetMs = juce::Time::getMillisecondCounterHiRes() - sendTimeMs;
+            const juce::String p2 = buildPayload(offsetMs);
+            sendSideSignal(safeTarget, "intervalSyncTag", p2);
+            sendIntervalSignal("intervalSyncTag", p2, safeTarget);
+        });
+    }
 }
 
 void NinjamVst3AudioProcessor::broadcastTransportProbe(const juce::String& target)
@@ -10048,6 +10446,13 @@ void NinjamVst3AudioProcessor::launchVideoSession(const juce::String& requestedR
                              .withParameter("chunkadaptresolution", "1")
                              .withParameter("helperVersion", getVersionString())
                              .withParameter("cacheBust", juce::String((juce::int64)juce::Time::getMillisecondCounter()));
+
+        // Mobile hotspot mode: force TURN relay + TCP to bypass UDP blocking
+        if (mobileHotspotModeEnabled.load(std::memory_order_relaxed))
+        {
+            helperUrl = helperUrl.withParameter("relay", "")
+                                 .withParameter("tcp", "");
+        }
         {
             juce::ScopedLock lock(chatLock);
             chatHistory.add("Tip: If your cam isn't showing, refresh the video page and select your camera before entering the room.");
@@ -10107,6 +10512,13 @@ void NinjamVst3AudioProcessor::launchVideoSession(const juce::String& requestedR
              .withParameter("noaudio", "1")
              .withParameter("buffer2", "0")
              .withParameter("buffer", juce::String(launchBufferMs));
+
+    // Mobile hotspot mode: force TURN relay + TCP to bypass UDP blocking
+    if (mobileHotspotModeEnabled.load(std::memory_order_relaxed))
+    {
+        url = url.withParameter("relay", "")
+                 .withParameter("tcp", "");
+    }
     {
         juce::ScopedLock lock(chatLock);
         chatHistory.add("Advanced sync helper unavailable on this machine; opening direct VDO view without live auto-buffer updates.");
@@ -12505,6 +12917,82 @@ bool NinjamVst3AudioProcessor::isMobileHotspotModeEnabled() const
     return mobileHotspotModeEnabled.load(std::memory_order_relaxed);
 }
 
+void NinjamVst3AudioProcessor::setSshTunnelEnabled(bool shouldEnable)
+{
+    sshTunnelEnabled.store(shouldEnable, std::memory_order_relaxed);
+    if (!shouldEnable)
+        sshTunnel.stop();
+}
+
+bool NinjamVst3AudioProcessor::isSshTunnelEnabled() const
+{
+    return sshTunnelEnabled.load(std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::setSshTunnelHost(const juce::String& host)
+{
+    sshTunnelHost = host.trim();
+}
+
+juce::String NinjamVst3AudioProcessor::getSshTunnelHost() const
+{
+    return sshTunnelHost;
+}
+
+void NinjamVst3AudioProcessor::setSshTunnelPort(int port)
+{
+    sshTunnelPort.store(juce::jlimit(1, 65535, port), std::memory_order_relaxed);
+}
+
+int NinjamVst3AudioProcessor::getSshTunnelPort() const
+{
+    return sshTunnelPort.load(std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::setSshTunnelUser(const juce::String& user)
+{
+    sshTunnelUser = user.trim();
+}
+
+juce::String NinjamVst3AudioProcessor::getSshTunnelUser() const
+{
+    return sshTunnelUser;
+}
+
+void NinjamVst3AudioProcessor::setSshTunnelKeyFile(const juce::String& path)
+{
+    sshTunnelKeyFile = path.trim();
+}
+
+juce::String NinjamVst3AudioProcessor::getSshTunnelKeyFile() const
+{
+    return sshTunnelKeyFile;
+}
+
+juce::String NinjamVst3AudioProcessor::getSshTunnelLastError() const
+{
+    return sshTunnel.getLastError();
+}
+
+bool NinjamVst3AudioProcessor::isSshTunnelActive() const
+{
+    return sshTunnel.isActive();
+}
+
+void NinjamVst3AudioProcessor::setSamplePadVolume(int padIndex, float volume)
+{
+    if (padIndex < 0 || padIndex >= numSamplePads)
+        return;
+    samplePads[(size_t)padIndex].volume.store(juce::jlimit(0.0f, 2.0f, volume), std::memory_order_relaxed);
+}
+
+float NinjamVst3AudioProcessor::getSamplePadVolume(int padIndex) const
+{
+    if (padIndex < 0 || padIndex >= numSamplePads)
+        return 1.0f;
+    return samplePads[(size_t)padIndex].volume.load(std::memory_order_relaxed);
+}
+
 int NinjamVst3AudioProcessor::getCodecMode() const
 {
     const int serverMaxLocalChannels = juce::jmax(1, serverMaxLocalChannelsCached.load(std::memory_order_relaxed));
@@ -12907,6 +13395,13 @@ void NinjamVst3AudioProcessor::refreshPublicServers()
 
 NinjamVst3AudioProcessor::~NinjamVst3AudioProcessor()
 {
+    if (zapChunkProcessingThread != nullptr)
+    {
+        zapChunkProcessingThread->signalThreadShouldExit();
+        zapChunkProcessingThread->stopThread(2000);
+        zapChunkProcessingThread.reset();
+    }
+
     if (chordAnalyzer != nullptr)
         chordAnalyzer->stop();
 
@@ -13039,6 +13534,7 @@ void NinjamVst3AudioProcessor::prepareToPlay (double sampleRate, int samplesPerB
     samplePadLastTransportBpi = 0;
     samplePadTransportInterval = 0;
     processingSampleRate = sampleRate > 1.0 ? sampleRate : 44100.0;
+    lastBlockSize = juce::jmax(1, samplesPerBlock);
     masterLufsMeter.prepare(processingSampleRate);
     masterLufsMeterR.prepare(processingSampleRate);
     for (auto& m : userLufsMeters)
@@ -13217,7 +13713,8 @@ bool NinjamVst3AudioProcessor::loadSamplePad(int padIndex, const juce::File& fil
     if (!readRightChannel)
         loaded.copyFrom(1, 0, loaded, 0, 0, samplesToRead);
 
-    const double detectedBpm = detectSampleBpmWithAubio(loaded, sourceRate);
+    const auto bpmDetection = detectSampleBpmDetailed(loaded, sourceRate);
+    const double detectedBpm = bpmDetection.normalisedBpm;
 
     {
         const juce::ScopedLock lock(samplePadsLock);
@@ -13230,12 +13727,13 @@ bool NinjamVst3AudioProcessor::loadSamplePad(int padIndex, const juce::File& fil
         pad.sourceSampleRate = sourceRate;
         pad.originalSourceSampleRate = sourceRate;
         pad.sourceBpm = detectedBpm;
+        pad.rawSourceBpm = bpmDetection.rawBpm;
         pad.lastSyncedTargetBpm = 0.0;
         pad.bpmSyncApplied = false;
         pad.bpmSyncEnabled.store(detectedBpm > 1.0, std::memory_order_relaxed);
         pad.playbackSpeed.store((int)SamplePadPlaybackSpeed::normal, std::memory_order_relaxed);
         pad.recordedLoop = false;
-        pad.loopLengthBeats = 0;
+        pad.loopLengthBeats = bpmDetection.loopLengthBeats;
         pad.recordLoopLengthBeatsOverride = 0;
         pad.playing.store(false, std::memory_order_relaxed);
         pad.playbackScheduled.store(false, std::memory_order_relaxed);
@@ -13261,6 +13759,10 @@ bool NinjamVst3AudioProcessor::loadSamplePad(int padIndex, const juce::File& fil
         pad.midiHoldStartMs = 0.0;
         pad.position.store(0.0, std::memory_order_relaxed);
     }
+
+    // Auto-resync to NINJAM BPM if BPM sync was enabled by detection
+    if (detectedBpm > 1.0 && isSamplePadsFeatureEnabled())
+        resyncSamplePadToBpm(padIndex, (double)getBPM(), false);
 
     return true;
 }
@@ -13326,12 +13828,13 @@ void NinjamVst3AudioProcessor::loadSamplePadAsync(int padIndex,
                         pad.sourceSampleRate = prepared.sourceRate;
                         pad.originalSourceSampleRate = prepared.sourceRate;
                         pad.sourceBpm = prepared.detectedBpm;
+                        pad.rawSourceBpm = prepared.rawDetectedBpm;
                         pad.lastSyncedTargetBpm = 0.0;
                         pad.bpmSyncApplied = false;
                         pad.bpmSyncEnabled.store(prepared.detectedBpm > 1.0, std::memory_order_relaxed);
                         pad.playbackSpeed.store((int)SamplePadPlaybackSpeed::normal, std::memory_order_relaxed);
                         pad.recordedLoop = false;
-                        pad.loopLengthBeats = 0;
+                        pad.loopLengthBeats = prepared.loopLengthBeats;
                         pad.recordLoopLengthBeatsOverride = 0;
                         pad.playing.store(false, std::memory_order_relaxed);
                         pad.playbackScheduled.store(false, std::memory_order_relaxed);
@@ -13357,6 +13860,10 @@ void NinjamVst3AudioProcessor::loadSamplePadAsync(int padIndex,
                         pad.midiHoldStartMs = 0.0;
                         pad.position.store(0.0, std::memory_order_relaxed);
                     }
+
+                    // Auto-resync to NINJAM BPM if BPM sync was enabled by detection
+                    if (prepared.detectedBpm > 1.0 && isSamplePadsFeatureEnabled())
+                        resyncSamplePadToBpm(padIndex, (double)getBPM(), false);
 
                     if (completion)
                         completion(true, {});
@@ -13415,6 +13922,7 @@ void NinjamVst3AudioProcessor::clearSamplePad(int padIndex)
     pad.matchBpi.store(false, std::memory_order_relaxed);
     pad.bpmSyncEnabled.store(true, std::memory_order_relaxed);
     pad.playbackSpeed.store((int)SamplePadPlaybackSpeed::normal, std::memory_order_relaxed);
+    pad.pendingPlaybackSpeed.store(-1, std::memory_order_relaxed);
     pad.duckRoute.store(false, std::memory_order_relaxed);
     for (auto& route : pad.fxSlotRoutes)
         route.store(false, std::memory_order_relaxed);
@@ -13730,31 +14238,64 @@ void NinjamVst3AudioProcessor::triggerSamplePad(int padIndex)
         return;
     }
 
-    if (pad.recordedLoop && pad.loopLengthBeats > 0)
+    if (pad.loop.load(std::memory_order_relaxed))
     {
         const int bpi = juce::jmax(1, getBPI());
+
+        // Use the same timing source as the looper recording (intervalIndex + getIntervalProgress)
+        // since the looper recording starts in sync and on time.
         const double currentBeat = (double)intervalIndex.load(std::memory_order_relaxed) * (double)bpi
             + (double)juce::jlimit(0.0f, 1.0f, getIntervalProgress()) * (double)bpi;
-        const double loopLengthBeats = (double)juce::jmax(1, pad.loopLengthBeats);
-        if (pad.matchBpi.load(std::memory_order_relaxed))
+
+        const bool syncBpiEnabled = pad.bpmSyncEnabled.load(std::memory_order_relaxed);
+        const bool matchBpiEnabled = pad.matchBpi.load(std::memory_order_relaxed);
+
+        // When Sync BPI or Match BPI is enabled, cue to the next interval boundary (BPI 1).
+        if (syncBpiEnabled || matchBpiEnabled || pad.recordedLoop)
         {
-            double interval = std::floor(currentBeat / (double)bpi);
-            double candidate = interval * (double)bpi + pad.recordedStartBeatInInterval;
-            if (candidate <= currentBeat + 0.0001)
-                candidate += (double)bpi;
-            pad.scheduledStartBeat = candidate;
+            const double startOffset = (matchBpiEnabled || pad.recordedLoop)
+                ? pad.recordedStartBeatInInterval
+                : 0.0;
+
+            pad.scheduledStartBeat = nextSamplePadIntervalStartBeat(currentBeat, bpi) + startOffset;
+            pad.scheduledPlaybackRouteToLocal = routeNewVoiceToLocal;
+            pad.playbackScheduled.store(true, std::memory_order_relaxed);
+            return;
         }
-        else
+
+        // No sync enabled — schedule to the next loop-length boundary.
+        // Determine the loop length in beats from the sample length and raw source BPM.
+        double loopLengthBeats = (double)juce::jmax(1, pad.loopLengthBeats);
+        if (pad.loopLengthBeats <= 0 && pad.rawSourceBpm > 1.0 && pad.sourceSampleRate > 1.0)
         {
-            const double anchor = pad.loopAnchorBeat;
-            double loops = std::ceil((currentBeat - anchor) / loopLengthBeats);
-            if (!std::isfinite(loops) || loops < 0.0)
-                loops = 0.0;
-            double candidate = anchor + loops * loopLengthBeats;
-            if (candidate <= currentBeat + 0.0001)
-                candidate += loopLengthBeats;
-            pad.scheduledStartBeat = candidate;
+            const double sampleSeconds = (double)length / pad.sourceSampleRate;
+            loopLengthBeats = juce::jmax(1.0, sampleSeconds * pad.rawSourceBpm / 60.0);
+            loopLengthBeats = juce::jmax(1.0, std::round(loopLengthBeats));
         }
+        else if (pad.loopLengthBeats <= 0 && pad.sourceBpm > 1.0 && pad.sourceSampleRate > 1.0)
+        {
+            const double sampleSeconds = (double)length / pad.sourceSampleRate;
+            loopLengthBeats = juce::jmax(1.0, sampleSeconds * pad.sourceBpm / 60.0);
+            loopLengthBeats = juce::jmax(1.0, std::round(loopLengthBeats));
+        }
+
+        // Account for playback speed (half speed doubles, double speed halves)
+        const auto padSpeed = sanitizeSamplePadPlaybackSpeed(pad.playbackSpeed.load(std::memory_order_relaxed));
+        if (padSpeed == SamplePadPlaybackSpeed::half)
+            loopLengthBeats *= 2.0;
+        else if (padSpeed == SamplePadPlaybackSpeed::doubleSpeed)
+            loopLengthBeats *= 0.5;
+        loopLengthBeats = juce::jmax(1.0, std::round(loopLengthBeats));
+
+        const double anchor = pad.loopAnchorBeat > 0.0 ? pad.loopAnchorBeat : 0.0;
+        double loops = std::ceil((currentBeat - anchor) / loopLengthBeats);
+        if (!std::isfinite(loops) || loops < 0.0)
+            loops = 0.0;
+        double candidate = anchor + loops * loopLengthBeats;
+        if (candidate <= currentBeat + 0.0001)
+            candidate += loopLengthBeats;
+        candidate = std::round(candidate);
+        pad.scheduledStartBeat = candidate;
         pad.scheduledPlaybackRouteToLocal = routeNewVoiceToLocal;
         pad.playbackScheduled.store(true, std::memory_order_relaxed);
         return;
@@ -13917,7 +14458,23 @@ void NinjamVst3AudioProcessor::setSamplePadBpmSyncEnabled(int padIndex, bool sho
         return;
 
     samplePads[(size_t)padIndex].bpmSyncEnabled.store(shouldEnable, std::memory_order_relaxed);
-    if (shouldEnable && isSamplePadsFeatureEnabled())
+
+    if (!shouldEnable)
+    {
+        // Restore the original unstretched sample so playback returns to native speed
+        const juce::ScopedLock lock(samplePadsLock);
+        auto& pad = samplePads[(size_t)padIndex];
+        if (pad.originalSample.getNumSamples() > 0)
+        {
+            pad.sample = pad.originalSample;
+            pad.sourceSampleRate = pad.originalSourceSampleRate;
+            pad.lastSyncedTargetBpm = 0.0;
+            pad.bpmSyncApplied = false;
+            pad.playbackSpeed.store((int)SamplePadPlaybackSpeed::normal, std::memory_order_relaxed);
+            pad.pendingPlaybackSpeed.store(-1, std::memory_order_relaxed);
+        }
+    }
+    else if (isSamplePadsFeatureEnabled())
         resyncSamplePadToBpm(padIndex, (double)getBPM(), false);
 }
 
@@ -13925,6 +14482,42 @@ bool NinjamVst3AudioProcessor::isSamplePadBpmSyncEnabled(int padIndex) const
 {
     return isValidSamplePadIndex(padIndex)
         && samplePads[(size_t)padIndex].bpmSyncEnabled.load(std::memory_order_relaxed);
+}
+
+double NinjamVst3AudioProcessor::getSamplePadSourceBpm(int padIndex) const
+{
+    if (!isValidSamplePadIndex(padIndex))
+        return 0.0;
+    return samplePads[(size_t)padIndex].sourceBpm;
+}
+
+void NinjamVst3AudioProcessor::setSamplePadSourceBpm(int padIndex, double newBpm)
+{
+    if (!isValidSamplePadIndex(padIndex) || newBpm <= 1.0 || !std::isfinite(newBpm))
+        return;
+
+    {
+        const juce::ScopedLock lock(samplePadsLock);
+        auto& pad = samplePads[(size_t)padIndex];
+        if (pad.originalSample.getNumSamples() <= 0)
+            return;
+
+        // Recalculate loop length in beats from the new BPM and the original sample duration
+        const double durationSeconds = (double)pad.originalSample.getNumSamples() / pad.originalSourceSampleRate;
+        double correctedBpm = newBpm;
+        int correctedLoopBeats = 0;
+        correctTempoOctave(newBpm, durationSeconds, correctedBpm, correctedLoopBeats);
+
+        pad.sourceBpm = correctedBpm;
+        pad.rawSourceBpm = correctedBpm;
+        pad.loopLengthBeats = correctedLoopBeats;
+        pad.bpmSyncEnabled.store(true, std::memory_order_relaxed);
+        pad.bpmSyncApplied = false;
+        pad.lastSyncedTargetBpm = 0.0;
+    }
+
+    // Trigger a resync to the current NINJAM BPM with the corrected values
+    resyncSamplePadToBpm(padIndex, (double)getBPM(), true);
 }
 
 void NinjamVst3AudioProcessor::setSamplePadPlaybackSpeed(int padIndex, SamplePadPlaybackSpeed speed)
@@ -13936,7 +14529,19 @@ void NinjamVst3AudioProcessor::setSamplePadPlaybackSpeed(int padIndex, SamplePad
     {
         const juce::ScopedLock lock(samplePadsLock);
         auto& pad = samplePads[(size_t)padIndex];
+
+        // If the pad is currently playing a loop, defer the speed change until
+        // the loop wraps around to avoid a jarring mid-loop pitch/tempo jump.
+        if (pad.loop.load(std::memory_order_relaxed)
+            && pad.playing.load(std::memory_order_relaxed)
+            && !pad.recordedLoop)
+        {
+            pad.pendingPlaybackSpeed.store((int)speed, std::memory_order_relaxed);
+            return;
+        }
+
         pad.playbackSpeed.store((int)speed, std::memory_order_relaxed);
+        pad.pendingPlaybackSpeed.store(-1, std::memory_order_relaxed);
         pad.bpmSyncEnabled.store(true, std::memory_order_relaxed);
         pad.bpmSyncApplied = false;
         pad.lastSyncedTargetBpm = 0.0;
@@ -15080,6 +15685,8 @@ void NinjamVst3AudioProcessor::enqueueSamplePadResyncJob(int padIndex, double ta
             juce::AudioBuffer<float> original;
             double sourceRate = 44100.0;
             double sourceBpm = 0.0;
+            double rawSourceBpm = 0.0;
+            int loopLengthBeats = 0;
             SamplePadPlaybackSpeed playbackSpeed = SamplePadPlaybackSpeed::normal;
             double effectiveTargetBpm = 0.0;
 
@@ -15110,6 +15717,8 @@ void NinjamVst3AudioProcessor::enqueueSamplePadResyncJob(int padIndex, double ta
 
                 sourceRate = sourceRate > 1.0 ? sourceRate : 44100.0;
                 sourceBpm = pad.sourceBpm;
+                rawSourceBpm = pad.rawSourceBpm;
+                loopLengthBeats = pad.loopLengthBeats;
                 playbackSpeed = sanitizeSamplePadPlaybackSpeed(pad.playbackSpeed.load(std::memory_order_relaxed));
                 effectiveTargetBpm = targetBpm * samplePadPlaybackSpeedMultiplier(playbackSpeed);
                 if (!force && pad.bpmSyncApplied && std::abs(pad.lastSyncedTargetBpm - effectiveTargetBpm) < 0.05)
@@ -15124,7 +15733,13 @@ void NinjamVst3AudioProcessor::enqueueSamplePadResyncJob(int padIndex, double ta
             }
 
             if (sourceBpm <= 1.0 || !std::isfinite(sourceBpm))
-                sourceBpm = detectSampleBpmWithAubio(original, sourceRate);
+            {
+                const auto redetect = detectSampleBpmDetailed(original, sourceRate);
+                sourceBpm = redetect.normalisedBpm;
+                rawSourceBpm = redetect.rawBpm;
+                if (loopLengthBeats <= 0)
+                    loopLengthBeats = redetect.loopLengthBeats;
+            }
 
             if (sourceBpm <= 1.0 || !std::isfinite(sourceBpm)
                 || effectiveTargetBpm <= 1.0 || !std::isfinite(effectiveTargetBpm))
@@ -15138,8 +15753,21 @@ void NinjamVst3AudioProcessor::enqueueSamplePadResyncJob(int padIndex, double ta
                 return juce::ThreadPoolJob::jobHasFinished;
             }
 
-            const double ratio = sourceBpm / effectiveTargetBpm;
-            const int targetSamples = juce::jmax(1, (int) std::llround((double) original.getNumSamples() * ratio));
+            // Calculate target samples from loop length in beats, not BPM ratio.
+            // This ensures the stretched sample is exactly loopLengthBeats beats at the target BPM,
+            // so it loops perfectly in sync with the NINJAM interval.
+            int targetSamples = 0;
+            if (loopLengthBeats > 0)
+            {
+                const double secondsPerBeat = 60.0 / effectiveTargetBpm;
+                targetSamples = juce::jmax(1, (int) std::llround((double)loopLengthBeats * secondsPerBeat * sourceRate));
+            }
+            else
+            {
+                // Fallback: use BPM ratio if loop length wasn't detected
+                const double ratio = sourceBpm / effectiveTargetBpm;
+                targetSamples = juce::jmax(1, (int) std::llround((double) original.getNumSamples() * ratio));
+            }
             juce::AudioBuffer<float> synced = stretchLoopWithSignalsmith(original, sourceRate, targetSamples);
             if (synced.getNumSamples() <= 0)
                 return juce::ThreadPoolJob::jobHasFinished;
@@ -15208,6 +15836,8 @@ void NinjamVst3AudioProcessor::resyncSamplePadToBpm(int padIndex, double targetB
     juce::AudioBuffer<float> original;
     double sourceRate = 44100.0;
     double sourceBpm = 0.0;
+    double rawSourceBpm = 0.0;
+    int loopLengthBeats = 0;
     SamplePadPlaybackSpeed playbackSpeed = SamplePadPlaybackSpeed::normal;
     double effectiveTargetBpm = 0.0;
     bool shouldSync = false;
@@ -15229,6 +15859,8 @@ void NinjamVst3AudioProcessor::resyncSamplePadToBpm(int padIndex, double targetB
         original = pad.originalSample;
         sourceRate = pad.originalSourceSampleRate > 1.0 ? pad.originalSourceSampleRate : pad.sourceSampleRate;
         sourceBpm = pad.sourceBpm;
+        rawSourceBpm = pad.rawSourceBpm;
+        loopLengthBeats = pad.loopLengthBeats;
         playbackSpeed = sanitizeSamplePadPlaybackSpeed(pad.playbackSpeed.load(std::memory_order_relaxed));
         effectiveTargetBpm = targetBpm * samplePadPlaybackSpeedMultiplier(playbackSpeed);
         if (!force && pad.bpmSyncApplied && std::abs(pad.lastSyncedTargetBpm - effectiveTargetBpm) < 0.05)
@@ -15241,7 +15873,11 @@ void NinjamVst3AudioProcessor::resyncSamplePadToBpm(int padIndex, double targetB
 
     if (sourceBpm <= 1.0 || !std::isfinite(sourceBpm))
     {
-        sourceBpm = detectSampleBpmWithAubio(original, sourceRate);
+        const auto redetect = detectSampleBpmDetailed(original, sourceRate);
+        sourceBpm = redetect.normalisedBpm;
+        rawSourceBpm = redetect.rawBpm;
+        if (loopLengthBeats <= 0)
+            loopLengthBeats = redetect.loopLengthBeats;
     }
 
     if (sourceBpm <= 1.0 || !std::isfinite(sourceBpm))
@@ -15253,8 +15889,18 @@ void NinjamVst3AudioProcessor::resyncSamplePadToBpm(int padIndex, double targetB
     if (!isSamplePadsFeatureEnabled())
         return;
 
-    const double ratio = sourceBpm / effectiveTargetBpm;
-    const int targetSamples = juce::jmax(1, (int)std::llround((double)original.getNumSamples() * ratio));
+    // Calculate target samples from loop length in beats, not BPM ratio.
+    int targetSamples = 0;
+    if (loopLengthBeats > 0)
+    {
+        const double secondsPerBeat = 60.0 / effectiveTargetBpm;
+        targetSamples = juce::jmax(1, (int)std::llround((double)loopLengthBeats * secondsPerBeat * sourceRate));
+    }
+    else
+    {
+        const double ratio = sourceBpm / effectiveTargetBpm;
+        targetSamples = juce::jmax(1, (int)std::llround((double)original.getNumSamples() * ratio));
+    }
     juce::AudioBuffer<float> synced = stretchLoopWithSignalsmith(original, sourceRate, targetSamples);
     if (synced.getNumSamples() <= 0)
         return;
@@ -15494,9 +16140,9 @@ void NinjamVst3AudioProcessor::processSamplePadLooperRecording(int numSamples,
     const int safeBpi = juce::jmax(1, bpi);
     const double blockEndBeat = blockStartBeat + (double)numSamples / safeSamplesPerBeat;
 
-    const juce::ScopedLock lock(samplePadsLock);
     for (auto& pad : samplePads)
     {
+        const juce::ScopedLock padLock(samplePadsLock);
         bool startedThisBlock = false;
         int recordCopyStart = 0;
 
@@ -15596,14 +16242,18 @@ void NinjamVst3AudioProcessor::processSamplePadLooperRecording(int numSamples,
                             ? juce::jmax(1, (int)std::llround(capturedBeats))
                             : quantiseSamplePadFreeLoopBeats(capturedBeats);
                 const int targetSamples = juce::jmax(1, (int)std::llround((double)quantisedBeats * safeSamplesPerBeat));
-                juce::AudioBuffer<float> loopBuffer(2, targetSamples);
-                loopBuffer.clear();
+                if (samplePadLoopFinishBuffer.getNumChannels() < 2 || samplePadLoopFinishBuffer.getNumSamples() < targetSamples)
+                    samplePadLoopFinishBuffer.setSize(2, targetSamples, false, true, true);
+                samplePadLoopFinishBuffer.clear(0, targetSamples);
+                samplePadLoopFinishBuffer.clear(1, targetSamples);
 
                 const int samplesToCopy = juce::jmin(pad.recordBuffer.getNumSamples(), targetSamples);
-                loopBuffer.copyFrom(0, 0, pad.recordBuffer, 0, 0, samplesToCopy);
-                loopBuffer.copyFrom(1, 0, pad.recordBuffer, 1, 0, samplesToCopy);
+                samplePadLoopFinishBuffer.copyFrom(0, 0, pad.recordBuffer, 0, 0, samplesToCopy);
+                samplePadLoopFinishBuffer.copyFrom(1, 0, pad.recordBuffer, 1, 0, samplesToCopy);
 
-                pad.sample = std::move(loopBuffer);
+                pad.sample.setSize(2, targetSamples, false, true, true);
+                pad.sample.copyFrom(0, 0, samplePadLoopFinishBuffer, 0, 0, targetSamples);
+                pad.sample.copyFrom(1, 0, samplePadLoopFinishBuffer, 1, 0, targetSamples);
                 pad.originalSample = pad.sample;
                 pad.file = juce::File{};
                 pad.sourceSampleRate = juce::jmax(1.0, processingSampleRate);
@@ -15824,9 +16474,24 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
     float* monitorOutR = samplePadsMonitorRenderBuffer.getWritePointer(1);
     float* oneShotOutL = samplePadsOneShotRenderBuffer.getWritePointer(0);
     float* oneShotOutR = samplePadsOneShotRenderBuffer.getWritePointer(1);
-    const bool duckActive = samplePadsDuckEnabled.load(std::memory_order_relaxed);
+    const bool globalDuckEnabled = samplePadsDuckEnabled.load(std::memory_order_relaxed);
+    // Global Duck is the master enable. Only pads with D enabled get the duck effect.
+    // When global Duck is off, no ducking happens at all.
+    bool anyPadNeedsDuck = false;
+    if (globalDuckEnabled)
+    {
+        for (const auto& p : samplePads)
+        {
+            if (p.duckRoute.load(std::memory_order_relaxed))
+            {
+                anyPadNeedsDuck = true;
+                break;
+            }
+        }
+    }
+
     const float* duckGains = nullptr;
-    if (duckActive)
+    if (anyPadNeedsDuck)
     {
         if (samplePadDuckGainBuffer.size() < (size_t)numSamples)
             samplePadDuckGainBuffer.resize((size_t)numSamples, 1.0f);
@@ -15835,22 +16500,42 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
         const auto duckShape = getSamplePadDuckShape();
         const auto duckLength = getSamplePadDuckLength();
         samplePadDuckOscillator.setFrequency((float)(bpm / 60.0), false);
+
+        // The duck shapes already use smoothDuckStep (Hermite interpolation) which
+        // produces a smooth curve. We only need minimal smoothing to prevent clicks
+        // from the hardGate shape's sharp transitions. Using 0.5ms attack / 2ms release
+        // preserves the shape character while eliminating artifacts.
+        const double sr = processingSampleRate > 1.0 ? processingSampleRate : juce::jmax(1.0, getSampleRate());
+        const float attackCoeff = 1.0f - std::exp(-1.0f / (0.0005f * (float)sr));  // 0.5ms attack
+        const float releaseCoeff = 1.0f - std::exp(-1.0f / (0.002f * (float)sr));  // 2ms release
+
         for (int i = 0; i < numSamples; ++i)
         {
             (void)samplePadDuckOscillator.processSample(0.0f);
-            samplePadDuckGainBuffer[(size_t)i] =
-                getSamplePadDuckGainForBeat(blockStartBeat + (double)i / safeSamplesPerBeat,
-                                            duckShape,
-                                            duckLength);
+            const float target =
+                getSamplePadDuckTargetForBeat(blockStartBeat + (double)i / safeSamplesPerBeat,
+                                              duckShape,
+                                              duckLength);
+
+            // Minimal smoothing: only enough to prevent clicks on sharp transitions
+            const float coeff = target < smoothedDuckGain ? attackCoeff : releaseCoeff;
+            smoothedDuckGain += (target - smoothedDuckGain) * coeff;
+            samplePadDuckGainBuffer[(size_t)i] = smoothedDuckGain;
         }
         duckGains = samplePadDuckGainBuffer.data();
     }
+    else
+    {
+        // No ducking needed — reset smoothed gain to 1.0
+        smoothedDuckGain = 1.0f;
+    }
 
     {
-        const juce::ScopedLock lock(samplePadsLock);
         std::array<bool, numSamplePadFxSlots> localRouteFxSlotsInUse {};
-        for (const auto& activePad : samplePads)
         {
+            const juce::ScopedLock lock(samplePadsLock);
+            for (const auto& activePad : samplePads)
+            {
             const bool localMainActive =
                 (activePad.playing.load(std::memory_order_relaxed)
                     && activePad.mainVoiceRouteToLocal.load(std::memory_order_relaxed))
@@ -15873,9 +16558,11 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
             for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
                 localRouteFxSlotsInUse[(size_t)slot] = localRouteFxSlotsInUse[(size_t)slot]
                     || activePad.fxSlotRoutes[(size_t)slot].load(std::memory_order_relaxed);
+            }
         }
         for (int padIndex = 0; padIndex < numSamplePads; ++padIndex)
         {
+            const juce::ScopedLock padLock(samplePadsLock);
             auto& pad = samplePads[(size_t)padIndex];
             const int length = pad.sample.getNumSamples();
             if (length <= 0)
@@ -15896,8 +16583,19 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
             const bool reverse = pad.reverse.load(std::memory_order_relaxed);
             const bool loop = pad.loop.load(std::memory_order_relaxed);
             const double lengthD = (double)length;
-            const double step = juce::jmax(0.000001, pad.sourceSampleRate / targetRate);
-            const bool duckThisPad = duckActive && pad.duckRoute.load(std::memory_order_relaxed);
+            const auto padSpeed = sanitizeSamplePadPlaybackSpeed(pad.playbackSpeed.load(std::memory_order_relaxed));
+            const bool bpmSynced = pad.bpmSyncEnabled.load(std::memory_order_relaxed) && pad.bpmSyncApplied;
+            // When BPM sync is active, the sample is already pre-stretched for the speed.
+            // Only apply the speed multiplier to the step when BPM sync is off.
+            double speedMultiplier = 1.0;
+            if (!bpmSynced)
+            {
+                if (padSpeed == SamplePadPlaybackSpeed::half) speedMultiplier = 0.5;
+                else if (padSpeed == SamplePadPlaybackSpeed::doubleSpeed) speedMultiplier = 2.0;
+            }
+            const double step = juce::jmax(0.000001, (pad.sourceSampleRate / targetRate) * speedMultiplier);
+            const bool duckThisPad = globalDuckEnabled && pad.duckRoute.load(std::memory_order_relaxed);
+            const float padVolume = pad.volume.load(std::memory_order_relaxed);
             std::array<bool, numSamplePadFxSlots> routedFxSlots {};
             bool hasRoutedFxSlot = false;
             for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
@@ -15913,13 +16611,24 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
                 && pad.playbackScheduled.load(std::memory_order_relaxed)
                 && pad.scheduledStartBeat < blockEndBeat)
             {
-                startSample = juce::jlimit(0, numSamples - 1,
-                                           (int)std::llround((pad.scheduledStartBeat - blockStartBeat) * safeSamplesPerBeat));
-                pad.playbackScheduled.store(false, std::memory_order_relaxed);
-                pad.mainVoiceRouteToLocal.store(pad.scheduledPlaybackRouteToLocal, std::memory_order_relaxed);
-                pad.position.store(reverse ? juce::jmax(0.0, lengthD - 1.0) : 0.0, std::memory_order_relaxed);
-                pad.playing.store(true, std::memory_order_relaxed);
-                mainVoiceActive = true;
+                // Missed-start recovery: if the scheduled beat is in the past (we missed it
+                // between blocks), reschedule to the next interval boundary rather than
+                // starting late. Same approach as the looper recording.
+                constexpr double missedScheduledStartToleranceBeats = 0.02;
+                if (pad.scheduledStartBeat < blockStartBeat - missedScheduledStartToleranceBeats)
+                {
+                    pad.scheduledStartBeat = nextSamplePadIntervalStartBeat(blockStartBeat, bpi);
+                }
+                else
+                {
+                    startSample = juce::jlimit(0, numSamples - 1,
+                                               (int)std::llround((pad.scheduledStartBeat - blockStartBeat) * safeSamplesPerBeat));
+                    pad.playbackScheduled.store(false, std::memory_order_relaxed);
+                    pad.mainVoiceRouteToLocal.store(pad.scheduledPlaybackRouteToLocal, std::memory_order_relaxed);
+                    pad.position.store(reverse ? juce::jmax(0.0, lengthD - 1.0) : 0.0, std::memory_order_relaxed);
+                    pad.playing.store(true, std::memory_order_relaxed);
+                    mainVoiceActive = true;
+                }
             }
 
             if (mainVoiceActive)
@@ -15936,7 +16645,7 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
                     const int index0 = juce::jlimit(0, length - 1, (int)std::floor(pos));
                     const int index1 = juce::jmin(index0 + 1, length - 1);
                     const float frac = (float)(pos - (double)index0);
-                    const float gain = duckThisPad ? duckGains[i] : 1.0f;
+                    const float gain = (duckThisPad ? duckGains[i] : 1.0f) * padVolume;
                     const float sampleL = (srcL[index0] + (srcL[index1] - srcL[index0]) * frac) * gain;
                     const float sampleR = (srcR[index0] + (srcR[index1] - srcR[index0]) * frac) * gain;
                     routeOutL[i] += sampleL;
@@ -15962,6 +16671,16 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
                             {
                                 while (pos < 0.0)
                                     pos += lengthD;
+                                // Apply deferred speed change at loop boundary
+                                const int pendingSpeed = pad.pendingPlaybackSpeed.load(std::memory_order_relaxed);
+                                if (pendingSpeed >= 0)
+                                {
+                                    pad.pendingPlaybackSpeed.store(-1, std::memory_order_relaxed);
+                                    pad.playbackSpeed.store(pendingSpeed, std::memory_order_relaxed);
+                                    pad.bpmSyncApplied = false;
+                                    pad.lastSyncedTargetBpm = 0.0;
+                                    samplePadPendingSpeedResync[(size_t)padIndex].store(true, std::memory_order_relaxed);
+                                }
                             }
                             else
                             {
@@ -15977,6 +16696,16 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
                         {
                             while (pos >= lengthD)
                                 pos -= lengthD;
+                            // Apply deferred speed change at loop boundary
+                            const int pendingSpeed = pad.pendingPlaybackSpeed.load(std::memory_order_relaxed);
+                            if (pendingSpeed >= 0)
+                            {
+                                pad.pendingPlaybackSpeed.store(-1, std::memory_order_relaxed);
+                                pad.playbackSpeed.store(pendingSpeed, std::memory_order_relaxed);
+                                pad.bpmSyncApplied = false;
+                                pad.lastSyncedTargetBpm = 0.0;
+                                samplePadPendingSpeedResync[(size_t)padIndex].store(true, std::memory_order_relaxed);
+                            }
                         }
                         else
                         {
@@ -16009,7 +16738,7 @@ bool NinjamVst3AudioProcessor::renderSamplePads(int numSamples,
                     const int index0 = juce::jlimit(0, length - 1, (int)std::floor(pos));
                     const int index1 = juce::jmin(index0 + 1, length - 1);
                     const float frac = (float)(pos - (double)index0);
-                    const float gain = duckThisPad ? duckGains[i] : 1.0f;
+                    const float gain = (duckThisPad ? duckGains[i] : 1.0f) * padVolume;
                     const float sampleL = (srcL[index0] + (srcL[index1] - srcL[index0]) * frac) * gain;
                     const float sampleR = (srcR[index0] + (srcR[index1] - srcR[index0]) * frac) * gain;
                     routeOutL[i] += sampleL;
@@ -17059,6 +17788,7 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
         int remoteServerLatencyMs = -1;
         int remoteBpi = 0;
         int remoteBeat = -1;
+        double sendOffsetMs = 0.0;
         const juce::var parsed = juce::JSON::parse(payload);
         if (auto* obj = parsed.getDynamicObject())
         {
@@ -17076,6 +17806,8 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                 remoteBpi = (int)obj->getProperty("bpi");
             if (obj->hasProperty("beatIndex"))
                 remoteBeat = (int)obj->getProperty("beatIndex");
+            if (obj->hasProperty("sendOffsetMs"))
+                sendOffsetMs = (double)obj->getProperty("sendOffsetMs");
         }
         const int localInterval = getIntervalIndex();
         juce::String status = "Interval Tag " + sender;
@@ -17101,13 +17833,18 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
             if (senderKey.isNotEmpty() && senderKey != localUserKey)
             {
                 const double signalSeenMs = juce::Time::getMillisecondCounterHiRes();
-                noteRemoteVideoRoomActivity(signalSeenMs);
+                // If this is a redundant retransmission (sendOffsetMs > 0),
+                // adjust the received time back by the offset so the buffer
+                // calculation is based on when the original was sent, not
+                // when this duplicate arrived.
+                const double effectiveSignalSeenMs = signalSeenMs - sendOffsetMs;
+                noteRemoteVideoRoomActivity(effectiveSignalSeenMs);
                 {
                     const juce::ScopedLock lock(intervalSyncAnnouncementLock);
-                    lastRemoteIntervalSignalSeenMsByUser[senderKey] = signalSeenMs;
+                    lastRemoteIntervalSignalSeenMsByUser[senderKey] = effectiveSignalSeenMs;
                     const juce::String canonicalSenderKey = canonicalDelayUserKey(senderKey);
                     if (canonicalSenderKey.isNotEmpty())
-                        lastRemoteIntervalSignalSeenMsByUser[canonicalSenderKey] = signalSeenMs;
+                        lastRemoteIntervalSignalSeenMsByUser[canonicalSenderKey] = effectiveSignalSeenMs;
                 }
                 const bool bpiMatches = (remoteBpi <= 0 || remoteBpi == localBpi);
                 if (!bpiMatches)
@@ -17118,7 +17855,18 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                 bool shouldStorePending = false;
                 const juce::String displaySender = sender.isNotEmpty() ? sender : (payloadUserId.isNotEmpty() ? payloadUserId : senderKey);
                 const long long receivedSampleCount = intervalSyncSampleCounter.load(std::memory_order_relaxed);
-                const double receivedAtMs = signalSeenMs;
+
+                // Check if this sync tag is from an interval that has already passed.
+                // If the tag's interval is more than 1 behind our current interval, it
+                // arrived too late to be useful for this interval's calculation.
+                // We still update signal-seen time and server latency (so the indicator
+                // knows we're hearing from this user), but we don't store it as pending
+                // because processing it at the next boundary would give a buffer that's
+                // off by a full interval. The existing firm delay persists instead.
+                const int localIntervalNow = getDisplayIntervalIndex();
+                const bool tagIsLate = (remoteIntervalAbsolute >= 0 && localIntervalNow >= 0
+                                        && remoteIntervalAbsolute < localIntervalNow - 1);
+
                 {
                     const juce::ScopedLock lock(intervalSyncAnnouncementLock);
                     const int clampedRemoteServerLatencyMs = remoteServerLatencyMs >= 0 ? juce::jlimit(0, 3000, remoteServerLatencyMs) : -1;
@@ -17135,7 +17883,9 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                     if (it == lastAnnouncedRemoteIntervalByUser.end() || it->second != remoteMarkerKey)
                     {
                         lastAnnouncedRemoteIntervalByUser[senderKey] = remoteMarkerKey;
-                        shouldStorePending = true;
+                        // Only store as pending if the tag is not from a past interval.
+                        // Late tags would produce a buffer offset by a full interval.
+                        shouldStorePending = !tagIsLate;
                     }
                 }
 
@@ -17165,7 +17915,7 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                     pending.senderKey = senderKey;
                     pending.displaySender = displaySender;
                     pending.receivedSampleCount = receivedSampleCount;
-                    pending.receivedAtMs = receivedAtMs;
+                    pending.receivedAtMs = effectiveSignalSeenMs;
                 }
             }
         }
@@ -17291,15 +18041,18 @@ void NinjamVst3AudioProcessor::ChatMessage_Callback(void* userData, NJClient* in
             }
             if (recognizedNow)
             {
-                juce::ScopedLock lock(self->chatLock);
-                self->chatHistory.add(recognizedMessage);
-                self->chatSenders.add("");
-                self->chatRevision.fetch_add(1);
-                if (self->chatHistory.size() > 100)
+                juce::MessageManager::callAsync([self, recognizedMessage]()
                 {
-                    self->chatHistory.removeRange(0, self->chatHistory.size() - 100);
-                    self->chatSenders.removeRange(0, juce::jmax(0, self->chatSenders.size() - 100));
-                }
+                    juce::ScopedLock lock(self->chatLock);
+                    self->chatHistory.add(recognizedMessage);
+                    self->chatSenders.add("");
+                    self->chatRevision.fetch_add(1);
+                    if (self->chatHistory.size() > 100)
+                    {
+                        self->chatHistory.removeRange(0, self->chatHistory.size() - 100);
+                        self->chatSenders.removeRange(0, juce::jmax(0, self->chatSenders.size() - 100));
+                    }
+                });
             }
         }
         return true;
@@ -17452,15 +18205,20 @@ void NinjamVst3AudioProcessor::ChatMessage_Callback(void* userData, NJClient* in
         }
         {
             const juce::String stored = line;
-            juce::ScopedLock lock(self->chatLock);
-            self->chatHistory.add(stored);
-            self->chatSenders.add(lineSender);
-            self->chatRevision.fetch_add(1);
-            if (self->chatHistory.size() > 100)
+            // Defer chat history insertion to the message thread to avoid chatLock
+            // contention between the audio thread and UI reads.
+            juce::MessageManager::callAsync([self, stored, lineSender]()
             {
-                self->chatHistory.removeRange(0, self->chatHistory.size() - 100);
-                self->chatSenders.removeRange(0, juce::jmax(0, self->chatSenders.size() - 100));
-            }
+                juce::ScopedLock lock(self->chatLock);
+                self->chatHistory.add(stored);
+                self->chatSenders.add(lineSender);
+                self->chatRevision.fetch_add(1);
+                if (self->chatHistory.size() > 100)
+                {
+                    self->chatHistory.removeRange(0, self->chatHistory.size() - 100);
+                    self->chatSenders.removeRange(0, juce::jmax(0, self->chatSenders.size() - 100));
+                }
+            });
         }
 
         if (shouldTranslateBody)
@@ -17535,6 +18293,7 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     }
 
     const long long blockStartSampleCounter = intervalSyncSampleCounter.fetch_add((long long)numSamples, std::memory_order_relaxed);
+    lastBlockSize = juce::jmax(1, numSamples);
     const bool useHostMidiForLearn = getMidiLearnInputDeviceId().isEmpty();
     const bool useHostMidiForRelay = getMidiRelayInputDeviceId().isEmpty();
     const bool samplePadsEnabledAtBlock = isSamplePadsFeatureEnabled();
@@ -17605,12 +18364,15 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         }
     }
 
-    std::vector<float> blockLinkAudioSamples;
     int blockLinkAudioNumChannels = 0;
     int blockLinkAudioNumFrames = 0;
     if (isLinkAudioEnabled() && isLinkAudioReceiveEnabled())
     {
-        blockLinkAudioSamples.assign((size_t)numSamples * 2u, 0.0f);
+        const size_t requiredSamples = (size_t)numSamples * 2u;
+        if (blockLinkAudioSamples.size() < requiredSamples)
+            blockLinkAudioSamples.resize(requiredSamples, 0.0f);
+        else
+            std::fill_n(blockLinkAudioSamples.data(), requiredSamples, 0.0f);
         blockLinkAudioNumChannels = 2;
         blockLinkAudioNumFrames = numSamples;
 
@@ -17624,7 +18386,6 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         const size_t framesRead = linkAudioReceiveRing.readInterleaved(blockLinkAudioSamples.data(), (size_t)numSamples);
         if (framesRead == 0)
         {
-            blockLinkAudioSamples.clear();
             blockLinkAudioNumChannels = 0;
             blockLinkAudioNumFrames = 0;
         }
@@ -18638,7 +19399,7 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         }
     }
 
-    if (monitorEnabled || transmitEnabled)
+    if (monitorEnabled)
     {
         if (numOutputBusesOut > 0)
         {
@@ -18682,7 +19443,7 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         }
     }
 
-    if ((monitorEnabled || transmitEnabled) && voiceChatMode && numOutputBusesOut > 0)
+    if (monitorEnabled && voiceChatMode && numOutputBusesOut > 0)
     {
         auto mainBus = getBusBuffer(buffer, false, 0);
         const int outChans = mainBus.getNumChannels();
@@ -18696,7 +19457,7 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
         else if (outLeft == 0 && outChans == 1)
             mainBus.addFrom(0, 0, voiceChannelBuffer, 0, 0, numSamples);
     }
-    if ((monitorEnabled || transmitEnabled) && samplePadsActiveThisBlock && numOutputBusesOut > 0)
+    if (monitorEnabled && samplePadsActiveThisBlock && numOutputBusesOut > 0)
     {
         auto mainBus = getBusBuffer(buffer, false, 0);
         const int outChans = mainBus.getNumChannels();
@@ -18984,62 +19745,90 @@ void NinjamVst3AudioProcessor::IntervalChunkCallback_cb(void* userData, NJClient
     if (self == nullptr || !self->ninjamZapVideoEnabled.load(std::memory_order_relaxed))
         return;
 
-    const auto codec = getNinjamZapVideoCodec(fourcc);
-    const juce::String sender = username != nullptr ? juce::String::fromUTF8(username) : juce::String();
-    const juce::String streamKey = sender + ":" + juce::String(chidx);
-    const juce::String reassemblyKey = streamKey + ":" + guidToHexString(guid);
-    const double receivedMs = juce::Time::getMillisecondCounterHiRes();
-    self->noteRemoteVideoRoomActivity(receivedMs);
+    // On the audio thread: do minimal work — copy raw data and enqueue for background processing.
+    PendingZapChunk chunk;
+    chunk.username = username != nullptr ? std::string(username) : std::string();
+    chunk.chidx = chidx;
+    chunk.fourcc = fourcc;
+    if (guid != nullptr)
+        std::memcpy(chunk.guid.data(), guid, 16);
+    if (dataLen > 0 && data != nullptr)
+        chunk.data.assign(static_cast<const unsigned char*>(data),
+                          static_cast<const unsigned char*>(data) + dataLen);
+    chunk.flags = flags;
+    chunk.receivedMs = juce::Time::getMillisecondCounterHiRes();
+    self->noteRemoteVideoRoomActivity(chunk.receivedMs);
+
+    {
+        const juce::ScopedLock lock(self->pendingZapChunksLock);
+        self->pendingZapChunks.push_back(std::move(chunk));
+    }
+}
+
+void NinjamVst3AudioProcessor::processPendingZapChunks()
+{
+    std::vector<PendingZapChunk> localQueue;
+    {
+        const juce::ScopedLock lock(pendingZapChunksLock);
+        localQueue.swap(pendingZapChunks);
+    }
+    for (const auto& chunk : localQueue)
+        processSingleZapChunk(chunk);
+}
+
+void NinjamVst3AudioProcessor::processSingleZapChunk(const PendingZapChunk& chunk)
+{
+    const auto codec = getNinjamZapVideoCodec(chunk.fourcc);
+    const juce::String sender = juce::String::fromUTF8(chunk.username.c_str());
+    const juce::String streamKey = sender + ":" + juce::String(chunk.chidx);
+    const juce::String reassemblyKey = streamKey + ":" + guidToHexString(chunk.guid.data());
     std::vector<juce::MemoryBlock> chunks;
 
     if (reassemblyKey.isNotEmpty())
     {
-        const juce::ScopedLock lock(self->ninjamZapVideoChunkLock);
-        auto& reassembler = self->ninjamZapVideoChunkReassemblers[reassemblyKey];
-        if (dataLen > 0 && data != nullptr)
-            chunks = reassembler.pushBytes(data, static_cast<size_t>(dataLen));
-
+        const juce::ScopedLock lock(ninjamZapVideoChunkLock);
+        auto& reassembler = ninjamZapVideoChunkReassemblers[reassemblyKey];
+        if (!chunk.data.empty())
+            chunks = reassembler.pushBytes(chunk.data.data(), chunk.data.size());
     }
 
-    if (!self->ninjamZapVideoReceivedNotice.exchange(true, std::memory_order_relaxed))
+    if (!ninjamZapVideoReceivedNotice.exchange(true, std::memory_order_relaxed))
     {
         juce::String message = "Receiving NINJAMZap video transport";
         if (sender.isNotEmpty())
             message << " from " << sender;
-        message << " on channel " << (chidx + 1)
+        message << " on channel " << (chunk.chidx + 1)
                 << " as " << ninjamplus::zap::getCodecName(codec)
-                << " (" << dataLen << " bytes first fragment";
+                << " (" << (int)chunk.data.size() << " bytes first fragment";
         if (!chunks.empty())
             message << ", " << (int)chunks.size() << " complete Zap chunk" << (chunks.size() == 1 ? "" : "s");
         message << ").";
         message << " Browser decode path active.";
-        self->addSystemChatLine(message);
+        addSystemChatLine(message);
     }
 
     if (!chunks.empty())
     {
-        for (const auto& chunk : chunks)
+        for (const auto& completedChunk : chunks)
         {
-            // Sync markers may be sent as zero-length payloads wrapped by the
-            // chunk framing; detect and log them but otherwise ignore.
             ninjamplus::zap::SyncMarker marker;
             bool markerAlreadySeen = false;
             {
-                const juce::ScopedLock lock(self->ninjamZapVideoChunkLock);
-                auto markerSeenIt = self->ninjamZapVideoMarkerSeenByReassemblyKey.find(reassemblyKey);
-                markerAlreadySeen = markerSeenIt != self->ninjamZapVideoMarkerSeenByReassemblyKey.end()
+                const juce::ScopedLock lock(ninjamZapVideoChunkLock);
+                auto markerSeenIt = ninjamZapVideoMarkerSeenByReassemblyKey.find(reassemblyKey);
+                markerAlreadySeen = markerSeenIt != ninjamZapVideoMarkerSeenByReassemblyKey.end()
                     && markerSeenIt->second;
             }
 
             if (!markerAlreadySeen
-                && ninjamplus::zap::parseSyncMarkerPayload(chunk.getData(), chunk.getSize(), marker))
+                && ninjamplus::zap::parseSyncMarkerPayload(completedChunk.getData(), completedChunk.getSize(), marker))
             {
                 const juce::String audioGuidHex = guidToHexString(marker.audioGuid.data());
                 {
-                    const juce::ScopedLock lock(self->ninjamZapVideoChunkLock);
-                    self->ninjamZapVideoAudioGuidByReassemblyKey[reassemblyKey] = audioGuidHex;
-                    self->ninjamZapVideoMarkerIntervalByReassemblyKey[reassemblyKey] = (int)marker.intervalCounter;
-                    self->ninjamZapVideoMarkerSeenByReassemblyKey[reassemblyKey] = true;
+                    const juce::ScopedLock lock(ninjamZapVideoChunkLock);
+                    ninjamZapVideoAudioGuidByReassemblyKey[reassemblyKey] = audioGuidHex;
+                    ninjamZapVideoMarkerIntervalByReassemblyKey[reassemblyKey] = (int)marker.intervalCounter;
+                    ninjamZapVideoMarkerSeenByReassemblyKey[reassemblyKey] = true;
                 }
                 continue;
             }
@@ -19052,47 +19841,47 @@ void NinjamVst3AudioProcessor::IntervalChunkCallback_cb(void* userData, NJClient
                 juce::String audioGuidHex;
                 int markerInterval = -1;
                 {
-                    const juce::ScopedLock lock(self->ninjamZapVideoChunkLock);
-                    auto guidIt = self->ninjamZapVideoAudioGuidByReassemblyKey.find(reassemblyKey);
-                    if (guidIt != self->ninjamZapVideoAudioGuidByReassemblyKey.end())
+                    const juce::ScopedLock lock(ninjamZapVideoChunkLock);
+                    auto guidIt = ninjamZapVideoAudioGuidByReassemblyKey.find(reassemblyKey);
+                    if (guidIt != ninjamZapVideoAudioGuidByReassemblyKey.end())
                         audioGuidHex = guidIt->second;
-                    auto intervalIt = self->ninjamZapVideoMarkerIntervalByReassemblyKey.find(reassemblyKey);
-                    if (intervalIt != self->ninjamZapVideoMarkerIntervalByReassemblyKey.end())
+                    auto intervalIt = ninjamZapVideoMarkerIntervalByReassemblyKey.find(reassemblyKey);
+                    if (intervalIt != ninjamZapVideoMarkerIntervalByReassemblyKey.end())
                         markerInterval = intervalIt->second;
                 }
 
-                NinjamVst3AudioProcessor::ZapVideoDecodeJob job;
+                ZapVideoDecodeJob job;
                 job.streamKey = streamKey;
                 job.sender = sender;
                 job.audioGuidHex = audioGuidHex;
                 job.markerInterval = markerInterval;
-                job.channelIndex = chidx;
+                job.channelIndex = chunk.chidx;
                 job.codec = codec;
-                job.payload.append(chunk.getData(), chunk.getSize());
-                job.receivedMs = receivedMs;
+                job.payload.append(completedChunk.getData(), completedChunk.getSize());
+                job.receivedMs = chunk.receivedMs;
                 job.queuedMs = juce::Time::getMillisecondCounterHiRes();
                 {
-                    const juce::ScopedLock lock(self->zapVideoFrameLock);
-                    auto timingIt = self->zapVideoSenderTimingByStream.find(streamKey);
-                    if (timingIt != self->zapVideoSenderTimingByStream.end()
+                    const juce::ScopedLock lock(zapVideoFrameLock);
+                    auto timingIt = zapVideoSenderTimingByStream.find(streamKey);
+                    if (timingIt != zapVideoSenderTimingByStream.end()
                         && job.queuedMs - timingIt->second.updatedMs <= 5000.0)
                     {
                         job.senderCaptureQueueMs = timingIt->second.captureQueueMs;
                         job.senderEncodeMs = timingIt->second.encodeMs;
                     }
                 }
-                self->publishBrowserDecodedZapVideoFrame(job);
+                publishBrowserDecodedZapVideoFrame(job);
             }
         }
     }
 
-    if ((flags & 1) != 0 && reassemblyKey.isNotEmpty())
+    if ((chunk.flags & 1) != 0 && reassemblyKey.isNotEmpty())
     {
-        const juce::ScopedLock lock(self->ninjamZapVideoChunkLock);
-        self->ninjamZapVideoChunkReassemblers.erase(reassemblyKey);
-        self->ninjamZapVideoAudioGuidByReassemblyKey.erase(reassemblyKey);
-        self->ninjamZapVideoMarkerIntervalByReassemblyKey.erase(reassemblyKey);
-        self->ninjamZapVideoMarkerSeenByReassemblyKey.erase(reassemblyKey);
+        const juce::ScopedLock lock(ninjamZapVideoChunkLock);
+        ninjamZapVideoChunkReassemblers.erase(reassemblyKey);
+        ninjamZapVideoAudioGuidByReassemblyKey.erase(reassemblyKey);
+        ninjamZapVideoMarkerIntervalByReassemblyKey.erase(reassemblyKey);
+        ninjamZapVideoMarkerSeenByReassemblyKey.erase(reassemblyKey);
     }
 }
 
@@ -20130,6 +20919,11 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     state.setProperty("metronomeOutputChannel", getMetronomeOutputChannel(), nullptr);
     state.setProperty("transmitLocal", isTransmittingLocal(), nullptr);
     state.setProperty("mobileHotspotMode", isMobileHotspotModeEnabled(), nullptr);
+    state.setProperty("sshTunnelEnabled", isSshTunnelEnabled(), nullptr);
+    state.setProperty("sshTunnelHost", getSshTunnelHost(), nullptr);
+    state.setProperty("sshTunnelPort", getSshTunnelPort(), nullptr);
+    state.setProperty("sshTunnelUser", getSshTunnelUser(), nullptr);
+    state.setProperty("sshTunnelKeyFile", getSshTunnelKeyFile(), nullptr);
     state.setProperty("autoReconnectEnabled", isAutoReconnectEnabled(), nullptr);
     state.setProperty("chordDetectionEnabled", isChordDetectionEnabled(), nullptr);
     state.setProperty("samplePadsVolume", (double)getSamplePadVolume(), nullptr);
@@ -20161,6 +20955,7 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
             state.setProperty("samplePadBpmSync" + juce::String(pad), samplePad.bpmSyncEnabled.load(std::memory_order_relaxed), nullptr);
             state.setProperty("samplePadPlaybackSpeed" + juce::String(pad), samplePad.playbackSpeed.load(std::memory_order_relaxed), nullptr);
             state.setProperty("samplePadDuckRoute" + juce::String(pad), samplePad.duckRoute.load(std::memory_order_relaxed), nullptr);
+            state.setProperty("samplePadVolume" + juce::String(pad), (double)samplePad.volume.load(std::memory_order_relaxed), nullptr);
             for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
             {
                 state.setProperty("samplePadFxSlotRoute" + juce::String(pad) + "_" + juce::String(slot),
@@ -20236,6 +21031,11 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setMetronomeOutputChannel((int)state.getProperty("metronomeOutputChannel", 0));
     setTransmitLocal((bool)state.getProperty("transmitLocal", false));
     setMobileHotspotModeEnabled((bool)state.getProperty("mobileHotspotMode", false));
+    setSshTunnelEnabled((bool)state.getProperty("sshTunnelEnabled", false));
+    setSshTunnelHost(state.getProperty("sshTunnelHost", "").toString());
+    setSshTunnelPort((int)state.getProperty("sshTunnelPort", 22));
+    setSshTunnelUser(state.getProperty("sshTunnelUser", "").toString());
+    setSshTunnelKeyFile(state.getProperty("sshTunnelKeyFile", "").toString());
     setAutoReconnectEnabled((bool)state.getProperty("autoReconnectEnabled", true));
     setChordDetectionEnabled((bool)state.getProperty("chordDetectionEnabled", true));
     setSamplePadVolume(juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("samplePadsVolume", 1.0)));
@@ -20280,6 +21080,7 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
         setSamplePadReverseEnabled(pad, (bool)state.getProperty("samplePadReverse" + juce::String(pad), false));
         setSamplePadMatchBpiEnabled(pad, (bool)state.getProperty("samplePadMatchBpi" + juce::String(pad), false));
         setSamplePadDuckRouteEnabled(pad, (bool)state.getProperty("samplePadDuckRoute" + juce::String(pad), false));
+        setSamplePadVolume(pad, juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("samplePadVolume" + juce::String(pad), 1.0)));
         for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
             setSamplePadFxSlotRouteEnabled(pad,
                                            slot,
@@ -20313,6 +21114,7 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
     const int safeLocalMarkerBeat = juce::jmax(0, localMarkerBeat);
     const double safeIntervalDurationMs = juce::jmax(1.0, intervalDurationMs);
     const double localMarkerAtMs = juce::Time::getMillisecondCounterHiRes();
+    const int localIntervalNow = getDisplayIntervalIndex();
 
     for (;;)
     {
@@ -20326,6 +21128,14 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
             {
                 if (staleIt->second.receivedSampleCount < 0 && staleIt->second.receivedAtMs <= 0.0)
                     staleIt = pendingRemoteIntervalStartsByUser.erase(staleIt);
+                else if (staleIt->second.remoteIntervalAbsolute >= 0
+                         && localIntervalNow >= 0
+                         && staleIt->second.remoteIntervalAbsolute < localIntervalNow - 2)
+                {
+                    // Pending entry from an interval that has already passed — remove it
+                    // so it doesn't produce a buffer offset by a full interval.
+                    staleIt = pendingRemoteIntervalStartsByUser.erase(staleIt);
+                }
                 else
                     ++staleIt;
             }
@@ -20527,6 +21337,21 @@ void NinjamVst3AudioProcessor::timerCallback()
     }
     noteSlowIntervalStep("clientRun", juce::Time::getMillisecondCounterHiRes() - stepStartMs);
     updateMasterChordTimeline();
+
+    // Check for deferred playback speed changes that were applied at a loop boundary
+    // and trigger the resync from here (safe to use samplePadsLock).
+    if (isSamplePadsFeatureEnabled())
+    {
+        const double currentBpm = (double)getBPM();
+        if (currentBpm > 1.0)
+        {
+            for (int pad = 0; pad < numSamplePads; ++pad)
+            {
+                if (samplePadPendingSpeedResync[(size_t)pad].exchange(false, std::memory_order_relaxed))
+                    resyncSamplePadToBpm(pad, currentBpm, true);
+            }
+        }
+    }
 
     if (disconnectAfterLicenseRejected.exchange(false, std::memory_order_acq_rel))
     {

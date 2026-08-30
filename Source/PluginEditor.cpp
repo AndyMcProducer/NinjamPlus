@@ -3288,8 +3288,10 @@ juce::String buildSyncTooltip(NinjamVst3AudioProcessor::SyncMode syncMode, float
     juce::String sourceLabel = "Host Transport";
     if (syncMode == NinjamVst3AudioProcessor::SyncMode::abletonLink)
         sourceLabel = "Ableton Link";
+    else if (syncMode == NinjamVst3AudioProcessor::SyncMode::midi)
+        sourceLabel = "Midi Clock";
 
-    juce::String tooltip = "Click to toggle transport sync. Right-click for sync source and compensation. Source: ";
+    juce::String tooltip = "Click to toggle transport sync. Right-click for sync source. Source: ";
     tooltip << sourceLabel
             << ". Current advance: "
             << juce::String(compensationMs, compensationMs < 10.0f ? 1 : 0)
@@ -4382,7 +4384,9 @@ public:
             return;
         }
 
-        routeInteractionActive = e.mods.isLeftButtonDown() && e.mods.isShiftDown();
+        // Route dragging: Shift+Left-click OR Middle mouse button
+        routeInteractionActive = (e.mods.isLeftButtonDown() && e.mods.isShiftDown())
+                                 || e.mods.isMiddleButtonDown();
         if (routeInteractionActive)
         {
             if (onRouteMouseDown)
@@ -4568,7 +4572,7 @@ public:
         nameLabel.setColour(juce::Label::textColourId, juce::Colours::white.withAlpha(0.94f));
         nameLabel.setColour(juce::Label::backgroundColourId, juce::Colours::transparentBlack);
         nameLabel.setColour(juce::Label::outlineColourId, juce::Colours::transparentBlack);
-        nameLabel.setTooltip("Right-click to rename pad");
+        nameLabel.setTooltip("Pad name. Right-click to rename this pad.");
         nameLabel.setInterceptsMouseClicks(false, false);
         nameLabel.onTextChange = [this]
         {
@@ -4579,7 +4583,7 @@ public:
 
         recordButton.setName("record");
         recordButton.setClickingTogglesState(true);
-        recordButton.setTooltip("Arm loop recording");
+        recordButton.setTooltip("Arm loop recording. Hold pad for 2s to schedule BPI record at next interval.");
         recordButton.setLookAndFeel(&toggleLookAndFeel);
         recordButton.onClick = [this]
         {
@@ -4589,7 +4593,7 @@ public:
 
         matchBpiButton.setName("matchbpi");
         matchBpiButton.setClickingTogglesState(true);
-        matchBpiButton.setTooltip("Match BPI start position");
+        matchBpiButton.setTooltip("Match BPI: align this pad's loop start to the server's BPI interval boundary.");
         matchBpiButton.setLookAndFeel(&toggleLookAndFeel);
         matchBpiButton.onClick = [this]
         {
@@ -4599,7 +4603,7 @@ public:
 
         loopButton.setName("loop");
         loopButton.setClickingTogglesState(true);
-        loopButton.setTooltip("Loop");
+        loopButton.setTooltip("Loop: continuously loop the sample when triggered.");
         loopButton.setLookAndFeel(&toggleLookAndFeel);
         loopButton.onClick = [this]
         {
@@ -4609,7 +4613,7 @@ public:
 
         reverseButton.setName("reverse");
         reverseButton.setClickingTogglesState(true);
-        reverseButton.setTooltip("Reverse");
+        reverseButton.setTooltip("Reverse: play the sample backwards.");
         reverseButton.setLookAndFeel(&toggleLookAndFeel);
         reverseButton.onClick = [this]
         {
@@ -4620,17 +4624,47 @@ public:
         duckRouteButton.setName("duckroute");
         duckRouteButton.setButtonText("D");
         duckRouteButton.setClickingTogglesState(true);
-        duckRouteButton.setTooltip("Route this pad through the sampler duck");
+        duckRouteButton.setTooltip("Route this pad through the duck effect (D). Requires global Duck to be enabled.");
         duckRouteButton.setLookAndFeel(&toggleLookAndFeel);
         duckRouteButton.onClick = [this]
         {
             const bool enabled = duckRouteButton.getToggleState();
             processor.setSamplePadDuckRouteEnabled(padIndex, enabled);
-            if (enabled)
-                processor.setSamplePadDuckEnabled(true);
             refreshFromProcessor();
         };
         addAndMakeVisible(duckRouteButton);
+
+        // Per-pad volume control (numeric, click arrows or mouse wheel)
+        volumeLabel.setEditable(true, false, false);
+        volumeLabel.setJustificationType(juce::Justification::centred);
+        volumeLabel.setFont(juce::Font(10.0f));
+        volumeLabel.setColour(juce::Label::textColourId, juce::Colours::white.withAlpha(0.85f));
+        volumeLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0xff1a1d22));
+        volumeLabel.setColour(juce::Label::outlineColourId, juce::Colour(0xff3a3d42));
+        volumeLabel.setColour(juce::Label::textWhenEditingColourId, juce::Colours::white);
+        volumeLabel.setTooltip("Pad volume (0-200%). Mouse wheel or type to adjust.");
+        volumeLabel.setText(juce::String(juce::roundToInt(processor.getSamplePadVolume(padIndex) * 100.0f)) + "%", juce::dontSendNotification);
+        volumeLabel.onTextChange = [this]
+        {
+            const auto text = volumeLabel.getText().retainCharacters("0123456789.").trim();
+            const float val = juce::jlimit(0.0f, 2.0f, text.getFloatValue() / 100.0f);
+            processor.setSamplePadVolume(padIndex, val);
+            volumeLabel.setText(juce::String(juce::roundToInt(val * 100.0f)) + "%", juce::dontSendNotification);
+            editor.notifyPersistentSettingsDirty();
+        };
+        volumeLabel.onEditorShow = [this]
+        {
+            if (auto* ed = volumeLabel.getCurrentTextEditor())
+                ed->setInputRestrictions(4, "0123456789");
+        };
+        volumeLabel.onWheelStep = [this](int steps)
+        {
+            float val = juce::jlimit(0.0f, 2.0f, processor.getSamplePadVolume(padIndex) + steps * 0.01f);
+            processor.setSamplePadVolume(padIndex, val);
+            volumeLabel.setText(juce::String(juce::roundToInt(val * 100.0f)) + "%", juce::dontSendNotification);
+            editor.notifyPersistentSettingsDirty();
+        };
+        addAndMakeVisible(volumeLabel);
 
         lastTriggerFlashCounter = processor.getSamplePadTriggerFlashCounter(padIndex);
         refreshFromProcessor();
@@ -4662,6 +4696,7 @@ public:
         const bool recording = cachedRecording;
         const bool playing = cachedPlaying;
         const bool waitingForBpiLoop = cachedWaitingForBpiLoop;
+        const bool waitingForPlayback = cachedPlaybackScheduled;
         const bool hover = isMouseOverOrDragging();
 
         const double nowMs = juce::Time::getMillisecondCounterHiRes();
@@ -4685,6 +4720,13 @@ public:
             activeTop = juce::Colour(0xffffad45);
             activeMid = juce::Colour(0xff8b4b12);
             activeGlow = juce::Colour(0xffff9f2f);
+        }
+        else if (waitingForPlayback)
+        {
+            activeTint = true;
+            activeTop = juce::Colour(0xff3a8fe0);
+            activeMid = juce::Colour(0xff1a3f6b);
+            activeGlow = juce::Colour(0xff48a0ff);
         }
         else if (playing)
         {
@@ -4746,7 +4788,7 @@ public:
             }
         }
 
-        // Pulsing / outline logic: recording (red) > waiting for BPI loop (orange) > playing (green) > static
+        // Pulsing / outline logic: recording (red) > waiting for BPI record (orange) > waiting for playback (blue) > playing (green) > static
         float outlineThickness = loaded ? 1.8f : 1.2f;
         juce::Colour outlineColour;
         float outlineAlpha = 1.0f;
@@ -4760,6 +4802,11 @@ public:
         {
             outlineColour = juce::Colour(0xffffa040);
             outlineAlpha = 0.46f + 0.44f * pulse;
+        }
+        else if (waitingForPlayback)
+        {
+            outlineColour = juce::Colour(0xff48a0ff);
+            outlineAlpha = 0.50f + 0.40f * pulse;
         }
         else if (playing)
         {
@@ -4845,6 +4892,8 @@ public:
         auto bottom = area.removeFromBottom(22);
         duckRouteButton.setBounds(bottom.removeFromRight(21).reduced(1));
         bottom.removeFromRight(4);
+        volumeLabel.setBounds(bottom.removeFromRight(36).reduced(1));
+        bottom.removeFromRight(4);
         auto nameArea = bottom.reduced(2, 0);
         nameLabel.setBounds(nameArea);
     }
@@ -4886,6 +4935,17 @@ public:
             return;
         }
 
+        // Middle mouse button starts an FX route drag from this pad
+        if (e.mods.isMiddleButtonDown())
+        {
+            mouseDownActive = true;
+            mouseHoldActionTriggered = true;
+            fxRouteDragActive = true;
+            if (onFxRouteDrag)
+                onFxRouteDrag(padIndex, getParentPointForEvent(e), false);
+            return;
+        }
+
         if (e.mods.isLeftButtonDown())
         {
             if (processor.isSamplePadRecording(padIndex) || processor.isSamplePadWaitingForBpiLoop(padIndex))
@@ -4907,7 +4967,18 @@ public:
 
     void mouseDrag(const juce::MouseEvent& e) override
     {
-        if (!mouseDownActive || !e.mods.isLeftButtonDown())
+        if (!mouseDownActive)
+            return;
+
+        // Middle mouse drag routes to FX
+        if (e.mods.isMiddleButtonDown())
+        {
+            if (onFxRouteDrag)
+                onFxRouteDrag(padIndex, getParentPointForEvent(e), false);
+            return;
+        }
+
+        if (!e.mods.isLeftButtonDown())
             return;
 
         if (!fxRouteDragActive)
@@ -5017,6 +5088,7 @@ public:
         const bool loaded = processor.hasSamplePadSample(padIndex);
         const bool playing = processor.isSamplePadPlaying(padIndex);
         const bool waitingForBpiLoop = processor.isSamplePadWaitingForBpiLoop(padIndex);
+        const bool playbackScheduled = processor.isSamplePadPlaybackScheduled(padIndex);
         const int loopBeats = processor.getSamplePadLoopLengthBeats(padIndex);
         const float loopProgress = loopBeats > 0 ? processor.getSamplePadLoopProgress(padIndex) : 0.0f;
         const int recordStartCountdownBeats = waitingForBpiLoop ? processor.getSamplePadRecordStartCountdownBeats(padIndex) : 0;
@@ -5034,6 +5106,13 @@ public:
         if (duckRouteButton.getToggleState() != duckRouteEnabled)
             duckRouteButton.setToggleState(duckRouteEnabled, juce::dontSendNotification);
 
+        const float padVol = processor.getSamplePadVolume(padIndex);
+        if (std::abs(padVol - lastDisplayedVolume) > 0.005f && ! volumeLabel.isBeingEdited())
+        {
+            lastDisplayedVolume = padVol;
+            volumeLabel.setText(juce::String(juce::roundToInt(padVol * 100.0f)) + "%", juce::dontSendNotification);
+        }
+
         bool visualStateChanged = loaded != cachedLoaded
             || recording != cachedRecording
             || playing != cachedPlaying
@@ -5048,6 +5127,7 @@ public:
         cachedRecording = recording;
         cachedPlaying = playing;
         cachedWaitingForBpiLoop = waitingForBpiLoop;
+        cachedPlaybackScheduled = playbackScheduled;
         cachedLoopBeats = loopBeats;
         cachedLoopProgress = loopProgress;
         cachedRecordStartCountdownBeats = recordStartCountdownBeats;
@@ -5083,16 +5163,20 @@ private:
         menu.addItem(2, "Delete Sample", hasSample);
         menu.addItem(3, "Rename Pad");
         menu.addSeparator();
-        menu.addItem(4, "Auto BPM Sync", hasSample, processor.isSamplePadBpmSyncEnabled(padIndex));
+
+        // Show detected original BPM at the top — clickable to edit
+        const double origBpm = processor.getSamplePadSourceBpm(padIndex);
+        if (hasSample && origBpm > 1.0)
+            menu.addItem(30, "Orig. BPM: " + juce::String(origBpm, 1) + "  (click to edit)");
+
+        menu.addItem(4, "Sync BPI", hasSample, processor.isSamplePadBpmSyncEnabled(padIndex));
         juce::PopupMenu speedMenu;
         const auto currentSpeed = processor.getSamplePadPlaybackSpeed(padIndex);
         speedMenu.addItem(20, "Half Speed", hasSample, currentSpeed == NinjamVst3AudioProcessor::SamplePadPlaybackSpeed::half);
         speedMenu.addItem(21, "Normal Speed", hasSample, currentSpeed == NinjamVst3AudioProcessor::SamplePadPlaybackSpeed::normal);
         speedMenu.addItem(22, "Double Speed", hasSample, currentSpeed == NinjamVst3AudioProcessor::SamplePadPlaybackSpeed::doubleSpeed);
         menu.addSubMenu("Playback Speed", speedMenu, hasSample);
-        menu.addItem(5, "Resync to NINJAM BPM", hasSample && processor.isSamplePadLoopEnabled(padIndex));
         menu.addItem(6, "Undo BPM Resync", processor.canUndoSamplePadBpmResync(padIndex));
-        menu.addItem(7, "Sync to Beat", hasSample && processor.isSamplePadLoopEnabled(padIndex));
         menu.addItem(8, "Undo Clear", processor.canUndoSamplePadClear(padIndex));
         menu.addSeparator();
         juce::PopupMenu clearWireMenu;
@@ -5142,20 +5226,35 @@ private:
                                        !safeThis->processor.isSamplePadBpmSyncEnabled(safeThis->padIndex));
                                    safeThis->refreshFromProcessor();
                                }
-                               else if (result == 5)
-                               {
-                                   safeThis->processor.requestSamplePadResyncToNinjamBpm(safeThis->padIndex, true);
-                                   safeThis->refreshFromProcessor();
-                               }
                                else if (result == 6)
                                {
                                    safeThis->processor.undoSamplePadBpmResync(safeThis->padIndex);
                                    safeThis->refreshFromProcessor();
                                }
-                               else if (result == 7)
+                               else if (result == 30)
                                {
-                                   safeThis->processor.syncSamplePadLoopToBeat(safeThis->padIndex);
-                                   safeThis->refreshFromProcessor();
+                                   // Edit original BPM — show an inline text editor dialog
+                                   const double currentBpm = safeThis->processor.getSamplePadSourceBpm(safeThis->padIndex);
+                                   auto* editor = new juce::AlertWindow("Set Original BPM",
+                                       "Enter the correct original BPM for this sample:", juce::AlertWindow::NoIcon);
+                                   editor->addTextEditor("bpm", juce::String(currentBpm, 1), "BPM");
+                                   editor->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
+                                   editor->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+                                   editor->enterModalState(true, juce::ModalCallbackFunction::create(
+                                       [safeThis, editor](int modalResult)
+                                       {
+                                           if (modalResult == 1 && safeThis != nullptr)
+                                           {
+                                               const juce::String text = editor->getTextEditorContents("bpm");
+                                               const double newBpm = text.getDoubleValue();
+                                               if (newBpm > 1.0 && newBpm < 1000.0)
+                                               {
+                                                   safeThis->processor.setSamplePadSourceBpm(safeThis->padIndex, newBpm);
+                                                   safeThis->refreshFromProcessor();
+                                               }
+                                           }
+                                           delete editor;
+                                       }));
                                }
                                else if (result == 8)
                                {
@@ -5262,6 +5361,8 @@ private:
     LeftClickOnlyTextButton loopButton{ "" };
     LeftClickOnlyTextButton reverseButton{ "" };
     LeftClickOnlyTextButton duckRouteButton{ "D" };
+    MouseWheelLabel volumeLabel;
+    float lastDisplayedVolume = -1.0f;
     SamplePadToggleLookAndFeel toggleLookAndFeel;
     std::unique_ptr<juce::FileChooser> chooser;
     static constexpr double hitGlowDurationMs = 240.0;
@@ -5272,6 +5373,7 @@ private:
     bool cachedRecording = false;
     bool cachedPlaying = false;
     bool cachedWaitingForBpiLoop = false;
+    bool cachedPlaybackScheduled = false;
     int cachedLoopBeats = 0;
     float cachedLoopProgress = 0.0f;
     int cachedRecordStartCountdownBeats = 0;
@@ -5321,9 +5423,10 @@ public:
         padsMidiLabel.setJustificationType(juce::Justification::centredLeft);
         padsMidiLabel.setFont(juce::Font(12.0f, juce::Font::bold));
         padsMidiLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+        padsMidiLabel.setTooltip("Select which MIDI device triggers the sample pads");
         addAndMakeVisible(padsMidiLabel);
 
-        padsMidiSelector.setTooltip("Pads MIDI input");
+        padsMidiSelector.setTooltip("Select MIDI input device for triggering sample pads");
         padsMidiSelector.setPopupMinimumWidth(210);
         padsMidiSelector.onPopupActiveChanged = [this](bool active)
         {
@@ -5344,9 +5447,10 @@ public:
         looperInputLabel.setJustificationType(juce::Justification::centredLeft);
         looperInputLabel.setFont(juce::Font(12.0f, juce::Font::bold));
         looperInputLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+        looperInputLabel.setTooltip("Select audio input source for loop recording into pads");
         addAndMakeVisible(looperInputLabel);
 
-        looperInputSelector.setTooltip("Looper recording input");
+        looperInputSelector.setTooltip("Audio input source for pad loop recording (local channels or remote users)");
         looperInputSelector.setPopupMinimumWidth(210);
         looperInputSelector.onPopupActiveChanged = [this](bool active)
         {
@@ -5367,10 +5471,11 @@ public:
         bankLabel.setJustificationType(juce::Justification::centredLeft);
         bankLabel.setFont(juce::Font(12.0f, juce::Font::bold));
         bankLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+        bankLabel.setTooltip("Load or save sets of sample pads as banks");
         addAndMakeVisible(bankLabel);
 
         bankSelector.setTextWhenNothingSelected("Select bank");
-        bankSelector.setTooltip("Saved sample pad banks");
+        bankSelector.setTooltip("Choose a saved sample pad bank to load. Load button applies the selection.");
         bankSelector.setPopupMinimumWidth(240);
         bankSelector.onPopupActiveChanged = [this](bool active)
         {
@@ -5382,7 +5487,7 @@ public:
         {
             auto& button = samplerSizeButtons[(size_t)i];
             button.setButtonText(i == 0 ? "-" : "+");
-            button.setTooltip(i == 0 ? "Smaller sampler window" : "Larger sampler window");
+            button.setTooltip(i == 0 ? "Shrink the sampler window" : "Enlarge the sampler window");
             button.setVisible(abletonHosted);
             button.onClick = [this, i]
             {
@@ -5396,17 +5501,17 @@ public:
         updateSamplerSizeButtons();
 
         loadBankButton.setButtonText("Load");
-        loadBankButton.setTooltip("Load selected bank or choose a bank folder");
+        loadBankButton.setTooltip("Load the selected bank, or pick a folder to load banks from");
         loadBankButton.onClick = [this] { loadSelectedBank(); };
         addAndMakeVisible(loadBankButton);
 
         saveBankButton.setButtonText("Save");
-        saveBankButton.setTooltip("Save current pads as a bank");
+        saveBankButton.setTooltip("Save all current sample pads as a named bank for later recall");
         saveBankButton.onClick = [this] { showSaveBankDialog(); };
         addAndMakeVisible(saveBankButton);
 
         resetSettingsButton.setButtonText("Reset");
-        resetSettingsButton.setTooltip("Reset sampler settings without clearing pads");
+        resetSettingsButton.setTooltip("Reset sampler settings (volume, limiter, duck, FX) without clearing loaded pads");
         resetSettingsButton.onClick = [this]
         {
             processor.resetSamplePadSettings();
@@ -5419,7 +5524,7 @@ public:
         addAndMakeVisible(resetSettingsButton);
 
         clearPadsButton.setButtonText("Clear");
-        clearPadsButton.setTooltip("Clear all sample pads");
+        clearPadsButton.setTooltip("Clear all sample pads (removes all loaded samples and recordings)");
         clearPadsButton.onClick = [this]
         {
             processor.clearAllSamplePads();
@@ -5441,7 +5546,7 @@ public:
             knob.setLookAndFeel(&editor.getSamplerKnobLookAndFeel());
             knob.getProperties().set("disableImageKnob", true);
             knob.getProperties().set("forceGreyKnob", true);
-            knob.setTooltip("Sampler FX amount " + juce::String(slot + 1));
+            knob.setTooltip("Sampler FX " + juce::String(slot + 1) + " amount. Shift+drag or middle-mouse drag to another FX knob to chain. Right-click for MIDI learn.");
             knob.setValue(processor.getSamplePadFxSlotAmount(slot), juce::dontSendNotification);
             knob.onControlInteraction = [this]
             {
@@ -5473,7 +5578,7 @@ public:
 
             auto& selector = sampleFxSelectors[(size_t)slot];
             selector.setPopupMinimumWidth(220);
-            selector.setTooltip("Sampler FX type " + juce::String(slot + 1));
+            selector.setTooltip("Sampler FX " + juce::String(slot + 1) + " type. Select reverb, delay, filter, or phaser.");
             selector.onPopupActiveChanged = [this](bool active)
             {
                 samplerPopupActive = active;
@@ -5497,7 +5602,7 @@ public:
         volumeSlider.setDoubleClickReturnValue(true, 1.0);
         volumeSlider.setValue(processor.getSamplePadVolume(), juce::dontSendNotification);
         volumeSlider.setLookAndFeel(&faderLookAndFeel);
-        volumeSlider.setTooltip("Sample pad volume");
+        volumeSlider.setTooltip("Sampler master volume. Controls overall output level of all pads.");
         volumeSlider.onValueChange = [this]
         {
             processor.setSamplePadVolume((float)volumeSlider.getValue());
@@ -5514,7 +5619,7 @@ public:
         limiterButton.setClickingTogglesState(true);
         limiterButton.setButtonText("Limiter");
         limiterButton.setToggleState(processor.isSamplePadLimiterEnabled(), juce::dontSendNotification);
-        limiterButton.setTooltip("Limit sample pads to -2 dB");
+        limiterButton.setTooltip("Limiter: prevents sampler output from exceeding -2 dB. Protects against clipping.");
         limiterButton.onClick = [this]
         {
             processor.setSamplePadLimiterEnabled(limiterButton.getToggleState());
@@ -5526,7 +5631,7 @@ public:
         duckButton.setClickingTogglesState(true);
         duckButton.setButtonText("Duck");
         duckButton.setToggleState(processor.isSamplePadDuckEnabled(), juce::dontSendNotification);
-        duckButton.setTooltip("Tempo-synced sampler duck before the sampler limiter");
+        duckButton.setTooltip("Master enable for tempo-synced duck. Only affects pads with D enabled. Right-click for shape/length.");
         duckButton.onClick = [this]
         {
             processor.setSamplePadDuckEnabled(duckButton.getToggleState());
@@ -5542,7 +5647,7 @@ public:
         defaultFxButton.setClickingTogglesState(true);
         defaultFxButton.setButtonText("NJ FX");
         defaultFxButton.setToggleState(processor.getSamplePadsUseDefaultFx(), juce::dontSendNotification);
-        defaultFxButton.setTooltip("Route sample pads into the main NINJAM reverb/delay sends");
+        defaultFxButton.setTooltip("NJ FX: route sample pads through the main NINJAM reverb and delay effects sends");
         defaultFxButton.onClick = [this]
         {
             processor.setSamplePadsUseDefaultFx(defaultFxButton.getToggleState());
@@ -5553,7 +5658,7 @@ public:
         monitorButton.setClickingTogglesState(true);
         monitorButton.setButtonText("Monitor");
         monitorButton.setToggleState(processor.isSamplePadMonitorModeEnabled(), juce::dontSendNotification);
-        monitorButton.setTooltip("Private monitor for newly triggered pads");
+        monitorButton.setTooltip("Monitor mode: newly triggered pads play privately (not transmitted) until released");
         monitorButton.onClick = [this]
         {
             processor.setSamplePadMonitorModeEnabled(monitorButton.getToggleState());
@@ -5587,12 +5692,20 @@ public:
         g.setGradientFill(bg);
         g.fillAll();
 
+        // Draw committed (static) route lines behind child components
         if (!isResizeRefreshSuppressed(juce::Time::getMillisecondCounterHiRes()))
-            drawFxRouteLines(g);
+            drawFxRouteLines(g, false);
 
         auto frame = getLocalBounds().toFloat().reduced(6.0f);
         g.setColour(juce::Colours::white.withAlpha(0.08f));
         g.drawRoundedRectangle(frame, 7.0f, 1.0f);
+    }
+
+    void paintOverChildren(juce::Graphics& g) override
+    {
+        // Draw active drag lines in front of child components
+        if (!isResizeRefreshSuppressed(juce::Time::getMillisecondCounterHiRes()))
+            drawFxRouteLines(g, true);
     }
 
     void resized() override
@@ -6098,55 +6211,59 @@ private:
         g.fillPath(arrow);
     }
 
-    void drawFxRouteLines(juce::Graphics& g) const
+    void drawFxRouteLines(juce::Graphics& g, bool dragOnly) const
     {
-        for (int sourceSlot = 0; sourceSlot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++sourceSlot)
+        if (!dragOnly)
         {
-            const auto sourceBounds = sampleFxKnobs[(size_t)sourceSlot].getBounds().toFloat();
-            if (sourceBounds.isEmpty())
-                continue;
-
-            const auto start = sourceBounds.getCentre();
-            for (int targetSlot = 0; targetSlot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++targetSlot)
+            for (int sourceSlot = 0; sourceSlot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++sourceSlot)
             {
-                if (!processor.isSamplePadFxSlotToSlotRouteEnabled(sourceSlot, targetSlot))
+                const auto sourceBounds = sampleFxKnobs[(size_t)sourceSlot].getBounds().toFloat();
+                if (sourceBounds.isEmpty())
                     continue;
 
-                const auto targetBounds = sampleFxKnobs[(size_t)targetSlot].getBounds().toFloat();
-                if (targetBounds.isEmpty())
+                const auto start = sourceBounds.getCentre();
+                for (int targetSlot = 0; targetSlot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++targetSlot)
+                {
+                    if (!processor.isSamplePadFxSlotToSlotRouteEnabled(sourceSlot, targetSlot))
+                        continue;
+
+                    const auto targetBounds = sampleFxKnobs[(size_t)targetSlot].getBounds().toFloat();
+                    if (targetBounds.isEmpty())
+                        continue;
+
+                    drawCable(g,
+                              start,
+                              targetBounds.getCentre(),
+                              sampleFxSlotColour(sourceSlot).interpolatedWith(sampleFxSlotColour(targetSlot), 0.35f),
+                              0.62f,
+                              2.2f,
+                              true);
+                }
+            }
+
+            for (int pad = 0; pad < NinjamVst3AudioProcessor::numSamplePads; ++pad)
+            {
+                if (pads[(size_t)pad] == nullptr)
                     continue;
 
-                drawCable(g,
-                          start,
-                          targetBounds.getCentre(),
-                          sampleFxSlotColour(sourceSlot).interpolatedWith(sampleFxSlotColour(targetSlot), 0.35f),
-                          0.62f,
-                          2.2f,
-                          true);
+                const auto padBounds = pads[(size_t)pad]->getBounds().toFloat();
+                const auto start = juce::Point<float>(padBounds.getX() + 8.0f, padBounds.getCentreY());
+                for (int slot = 0; slot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++slot)
+                {
+                    if (!processor.isSamplePadFxSlotRouteEnabled(pad, slot))
+                        continue;
+
+                    const auto knobBounds = sampleFxKnobs[(size_t)slot].getBounds().toFloat();
+                    if (knobBounds.isEmpty())
+                        continue;
+
+                    const auto end = juce::Point<float>(knobBounds.getRight() - 3.0f, knobBounds.getCentreY());
+                    drawCable(g, start, end, sampleFxSlotColour(slot), 0.48f, 2.0f);
+                }
             }
         }
 
-        for (int pad = 0; pad < NinjamVst3AudioProcessor::numSamplePads; ++pad)
-        {
-            if (pads[(size_t)pad] == nullptr)
-                continue;
-
-            const auto padBounds = pads[(size_t)pad]->getBounds().toFloat();
-            const auto start = juce::Point<float>(padBounds.getX() + 8.0f, padBounds.getCentreY());
-            for (int slot = 0; slot < NinjamVst3AudioProcessor::numSamplePadFxSlots; ++slot)
-            {
-                if (!processor.isSamplePadFxSlotRouteEnabled(pad, slot))
-                    continue;
-
-                const auto knobBounds = sampleFxKnobs[(size_t)slot].getBounds().toFloat();
-                if (knobBounds.isEmpty())
-                    continue;
-
-                const auto end = juce::Point<float>(knobBounds.getRight() - 3.0f, knobBounds.getCentreY());
-                drawCable(g, start, end, sampleFxSlotColour(slot), 0.48f, 2.0f);
-            }
-        }
-
+        // Active drag lines — drawn on top via paintOverChildren
         if (fxRouteDragActive
             && fxRouteDragPad >= 0
             && fxRouteDragPad < NinjamVst3AudioProcessor::numSamplePads
@@ -6521,10 +6638,10 @@ private:
         duckButton.setColour(juce::TextButton::buttonOnColourId, colour);
         duckButton.setColour(juce::TextButton::textColourOnId, juce::Colours::black);
         duckButton.setColour(juce::TextButton::textColourOffId, juce::Colours::lightgrey);
-        duckButton.setTooltip("Tempo-synced sampler duck: "
-                              + samplePadDuckShapeName(processor.getSamplePadDuckShape())
-                              + ", "
-                              + samplePadDuckLengthName(processor.getSamplePadDuckLength()));
+        duckButton.setTooltip("Duck: tempo-synced sidechain volume pump. Only affects pads with D enabled. "
+                              "Current: " + samplePadDuckShapeName(processor.getSamplePadDuckShape())
+                              + ", " + samplePadDuckLengthName(processor.getSamplePadDuckLength())
+                              + ". Right-click to change shape and length.");
     }
 
     void updateDefaultFxButtonColour()
@@ -6841,6 +6958,13 @@ public:
             }
         }
         setVisible(true);
+
+        // Tooltips require a TooltipWindow in the same component hierarchy.
+        // Since this is a separate DocumentWindow from the main editor, we need
+        // our own TooltipWindow for tooltips to work in the sampler window.
+        tooltipWindow.setOpaque(false);
+        addChildComponent(tooltipWindow);
+        tooltipWindow.setVisible(true);
     }
 
     void applyAbletonSizePreset(int presetIndex)
@@ -6916,6 +7040,7 @@ private:
     bool pendingBoundsChanged = false;
     bool pendingBoundsSaveNow = false;
     static constexpr int boundsChangedDebounceMs = 250;
+    juce::TooltipWindow tooltipWindow{ this, 600 };
 };
 
 struct ChatStylePalette
@@ -8150,7 +8275,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     videoButton.onClick = [this] { videoClicked(); };
 
     addAndMakeVisible(samplePadsButton);
-    samplePadsButton.setTooltip("Sample Pads");
+    samplePadsButton.setTooltip("Sample Pads / Looper: open the sampler window with 16 pads, loop recording, and FX routing");
     samplePadsButton.setLookAndFeel(&samplePadsBtnLAF);
     samplePadsButton.onClick = [this] { showSamplePadsWindow(); };
 
@@ -8229,6 +8354,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     syncButton.setClickingTogglesState(true);
     syncButton.setToggleState(false, juce::dontSendNotification);
     syncButton.setLookAndFeel(&syncIconLAF);
+    syncIconLAF.bottomText = audioProcessor.isStandaloneWrapper() ? "MIDI" : "HOST";
     syncButton.onClick = [this] { syncToggled(); updateSyncButtonColor(); };
     syncButton.onPopupMenuRequest = [this] { showSyncCompensationMenu(syncButton); };
     updateSyncButtonTooltip();
@@ -8998,17 +9124,23 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     if (!audioProcessor.isStandaloneWrapper() && isAbletonLiveHost())
     {
         abletonWindowSizePreset = juce::jlimit(0, 2, abletonWindowSizePreset);
+        // Allow free resizing in Ableton — the deferred resize logic handles
+        // the layout after the mouse is released (85ms after last resize event).
+        // The preset sizes are still available as quick-select from the right-click menu.
         const auto targetSize = abletonEditorWindowSizeForPreset(abletonWindowSizePreset);
         pendingDeferredResizeLayout = false;
         applyingDeferredResizeLayout = false;
-        setResizable(false, false);
-        setResizeLimits(targetSize.getWidth(),
-                        targetSize.getHeight(),
-                        targetSize.getWidth(),
-                        targetSize.getHeight());
+        setResizable(true, true);
+        setResizeLimits(1024, 540, 2200, 1500);
         suppressHeavyUiUntilMs = juce::Time::getMillisecondCounterHiRes() + 400.0;
-        hostResizeLockedForConnection = true;
-        setSize(targetSize.getWidth(), targetSize.getHeight());
+        hostResizeLockedForConnection = false;
+        // Restore saved size or use preset default
+        const int savedW = juce::jlimit(1024, 2200, lastSavedEditorWidth);
+        const int savedH = juce::jlimit(540, 1500, lastSavedEditorHeight);
+        if (savedW >= 1024 && savedH >= 540)
+            setSize(savedW, savedH);
+        else
+            setSize(targetSize.getWidth(), targetSize.getHeight());
     }
     else
     {
@@ -9171,6 +9303,14 @@ void NinjamVst3AudioProcessorEditor::paint (juce::Graphics& g)
     juce::ignoreUnused(g);
 }
 
+void NinjamVst3AudioProcessorEditor::moved()
+{
+    // Mark settings dirty so window position is saved when the window moves.
+    // The actual save is throttled by the timer (every 1.5s).
+    if (audioProcessor.isStandaloneWrapper())
+        markPersistentSettingsDirty();
+}
+
 void NinjamVst3AudioProcessorEditor::paintOverChildren(juce::Graphics& g)
 {
     const bool abletonHostEditor = !audioProcessor.isStandaloneWrapper() && isAbletonLiveHost();
@@ -9278,6 +9418,41 @@ void NinjamVst3AudioProcessorEditor::paintOverChildren(juce::Graphics& g)
         g.setFont(getLookAndFeel().getTextButtonFont(transmitButton, transmitButton.getHeight()));
         g.drawText(transmitButton.getButtonText(), transmitButton.getBounds(), juce::Justification::centred, false);
     }
+
+    // During deferred resize (dragging the window edge in a plugin host), show a placeholder
+    // outline so the user sees the target size without the GUI actually relayouting in real-time.
+    if (pendingDeferredResizeLayout && !audioProcessor.isStandaloneWrapper())
+    {
+        const auto bounds = getLocalBounds().toFloat();
+        // Dim the existing content
+        g.setColour(juce::Colours::black.withAlpha(0.45f));
+        g.fillRect(bounds);
+
+        // Draw a dashed outline showing the new target size
+        const float dashLength = 8.0f;
+        const float gapLength = 6.0f;
+        g.setColour(juce::Colour(0xff48a0ff).withAlpha(0.85f));
+        // Top and bottom
+        for (float x = 0.0f; x < bounds.getWidth(); x += dashLength + gapLength)
+        {
+            const float w = juce::jmin(dashLength, bounds.getWidth() - x);
+            g.fillRect(x, 0.0f, w, 2.0f);
+            g.fillRect(x, bounds.getBottom() - 2.0f, w, 2.0f);
+        }
+        // Left and right
+        for (float y = 0.0f; y < bounds.getHeight(); y += dashLength + gapLength)
+        {
+            const float h = juce::jmin(dashLength, bounds.getHeight() - y);
+            g.fillRect(0.0f, y, 2.0f, h);
+            g.fillRect(bounds.getRight() - 2.0f, y, 2.0f, h);
+        }
+
+        // Show the target size text
+        g.setColour(juce::Colour(0xff48a0ff));
+        g.setFont(juce::Font(16.0f, juce::Font::bold));
+        const juce::String sizeText = juce::String(getWidth()) + " x " + juce::String(getHeight());
+        g.drawText(sizeText, bounds, juce::Justification::centred, false);
+    }
 }
 
 void NinjamVst3AudioProcessorEditor::resized()
@@ -9288,7 +9463,9 @@ void NinjamVst3AudioProcessorEditor::resized()
     backgroundComponent.setBounds(getLocalBounds());
     backgroundComponent.toBack();
 
-    if (!audioProcessor.isStandaloneWrapper() && isAbletonLiveHost() && !applyingDeferredResizeLayout)
+    // Defer heavy layout work during live resize for all plugin hosts (not just Ableton).
+    // This prevents lag on Mac AU in Reaper and other hosts where resize events fire rapidly.
+    if (!audioProcessor.isStandaloneWrapper() && !applyingDeferredResizeLayout)
     {
         const bool hasCompletedInitialLayout = lastLaidOutEditorWidth > 0 && lastLaidOutEditorHeight > 0;
         if (hasCompletedInitialLayout)
@@ -9297,6 +9474,8 @@ void NinjamVst3AudioProcessorEditor::resized()
                 return;
             pendingDeferredResizeLayout = true;
             lastResizeEventMs = juce::Time::getMillisecondCounterHiRes();
+            // Repaint to show the placeholder outline during deferred resize
+            repaint();
             return;
         }
     }
@@ -9457,7 +9636,6 @@ void NinjamVst3AudioProcessorEditor::resized()
     localFaderLabel.setVisible(true);
     localChordLabel.setVisible(true);
     localFaderLabel.setBounds(localHeader.removeFromLeft(32));
-    localHeader.removeFromLeft(2);
     localChordLabel.setBounds(localHeader.removeFromLeft(64));
     // Voice toggle on the far right (when no separate voice channel)
     juce::Rectangle<int> voiceToggleArea;
@@ -9660,6 +9838,9 @@ void NinjamVst3AudioProcessorEditor::resized()
 
     lastLaidOutEditorWidth = getWidth();
     lastLaidOutEditorHeight = getHeight();
+
+    // Mark settings dirty so window size is saved.
+    markPersistentSettingsDirty();
 }
 
 void NinjamVst3AudioProcessorEditor::timerCallback()
@@ -9685,11 +9866,11 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         lastLocalVoiceLayoutServerMaxChannels = currentServerMaxLocalChannels;
         lastLocalVoiceLayoutNumLocalChannels = currentNumLocalChannels;
         lastLocalVoiceLayoutCanUseDedicatedVoice = currentCanUseDedicatedVoice;
-        const bool bypassAbletonEarlyReturn = !audioProcessor.isStandaloneWrapper() && isAbletonLiveHost();
-        if (bypassAbletonEarlyReturn)
+        const bool bypassDeferredResize = !audioProcessor.isStandaloneWrapper();
+        if (bypassDeferredResize)
             applyingDeferredResizeLayout = true;
         resized();
-        if (bypassAbletonEarlyReturn)
+        if (bypassDeferredResize)
             applyingDeferredResizeLayout = false;
         repaint();
     }
@@ -9719,7 +9900,7 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         lastPersistentSettingsSaveMs = nowMs;
     }
 
-    if (pendingDeferredResizeLayout && !audioProcessor.isStandaloneWrapper() && isAbletonLiveHost())
+    if (pendingDeferredResizeLayout && !audioProcessor.isStandaloneWrapper())
     {
         if (nowMs - lastResizeEventMs >= 85.0)
         {
@@ -10183,6 +10364,9 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         updateVoiceChatButtonColor();
         voiceChatButton.repaint();
     }
+
+    if (syncButton.getToggleState())
+        updateSyncButtonColor();
 
     double hostBpm = 0.0;
     bool hostPlaying = false;
@@ -10893,6 +11077,44 @@ void NinjamVst3AudioProcessorEditor::savePersistentSettingsToDisk(bool includePr
         props.setValue("samplePadsWindowW", samplePadsWindowBounds.getWidth());
         props.setValue("samplePadsWindowH", samplePadsWindowBounds.getHeight());
     }
+
+    // Save main editor window size and screen position so it restores on the same screen.
+    // For plugin mode, the host controls the window position, so we only save the size.
+    // For standalone mode, we save the full screen-relative bounds.
+    if (audioProcessor.isStandaloneWrapper())
+    {
+        auto* topLevel = getTopLevelComponent();
+        if (topLevel != nullptr)
+        {
+            const auto screenBounds = topLevel->getScreenBounds();
+            props.setValue("editorWindowX", screenBounds.getX());
+            props.setValue("editorWindowY", screenBounds.getY());
+            props.setValue("editorWindowW", juce::jlimit(1024, 2200, screenBounds.getWidth()));
+            props.setValue("editorWindowH", juce::jlimit(600, 1500, screenBounds.getHeight()));
+
+            // Remember which screen the window was on
+            const auto& screens = juce::Desktop::getInstance().getDisplays();
+            int screenIndex = -1;
+            if (auto* display = screens.getDisplayForPoint(screenBounds.getCentre()))
+            {
+                for (int i = 0; i < screens.displays.size(); ++i)
+                {
+                    if (&screens.displays.getReference(i) == display)
+                    {
+                        screenIndex = i;
+                        break;
+                    }
+                }
+            }
+            props.setValue("editorWindowScreen", screenIndex);
+        }
+    }
+    else
+    {
+        // Plugin mode: save the editor size (host controls position)
+        props.setValue("editorWindowW", juce::jlimit(1024, 2200, getWidth()));
+        props.setValue("editorWindowH", juce::jlimit(600, 1500, getHeight()));
+    }
     props.setValue("chatColourKey", audioProcessor.getLocalChatColourKey());
     props.setValue("chatWindowColourKey", chatWindowColourKey);
     props.setValue("chatTtsEnabled", chatTtsEnabled);
@@ -10927,15 +11149,23 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
 
     juce::PropertiesFile props(popts);
 
-    const juce::String encodedState = props.getValue("pluginStateBase64");
-    if (encodedState.isNotEmpty())
+    // Only restore the full processor state on the very first editor open.
+    // On subsequent GUI reopens, the processor already has live state (playing
+    // pads, NINJAM connection, etc.) that must not be overwritten from disk.
+    const bool shouldRestoreProcessorState = !audioProcessor.hasEditorStateBeenRestoredFromDisk();
+    if (shouldRestoreProcessorState)
     {
-        juce::MemoryOutputStream stateData;
-        if (juce::Base64::convertFromBase64(stateData, encodedState))
+        audioProcessor.markEditorStateRestoredFromDisk();
+        const juce::String encodedState = props.getValue("pluginStateBase64");
+        if (encodedState.isNotEmpty())
         {
-            const auto state = stateData.getMemoryBlock();
-            if (state.getSize() > 0)
-                audioProcessor.setStateInformation(state.getData(), (int) state.getSize());
+            juce::MemoryOutputStream stateData;
+            if (juce::Base64::convertFromBase64(stateData, encodedState))
+            {
+                const auto state = stateData.getMemoryBlock();
+                if (state.getSize() > 0)
+                    audioProcessor.setStateInformation(state.getData(), (int) state.getSize());
+            }
         }
     }
 
@@ -10991,6 +11221,58 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
                                                       juce::jlimit(500, 840, props.getIntValue("samplePadsWindowH", 600)));
     }
 
+    // Restore main editor window size and position.
+    // For plugin mode, only the size is restored (host controls position).
+    // For standalone mode, restore the full position on the saved screen.
+    {
+        const int savedW = juce::jlimit(1024, 2200, props.getIntValue("editorWindowW", 0));
+        const int savedH = juce::jlimit(600, 1500, props.getIntValue("editorWindowH", 0));
+        if (savedW >= 1024 && savedH >= 600)
+        {
+            if (audioProcessor.isStandaloneWrapper())
+            {
+                const int savedX = props.getIntValue("editorWindowX", 0);
+                const int savedY = props.getIntValue("editorWindowY", 0);
+                const int savedScreen = props.getIntValue("editorWindowScreen", -1);
+
+                // Validate that the saved position is on a valid screen.
+                // If the screen is gone (e.g., monitor disconnected), fall back to centring.
+                const auto& screens = juce::Desktop::getInstance().getDisplays();
+                juce::Rectangle<int> restoredBounds(savedX, savedY, savedW, savedH);
+
+                bool positionValid = false;
+                if (savedScreen >= 0 && savedScreen < screens.displays.size())
+                {
+                    const auto& display = screens.displays.getReference(savedScreen);
+                    // Check if the saved position overlaps the saved screen
+                    if (display.totalArea.intersects(restoredBounds))
+                        positionValid = true;
+                }
+
+                if (positionValid)
+                {
+                    setSize(savedW, savedH);
+                    setTopLeftPosition(savedX, savedY);
+                }
+                else
+                {
+                    // Screen gone or invalid — centre on the primary display with saved size
+                    setSize(savedW, savedH);
+                    centreWithSize(savedW, savedH);
+                }
+            }
+            else
+            {
+                // Plugin mode: just restore the size
+                setSize(savedW, savedH);
+            }
+        }
+
+        // Remember the saved size for Ableton init (which runs before this load completes)
+        lastSavedEditorWidth = savedW;
+        lastSavedEditorHeight = savedH;
+    }
+
     transmitButton.setToggleState(audioProcessor.isTransmittingLocal(), juce::dontSendNotification);
     updateTransmitButtonColor();
 
@@ -11013,9 +11295,13 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
     const auto restoredSyncMode = audioProcessor.getSyncMode();
     if (restoredSyncMode != NinjamVst3AudioProcessor::SyncMode::off)
         preferredSyncMode = restoredSyncMode;
-    syncButton.setToggleState(restoredSyncMode != NinjamVst3AudioProcessor::SyncMode::off, juce::dontSendNotification);
+    // Always start with sync off on plugin/standalone launch
+    audioProcessor.setSyncMode(NinjamVst3AudioProcessor::SyncMode::off);
+    syncButton.setToggleState(false, juce::dontSendNotification);
     updateSyncButtonColor();
     updateSyncButtonTooltip();
+
+    autoTuneButton.setToggleState(audioProcessor.getAutoTuneEnabled(), juce::dontSendNotification);
 
     masterFader.setValue(audioProcessor.getMasterOutputGain(), juce::dontSendNotification);
     limiterButton.setToggleState(audioProcessor.isMasterLimiterEnabled(), juce::dontSendNotification);
@@ -11151,7 +11437,13 @@ void NinjamVst3AudioProcessorEditor::chatToggled()
             chatPoppedOut = false;
     }
     updateChatButtonColor();
+    // Bypass the deferred-resize optimization: chat visibility changes don't
+    // alter the window size, so resized() would otherwise early-return without
+    // updating chat component visibility.
+    const bool wasApplyingDeferredLayout = applyingDeferredResizeLayout;
+    applyingDeferredResizeLayout = true;
     resized();
+    applyingDeferredResizeLayout = wasApplyingDeferredLayout;
 }
 
 void NinjamVst3AudioProcessorEditor::openChatPopoutWindow(const juce::StringArray& history,
@@ -11163,7 +11455,10 @@ void NinjamVst3AudioProcessorEditor::openChatPopoutWindow(const juce::StringArra
     if (!chatPoppedOut || !chatButton.getToggleState())
     {
         updateChatButtonColor();
+        const bool wasApplyingDeferredLayout = applyingDeferredResizeLayout;
+        applyingDeferredResizeLayout = true;
         resized();
+        applyingDeferredResizeLayout = wasApplyingDeferredLayout;
         return;
     }
 
@@ -11250,7 +11545,11 @@ void NinjamVst3AudioProcessorEditor::openChatPopoutWindow(const juce::StringArra
                                             safeThis->chatPoppedOut = false;
                                             safeThis->chatButton.setToggleState(false, juce::dontSendNotification);
                                             safeThis->updateChatButtonColor();
+                                            // Bypass deferred-resize optimization so chat hides on close
+                                            const bool wasDeferred = safeThis->applyingDeferredResizeLayout;
+                                            safeThis->applyingDeferredResizeLayout = true;
                                             safeThis->resized();
+                                            safeThis->applyingDeferredResizeLayout = wasDeferred;
                                         },
                                         abletonHostedWindow,
                                         abletonChatWindowSizePreset));
@@ -11272,7 +11571,11 @@ void NinjamVst3AudioProcessorEditor::openChatPopoutWindow(const juce::StringArra
     }
 
     updateChatButtonColor();
+    // Bypass deferred-resize optimization so docked chat hides when popped out
+    const bool wasApplyingDeferredLayout = applyingDeferredResizeLayout;
+    applyingDeferredResizeLayout = true;
     resized();
+    applyingDeferredResizeLayout = wasApplyingDeferredLayout;
 }
 
 void NinjamVst3AudioProcessorEditor::chatPopoutClicked()
@@ -11324,7 +11627,11 @@ void NinjamVst3AudioProcessorEditor::chatPopoutClicked()
     }
 
     updateChatButtonColor();
+    // Bypass deferred-resize optimization so docked chat visibility updates
+    const bool wasApplyingDeferredLayout = applyingDeferredResizeLayout;
+    applyingDeferredResizeLayout = true;
     resized();
+    applyingDeferredResizeLayout = wasApplyingDeferredLayout;
 }
 
 void NinjamVst3AudioProcessorEditor::usersPopoutClicked()
@@ -11493,50 +11800,42 @@ void NinjamVst3AudioProcessorEditor::showTranslateLanguageMenu(juce::Component& 
 
 void NinjamVst3AudioProcessorEditor::showSyncCompensationMenu(juce::Component& anchorComponent)
 {
-    static constexpr float presetValuesMs[] = { 0.0f, 5.0f, 10.0f, 15.0f, 20.0f, 25.0f, 32.0f, 40.0f,
-                                                50.0f, 64.0f, 80.0f, 96.0f, 128.0f, 160.0f, 192.0f, 250.0f };
-
-    auto idToMs = std::make_shared<std::map<int, float>>();
-    juce::PopupMenu presetMenu;
-    const float currentMs = audioProcessor.getSyncStartCompensationMs();
-
-    int compensationId = 100;
-    for (float presetMs : presetValuesMs)
-    {
-        ++compensationId;
-        presetMenu.addItem(compensationId,
-                           juce::String(presetMs, presetMs < 10.0f ? 1 : 0) + " ms",
-                           true,
-                           std::abs(currentMs - presetMs) < 0.1f);
-        (*idToMs)[compensationId] = presetMs;
-    }
-
     const auto activeMode = audioProcessor.getSyncMode();
     const auto selectedMode = activeMode != NinjamVst3AudioProcessor::SyncMode::off ? activeMode : preferredSyncMode;
+    const bool isStandalone = audioProcessor.isStandaloneWrapper();
 
     juce::PopupMenu sourceMenu;
-    sourceMenu.addItem(10, "Host Transport", !audioProcessor.isStandaloneWrapper(), selectedMode == NinjamVst3AudioProcessor::SyncMode::host);
-    sourceMenu.addItem(11, "Ableton Link", true, selectedMode == NinjamVst3AudioProcessor::SyncMode::abletonLink);
+    if (isStandalone)
+    {
+        sourceMenu.addItem(12, "Midi Clock", true, selectedMode == NinjamVst3AudioProcessor::SyncMode::midi);
+        sourceMenu.addItem(11, "Ableton Link", true, selectedMode == NinjamVst3AudioProcessor::SyncMode::abletonLink);
+    }
+    else
+    {
+        sourceMenu.addItem(10, "Host Transport", true, selectedMode == NinjamVst3AudioProcessor::SyncMode::host);
+        sourceMenu.addItem(11, "Ableton Link", true, selectedMode == NinjamVst3AudioProcessor::SyncMode::abletonLink);
+    }
 
     juce::PopupMenu menu;
     menu.addSectionHeader("Transport Sync");
     menu.addSubMenu("Sync Source", sourceMenu);
-    menu.addSeparator();
-    menu.addSectionHeader("Start Compensation");
-    menu.addSubMenu("Advance NINJAM Start", presetMenu);
 
     juce::Component::SafePointer<NinjamVst3AudioProcessorEditor> safeThis(this);
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&anchorComponent),
-                       [safeThis, idToMs](int result) mutable
+                       [safeThis](int result) mutable
                        {
                            if (safeThis == nullptr || result == 0)
                                return;
 
-                           if (result == 10 || result == 11)
+                           if (result == 10 || result == 11 || result == 12)
                            {
-                               safeThis->preferredSyncMode = (result == 11)
-                                   ? NinjamVst3AudioProcessor::SyncMode::abletonLink
-                                   : NinjamVst3AudioProcessor::SyncMode::host;
+                               if (result == 11)
+                                   safeThis->preferredSyncMode = NinjamVst3AudioProcessor::SyncMode::abletonLink;
+                               else if (result == 12)
+                                   safeThis->preferredSyncMode = NinjamVst3AudioProcessor::SyncMode::midi;
+                               else
+                                   safeThis->preferredSyncMode = NinjamVst3AudioProcessor::SyncMode::host;
+
                                if (safeThis->syncButton.getToggleState()
                                    || safeThis->audioProcessor.getSyncMode() != NinjamVst3AudioProcessor::SyncMode::off)
                                {
@@ -11547,13 +11846,6 @@ void NinjamVst3AudioProcessorEditor::showSyncCompensationMenu(juce::Component& a
                                safeThis->updateSyncButtonColor();
                                return;
                            }
-
-                           const auto it = idToMs->find(result);
-                           if (it == idToMs->end())
-                               return;
-
-                           safeThis->audioProcessor.setSyncStartCompensationMs(it->second);
-                           safeThis->updateSyncButtonTooltip();
                        });
 }
 
@@ -11582,7 +11874,7 @@ void NinjamVst3AudioProcessorEditor::syncToggled()
     auto modeToEnable = preferredSyncMode;
     if (modeToEnable == NinjamVst3AudioProcessor::SyncMode::off)
         modeToEnable = audioProcessor.isStandaloneWrapper()
-            ? NinjamVst3AudioProcessor::SyncMode::abletonLink
+            ? NinjamVst3AudioProcessor::SyncMode::midi
             : NinjamVst3AudioProcessor::SyncMode::host;
 
     preferredSyncMode = modeToEnable;
@@ -11774,6 +12066,120 @@ void NinjamVst3AudioProcessorEditor::showAutoTuneMenu()
     menu.showMenuAsync(juce::PopupMenu::Options()
                            .withTargetComponent(&autoTuneButton)
                            .withMinimumWidth(220));
+}
+
+void NinjamVst3AudioProcessorEditor::showSshTunnelSettingsPopup()
+{
+    auto* dialog = new juce::DialogWindow("SSH Tunnel Settings",
+                                          juce::Colour(0xff1e2228), true, true);
+
+    auto* content = new juce::Component();
+    content->setSize(420, 240);
+
+    auto* enabledToggle = new juce::ToggleButton("Enable SSH Tunnel");
+    enabledToggle->setToggleState(audioProcessor.isSshTunnelEnabled(), juce::dontSendNotification);
+    enabledToggle->setBounds(16, 12, 200, 24);
+    content->addAndMakeVisible(enabledToggle);
+
+    auto* hostLabel = new juce::Label({}, "SSH Host:");
+    hostLabel->setBounds(16, 46, 80, 24);
+    hostLabel->setJustificationType(juce::Justification::centredRight);
+    content->addAndMakeVisible(hostLabel);
+
+    auto* hostField = new juce::TextEditor();
+    hostField->setText(audioProcessor.getSshTunnelHost(), juce::dontSendNotification);
+    hostField->setBounds(100, 46, 200, 24);
+    hostField->setTooltip("SSH server hostname or IP (e.g. myserver.com)");
+    content->addAndMakeVisible(hostField);
+
+    auto* portLabel = new juce::Label({}, "SSH Port:");
+    portLabel->setBounds(16, 78, 80, 24);
+    portLabel->setJustificationType(juce::Justification::centredRight);
+    content->addAndMakeVisible(portLabel);
+
+    auto* portField = new juce::TextEditor();
+    portField->setText(juce::String(audioProcessor.getSshTunnelPort()), juce::dontSendNotification);
+    portField->setBounds(100, 78, 60, 24);
+    portField->setInputRestrictions(5, "0123456789");
+    content->addAndMakeVisible(portField);
+
+    auto* userLabel = new juce::Label({}, "SSH User:");
+    userLabel->setBounds(16, 110, 80, 24);
+    userLabel->setJustificationType(juce::Justification::centredRight);
+    content->addAndMakeVisible(userLabel);
+
+    auto* userField = new juce::TextEditor();
+    userField->setText(audioProcessor.getSshTunnelUser(), juce::dontSendNotification);
+    userField->setBounds(100, 110, 200, 24);
+    content->addAndMakeVisible(userField);
+
+    auto* keyLabel = new juce::Label({}, "Key File:");
+    keyLabel->setBounds(16, 142, 80, 24);
+    keyLabel->setJustificationType(juce::Justification::centredRight);
+    content->addAndMakeVisible(keyLabel);
+
+    auto* keyField = new juce::TextEditor();
+    keyField->setText(audioProcessor.getSshTunnelKeyFile(), juce::dontSendNotification);
+    keyField->setBounds(100, 142, 280, 24);
+    keyField->setTooltip("Optional: path to SSH private key file");
+    content->addAndMakeVisible(keyField);
+
+    auto* infoLabel = new juce::Label({}, "Routes the NINJAM connection through an SSH tunnel.\n"
+                                          "All audio, chat, and VDO sync data flows encrypted.\n"
+                                          "The NINJAM server sees the SSH server's IP.");
+    infoLabel->setBounds(16, 174, 388, 40);
+    infoLabel->setJustificationType(juce::Justification::topLeft);
+    infoLabel->setColour(juce::Label::textColourId, juce::Colours::grey);
+    infoLabel->setFont(juce::Font(12.0f));
+    content->addAndMakeVisible(infoLabel);
+
+    auto* saveButton = new juce::TextButton("Save");
+    saveButton->setBounds(240, 210, 80, 24);
+    content->addAndMakeVisible(saveButton);
+
+    auto* cancelButton = new juce::TextButton("Cancel");
+    cancelButton->setBounds(326, 210, 80, 24);
+    content->addAndMakeVisible(cancelButton);
+
+    juce::Component::SafePointer<juce::DialogWindow> safeDialog(dialog);
+    juce::Component::SafePointer<NinjamVst3AudioProcessorEditor> safeEditor(this);
+
+    saveButton->onClick = [safeDialog, safeEditor, enabledToggle, hostField, portField, userField, keyField]() mutable
+    {
+        if (safeEditor != nullptr)
+        {
+            safeEditor->audioProcessor.setSshTunnelEnabled(enabledToggle->getToggleState());
+            safeEditor->audioProcessor.setSshTunnelHost(hostField->getText());
+            safeEditor->audioProcessor.setSshTunnelPort(hostField->getText().trim().isNotEmpty()
+                ? portField->getText().getIntValue() : 22);
+            safeEditor->audioProcessor.setSshTunnelUser(userField->getText());
+            safeEditor->audioProcessor.setSshTunnelKeyFile(keyField->getText());
+            safeEditor->markPersistentSettingsDirty();
+        }
+        if (safeDialog != nullptr)
+            safeDialog->exitModalState(0);
+    };
+
+    cancelButton->onClick = [safeDialog]() mutable
+    {
+        if (safeDialog != nullptr)
+            safeDialog->exitModalState(0);
+    };
+
+    dialog->setAlwaysOnTop(true);
+    dialog->setContentOwned(content, true);
+    dialog->centreAroundComponent(this, 420, 240);
+    dialog->setVisible(true);
+    dialog->toFront(true);
+    dialog->enterModalState(true, nullptr, true);
+}
+
+void NinjamVst3AudioProcessorEditor::showHelpWindow()
+{
+    auto* helpWindow = new HelpWindow();
+    helpWindow->setVisible(true);
+    helpWindow->toFront(true);
+    helpWindow->enterModalState(true, nullptr, false);
 }
 
 void NinjamVst3AudioProcessorEditor::serverListClicked()
@@ -12271,8 +12677,6 @@ bool NinjamVst3AudioProcessorEditor::shouldDeferHeavyUiWork() const
 {
     if (audioProcessor.isStandaloneWrapper())
         return false;
-    if (!isAbletonLiveHost())
-        return false;
     if (pendingDeferredResizeLayout || applyingDeferredResizeLayout)
         return true;
     return juce::Time::getMillisecondCounterHiRes() < suppressHeavyUiUntilMs;
@@ -12324,16 +12728,12 @@ void NinjamVst3AudioProcessorEditor::setAbletonWindowSizePreset(int presetIndex)
 
     const auto targetSize = abletonEditorWindowSizeForPreset(abletonWindowSizePreset);
 
+    // Apply the preset size immediately (no drag in progress)
     pendingDeferredResizeLayout = false;
-    applyingDeferredResizeLayout = false;
-    setResizable(false, false);
-    setResizeLimits(targetSize.getWidth(),
-                    targetSize.getHeight(),
-                    targetSize.getWidth(),
-                    targetSize.getHeight());
+    applyingDeferredResizeLayout = true;
     setSize(targetSize.getWidth(), targetSize.getHeight());
+    applyingDeferredResizeLayout = false;
     suppressHeavyUiUntilMs = juce::Time::getMillisecondCounterHiRes() + 400.0;
-    hostResizeLockedForConnection = true;
 
     auto popts = makeSettingsOptions();
     juce::PropertiesFile props(popts);
@@ -12413,7 +12813,9 @@ void NinjamVst3AudioProcessorEditor::updateHostResizeModeForConnectionStatus(int
     if (audioProcessor.isStandaloneWrapper())
         return;
 
-    const bool shouldLock = isAbletonLiveHost();
+    // No longer lock resize for Ableton — the deferred resize logic handles
+    // layout after mouse release, preventing crashes while allowing free resizing.
+    const bool shouldLock = false;
     if (shouldLock == hostResizeLockedForConnection)
         return;
 
@@ -12430,7 +12832,7 @@ void NinjamVst3AudioProcessorEditor::updateHostResizeModeForConnectionStatus(int
     else
     {
         setResizable(true, true);
-        setResizeLimits(1024, 600, 2200, 1500);
+        setResizeLimits(1024, 540, 2200, 1500);
     }
 
     hostResizeLockedForConnection = shouldLock;
@@ -12589,7 +12991,18 @@ void NinjamVst3AudioProcessorEditor::updateMetronomeButtonColor()
 
 void NinjamVst3AudioProcessorEditor::updateSyncButtonColor()
 {
-    repaint();
+    if (syncButton.getToggleState())
+    {
+        syncGlowPhase += juce::MathConstants<float>::twoPi * 30.0f / 1000.0f;
+        syncIconLAF.glowPhase = syncGlowPhase;
+        syncButton.repaint();
+    }
+    else
+    {
+        syncGlowPhase = 0.0f;
+        syncIconLAF.glowPhase = 0.0f;
+        syncButton.repaint();
+    }
 }
 
 void NinjamVst3AudioProcessorEditor::updateSyncButtonTooltip()
@@ -12716,7 +13129,9 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
     menu.addItem(41, "Midi Settings");
     menu.addItem(42, "Enable Chord Detection", true, audioProcessor.isChordDetectionEnabled());
     menu.addItem(46, "Enable Sample Pads / Looper", true, audioProcessor.isSamplePadsFeatureEnabled());
-    menu.addItem(48, "Mobile Hotspot Keepalive", true, audioProcessor.isMobileHotspotModeEnabled());
+    menu.addItem(48, "Mobile Hotspot Mode", true, audioProcessor.isMobileHotspotModeEnabled());
+    menu.addItem(58, "Tunnel SSH", true, audioProcessor.isSshTunnelEnabled());
+    menu.addItem(62, "Configure SSH Tunnel...");
     menu.addItem(49, "Automatically Reconnect", true, audioProcessor.isAutoReconnectEnabled());
     menu.addItem(43, "Ableton Link Audio");
     menu.addItem(57, "Change VDO Room...", audioProcessor.canChangeVdoRoomName(), false);
@@ -12739,7 +13154,6 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
         menu.addSubMenu("Spread Output Start Pair", spreadStartPairMenu);
     }
 
-    menu.addItem(47, "Check for Updates...");
     menu.addSubMenu("Metronome Sound", metronomeSoundMenu);
     menu.addSubMenu("Metronome Output", metronomeOutputMenu);
     menu.addSubMenu("Transport Sync Source", syncSourceMenu);
@@ -12763,6 +13177,9 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
         remoteUsersSizeMenu.addItem(59, "Large", true, abletonRemoteUsersWindowSizePreset == 2);
         menu.addSubMenu("Remote Users Popout Size", remoteUsersSizeMenu);
     }
+
+    menu.addItem(61, "Help...");
+    menu.addItem(47, "Check for Updates...");
 
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&optionsButton),
         [this, customMetronomeFiles](int result)
@@ -12795,10 +13212,35 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
                 beginUpdateCheck(true);
                 return;
             }
+            if (result == 61)
+            {
+                showHelpWindow();
+                return;
+            }
             if (result == 48)
             {
                 audioProcessor.setMobileHotspotModeEnabled(!audioProcessor.isMobileHotspotModeEnabled());
                 markPersistentSettingsDirty();
+                return;
+            }
+            if (result == 58)
+            {
+                // If SSH host is already configured, just toggle on/off.
+                // Only show the settings dialog if no host has been set yet.
+                if (audioProcessor.getSshTunnelHost().trim().isNotEmpty())
+                {
+                    audioProcessor.setSshTunnelEnabled(!audioProcessor.isSshTunnelEnabled());
+                    markPersistentSettingsDirty();
+                }
+                else
+                {
+                    showSshTunnelSettingsPopup();
+                }
+                return;
+            }
+            if (result == 62)
+            {
+                showSshTunnelSettingsPopup();
                 return;
             }
             if (result == 49)

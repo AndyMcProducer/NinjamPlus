@@ -19,6 +19,7 @@
 #include "ninjam/njclient.h"
 #include "ZapVideoCodec.h"
 #include "AutoTune.h"
+#include "SshTunnel.h"
 
 #ifndef NINJAMPLUS_HAS_H264_DECODE
 #define NINJAMPLUS_HAS_H264_DECODE 0
@@ -34,6 +35,7 @@ class NinjamVst3AudioProcessorEditor;
 class LocalVideoHttpServer;
 class ZapVideoDecodeWorker;
 class ZapCameraSender;
+class ZapChunkProcessingThread;
 class AsyncChatTranslationWorker;
 class BatchedChordAnalyzer;
 
@@ -70,6 +72,7 @@ class NinjamVst3AudioProcessor : public juce::AudioProcessor,
     friend class AsyncChatTranslationWorker;
     friend class ZapVideoDecodeWorker;
     friend class ZapCameraSender;
+    friend class ZapChunkProcessingThread;
 public:
     NinjamVst3AudioProcessor();
     ~NinjamVst3AudioProcessor() override;
@@ -343,6 +346,8 @@ public:
     }
     void setSamplePadsFeatureEnabled(bool shouldEnable);
     bool isSamplePadsFeatureEnabled() const;
+    bool hasEditorStateBeenRestoredFromDisk() const { return editorStateRestoredFromDisk.load(std::memory_order_relaxed); }
+    void markEditorStateRestoredFromDisk() { editorStateRestoredFromDisk.store(true, std::memory_order_relaxed); }
     bool loadSamplePad(int padIndex, const juce::File& file);
     void loadSamplePadAsync(int padIndex,
                             const juce::File& file,
@@ -361,10 +366,13 @@ public:
     bool isSamplePadRecording(int padIndex) const;
     bool isSamplePadPlaying(int padIndex) const;
     bool isSamplePadWaitingForBpiLoop(int padIndex) const;
+    bool isSamplePadPlaybackScheduled(int padIndex) const;
     void setSamplePadMatchBpiEnabled(int padIndex, bool shouldEnable);
     bool isSamplePadMatchBpiEnabled(int padIndex) const;
     void setSamplePadBpmSyncEnabled(int padIndex, bool shouldEnable);
     bool isSamplePadBpmSyncEnabled(int padIndex) const;
+    double getSamplePadSourceBpm(int padIndex) const;
+    void setSamplePadSourceBpm(int padIndex, double newBpm);
     enum class SamplePadPlaybackSpeed
     {
         half = -1,
@@ -501,11 +509,30 @@ public:
     void setMobileHotspotModeEnabled(bool shouldEnable);
     bool isMobileHotspotModeEnabled() const;
 
+    // SSH tunnel
+    void setSshTunnelEnabled(bool shouldEnable);
+    bool isSshTunnelEnabled() const;
+    void setSshTunnelHost(const juce::String& host);
+    juce::String getSshTunnelHost() const;
+    void setSshTunnelPort(int port);
+    int getSshTunnelPort() const;
+    void setSshTunnelUser(const juce::String& user);
+    juce::String getSshTunnelUser() const;
+    void setSshTunnelKeyFile(const juce::String& path);
+    juce::String getSshTunnelKeyFile() const;
+    juce::String getSshTunnelLastError() const;
+    bool isSshTunnelActive() const;
+
+    // Per-pad volume
+    void setSamplePadVolume(int padIndex, float volume);
+    float getSamplePadVolume(int padIndex) const;
+
     enum class SyncMode : int
     {
         off = 0,
         host = 1,
-        abletonLink = 2
+        abletonLink = 2,
+        midi = 3
     };
 
     struct LinkAudioChannelInfo
@@ -831,6 +858,7 @@ private:
     int fxDelayWritePosition = 0;
     std::array<float, 2> fxDelayLowpassState {};
     double processingSampleRate = 44100.0;
+    int lastBlockSize = 256;
 
     static constexpr int samplePadOneShotVoiceCount = 4;
 
@@ -854,6 +882,7 @@ private:
         double sourceSampleRate = 44100.0;
         double originalSourceSampleRate = 44100.0;
         double sourceBpm = 0.0;
+        double rawSourceBpm = 0.0;
         double lastSyncedTargetBpm = 0.0;
         double undoClearSourceSampleRate = 44100.0;
         double undoClearOriginalSourceSampleRate = 44100.0;
@@ -876,7 +905,9 @@ private:
         std::atomic<bool> matchBpi { false };
         std::atomic<bool> bpmSyncEnabled { true };
         std::atomic<int> playbackSpeed { (int)SamplePadPlaybackSpeed::normal };
+        std::atomic<int> pendingPlaybackSpeed { -1 }; // -1 = no pending change; deferred until loop boundary
         std::atomic<bool> duckRoute { false };
+        std::atomic<float> volume { 1.0f }; // per-pad volume (0.0 - 2.0)
         std::array<std::atomic<bool>, numSamplePadFxSlots> fxSlotRoutes {};
         std::atomic<bool> playing { false };
         std::atomic<bool> playbackScheduled { false };
@@ -930,8 +961,10 @@ private:
     std::shared_ptr<std::atomic<bool>> samplePadBackgroundAlive { std::make_shared<std::atomic<bool>>(true) };
     std::array<std::atomic<juce::uint64>, numSamplePads> samplePadLoadRequestSerial {};
     std::array<std::atomic<juce::uint64>, numSamplePads> samplePadResyncRequestSerial {};
+    std::array<std::atomic<bool>, numSamplePads> samplePadPendingSpeedResync {};
     std::atomic<juce::uint64> samplePadBankLoadRequestSerial { 0 };
     std::atomic<juce::uint64> samplePadBankSaveRequestSerial { 0 };
+    std::atomic<bool> editorStateRestoredFromDisk { false };
     mutable juce::CriticalSection samplePadsLock;
     std::array<SamplePadState, numSamplePads> samplePads;
     juce::AudioBuffer<float> samplePadsRenderBuffer;
@@ -959,8 +992,10 @@ private:
     SamplePadFxBufferBank samplePadPerPadFxSlotInputBuffers;
     SamplePadFxBufferBank samplePadMonitorPerPadFxSlotInputBuffers;
     juce::AudioBuffer<float> samplePadFxScratchBuffer;
+    juce::AudioBuffer<float> samplePadLoopFinishBuffer;
     juce::dsp::Oscillator<float> samplePadDuckOscillator;
     std::vector<float> samplePadDuckGainBuffer;
+    float smoothedDuckGain { 1.0f }; // Per-sample smoothed duck gain to avoid artifacts
     SamplePadDelayWritePositionBank samplePadPerPadDelayWritePositions {};
     SamplePadDelayWritePositionBank samplePadMonitorPerPadDelayWritePositions {};
     std::atomic<float> samplePadsVolume { 1.0f };
@@ -1128,6 +1163,7 @@ private:
     std::atomic<juce::uint64> linkAudioFramesReceived { 0 };
     std::atomic<juce::uint64> linkAudioFramesDropped { 0 };
     size_t linkAudioMaxNumSamples = 8192;
+    std::vector<float> blockLinkAudioSamples;
     double lastLinkAudioEndpointRefreshMs = 0.0;
     double linkAudioReceiveSelectedMissingSinceMs = 0.0;
 
@@ -1143,6 +1179,15 @@ private:
     std::atomic<juce::uint64> vdoRosterRevision { 0 };
     std::atomic<bool> mobileHotspotModeEnabled { false };
     double lastMobileHotspotHeartbeatSendMs = 0.0;
+    double lastMobileHotspotSyncRetransmitMs = 0.0;
+
+    // SSH tunnel
+    std::atomic<bool> sshTunnelEnabled { false };
+    std::atomic<int> sshTunnelPort { 22 };
+    juce::String sshTunnelHost;
+    juce::String sshTunnelUser;
+    juce::String sshTunnelKeyFile;
+    ninjamplus::SshTunnel sshTunnel;
     std::atomic<bool> vdoVideoSyncEnabled { false };
     std::atomic<bool> vdoCarrierChannelConfigured { false };
     mutable juce::CriticalSection vdoRoomLock;
@@ -1160,6 +1205,26 @@ private:
     std::atomic<bool> ninjamZapVideoReceivedNotice { false };
     std::atomic<double> lastRemoteVideoRoomActivityMs { 0.0 };
     juce::CriticalSection ninjamZapVideoChunkLock;
+
+    // Lightweight descriptor enqueued on the audio thread and processed on a background thread
+    // to avoid string/map/MemoryBlock work on the audio thread.
+    struct PendingZapChunk
+    {
+        std::string username;
+        int chidx = 0;
+        unsigned int fourcc = 0;
+        std::array<unsigned char, 16> guid {};
+        std::vector<unsigned char> data;
+        int flags = 0;
+        double receivedMs = 0.0;
+    };
+    juce::CriticalSection pendingZapChunksLock;
+    std::vector<PendingZapChunk> pendingZapChunks;
+    std::atomic<bool> zapChunkThreadShouldExit { false };
+    std::unique_ptr<juce::Thread> zapChunkProcessingThread;
+    void processPendingZapChunks();
+    void processSingleZapChunk(const PendingZapChunk& chunk);
+
     std::map<juce::String, ninjamplus::zap::ChunkReassembler> ninjamZapVideoChunkReassemblers;
     std::map<juce::String, juce::String> ninjamZapVideoAudioGuidByReassemblyKey;
     std::map<juce::String, int> ninjamZapVideoMarkerIntervalByReassemblyKey;
@@ -1214,6 +1279,8 @@ private:
     mutable juce::CriticalSection intervalSyncStatusLock;
     juce::String intervalSyncStatusText;
     std::atomic<long long> lastBroadcastIntervalTag { -1 };
+    juce::String lastBroadcastSyncTagPayload;
+    int lastBroadcastSyncTagMarkerBeat = -1;
     std::atomic<long long> lastProcessedIntervalMarkerKey { -1 };
     juce::CriticalSection intervalSyncAnnouncementLock;
     std::map<juce::String, long long> lastAnnouncedRemoteIntervalByUser;
@@ -1518,4 +1585,15 @@ inline bool NinjamVst3AudioProcessor::isSamplePadWaitingForBpiLoop(int padIndex)
 
     const auto& pad = samplePads[(size_t)padIndex];
     return pad.recordStartScheduled.load(std::memory_order_relaxed);
+}
+
+inline bool NinjamVst3AudioProcessor::isSamplePadPlaybackScheduled(int padIndex) const
+{
+    if (padIndex < 0 || padIndex >= numSamplePads)
+        return false;
+    if (!isSamplePadsFeatureEnabled())
+        return false;
+
+    const auto& pad = samplePads[(size_t)padIndex];
+    return pad.playbackScheduled.load(std::memory_order_relaxed);
 }

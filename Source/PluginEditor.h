@@ -439,6 +439,28 @@ private:
     bool leftInteractionActive = false;
 };
 
+class MouseWheelLabel : public juce::Label
+{
+public:
+    using juce::Label::Label;
+
+    std::function<void(int)> onWheelStep;
+
+    void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override
+    {
+        if (onWheelStep)
+        {
+            const int steps = (int)juce::roundToInt(std::abs(wheel.deltaY) * 10.0f);
+            const int dir = wheel.deltaY > 0.0f ? 1 : -1;
+            onWheelStep(dir * juce::jmax(1, steps));
+        }
+        else
+        {
+            juce::Label::mouseWheelMove(e, wheel);
+        }
+    }
+};
+
 class TranslateMenuTextButton : public juce::TextButton
 {
 public:
@@ -895,7 +917,303 @@ public:
         setSize(460, 230);
         centreAroundComponent(nullptr, getWidth(), getHeight());
     }
-    
+
+    void closeButtonPressed() override
+    {
+        setVisible(false);
+        exitModalState(0);
+    }
+};
+
+class HelpManualContent : public juce::Component
+{
+public:
+    HelpManualContent()
+    {
+        setOpaque(true);
+        setSize(620, 720);
+
+        addAndMakeVisible(viewport);
+        viewport.setViewedComponent(&content, false);
+        viewport.setScrollBarsShown(true, false);
+        viewport.setColour(juce::ScrollBar::backgroundColourId, juce::Colour(0xff1a1d22));
+        viewport.setColour(juce::ScrollBar::thumbColourId, juce::Colour(0xff4a545e));
+
+        buildContent();
+    }
+
+    void paint(juce::Graphics& g) override
+    {
+        g.fillAll(juce::Colour(0xff1b1f23));
+    }
+
+    void resized() override
+    {
+        viewport.setBounds(getLocalBounds());
+        content.setBounds(0, 0, viewport.getWidth() - 12, contentHeight);
+    }
+
+private:
+    juce::Viewport viewport;
+    juce::Component content;
+    int contentHeight = 0;
+
+    void buildContent()
+    {
+        const int margin = 16;
+        const int width = 620 - 12 - margin * 2;
+        int y = margin;
+
+        auto addTitle = [&](const juce::String& text)
+        {
+            auto* label = new juce::Label({}, text);
+            label->setFont(juce::Font(20.0f, juce::Font::bold));
+            label->setColour(juce::Label::textColourId, juce::Colour(0xff49d5ff));
+            label->setBounds(margin, y, width, 30);
+            content.addAndMakeVisible(label);
+            y += 34;
+        };
+
+        auto addHeading = [&](const juce::String& text)
+        {
+            y += 6;
+            auto* label = new juce::Label({}, text);
+            label->setFont(juce::Font(15.0f, juce::Font::bold));
+            label->setColour(juce::Label::textColourId, juce::Colour(0xffe8d030));
+            label->setBounds(margin, y, width, 24);
+            content.addAndMakeVisible(label);
+            y += 26;
+        };
+
+        auto addText = [&](const juce::String& text)
+        {
+            auto* label = new juce::Label({}, text);
+            label->setFont(juce::Font(13.0f));
+            label->setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+            label->setJustificationType(juce::Justification::topLeft);
+            const int h = juce::Label().getFont().withHeight(13.0f).getStringWidthFloat(text) > 0
+                ? juce::jmax(20, (int)(text.length() / 70.0 * 18.0) + 4)
+                : 20;
+            label->setBounds(margin, y, width, h);
+            content.addAndMakeVisible(label);
+            y += h + 2;
+        };
+
+        auto addBullet = [&](const juce::String& text)
+        {
+            auto* label = new juce::Label({}, "  - " + text);
+            label->setFont(juce::Font(13.0f));
+            label->setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+            label->setJustificationType(juce::Justification::topLeft);
+            const int h = juce::jmax(18, (int)(text.length() / 65.0 * 18.0) + 4);
+            label->setBounds(margin + 8, y, width - 8, h);
+            content.addAndMakeVisible(label);
+            y += h + 1;
+        };
+
+        auto addSpacer = [&]() { y += 6; };
+
+        // ---- Content ----
+        addTitle("NINJAMplus Instruction Manual");
+
+        addText("NINJAMplus is a NINJAM client built as a VST3 plugin and standalone app. "
+                "It lets you jam in real time with musicians over the internet using "
+                "interval-based audio exchange, with built-in video (VDO), chat, sampler, "
+                "auto-tune, and effects.");
+
+        // Connection
+        addHeading("Connection");
+        addBullet("Server: Enter a NINJAM server address (e.g. server.com or server.com:2049).");
+        addBullet("Name: Your display name in the session.");
+        addBullet("Password: Server password (use 'anon' for public servers, or check Anonymous).");
+        addBullet("Anonymous: Connect as an anonymous guest.");
+        addBullet("Connect: Connect to the specified server.");
+        addBullet("Disconnect: Leave the current session.");
+
+        // Local Channels
+        addHeading("Local Channels (You)");
+        addBullet("You: Label for your local channel section.");
+        addBullet("Chord: Shows detected chord from your audio input in real time.");
+        addBullet("Faders: Adjust the volume of each local channel you transmit.");
+        addBullet("Pan: Stereo pan control per channel.");
+        addBullet("Mute/Solo: Mute or solo individual channels.");
+        addBullet("Output: Select audio output routing for each channel.");
+        addBullet("+/-: Add or remove local channels (up to the server limit).");
+        addBullet("AT: Auto-Tune toggle for local channel 1. Right-click for scale, key, and quality settings.");
+        addBullet("Voice: Toggle voice chat mode on a separate channel.");
+        addBullet("Transmit: Enable/disable transmitting your local audio to the server.");
+        addBullet("Monitor: Enable/disable local monitoring of your own audio.");
+
+        // Remote Users
+        addHeading("Remote Users");
+        addBullet("Each connected user has a channel strip with fader, pan, mute, and solo.");
+        addBullet("User names and channel labels are shown above each strip.");
+        addBullet("Expand: Click to expand a multi-channel user into separate strips.");
+        addBullet("Popout: Pop the remote users mixer out into a separate floating window.");
+        addBullet("Size +/-: Adjust the remote users window size (Ableton-hosted only).");
+
+        // Master Section
+        addHeading("Master Section");
+        addBullet("Master Fader: Controls the overall output volume.");
+        addBullet("Limiter: Toggle master limiter to prevent clipping. Adjust threshold and release.");
+        addBullet("Auto Adjust Volume: Enable automatic level adjustment.");
+
+        // FX
+        addHeading("Effects (FX)");
+        addBullet("FX button: Open the reverb and delay settings.");
+        addBullet("Reverb: Room size, damping, wet/dry mix, early reflections, and tail controls.");
+        addBullet("Delay: Time, feedback, ping-pong, wet/dry mix. Can sync to host tempo.");
+        addBullet("NJ FX (sampler): Route sampler pads through the main reverb/delay sends.");
+
+        // Metronome
+        addHeading("Metronome");
+        addBullet("Metronome button: Toggle the metronome on/off.");
+        addBullet("Volume slider: Adjust metronome volume.");
+        addBullet("Right-click the metronome button to change sound (Classic, Soft Beep, Soft Tick, Wood Tick, or custom).");
+        addBullet("Metronome output can be routed to specific output channels.");
+
+        // Chat
+        addHeading("Chat");
+        addBullet("Chat button: Toggle the chat panel.");
+        addBullet("Type messages and press Enter to send to all users in the session.");
+        addBullet("Chat supports translation (auto-translate toggle).");
+        addBullet("Attachments can be shared via chat.");
+
+        // Video / VDO
+        addHeading("Video (VDO)");
+        addBullet("Video button: Toggle video background display.");
+        addBullet("VDO camera: Send and receive video synced with NINJAM intervals.");
+        addBullet("VDO Room: Create or join a VDO camera room for video sync.");
+        addBullet("Change VDO Room: Rename the VDO room (Options menu).");
+
+        // Sync
+        addHeading("Sync");
+        addBullet("Sync button: Toggle transport sync (Sync Host in plugin, Sync Midi in standalone).");
+        addBullet("When on, the button pulses to indicate active sync.");
+        addBullet("Right-click to select sync source: VST Host, Ableton Link, or MIDI.");
+        addBullet("Sync keeps NINJAM intervals aligned with your DAW or external clock.");
+
+        // Sampler
+        addHeading("Sample Pads / Looper");
+        addBullet("Sample Pads button: Open the 16-pad sampler window.");
+        addBullet("Each pad can hold a sample or loop recording.");
+        addBullet("Click a pad to trigger it. Drag and drop audio files to load samples.");
+        addBullet("Right-click a pad for options: load file, clear, Sync BPI, playback speed, FX routing.");
+
+        addHeading("Pad Controls (per pad)");
+        addBullet("Record (R): Arm loop recording. Hold the pad for 2 seconds to schedule BPI record at next interval.");
+        addBullet("Match BPI: Align the pad's loop start to the server's BPI interval boundary.");
+        addBullet("Sync BPI (right-click menu): Time-stretch the sample to match the server BPM and cue loop playback to start on BPI 1 (the next interval boundary). Pad turns blue while cued, then green when playing.");
+        addBullet("Loop: Continuously loop the sample when triggered. Loop pads start at the next loop boundary and show blue (cued) until they start, then turn green (playing).");
+        addBullet("Reverse: Play the sample backwards.");
+        addBullet("D: Route this pad through the duck effect (requires global Duck enabled).");
+        addBullet("Volume: Per-pad volume (0-200%). Mouse wheel or click to type a value.");
+        addBullet("Pad name: Right-click to rename the pad.");
+
+        addHeading("Sampler Panel Controls");
+        addBullet("MIDI: Select MIDI input device for triggering pads.");
+        addBullet("Input: Select audio input source for loop recording (local channels or remote users).");
+        addBullet("Bank: Save and load sets of pads as named banks.");
+        addBullet("Load: Load the selected bank or pick a folder to load from.");
+        addBullet("Save: Save current pads as a named bank.");
+        addBullet("Reset: Reset sampler settings without clearing loaded pads.");
+        addBullet("Clear: Remove all samples from all pads.");
+        addBullet("+/-: Resize the sampler window (Ableton-hosted only).");
+
+        addHeading("Sampler FX");
+        addBullet("FX knobs: Control the amount of each FX (reverb, delay, filter, phaser).");
+        addBullet("FX selectors: Choose the FX type for each slot.");
+        addBullet("Chain FX: Shift+drag or middle-mouse drag from one FX knob to another to chain them.");
+        addBullet("Right-click an FX knob for MIDI learn.");
+        addBullet("NJ FX: Route pads through the main NINJAM reverb/delay sends.");
+
+        addHeading("Duck Effect");
+        addBullet("Duck button: Master enable for the tempo-synced sidechain volume pump.");
+        addBullet("Only pads with D enabled are affected by the duck.");
+        addBullet("Right-click Duck to select shape (Smooth Pump, Tight Pump, Slow Pump, Hard Gate, Reverse Swell, Notch Pulse).");
+        addBullet("Length: 1/8, 1/4, or 1/2 note — sets the duck cycle length, synced to NINJAM BPM.");
+        addBullet("Limiter: Prevents sampler output from exceeding -2 dB.");
+        addBullet("Monitor: Newly triggered pads play privately (not transmitted) until released.");
+
+        // Options
+        addHeading("Options Menu");
+        addBullet("Standalone Settings: Audio device settings (standalone only).");
+        addBullet("Midi Settings: MIDI input/output configuration.");
+        addBullet("Enable Chord Detection: Toggle real-time chord detection.");
+        addBullet("Enable Sample Pads / Looper: Show or hide the sampler.");
+        addBullet("Mobile Hotspot Keepalive: Send keepalive signals for mobile hotspot connections.");
+        addBullet("Tunnel SSH: Route the NINJAM connection through an SSH tunnel for encrypted transport.");
+        addBullet("Automatically Reconnect: Reconnect if the connection drops.");
+        addBullet("Ableton Link Audio: Enable Ableton Link audio sync.");
+        addBullet("Metronome Sound/Output: Configure metronome sound and output routing.");
+        addBullet("Transport Sync Source: Choose sync source (Host, Ableton Link, MIDI).");
+        addBullet("Window Size: Quick-select preset sizes for the plugin window (Ableton-hosted). Free resizing is also supported — drag the window edge and the GUI relayouts when you release the mouse.");
+        addBullet("Window position and size are remembered — the plugin restores on the same screen and size you left it at.");
+        addBullet("Chat Popout Size: Set the chat popout window size.");
+        addBullet("Remote Users Popout Size: Set the remote users popout window size.");
+        addBullet("Check for Updates: Check for the latest NINJAMplus release.");
+        addBullet("Help: Open this instruction manual.");
+
+        // Server List
+        addHeading("Server List");
+        addBullet("Servers button: Browse public NINJAM servers.");
+        addBullet("Shows server name, user count, BPM/BPI, and player names.");
+        addBullet("Show Players: Toggle whether player names are displayed.");
+        addBullet("Refresh: Reload the server list.");
+        addBullet("Set Server: Fill the server field with the selected server.");
+
+        // Chat
+        addHeading("Chat (details)");
+        addBullet("Chat button: Toggle the chat panel on/off.");
+        addBullet("Popout: Open chat in a separate floating window.");
+        addBullet("Type a message and press Enter or click the send arrow.");
+        addBullet("AT button: Toggle auto-translate. Right-click to select target language.");
+        addBullet("+ button: Attach GIFs, images, and emoji to your messages.");
+
+        // Video
+        addHeading("Video / VDO (details)");
+        addBullet("Video Room button: Open the video session popup.");
+        addBullet("VDO Video: Send and receive camera video synced to NINJAM intervals.");
+        addBullet("NINJAMZap Video: Alternative compressed video transport.");
+        addBullet("Video BG: Toggle between video background and static skin texture.");
+
+        // MIDI/OSC
+        addHeading("MIDI / OSC Relay");
+        addBullet("MIDI/OSC button: Select relay targets for MIDI and OSC messages.");
+        addBullet("Midi Settings (Options): Configure MIDI learn, relay, and pad input devices.");
+        addBullet("Ableton Link Audio: Share audio between connected Ableton Link peers.");
+
+        // SSH Tunnel
+        addHeading("SSH Tunnel");
+        addBullet("Tunnel SSH (Options): Route the NINJAM connection through an SSH server.");
+        addBullet("All audio, chat, and VDO sync data flows encrypted through the tunnel.");
+        addBullet("The NINJAM server sees the SSH server's IP, not your local IP.");
+        addBullet("Configure SSH host, port, user, and optional key file.");
+        addBullet("Works with system ssh on Windows 10+, macOS, and Linux.");
+
+        addSpacer();
+        addText("For more information, visit https://github.com/AndyMcProducer/NinjamPlus");
+
+        contentHeight = y + margin;
+        content.setSize(620 - 12, contentHeight);
+    }
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(HelpManualContent)
+};
+
+class HelpWindow : public juce::DialogWindow
+{
+public:
+    HelpWindow()
+        : juce::DialogWindow("NINJAMplus Help", juce::Colour(0xff1b1f23), true)
+    {
+        auto* content = new HelpManualContent();
+        setContentOwned(content, true);
+        setResizable(true, false);
+        setSize(640, 740);
+        centreAroundComponent(nullptr, getWidth(), getHeight());
+    }
+
     void closeButtonPressed() override
     {
         setVisible(false);
@@ -1339,6 +1657,9 @@ private:
 class SyncIconLookAndFeel : public juce::LookAndFeel_V4
 {
 public:
+    juce::String bottomText { "HOST" };
+    float glowPhase = 0.0f; // 0..2pi, for pulsing when on
+
     void drawButtonBackground(juce::Graphics& g, juce::Button& button, const juce::Colour&,
                               bool shouldDrawButtonAsHighlighted, bool /*shouldDrawButtonAsDown*/) override
     {
@@ -1350,15 +1671,30 @@ public:
                                 : juce::Colour::fromRGB(35, 18, 4);
         juce::Colour rim = isOn ? juce::Colour::fromRGB(255, 160, 60)
                                 : juce::Colour::fromRGB(255, 160, 60).withAlpha(0.25f);
-        juce::Colour ic  = isOn ? juce::Colour::fromRGB(255, 185, 90)
-                                : juce::Colour::fromRGB(255, 185, 90).withAlpha(0.22f);
+        // Text/icon color: bright when off, black when on
+        juce::Colour ic  = isOn ? juce::Colours::black
+                                : juce::Colour::fromRGB(255, 185, 90);
+
+        // Pulse brightness when on
+        if (isOn)
+        {
+            float t = (std::sin(glowPhase) + 1.0f) * 0.5f; // 0..1
+            uint8 r = (uint8)(110 + (uint8)(145 * t));
+            uint8 g = (uint8)(60  + (uint8)(100 * t));
+            uint8 b = (uint8)(10  + (uint8)(50 * t));
+            bg = juce::Colour::fromRGB(r, g, b);
+            rim = juce::Colour::fromRGB(
+                (uint8)(160 + (uint8)(95 * t)),
+                (uint8)(60  + (uint8)(120 * t)),
+                (uint8)(0   + (uint8)(50 * t)));
+        }
 
         g.setColour(bg);
         g.fillRoundedRectangle(bounds, r);
         g.setColour(rim);
         g.drawRoundedRectangle(bounds, r, 1.5f);
 
-        // --- "SYNC" / divider / "HOST" stacked text icon ---
+        // --- "SYNC" / divider / bottom text stacked icon ---
         g.setColour(ic);
 
         const float cx = bounds.getCentreX();
@@ -1381,12 +1717,12 @@ public:
                    juce::jmax(0.8f, bounds.getHeight() * 0.04f));
         g.setColour(ic);
 
-        // Bottom: HOST
+        // Bottom: HOST or MIDI
         auto hostFont = juce::Font(juce::jmax(7.0f, bounds.getHeight() * 0.26f), juce::Font::bold);
         g.setFont(hostFont);
         auto hostTextBounds = juce::Rectangle<float>(bounds.getX(), cy + halfH * 0.15f,
                                                      bounds.getWidth(), halfH * 0.7f);
-        g.drawText("HOST", hostTextBounds, juce::Justification::centred);
+        g.drawText(bottomText, hostTextBounds, juce::Justification::centred);
 
         if (shouldDrawButtonAsHighlighted)
         {
@@ -1644,6 +1980,7 @@ public:
     void paint (juce::Graphics&) override;
     void paintOverChildren (juce::Graphics&) override;
     void resized() override;
+    void moved() override;
     void timerCallback() override;
     void parentHierarchyChanged() override;
     void mouseDown(const juce::MouseEvent& event) override;
@@ -1686,7 +2023,9 @@ public:
     ATButtonLookAndFeel chatBtnLAF;
     SamplePadsButtonLookAndFeel samplePadsBtnLAF;
     OutlinedLabelLookAndFeel outlinedLabelLAF;
-    
+
+    void notifyPersistentSettingsDirty() { markPersistentSettingsDirty(); }
+
 private:
     NinjamVst3AudioProcessor& audioProcessor;
     IntervalDisplayComponent intervalDisplay;
@@ -1835,6 +2174,8 @@ private:
 
     void serverListClicked();
     void showAutoTuneMenu();
+    void showSshTunnelSettingsPopup();
+    void showHelpWindow();
     void updateAutoLevelButtonColor();
     void updateChatButtonColor();
     void updateTranslateButtonState();
@@ -1975,9 +2316,12 @@ private:
     double suppressHeavyUiUntilMs = 0.0;
     int lastLaidOutEditorWidth = -1;
     int lastLaidOutEditorHeight = -1;
+    int lastSavedEditorWidth = -1;
+    int lastSavedEditorHeight = -1;
     int currentEditorTimerIntervalMs = 0;
     int heavyUiTickCounter = 0;
     float voiceChatGlowPhase = 0.0f;
+    float syncGlowPhase = 0.0f;
     bool chatTtsEnabled = false;
     juce::String chatTtsVoiceId;
     float chatTtsVolume = 1.0f;

@@ -112,18 +112,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(opus)
 
-# Fetch signalsmith-stretch from its upstream repository so CI and local builds
-# always obtain the header/source directly during CMake configure.
-FetchContent_Declare(
-    signalsmith_stretch
-    GIT_REPOSITORY https://github.com/signalsmith-audio/signalsmith-stretch.git
-    GIT_TAG        57b93f4e9206a089a45387eaa39bdc9f310d3308
-)
-FetchContent_GetProperties(signalsmith_stretch)
-if (NOT signalsmith_stretch_POPULATED)
-    FetchContent_Populate(signalsmith_stretch)
-endif()
-
 # Fetch Ableton Link (header-only CMake integration, with asio-standalone submodule)
 FetchContent_Declare(
     abletonlink
@@ -196,6 +184,8 @@ target_sources(NINJAM_VST3 PRIVATE
     Source/ZapVideoCodec.cpp
     Source/ZapVideoCodec.h
     Source/AutoTune.h
+    Source/SshTunnel.h
+    Source/SshTunnel.cpp
     
     # NINJAM Core
     ${NINJAM_ROOT}/ninjam/njclient.cpp
@@ -225,6 +215,30 @@ target_sources(NINJAM_VST3 PRIVATE
 
     # Rubber Band Library (single-file compilation unit for pitch shifting / auto-tune)
     third_party/rubberband/single/RubberBandSingle.cpp
+
+    # LibrosaCpp (olilarkin/librosa.cpp) — tempo estimation and beat tracking
+    third_party/librosa-cpp/vendor/incbeta/incbeta.c
+    third_party/librosa-cpp/src/internal/fft_pocketfft.cpp
+    third_party/librosa-cpp/src/util/utils.cpp
+    third_party/librosa-cpp/src/util/exceptions.cpp
+    third_party/librosa-cpp/src/core/convert.cpp
+    third_party/librosa-cpp/src/core/audio.cpp
+    third_party/librosa-cpp/src/core/spectrum.cpp
+    third_party/librosa-cpp/src/core/pitch.cpp
+    third_party/librosa-cpp/src/core/harmonic.cpp
+    third_party/librosa-cpp/src/core/constantq.cpp
+    third_party/librosa-cpp/src/core/notation.cpp
+    third_party/librosa-cpp/src/core/intervals.cpp
+    third_party/librosa-cpp/src/filters.cpp
+    third_party/librosa-cpp/src/sequence.cpp
+    third_party/librosa-cpp/src/feature/spectral.cpp
+    third_party/librosa-cpp/src/feature/rhythm.cpp
+    third_party/librosa-cpp/src/feature/inverse.cpp
+    third_party/librosa-cpp/src/onset.cpp
+    third_party/librosa-cpp/src/beat.cpp
+    third_party/librosa-cpp/src/decompose.cpp
+    third_party/librosa-cpp/src/segment.cpp
+    third_party/librosa-cpp/src/effects.cpp
 )
 
 # Rubber Band needs NOMINMAX on Windows to avoid std::min/max macro conflicts
@@ -233,6 +247,20 @@ if (WIN32)
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rubberband/single/RubberBandSingle.cpp"
         PROPERTIES COMPILE_DEFINITIONS NOMINMAX
     )
+    # LibrosaCpp / Eigen also need NOMINMAX and _USE_MATH_DEFINES on Windows
+    file(GLOB LIBROSA_CPP_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/librosa-cpp/src/*.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/librosa-cpp/src/core/*.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/librosa-cpp/src/feature/*.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/librosa-cpp/src/internal/*.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/librosa-cpp/src/util/*.cpp"
+    )
+    foreach(_librosa_src ${LIBROSA_CPP_SOURCES})
+        set_source_files_properties(
+            "${_librosa_src}"
+            PROPERTIES COMPILE_DEFINITIONS "NOMINMAX;_USE_MATH_DEFINES"
+        )
+    endforeach()
 endif()
 
 # Include directories
@@ -248,9 +276,12 @@ target_include_directories(NINJAM_VST3 PRIVATE
     third_party/chord-detector/src
     third_party/chord-detector/libs/kiss_fft130
     third_party/chord-detector
-    ${signalsmith_stretch_SOURCE_DIR}/include
-    third_party/signalsmith-linear/include
     third_party/rubberband
+    third_party/librosa-cpp/include
+    third_party/librosa-cpp/src
+    third_party/librosa-cpp/vendor
+    third_party/librosa-cpp/modules/eigen
+    third_party/librosa-cpp/modules/pocketfft
     $<$<BOOL:${WIN32}>:${asiosdk_SOURCE_DIR}/common>
     $<$<BOOL:${WIN32}>:${asiosdk_SOURCE_DIR}/host>
 )
@@ -303,45 +334,8 @@ else()
     endif()
 endif()
 
-set(NINJAMPLUS_LOCAL_AUBIO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/local_deps/aubio-install")
-find_path(AUBIO_INCLUDE_DIR
-    NAMES aubio.h aubio/aubio.h
-    HINTS "${NINJAMPLUS_LOCAL_AUBIO_ROOT}/include")
-find_library(AUBIO_LIBRARY_RELEASE
-    NAMES aubio libaubio
-    HINTS
-        "${NINJAMPLUS_LOCAL_AUBIO_ROOT}/lib"
-        "${CMAKE_CURRENT_SOURCE_DIR}/local_deps/aubio-build/src/Release")
-find_library(AUBIO_LIBRARY_DEBUG
-    NAMES aubiod libaubiod aubio_d libaubio_d
-    HINTS
-        "${NINJAMPLUS_LOCAL_AUBIO_ROOT}/lib"
-        "${CMAKE_CURRENT_SOURCE_DIR}/local_deps/aubio-build/src/Debug")
-if (AUBIO_INCLUDE_DIR AND (AUBIO_LIBRARY_RELEASE OR AUBIO_LIBRARY_DEBUG))
-    target_include_directories(NINJAM_VST3 PRIVATE ${AUBIO_INCLUDE_DIR})
-
-    if (AUBIO_LIBRARY_RELEASE)
-        target_link_libraries(NINJAM_VST3 PRIVATE $<$<NOT:$<CONFIG:Debug>>:${AUBIO_LIBRARY_RELEASE}>)
-    endif()
-
-    if (AUBIO_LIBRARY_DEBUG)
-        target_link_libraries(NINJAM_VST3 PRIVATE $<$<CONFIG:Debug>:${AUBIO_LIBRARY_DEBUG}>)
-    endif()
-
-    if (AUBIO_LIBRARY_DEBUG)
-        target_compile_definitions(NINJAM_VST3 PRIVATE NINJAMPLUS_HAS_AUBIO=1)
-    elseif (AUBIO_LIBRARY_RELEASE)
-        # The local aubio dependency is currently release-only, so keep it out of
-        # Debug links to avoid mixing MSVCRT with the project's Debug CRT.
-        target_compile_definitions(NINJAM_VST3 PRIVATE
-            $<$<CONFIG:Debug>:NINJAMPLUS_HAS_AUBIO=0>
-            $<$<NOT:$<CONFIG:Debug>>:NINJAMPLUS_HAS_AUBIO=1>)
-    else()
-        target_compile_definitions(NINJAM_VST3 PRIVATE NINJAMPLUS_HAS_AUBIO=0)
-    endif()
-else()
-    target_compile_definitions(NINJAM_VST3 PRIVATE NINJAMPLUS_HAS_AUBIO=0)
-endif()
+# LibrosaCpp is always available (bundled with pocketfft backend)
+target_compile_definitions(NINJAM_VST3 PRIVATE NINJAMPLUS_HAS_LIBROSA=1)
 
 set(NINJAMPLUS_ONNXRUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime")
 set(NINJAMPLUS_SOLITITO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/solitito-ai")
