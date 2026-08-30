@@ -20,6 +20,7 @@
 #include "ZapVideoCodec.h"
 #include "AutoTune.h"
 #include "SshTunnel.h"
+#include "SessionRecorder.h"
 
 #ifndef NINJAMPLUS_HAS_H264_DECODE
 #define NINJAMPLUS_HAS_H264_DECODE 0
@@ -230,7 +231,15 @@ public:
     
     // Version information
     juce::String getVersionString() const;
-    
+
+    // Session recording
+    bool startSessionRecording(const juce::File& outputFolder);
+    bool stopSessionRecording();
+    bool isSessionRecording() const;
+    bool isSessionRecordingFinishing() const;
+    juce::String getSessionRecordingStatus() const;
+    juce::File getSessionRecordingFile() const;
+
     void setSoftLimiterEnabled(bool shouldEnable);
     bool isSoftLimiterEnabled() const;
     void setUserClipEnabled(int userIndex, bool enabled);
@@ -1197,6 +1206,7 @@ private:
     juce::String sshTunnelUser;
     juce::String sshTunnelKeyFile;
     ninjamplus::SshTunnel sshTunnel;
+    SessionRecorder sessionRecorder;
     std::atomic<bool> vdoVideoSyncEnabled { false };
     std::atomic<bool> vdoCarrierChannelConfigured { false };
     mutable juce::CriticalSection vdoRoomLock;

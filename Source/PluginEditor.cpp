@@ -8307,12 +8307,22 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         autoLevelEnabled = newState;
         if (!autoLevelEnabled)
         {
+            // Restore original volumes for users who were present when auto level
+            // was enabled. Users who joined while auto level was on get reset to 1.0 (0dB).
             auto users = audioProcessor.getConnectedUsers();
             for (auto& u : users)
-                audioProcessor.setUserVolume(u.index, u.volume);
+            {
+                auto origIt = autoLevelOriginalVolumes.find(u.index);
+                const float restoreVol = (origIt != autoLevelOriginalVolumes.end())
+                    ? origIt->second
+                    : 1.0f;
+                audioProcessor.rememberUserVolume(u.index, restoreVol, u.name);
+                audioProcessor.setUserVolume(u.index, restoreVol);
+            }
 
             autoLevelCurrentGains.clear();
             autoLevelLastAppliedGains.clear();
+            autoLevelOriginalVolumes.clear();
             autoLevelPeakLevels.clear();
             autoLevelChannelActiveTicks.clear();
             autoLevelMeasureTicks.clear();
@@ -8320,6 +8330,14 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
             autoLevelUnderTargetTicks.clear();
             autoLevelUserNameById.clear();
             autoLevelWorkTickCounter = 0;
+        }
+        else
+        {
+            // Just enabled — snapshot current volumes as originals
+            autoLevelOriginalVolumes.clear();
+            auto users = audioProcessor.getConnectedUsers();
+            for (auto& u : users)
+                autoLevelOriginalVolumes[u.index] = u.volume;
         }
         audioProcessor.setSoftLimiterEnabled(autoLevelEnabled);
         updateAutoLevelButtonColor();
@@ -8378,6 +8396,63 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     addAndMakeVisible(aboutButton);
     aboutButton.setTooltip("About NINJAMplus");
     aboutButton.onClick = [this] { showAboutWindow(); };
+
+    // Session recording buttons
+    addAndMakeVisible(recordButton);
+    recordButton.setTooltip("Start/Stop session recording to a multiplexed Ogg (MOGG) file");
+    recordButton.setClickingTogglesState(true);
+    recordButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff2a2e33));
+    recordButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xffcc2222));
+    recordButton.setColour(juce::TextButton::textColourOffId, juce::Colours::lightgrey);
+    recordButton.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+    recordButton.onClick = [this]
+    {
+        if (recordButton.getToggleState())
+        {
+            if (!recordFolder.isDirectory())
+            {
+                // Prompt for folder if not set
+                chooseRecordFolder();
+                if (!recordFolder.isDirectory())
+                {
+                    recordButton.setToggleState(false, juce::dontSendNotification);
+                    return;
+                }
+            }
+            // Pass the folder — the recorder creates a timestamped subfolder inside it
+            if (!audioProcessor.startSessionRecording(recordFolder))
+            {
+                recordButton.setToggleState(false, juce::dontSendNotification);
+                juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                    "Recording Failed",
+                    "Could not start recording to:\n" + recordFolder.getFullPathName(),
+                    "OK");
+            }
+            else
+            {
+                recordButton.setButtonText("Stop");
+                lastRecordServer = serverField.getText().trim();
+                recordDisconnectTimeMs = 0.0;
+            }
+        }
+        else
+        {
+            audioProcessor.stopSessionRecording();
+            recordButton.setButtonText("Record");
+        }
+        updateRecordButtonColor();
+        markPersistentSettingsDirty();
+    };
+    updateRecordButtonColor();
+
+    addAndMakeVisible(recordFolderButton);
+    recordFolderButton.setTooltip("Choose folder for session recordings");
+    recordFolderButton.onClick = [this] { chooseRecordFolder(); markPersistentSettingsDirty(); };
+
+    addAndMakeVisible(recordStatusLabel);
+    recordStatusLabel.setColour(juce::Label::textColourId, juce::Colours::grey);
+    recordStatusLabel.setFont(juce::Font(11.0f));
+    recordStatusLabel.setJustificationType(juce::Justification::centredLeft);
 
     addAndMakeVisible(tempoLabel);
     tempoLabel.setJustificationType(juce::Justification::centredLeft);
@@ -9462,9 +9537,9 @@ void NinjamVst3AudioProcessorEditor::paintOverChildren(juce::Graphics& g)
         g.drawText(transmitButton.getButtonText(), transmitButton.getBounds(), juce::Justification::centred, false);
     }
 
-    // During deferred resize (dragging the window edge in a plugin host), show a placeholder
+    // During deferred resize (dragging the window edge in Ableton Live), show a placeholder
     // outline so the user sees the target size without the GUI actually relayouting in real-time.
-    if (pendingDeferredResizeLayout && !audioProcessor.isStandaloneWrapper())
+    if (pendingDeferredResizeLayout && !audioProcessor.isStandaloneWrapper() && isAbletonLiveHost())
     {
         const auto bounds = getLocalBounds().toFloat();
         // Dim the existing content
@@ -9506,9 +9581,11 @@ void NinjamVst3AudioProcessorEditor::resized()
     backgroundComponent.setBounds(getLocalBounds());
     backgroundComponent.toBack();
 
-    // Defer heavy layout work during live resize for all plugin hosts (not just Ableton).
-    // This prevents lag on Mac AU in Reaper and other hosts where resize events fire rapidly.
-    if (!audioProcessor.isStandaloneWrapper() && !applyingDeferredResizeLayout)
+    // Defer heavy layout work during live resize only for Ableton Live,
+    // which has a particularly slow plugin resize path. Other DAWs
+    // (Reaper, Studio One, etc.) handle resize smoothly without deferral.
+    const bool isAbletonPlugin = !audioProcessor.isStandaloneWrapper() && isAbletonLiveHost();
+    if (isAbletonPlugin && !applyingDeferredResizeLayout)
     {
         const bool hasCompletedInitialLayout = lastLaidOutEditorWidth > 0 && lastLaidOutEditorHeight > 0;
         if (hasCompletedInitialLayout)
@@ -9531,30 +9608,34 @@ void NinjamVst3AudioProcessorEditor::resized()
     area.removeFromBottom(10);
 
     auto topRow = area.removeFromTop(30);
-    // Right side of top row: texture / video-bg controls only
-    backgroundSelector.setBounds(topRow.removeFromRight(150));
+    // Right side of top row: record controls, texture / video-bg
+    backgroundSelector.setBounds(topRow.removeFromRight(130));
     topRow.removeFromRight(4);
-    videoBgToggle.setBounds(topRow.removeFromRight(90));
-    topRow.removeFromRight(10);
+    videoBgToggle.setBounds(topRow.removeFromRight(80));
+    topRow.removeFromRight(6);
+    recordButton.setBounds(topRow.removeFromRight(56));
+    topRow.removeFromRight(3);
+    recordFolderButton.setBounds(topRow.removeFromRight(66));
+    topRow.removeFromRight(6);
     // Left side: server fields
-    serverLabel.setBounds(topRow.removeFromLeft(60));
-    serverField.setBounds(topRow.removeFromLeft(150));
+    serverLabel.setBounds(topRow.removeFromLeft(55));
+    serverField.setBounds(topRow.removeFromLeft(140));
     topRow.removeFromLeft(4);
-    serverListButton.setBounds(topRow.removeFromLeft(72));
+    serverListButton.setBounds(topRow.removeFromLeft(68));
     topRow.removeFromLeft(4);
-    userLabel.setBounds(topRow.removeFromLeft(50));
-    userField.setBounds(topRow.removeFromLeft(90));
+    userLabel.setBounds(topRow.removeFromLeft(45));
+    userField.setBounds(topRow.removeFromLeft(80));
     topRow.removeFromLeft(4);
-    anonymousButton.setBounds(topRow.removeFromLeft(100));
+    anonymousButton.setBounds(topRow.removeFromLeft(90));
     if (!anonymousButton.getToggleState())
     {
         topRow.removeFromLeft(4);
-        passLabel.setBounds(topRow.removeFromLeft(66));
-        passField.setBounds(topRow.removeFromLeft(96));
+        passLabel.setBounds(topRow.removeFromLeft(60));
+        passField.setBounds(topRow.removeFromLeft(86));
         topRow.removeFromLeft(4);
     }
-    connectButton.setBounds(topRow.removeFromLeft(90));
-    topRow.removeFromLeft(8);
+    connectButton.setBounds(topRow.removeFromLeft(86));
+    topRow.removeFromLeft(6);
     statusLabel.setBounds(topRow);
 
     area.removeFromTop(4);
@@ -9922,6 +10003,43 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
     if (audioProcessor.getClient().GetStatus() == NJClient::NJC_STATUS_OK)
         currentServerMaxLocalChannels = juce::jmax(1, audioProcessor.getClient().GetMaxLocalChannels());
     maxChannelsLabel.setText("Max Ch: " + juce::String(currentServerMaxLocalChannels), juce::dontSendNotification);
+
+    // Session recording status
+    {
+        auto status = audioProcessor.getSessionRecordingStatus();
+        recordStatusLabel.setText(status, juce::dontSendNotification);
+
+        // Check if recording failed to start or just finished
+        if (!audioProcessor.isSessionRecording() && recordButton.getToggleState())
+        {
+            // Recording stopped or failed — reset button
+            recordButton.setToggleState(false, juce::dontSendNotification);
+            recordButton.setButtonText("Record");
+            updateRecordButtonColor();
+            if (status.containsIgnoreCase("failed"))
+            {
+                juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                    "Recording Failed",
+                    "Could not initialize the recording. Check disk space and permissions.",
+                    "OK");
+            }
+        }
+
+        // Pulsing red glow while recording
+        if (audioProcessor.isSessionRecording() && !audioProcessor.isSessionRecordingFinishing())
+        {
+            recordPulsePhase += 0.05f;
+            if (recordPulsePhase > 1.0f)
+                recordPulsePhase = 0.0f;
+            // Pulse between dark red and bright red
+            const float pulse = 0.5f + 0.5f * std::sin(recordPulsePhase * juce::MathConstants<float>::pi * 2.0f);
+            const juce::uint8 r = (juce::uint8)(0xcc + (0xff - 0xcc) * pulse);
+            const juce::uint8 g = (juce::uint8)(0x22 * (1.0f - pulse * 0.5f));
+            const juce::uint8 b = (juce::uint8)(0x22 * (1.0f - pulse * 0.5f));
+            recordButton.setColour(juce::TextButton::buttonColourId, juce::Colour(r, g, b));
+            recordButton.repaint();
+        }
+    }
     const bool currentCanUseDedicatedVoice = audioProcessor.canUseDedicatedVoiceChatChannel();
     const int currentNumLocalChannels = audioProcessor.getNumLocalChannels();
     if (currentServerMaxLocalChannels != lastLocalVoiceLayoutServerMaxChannels
@@ -9931,7 +10049,7 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         lastLocalVoiceLayoutServerMaxChannels = currentServerMaxLocalChannels;
         lastLocalVoiceLayoutNumLocalChannels = currentNumLocalChannels;
         lastLocalVoiceLayoutCanUseDedicatedVoice = currentCanUseDedicatedVoice;
-        const bool bypassDeferredResize = !audioProcessor.isStandaloneWrapper();
+        const bool bypassDeferredResize = !audioProcessor.isStandaloneWrapper() && isAbletonLiveHost();
         if (bypassDeferredResize)
             applyingDeferredResizeLayout = true;
         resized();
@@ -9965,7 +10083,7 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         lastPersistentSettingsSaveMs = nowMs;
     }
 
-    if (pendingDeferredResizeLayout && !audioProcessor.isStandaloneWrapper())
+    if (pendingDeferredResizeLayout && !audioProcessor.isStandaloneWrapper() && isAbletonLiveHost())
     {
         if (nowMs - lastResizeEventMs >= 85.0)
         {
@@ -9998,6 +10116,54 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
     }
 
     int status = audioProcessor.getClient().GetStatus();
+
+    // Session recording: handle disconnect/reconnect and server changes
+    if (audioProcessor.isSessionRecording())
+    {
+        const juce::String currentServer = serverField.getText().trim();
+        if (status == NJClient::NJC_STATUS_DISCONNECTED && lastConnectionStatus == NJClient::NJC_STATUS_OK)
+        {
+            // Just disconnected — start the 60s grace timer
+            recordDisconnectTimeMs = nowMs;
+        }
+        else if (status == NJClient::NJC_STATUS_OK && lastConnectionStatus != NJClient::NJC_STATUS_OK)
+        {
+            // Just reconnected
+            if (recordDisconnectTimeMs > 0.0
+                && (nowMs - recordDisconnectTimeMs) <= 60000.0
+                && currentServer.equalsIgnoreCase(lastRecordServer))
+            {
+                // Reconnected to same server within 60s — continue recording
+                recordDisconnectTimeMs = 0.0;
+            }
+            else
+            {
+                // Different server or too long — stop recording
+                audioProcessor.stopSessionRecording();
+                recordButton.setToggleState(false, juce::dontSendNotification);
+                recordButton.setButtonText("Record");
+                updateRecordButtonColor();
+                recordDisconnectTimeMs = 0.0;
+            }
+        }
+
+        // If disconnected for more than 60 seconds, stop recording
+        if (status == NJClient::NJC_STATUS_DISCONNECTED
+            && recordDisconnectTimeMs > 0.0
+            && (nowMs - recordDisconnectTimeMs) > 60000.0)
+        {
+            audioProcessor.stopSessionRecording();
+            recordButton.setToggleState(false, juce::dontSendNotification);
+            recordButton.setButtonText("Record");
+            updateRecordButtonColor();
+            recordDisconnectTimeMs = 0.0;
+        }
+
+        if (status == NJClient::NJC_STATUS_OK)
+            lastRecordServer = currentServer;
+    }
+
+    lastConnectionStatus = status;
     updateHostResizeModeForConnectionStatus(status);
     const juce::String currentLinkAudioInputLabel = buildLinkAudioLocalInputLabel(audioProcessor);
     if (currentLinkAudioInputLabel != lastLinkAudioLocalInputLabel)
@@ -10193,12 +10359,10 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
         if (!users.empty())
         {
             const float timerIntervalMs = abletonHostEditor ? 1200.0f : 180.0f;
-            const float noiseFloor = -50.0f; // LUFS
-            const float targetMasterLufs = -6.0f;
-            const float targetSoloLufs = -8.0f;
-            const float perUserCeilingLufs = -4.0f;
-            const float minGain = 0.05f;
-            const float maxGain = 2.0f;
+            const float noiseFloor = -55.0f; // LUFS
+            const float targetLufs = -14.0f;  // Master target
+            const float maxBoostGain = 6.0f;  // Max boost (6x = +15dB)
+            const float minGain = 0.5f;       // Don't attenuate below 0.5x (-6dB) unless extreme
 
             auto lufsToLinear = [](float lufs) -> float { return std::pow(10.0f, lufs / 20.0f); };
 
@@ -10212,12 +10376,22 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                     ++audibleUsers;
             }
 
-            const float targetPerUserLufs = juce::jmin(targetSoloLufs,
-                targetMasterLufs - 10.0f * std::log10(juce::jmax(1.0f, (float)audibleUsers)));
+            // Find the loudest audible user — everyone gets boosted toward that level.
+            // Use a minimum target of -14dB (not -10) to avoid clipping when many users
+            // are boosted simultaneously.
+            float loudestLufs = noiseFloor;
+            for (const auto& u : users)
+            {
+                const float lvl = observedLufs[u.index];
+                if (lvl > loudestLufs)
+                    loudestLufs = lvl;
+            }
+            // Target = loudest user, but at least -14dB, at most -8dB
+            const float refLufs = juce::jlimit(-14.0f, -8.0f, juce::jmax(loudestLufs, -14.0f));
+
+            // Check master level — if master is near clipping, reduce all targets
             const float masterLufs = audioProcessor.getMasterLufsAvg();
-            float masterReduction = 1.0f;
-            if (masterLufs > targetMasterLufs)
-                masterReduction = juce::jlimit(0.25f, 1.0f, lufsToLinear(targetMasterLufs - masterLufs));
+            const bool masterNearClip = masterLufs > -3.0f;
 
             std::set<int> activeIds;
 
@@ -10245,7 +10419,12 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
 
                 const float currentLevel = observedLufs[id];
                 if (!autoLevelCurrentGains.count(id))
-                    autoLevelCurrentGains[id] = juce::jlimit(minGain, maxGain, u.volume);
+                {
+                    // New user — start at their current volume (or 1.0 if they joined mid-auto-level)
+                    auto origIt = autoLevelOriginalVolumes.find(id);
+                    autoLevelCurrentGains[id] = (origIt != autoLevelOriginalVolumes.end())
+                        ? origIt->second : 1.0f;
+                }
 
                 const float currentGain = autoLevelCurrentGains[id];
                 const float sourceLufs = currentLevel;
@@ -10269,12 +10448,12 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                     float peakCoeff;
                     if (sourceLufs > longTermLufs)
                     {
-                        float attackMs = 700.0f / juce::jmin(envAdaptiveScale, 6.0f);
+                        float attackMs = 300.0f / juce::jmin(envAdaptiveScale, 6.0f);
                         peakCoeff = 1.0f - std::exp(-timerIntervalMs / attackMs);
                     }
                     else
                     {
-                        float releaseMs = 3500.0f / juce::jmin(envAdaptiveScale, 4.0f);
+                        float releaseMs = 2000.0f / juce::jmin(envAdaptiveScale, 4.0f);
                         peakCoeff = 1.0f - std::exp(-timerIntervalMs / releaseMs);
                     }
                     longTermLufs += (sourceLufs - longTermLufs) * peakCoeff;
@@ -10282,25 +10461,42 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
 
                 longTermLufs = juce::jlimit(noiseFloor - 10.0f, 0.0f, longTermLufs);
 
+                // Compute target gain: boost quiet users up to the reference level.
+                // Only attenuate if master is clipping.
                 float targetGain = currentGain;
                 if (longTermLufs > noiseFloor)
                 {
-                    float gainDb = targetPerUserLufs - longTermLufs;
-                    targetGain = currentGain * lufsToLinear(gainDb);
-                    targetGain = juce::jmin(targetGain, lufsToLinear(perUserCeilingLufs - longTermLufs));
-                    targetGain *= masterReduction;
+                    float gainDb = refLufs - longTermLufs;
+                    targetGain = lufsToLinear(gainDb);
+
+                    // If master is near clipping, don't boost anyone further
+                    if (masterNearClip && targetGain > currentGain)
+                        targetGain = currentGain;
+
+                    // Only reduce if the user is way above the reference AND master is clipping
+                    const float currentOutputLufs = longTermLufs + 20.0f * std::log10(juce::jmax(currentGain, 1.0e-6f));
+                    if (targetGain < currentGain && masterLufs < targetLufs + 6.0f)
+                    {
+                        // Master isn't clipping — don't attenuate
+                        targetGain = currentGain;
+                    }
+
+                    // Clamp: don't attenuate below minGain unless master is severely clipping
+                    if (targetGain < minGain && masterLufs < targetLufs + 10.0f)
+                        targetGain = minGain;
                 }
 
-                targetGain = juce::jlimit(minGain, maxGain, targetGain);
+                targetGain = juce::jlimit(minGain, maxBoostGain, targetGain);
 
                 const float currentOutputLufs = sourceLufs + 20.0f * std::log10(juce::jmax(currentGain, 1.0e-6f));
                 const float longTermOutputLufs = longTermLufs + 20.0f * std::log10(juce::jmax(currentGain, 1.0e-6f));
 
-                float diffDb = longTermOutputLufs - targetPerUserLufs;
+                float diffDb = longTermOutputLufs - refLufs;
                 float absDiffDb = std::abs(diffDb);
 
-                const bool tooHigh = (longTermOutputLufs > targetPerUserLufs + 1.0f) || (currentOutputLufs > targetMasterLufs + 2.0f);
-                const bool tooLow = longTermLufs > noiseFloor && longTermOutputLufs < targetPerUserLufs - 3.0f;
+                // Only use hysteresis for reduction — boosting should be responsive
+                const bool tooHigh = longTermOutputLufs > refLufs + 3.0f && masterLufs > targetLufs + 6.0f;
+                const bool tooLow = longTermLufs > noiseFloor && longTermOutputLufs < refLufs - 1.0f;
 
                 if (tooHigh)
                     ++autoLevelOverTargetTicks[id];
@@ -10312,20 +10508,15 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                 else
                     autoLevelUnderTargetTicks[id] = 0;
 
-                float hysteresisScale = 1.0f / juce::jmax(1.0f, absDiffDb * 0.3f);
-                int adaptiveHighPersist = juce::jmax(1, juce::roundToInt(3 * hysteresisScale));
-                int adaptiveLowPersist = juce::jmax(2, juce::roundToInt(6 * hysteresisScale));
+                const bool sustainedHigh = autoLevelOverTargetTicks[id] >= 3;
 
-                const bool sustainedHigh = autoLevelOverTargetTicks[id] >= adaptiveHighPersist;
-                const bool sustainedLow = autoLevelUnderTargetTicks[id] >= adaptiveLowPersist;
-
+                // Block reduction unless sustained high — we don't want to make people quieter
                 if (targetGain < currentGain && !sustainedHigh)
                     targetGain = currentGain;
-                else if (targetGain > currentGain && !sustainedLow)
-                    targetGain = currentGain;
+                // No hysteresis for boosting — always allow boosting quiet users up
 
                 const bool reducing = targetGain < currentGain;
-                const bool emergencyReduction = reducing && sustainedHigh && currentOutputLufs > targetMasterLufs + 2.0f;
+                const bool emergencyReduction = reducing && sustainedHigh && masterLufs > targetLufs + 10.0f;
 
                 float adaptiveScale = 1.0f + absDiffDb * 0.25f;
                 adaptiveScale = juce::jmin(adaptiveScale, 8.0f);
@@ -10333,16 +10524,18 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                 float smoothingCoeff;
                 if (reducing)
                 {
-                    float effectiveMs = emergencyReduction ? (450.0f / adaptiveScale) : (1400.0f / adaptiveScale);
+                    // Slow reduction — we prefer not to make people quieter
+                    float effectiveMs = emergencyReduction ? (600.0f / adaptiveScale) : (4000.0f / adaptiveScale);
                     smoothingCoeff = 1.0f - std::exp(-timerIntervalMs / effectiveMs);
                 }
                 else
                 {
-                    float effectiveMs = 5000.0f / adaptiveScale;
+                    // Fast boost — bring quiet users up quickly
+                    float effectiveMs = 400.0f / adaptiveScale;
                     smoothingCoeff = 1.0f - std::exp(-timerIntervalMs / effectiveMs);
                 }
                 if (isNew && !reducing)
-                    smoothingCoeff *= 0.35f;
+                    smoothingCoeff *= 0.5f;
 
                 const float unslewedGain = currentGain + (targetGain - currentGain) * smoothingCoeff;
 
@@ -10350,13 +10543,13 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                 float maxStep;
                 if (reducing)
                     maxStep = emergencyReduction
-                        ? juce::jmax(0.08f, (timerIntervalMs / 1000.0f) * 1.35f * slewScale)
-                        : juce::jmax(0.035f, (timerIntervalMs / 1000.0f) * 0.45f * slewScale);
+                        ? juce::jmax(0.05f, (timerIntervalMs / 1000.0f) * 0.8f * slewScale)
+                        : juce::jmax(0.02f, (timerIntervalMs / 1000.0f) * 0.25f * slewScale);
                 else
-                    maxStep = juce::jmax(0.006f, (timerIntervalMs / 1000.0f) * 0.12f * slewScale);
+                    maxStep = juce::jmax(0.05f, (timerIntervalMs / 1000.0f) * 0.8f * slewScale);
 
                 const float slewedDelta = juce::jlimit(-maxStep, maxStep, unslewedGain - currentGain);
-                autoLevelCurrentGains[id] = juce::jlimit(minGain, maxGain, currentGain + slewedDelta);
+                autoLevelCurrentGains[id] = juce::jlimit(minGain, maxBoostGain, currentGain + slewedDelta);
 
                 const float nextGain = autoLevelCurrentGains[id];
                 const auto appliedIt = autoLevelLastAppliedGains.find(id);
@@ -10375,6 +10568,7 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
                 {
                     int id = it->first;
                     autoLevelLastAppliedGains.erase(id);
+                    autoLevelOriginalVolumes.erase(id);
                     autoLevelPeakLevels.erase(id);
                     autoLevelChannelActiveTicks.erase(id);
                     autoLevelMeasureTicks.erase(id);
@@ -11191,6 +11385,8 @@ void NinjamVst3AudioProcessorEditor::savePersistentSettingsToDisk(bool includePr
     if (textureIdx >= 0 && textureIdx < textureFiles.size())
         props.setValue("texture", textureFiles[textureIdx].getFileName());
 
+    props.setValue("recordFolder", recordFolder.getFullPathName());
+
     if (includeProcessorState)
     {
         juce::MemoryBlock processorState;
@@ -11274,6 +11470,19 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
     setChatTtsVolume((float)props.getDoubleValue("chatTtsVolume", chatTtsVolume), false);
     setChatTtsOutputId(props.getValue("chatTtsOutputId", chatTtsOutputId), false);
     setChatTtsEnabled(props.getBoolValue("chatTtsEnabled", chatTtsEnabled), false);
+
+    {
+        const juce::String savedRecordFolder = props.getValue("recordFolder", "");
+        if (savedRecordFolder.isNotEmpty())
+        {
+            juce::File f(savedRecordFolder);
+            if (f.isDirectory())
+            {
+                recordFolder = f;
+                recordFolderButton.setButtonText(f.getFileName().substring(0, 12));
+            }
+        }
+    }
 
     abletonWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonWindowSizePreset", abletonWindowSizePreset));
     abletonChatWindowSizePreset = juce::jlimit(0, 2, props.getIntValue("abletonChatWindowSizePreset", abletonChatWindowSizePreset));
@@ -13490,6 +13699,47 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
             if (result == 58) setAbletonRemoteUsersWindowSizePreset(1);
             if (result == 59) setAbletonRemoteUsersWindowSizePreset(2);
         });
+}
+
+void NinjamVst3AudioProcessorEditor::chooseRecordFolder()
+{
+    auto* fc = new juce::FileChooser("Select Recording Folder",
+                         recordFolder.isDirectory() ? recordFolder : juce::File::getSpecialLocation(juce::File::userDocumentsDirectory));
+    fc->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+        [this, fc](const juce::FileChooser& chooser)
+        {
+            auto result = chooser.getResult();
+            if (result.isDirectory())
+            {
+                recordFolder = result;
+                recordFolderButton.setButtonText(result.getFileName().substring(0, 12));
+            }
+            delete fc;
+        });
+}
+
+void NinjamVst3AudioProcessorEditor::updateRecordButtonColor()
+{
+    if (audioProcessor.isSessionRecordingFinishing())
+    {
+        recordButton.setButtonText("Finishing...");
+        recordButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff886600));
+        recordButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff886600));
+    }
+    else if (audioProcessor.isSessionRecording())
+    {
+        recordButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xffcc2222));
+        recordButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xffcc2222));
+        recordButton.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
+        recordButton.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+    }
+    else
+    {
+        recordButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff2a2e33));
+        recordButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xffcc2222));
+        recordButton.setColour(juce::TextButton::textColourOffId, juce::Colours::lightgrey);
+        recordButton.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+    }
 }
 
 void NinjamVst3AudioProcessorEditor::showAboutWindow()

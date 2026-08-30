@@ -2015,6 +2015,11 @@ public:
     juce::Colour buttonThemeColour    { juce::Colour(0x00000000) };  // transparent = no override
     juce::Colour menuBarThemeColour   { juce::Colour(0x00000000) };  // transparent = no override
     juce::String chatWindowColourKey { "default" };
+    juce::File recordFolder;
+    int lastConnectionStatus = -1;
+    juce::String lastRecordServer;
+    double recordDisconnectTimeMs = 0.0;
+    float recordPulsePhase = 0.0f;
     CustomKnobLookAndFeel customKnobLookAndFeel;
     FaderIconLookAndFeel faderIconLookAndFeel;
     MetronomeButtonLookAndFeel metronomeBtnLAF;
@@ -2062,6 +2067,9 @@ private:
     LeftClickOnlyTextButton fxButton{ "FX" };
     LeftClickOnlyTextButton optionsButton{ "Options" };
     LeftClickOnlyTextButton aboutButton{ "?" };
+    LeftClickOnlyTextButton recordButton{ "Record" };
+    LeftClickOnlyTextButton recordFolderButton{ "Rec Folder" };
+    juce::Label recordStatusLabel;
     juce::Label tempoLabel;
     juce::ComboBox backgroundSelector{ "Background" };
     LeftClickOnlyToggleButton videoBgToggle{ "Video BG" };
@@ -2237,6 +2245,8 @@ private:
     void setAbletonWindowSizePreset(int presetIndex);
     void updateHostResizeModeForConnectionStatus(int status);
     void showAboutWindow();
+    void chooseRecordFolder();
+    void updateRecordButtonColor();
     void beginUpdateCheck(bool userInitiated);
     void completeUpdateCheck(bool userInitiated,
                              bool requestOk,
@@ -2335,6 +2345,7 @@ private:
     float storedMetronomeVolume = 0.5f;
     std::map<int, float> autoLevelCurrentGains;
     std::map<int, float> autoLevelLastAppliedGains;
+    std::map<int, float> autoLevelOriginalVolumes; // saved before auto-level adjusts
     std::map<int, float> autoLevelPeakLevels;
     std::map<int, int> autoLevelChannelActiveTicks;
     std::map<int, int> autoLevelMeasureTicks;

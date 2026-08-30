@@ -186,6 +186,8 @@ target_sources(NINJAM_VST3 PRIVATE
     Source/AutoTune.h
     Source/SshTunnel.h
     Source/SshTunnel.cpp
+    Source/SessionRecorder.h
+    Source/SessionRecorder.cpp
     
     # NINJAM Core
     ${NINJAM_ROOT}/ninjam/njclient.cpp
@@ -361,6 +363,7 @@ endif()
 target_link_libraries(NINJAM_VST3 PRIVATE
     juce::juce_audio_utils
     juce::juce_audio_processors
+    juce::juce_audio_formats
     juce::juce_gui_basics
     juce::juce_gui_extra
     juce::juce_video

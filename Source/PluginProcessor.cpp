@@ -4418,9 +4418,9 @@ namespace
     constexpr int kNinjamZapVideoOnlyChannelFlag = NJClient::NJCLIENT_CHANNEL_FLAG_VIDEO_ONLY;
     constexpr const char* sideSignalChatPrefix = "__NINJAM_VST3_SIDESIGNAL__ ";
     constexpr int remoteLatencyUpdateCadenceIntervals = 1;
-    // Fixed indices: 0=legacy audio, 1=hidden NJ+ control, 2=Opus multichannel lane, 4=voice.
+    // Fixed indices: 0=legacy audio, 1=hidden NJ+ control, 2=Opus multichannel lane, 3=voice.
     constexpr int kNinjamPlusControlChannelIndex = 1;
-    constexpr int kVoiceChatChannelIndex = 4;
+    constexpr int kVoiceChatChannelIndex = 3;
     constexpr int kOpusMultichannelBaseIndex = 2;
     constexpr int kSyncSignalChannelIndex = kNinjamPlusControlChannelIndex;
     constexpr double intervalHelperPayloadMinWriteMs = 500.0;
@@ -10711,7 +10711,9 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
                     if (!(fallback > 0.0))
                         fallback = state.lastMeasurementMs;
                     if (fallback > 0.0)
-                        bufferMs = juce::jmax(0, (int)std::llround(fallback)) + routeLatencyForBufferMs;
+                        // The measured delay already includes network route latency,
+                        // so we do NOT add routeLatencyForBufferMs on top.
+                        bufferMs = juce::jmax(0, (int)std::llround(fallback));
                 }
             }
             if (bufferMs < 0 && canonicalUserKey.isNotEmpty())
@@ -10736,7 +10738,9 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
                     if (!(fallback > 0.0))
                         fallback = state.lastMeasurementMs;
                     if (fallback > 0.0)
-                        bufferMs = juce::jmax(0, (int)std::llround(fallback)) + routeLatencyForBufferMs;
+                        // The measured delay already includes network route latency,
+                        // so we do NOT add routeLatencyForBufferMs on top.
+                        bufferMs = juce::jmax(0, (int)std::llround(fallback));
                 }
             }
             if (!intervalMeasurementSeen)
@@ -11870,6 +11874,64 @@ void NinjamVst3AudioProcessor::setSoftLimiterEnabled(bool shouldEnable)
     softLimiterEnabled.store(shouldEnable);
 }
 
+bool NinjamVst3AudioProcessor::startSessionRecording(const juce::File& outputFile)
+{
+    if (sessionRecorder.isRecording())
+        return false;
+
+    double sr = getSampleRate();
+    if (sr <= 0.0)
+        sr = 48000.0;
+
+    int numLocal = juce::jlimit(1, maxLocalChannels, numLocalChannels.load());
+
+    // Snapshot currently connected remote users and their channel counts
+    std::vector<int> userIds;
+    std::vector<int> channelCounts;
+    auto users = getConnectedUsers();
+    for (const auto& u : users)
+    {
+        if (u.index < 0 || u.index >= SessionRecorder::maxRemoteUsers)
+            continue;
+        int nch = 2; // default stereo for non-multichannel peers
+        if (isRemoteOpusMultichannelPeer(u.index))
+        {
+            int vcount = remoteOpusVirtualChannelCount[(size_t)u.index].load(std::memory_order_relaxed);
+            int packed = remoteOpusPackedChannelCount[(size_t)u.index].load(std::memory_order_relaxed);
+            nch = juce::jmax(1, packed > 0 ? packed : vcount);
+        }
+        userIds.push_back(u.index);
+        channelCounts.push_back(nch);
+    }
+
+    return sessionRecorder.startRecording(outputFile, sr, numLocal, userIds, channelCounts);
+}
+
+bool NinjamVst3AudioProcessor::stopSessionRecording()
+{
+    return sessionRecorder.stopRecording();
+}
+
+bool NinjamVst3AudioProcessor::isSessionRecording() const
+{
+    return sessionRecorder.isRecording() || sessionRecorder.isStarting();
+}
+
+bool NinjamVst3AudioProcessor::isSessionRecordingFinishing() const
+{
+    return sessionRecorder.isFinishing();
+}
+
+juce::String NinjamVst3AudioProcessor::getSessionRecordingStatus() const
+{
+    return sessionRecorder.getStatusMessage();
+}
+
+juce::File NinjamVst3AudioProcessor::getSessionRecordingFile() const
+{
+    return sessionRecorder.getOutputFile();
+}
+
 bool NinjamVst3AudioProcessor::isSoftLimiterEnabled() const
 {
     return softLimiterEnabled.load();
@@ -12442,7 +12504,14 @@ void NinjamVst3AudioProcessor::RemoteChannelAudioTap_Callback(void* userData,
                        self->remoteAudioTapAvailableSamples[(size_t)useridx] + framesToCopy);
     }
 
-    if (self->chordAnalyzer == nullptr)
+    // Session recorder: tap remote user stereo (non-Opus-multichannel)
+    if (self->sessionRecorder.isRecording())
+    {
+        // Pass interleaved data directly — writeRemoteUserInterleaved handles it
+        self->sessionRecorder.writeRemoteUserInterleaved(useridx, interleaved, numChannels, numFrames);
+    }
+
+    // Always update the LUFS meter regardless of chord analyzer state
     {
         auto& meter = self->userLufsMeters[(size_t)useridx];
         for (int frame = 0; frame < numFrames; ++frame)
@@ -12454,8 +12523,10 @@ void NinjamVst3AudioProcessor::RemoteChannelAudioTap_Callback(void* userData,
             meter.processSample(mono);
         }
         self->userLufsAvg[(size_t)useridx].store(meter.getCurrentLufs(), std::memory_order_relaxed);
-        return;
     }
+
+    if (self->chordAnalyzer == nullptr)
+        return;
 
     const int trackIndex = BatchedChordAnalyzer::remoteTrackIndexForUser(useridx);
     if (!self->isChordDetectionEnabled() || !self->isUserChordDetectionEnabled(useridx))
@@ -12491,6 +12562,15 @@ int NinjamVst3AudioProcessor::RemoteMultichannelTap_Callback(void* userData,
 
     if (interleaved == nullptr || numFrames <= 0 || numChannels <= 0)
         return 1;
+
+    // Session recorder: tap remote Opus multichannel user (pre-user-volume, decoded)
+    if (self->sessionRecorder.isRecording())
+    {
+        int packedCount = self->remoteOpusPackedChannelCount[(size_t)useridx].load(std::memory_order_relaxed);
+        if (packedCount <= 0)
+            packedCount = numChannels;
+        self->sessionRecorder.writeRemoteUserMultichannel(useridx, interleaved, packedCount, numFrames);
+    }
 
     int virtualCount = self->remoteOpusVirtualChannelCount[(size_t)useridx].load(std::memory_order_relaxed);
     virtualCount = juce::jlimit(1, maxLocalChannels, virtualCount);
@@ -17924,10 +18004,14 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                         remoteLatencyAverageByUser.erase(senderKey);
                     if (it == lastAnnouncedRemoteIntervalByUser.end() || it->second != remoteMarkerKey)
                     {
-                        lastAnnouncedRemoteIntervalByUser[senderKey] = remoteMarkerKey;
                         // Only store as pending if the tag is not from a past interval.
                         // Late tags would produce a buffer offset by a full interval.
                         shouldStorePending = !tagIsLate;
+                        // Only record the marker key if we actually stored it as pending.
+                        // If we skip a late tag, we want redundant retransmissions
+                        // (which may arrive in time) to still have a chance.
+                        if (shouldStorePending)
+                            lastAnnouncedRemoteIntervalByUser[senderKey] = remoteMarkerKey;
                     }
                 }
 
@@ -18838,6 +18922,13 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
     localPeakL.store(globalLocalMaxL);
     localPeakR.store(globalLocalMaxR);
 
+    // Session recorder: tap local channels (post-gain, post-AutoTune)
+    if (sessionRecorder.isRecording())
+    {
+        for (int ch = 0; ch < actualLocal; ++ch)
+            sessionRecorder.writeLocalChannel(ch, localChannelBuffer.getReadPointer(ch), numSamples);
+    }
+
     if (chordAnalyzer && !fedChordAnalyzer)
         chordAnalyzer->markNoInput(BatchedChordAnalyzer::localTrackIndex);
 
@@ -19624,6 +19715,18 @@ void NinjamVst3AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, j
             }
         }
     }
+
+    // Session recorder: tap master stereo mix (post-limiter, post-softclip)
+    if (sessionRecorder.isRecording() && numOutputBusesOut > 0)
+    {
+        auto mainBus = getBusBuffer(buffer, false, 0);
+        const int mainChans = mainBus.getNumChannels();
+        if (mainChans >= 2)
+            sessionRecorder.writeMasterBlock(mainBus.getReadPointer(0), mainBus.getReadPointer(1), numSamples);
+        else if (mainChans == 1)
+            sessionRecorder.writeMasterBlock(mainBus.getReadPointer(0), mainBus.getReadPointer(0), numSamples);
+    }
+
     if (numOutputBusesOut > 0)
     {
         auto mainBus = getBusBuffer(buffer, false, 0);
@@ -21285,7 +21388,10 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
             if (firmAverageMs >= 0 || averageMs >= 0)
             {
                 const double rawDelayMs = (double)(firmAverageMs >= 0 ? firmAverageMs : averageMs);
-                correctedDelayMs = juce::jmax(0, (int)std::llround(rawDelayMs) + serverRouteLatencyMs);
+                // The measured elapsed time already includes the full end-to-end path
+                // (remote user → server → us), so we do NOT add serverRouteLatencyMs
+                // on top — that would double-count the network latency.
+                correctedDelayMs = juce::jmax(0, (int)std::llround(rawDelayMs));
             }
         }
         if (correctedDelayMs >= 0)
@@ -21572,7 +21678,7 @@ void NinjamVst3AudioProcessor::timerCallback()
             njplus_debug_log("CONNECT serverMaxLocalChannels=%d user='%s'", serverMaxLocalChannels, currentUser.toRawUTF8());
             juce::String serverChannelMessage = "Server allows " + juce::String(serverMaxLocalChannels)
                 + " local channel" + (serverMaxLocalChannels == 1 ? "" : "s")
-                + ". NINJAMplus indices: audio 0, hidden control 1, voice 2, Opus 3+.";
+                + ". NINJAMplus indices: audio 0, hidden control 1, Opus 2, voice 3.";
             if (serverMaxLocalChannels <= kNinjamPlusControlChannelIndex)
                 serverChannelMessage << " Hidden control and Opus cannot fit on this server; voice can only replace audio index 0 while voice mode is enabled.";
             else if (serverMaxLocalChannels <= kVoiceChatChannelIndex)
