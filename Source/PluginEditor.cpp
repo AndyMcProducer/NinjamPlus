@@ -8171,6 +8171,15 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
 {
     setResizable(true, true);
     setResizeLimits(1024, 600, 2200, 1500);
+
+    // Apply DPI scale factor if the user has overridden it.
+    // 0 = auto (let JUCE use the system DPI), otherwise force a specific scale.
+    {
+        const float scaleFactor = audioProcessor.getDpiScaleFactor();
+        if (scaleFactor > 0.0f)
+            setScaleFactor(scaleFactor);
+    }
+
     customKnobLookAndFeel.setExplicitEditor(this);
     const bool settingsFileReady = renewSettingsFileIfCorrupt(makeSettingsOptions(), this);
 
@@ -8403,6 +8412,11 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     usersPopoutButton.setButtonText("Popout");
     usersPopoutButton.setTooltip("Open remote users in a separate floating window");
     usersPopoutButton.onClick = [this] { usersPopoutClicked(); };
+
+    addAndMakeVisible(maxChannelsLabel);
+    maxChannelsLabel.setColour(juce::Label::textColourId, juce::Colours::grey);
+    maxChannelsLabel.setFont(juce::Font(13.0f));
+    maxChannelsLabel.setJustificationType(juce::Justification::centredLeft);
 
     addAndMakeVisible(addLocalChannelButton);
     addLocalChannelButton.setButtonText("+");
@@ -8948,6 +8962,17 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     addAndMakeVisible(backgroundSelector);
     backgroundSelector.setTooltip("Skin");
     {
+        // Cache the texture directory scan so we only rescans when the
+        // directory has actually changed (files added/removed/modified).
+        // This avoids repeated findChildFiles calls on every GUI open.
+        struct TextureScanCache
+        {
+            juce::String texturesDirPath;
+            juce::int64 dirModificationTime = 0;
+            juce::Array<juce::File> cachedFiles;
+        };
+        static TextureScanCache scanCache;
+
         juce::Array<juce::File> roots;
         roots.add(juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory());
         {
@@ -8976,18 +9001,36 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
 
         if (texturesDir.isDirectory())
         {
-            // Each subdirectory is a theme; its name shows in the dropdown
-            auto dirs = texturesDir.findChildFiles(juce::File::findDirectories, false);
-            dirs.sort();
-            for (int i = 0; i < dirs.size(); ++i)
+            const juce::int64 currentModTime = texturesDir.getLastModificationTime().toMilliseconds();
+            const bool cacheValid = scanCache.cachedFiles.size() > 0
+                && scanCache.texturesDirPath == texturesDir.getFullPathName()
+                && scanCache.dirModificationTime == currentModTime;
+
+            if (cacheValid)
             {
-                if (dirs[i].getFileName().equalsIgnoreCase("Skin Template"))
-                    continue;
-                // Only include dirs that contain a bg.* file
-                auto bgFiles = dirs[i].findChildFiles(juce::File::findFiles, false, "bg.*");
-                if (bgFiles.isEmpty()) continue;
-                textureFiles.add(dirs[i]);
-                backgroundSelector.addItem(dirs[i].getFileName(), textureFiles.size());
+                // Reuse cached scan results — no directory I/O needed
+                textureFiles = scanCache.cachedFiles;
+                for (int i = 0; i < textureFiles.size(); ++i)
+                    backgroundSelector.addItem(textureFiles[i].getFileName(), i + 1);
+            }
+            else
+            {
+                // Rescan: list all theme subdirectories and check each for bg.*
+                auto dirs = texturesDir.findChildFiles(juce::File::findDirectories, false);
+                dirs.sort();
+                for (int i = 0; i < dirs.size(); ++i)
+                {
+                    if (dirs[i].getFileName().equalsIgnoreCase("Skin Template"))
+                        continue;
+                    auto bgFiles = dirs[i].findChildFiles(juce::File::findFiles, false, "bg.*");
+                    if (bgFiles.isEmpty()) continue;
+                    textureFiles.add(dirs[i]);
+                    backgroundSelector.addItem(dirs[i].getFileName(), textureFiles.size());
+                }
+                // Update cache
+                scanCache.texturesDirPath = texturesDir.getFullPathName();
+                scanCache.dirModificationTime = currentModTime;
+                scanCache.cachedFiles = textureFiles;
             }
         }
         if (backgroundSelector.getNumItems() == 0)
@@ -9113,7 +9156,7 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
     if (settingsFileReady)
         loadPersistentSettingsFromDisk();
     updateSamplePadsFeatureVisibility();
-    refreshExternalMidiInputDevices();
+    // refreshExternalMidiInputDevices() was already called above; no need to repeat it here.
     lastPersistentSettingsSaveMs = juce::Time::getMillisecondCounterHiRes();
     lastSavedUiSettingsFingerprint = buildPersistentSettingsFingerprint(false);
     persistentSettingsDirty = false;
@@ -9603,6 +9646,8 @@ void NinjamVst3AudioProcessorEditor::resized()
     spreadOutputsButton.setBounds(usersHeader.removeFromLeft(118).withTrimmedTop(2));
     usersHeader.removeFromLeft(6);
     usersPopoutButton.setBounds(usersHeader.removeFromLeft(60).withTrimmedTop(2));
+    usersHeader.removeFromLeft(6);
+    maxChannelsLabel.setBounds(usersHeader.removeFromLeft(70).withTrimmedTop(2));
     // Hide the Connected Users label — no longer used
     usersLabel.setBounds(juce::Rectangle<int>());
 
@@ -9644,9 +9689,18 @@ void NinjamVst3AudioProcessorEditor::resized()
     // -/+ buttons anchored to the RIGHT edge, just left of voice toggle
     auto addButtonArea = localHeader.removeFromRight(24);
     auto removeButtonArea = localHeader.removeFromRight(24);
-    // Auto-tune button to the left of -/+ buttons
-    localHeader.removeFromRight(2);
-    auto autoTuneArea = localHeader.removeFromRight(28);
+    // Auto-tune button to the left of -/+ buttons.
+    // When only 1 local channel is available (e.g. server has limited channels),
+    // the local area is too narrow for the AT button in the header. In that case
+    // we leave autoTuneArea empty here and position it next to the channel name
+    // below, in line with the voice button.
+    juce::Rectangle<int> autoTuneArea;
+    const bool singleLocalChannel = (numLocal == 1);
+    if (!singleLocalChannel)
+    {
+        localHeader.removeFromRight(2);
+        autoTuneArea = localHeader.removeFromRight(28);
+    }
     removeLocalChannelButton.setBounds(removeButtonArea);
     addLocalChannelButton.setBounds(addButtonArea);
     autoTuneButton.setBounds(autoTuneArea);
@@ -9731,7 +9785,17 @@ void NinjamVst3AudioProcessorEditor::resized()
         localInputSelectors[(size_t)i].setBounds(inputArea);
         localInputModeSelectors[(size_t)i].setBounds(inputModeArea);
         localDbLabels[(size_t)i].setBounds(dbArea);
-        localChannelNameLabels[(size_t)i].setBounds(nameArea);
+        // When single channel, reserve space on the right of the name for the AT button
+        if (singleLocalChannel && i == 0)
+        {
+            auto atArea = nameArea.removeFromRight(28);
+            localChannelNameLabels[(size_t)i].setBounds(nameArea);
+            autoTuneButton.setBounds(atArea);
+        }
+        else
+        {
+            localChannelNameLabels[(size_t)i].setBounds(nameArea);
+        }
         localReverbSendLabels[(size_t)i].setBounds(revLabelArea);
         localDelaySendLabels[(size_t)i].setBounds(dlyLabelArea);
         localChannelPulseBounds[(size_t)i] = pulseBounds.expanded(1);
@@ -9857,6 +9921,7 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
     int currentServerMaxLocalChannels = audioProcessor.getServerMaxLocalChannels();
     if (audioProcessor.getClient().GetStatus() == NJClient::NJC_STATUS_OK)
         currentServerMaxLocalChannels = juce::jmax(1, audioProcessor.getClient().GetMaxLocalChannels());
+    maxChannelsLabel.setText("Max Ch: " + juce::String(currentServerMaxLocalChannels), juce::dontSendNotification);
     const bool currentCanUseDedicatedVoice = audioProcessor.canUseDedicatedVoiceChatChannel();
     const int currentNumLocalChannels = audioProcessor.getNumLocalChannels();
     if (currentServerMaxLocalChannels != lastLocalVoiceLayoutServerMaxChannels
@@ -11144,8 +11209,10 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
     migrateOldSettingsIfNeeded();
 
     auto popts = makeSettingsOptions();
-    if (!renewSettingsFileIfCorrupt(popts, this))
-        return;
+    // Note: renewSettingsFileIfCorrupt was already called in the constructor,
+    // so we skip re-checking here. If the file was corrupt, the constructor
+    // already handled it and settingsFileReady would have been false, preventing
+    // this function from being called at all.
 
     juce::PropertiesFile props(popts);
 
@@ -11646,7 +11713,12 @@ void NinjamVst3AudioProcessorEditor::usersPopoutClicked()
         userList.setAbletonHostedMode(false, 1, {});
         userList.setPoppedOut(false);
         addAndMakeVisible(userList);
+        // Bypass the deferred-resize optimization so the userList is
+        // repositioned immediately when docking back in.
+        const bool wasApplyingDeferredLayout = applyingDeferredResizeLayout;
+        applyingDeferredResizeLayout = true;
         resized();
+        applyingDeferredResizeLayout = wasApplyingDeferredLayout;
         return;
     }
 
@@ -11686,7 +11758,12 @@ void NinjamVst3AudioProcessorEditor::usersPopoutClicked()
             safeThis->userList.setAbletonHostedMode(false, 1, {});
             safeThis->userList.setPoppedOut(false);
             safeThis->addAndMakeVisible(safeThis->userList);
+            // Bypass the deferred-resize optimization so the userList is
+            // repositioned immediately when docking back in.
+            const bool wasDeferred = safeThis->applyingDeferredResizeLayout;
+            safeThis->applyingDeferredResizeLayout = true;
             safeThis->resized();
+            safeThis->applyingDeferredResizeLayout = wasDeferred;
         }));
 
     // userList is now displayed inside the popout window; trigger layout
@@ -12021,21 +12098,57 @@ void NinjamVst3AudioProcessorEditor::showAutoTuneMenu()
 
     menu.addSeparator();
 
-    // Scale submenu
-    juce::PopupMenu scaleMenu;
+    // Scale submenu — organised into categories
     const int currentScale = audioProcessor.getAutoTuneScale();
-    const char* scaleNames[] = {
-        "Chromatic", "Major", "Minor", "Dorian",
-        "Mixolydian", "Pentatonic Major", "Pentatonic Minor"
-    };
-    for (int i = 0; i < 7; ++i)
+    using SQ = ninjamplus::ScaleQuantizer;
+
+    juce::PopupMenu standardMenu;
+    for (int i = SQ::getFirstStandardScale(); i < SQ::getFirstStandardScale() + SQ::getNumStandardScales(); ++i)
     {
-        scaleMenu.addItem(juce::String(scaleNames[i]), true, (i == currentScale), [this, i]
-        {
-            audioProcessor.setAutoTuneScale(i);
-        });
+        const auto s = (SQ::Scale)i;
+        standardMenu.addItem(SQ::getScaleName(s), true, (i == currentScale), [this, i]
+        { audioProcessor.setAutoTuneScale(i); });
     }
-    menu.addSubMenu("Scale", scaleMenu);
+
+    juce::PopupMenu hiphopMenu;
+    for (int i = SQ::getFirstHiphopScale(); i < SQ::getFirstHiphopScale() + SQ::getNumHiphopScales(); ++i)
+    {
+        const auto s = (SQ::Scale)i;
+        hiphopMenu.addItem(SQ::getScaleName(s), true, (i == currentScale), [this, i]
+        { audioProcessor.setAutoTuneScale(i); });
+    }
+
+    juce::PopupMenu microtonalMenu;
+    for (int i = SQ::getFirstMicrotonalScale(); i < SQ::getFirstMicrotonalScale() + SQ::getNumMicrotonalScales(); ++i)
+    {
+        const auto s = (SQ::Scale)i;
+        microtonalMenu.addItem(SQ::getScaleName(s), true, (i == currentScale), [this, i]
+        { audioProcessor.setAutoTuneScale(i); });
+    }
+
+    juce::PopupMenu worldMenu;
+    for (int i = SQ::getFirstWorldScale(); i < SQ::getFirstWorldScale() + SQ::getNumWorldScales(); ++i)
+    {
+        const auto s = (SQ::Scale)i;
+        worldMenu.addItem(SQ::getScaleName(s), true, (i == currentScale), [this, i]
+        { audioProcessor.setAutoTuneScale(i); });
+    }
+
+    juce::PopupMenu instrumentMenu;
+    for (int i = SQ::getFirstInstrumentScale(); i < SQ::getFirstInstrumentScale() + SQ::getNumInstrumentScales(); ++i)
+    {
+        const auto s = (SQ::Scale)i;
+        instrumentMenu.addItem(SQ::getScaleName(s), true, (i == currentScale), [this, i]
+        { audioProcessor.setAutoTuneScale(i); });
+    }
+
+    juce::PopupMenu scaleMenu;
+    scaleMenu.addSubMenu("Standard", standardMenu);
+    scaleMenu.addSubMenu("Hip-Hop", hiphopMenu);
+    scaleMenu.addSubMenu("Microtonal", microtonalMenu);
+    scaleMenu.addSubMenu("World", worldMenu);
+    scaleMenu.addSubMenu("Instruments", instrumentMenu);
+    menu.addSubMenu("Scales", scaleMenu);
 
     // Key submenu
     juce::PopupMenu keyMenu;
@@ -13136,6 +13249,25 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
     menu.addItem(43, "Ableton Link Audio");
     menu.addItem(57, "Change VDO Room...", audioProcessor.canChangeVdoRoomName(), false);
 
+    // DPI scaling submenu
+    {
+        constexpr int dpiAutoId = 100;
+        constexpr int dpi50Id   = 101;
+        constexpr int dpi75Id   = 102;
+        constexpr int dpi100Id  = 103;
+        constexpr int dpi125Id  = 104;
+        constexpr int dpi150Id  = 105;
+        const int currentDpiSetting = audioProcessor.getDpiScaleSetting();
+        juce::PopupMenu dpiMenu;
+        dpiMenu.addItem(dpiAutoId, "Auto (System Default)", true, currentDpiSetting == 0);
+        dpiMenu.addItem(dpi50Id,   "50%",  true, currentDpiSetting == 1);
+        dpiMenu.addItem(dpi75Id,   "75%",  true, currentDpiSetting == 2);
+        dpiMenu.addItem(dpi100Id,  "100%", true, currentDpiSetting == 3);
+        dpiMenu.addItem(dpi125Id,  "125%", true, currentDpiSetting == 4);
+        dpiMenu.addItem(dpi150Id,  "150%", true, currentDpiSetting == 5);
+        menu.addSubMenu("DPI Scaling", dpiMenu);
+    }
+
     {
         constexpr int spreadStartPairMenuIdBase = 60;
         const int totalOutputChannels = juce::jmax(2, audioProcessor.getTotalNumOutputChannels());
@@ -13241,6 +13373,20 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
             if (result == 62)
             {
                 showSshTunnelSettingsPopup();
+                return;
+            }
+            // DPI scaling
+            if (result >= 100 && result <= 105)
+            {
+                audioProcessor.setDpiScaleSetting(result - 100);
+                markPersistentSettingsDirty();
+                const float scaleFactor = audioProcessor.getDpiScaleFactor();
+                if (scaleFactor > 0.0f)
+                    setScaleFactor(scaleFactor);
+                else
+                    setScaleFactor(juce::Desktop::getInstance().getDisplays().getPrimaryDisplay()->scale);
+                resized();
+                repaint();
                 return;
             }
             if (result == 49)

@@ -224,20 +224,37 @@ private:
 };
 
 // =========================================================================
+// TuningPreset — frequency-ratio table for any tuning system
+// =========================================================================
+struct TuningPreset
+{
+    const char* name = "";
+    std::vector<double> ratios;   // frequency ratios from root, in [1, octaveRatio)
+    double octaveRatio = 2.0;     // 2.0 = octave, 3.0 = tritave (Bohlen-Pierce)
+};
+
+// =========================================================================
 // ScaleQuantizer — snap a frequency to the nearest allowed note
+// Supports standard 12-TET scales, microtonal EDO systems, just intonation,
+// world music tunings, and instrument-specific tunings.
 // =========================================================================
 class ScaleQuantizer
 {
 public:
     enum class Scale
     {
-        Chromatic,
-        Major,
-        Minor,
-        Dorian,
-        Mixolydian,
-        PentatonicMajor,
-        PentatonicMinor
+        // Standard 12-TET (0-6)
+        Chromatic, Major, Minor, Dorian, Mixolydian, PentatonicMajor, PentatonicMinor,
+        // Microtonal EDO & Just (7-12)
+        Tet24, Edo22, Edo31, BohlenPierce, JustIntonation7, JustIntonation11,
+        // World (13-23)
+        IndianShruti, Maqam, GamelanSlendro, GamelanPelog, DeltaBlues, Georgian,
+        ChinesePentatonic, JapaneseHirajoshi, KoreanPentatonic, African5tone, African7tone,
+        // Instruments (24-27)
+        SitarShruti, OudMaqam, Bagpipe, HonkyTonkPiano,
+        // Hip-Hop (28-30)
+        TrapMinor, PhrygianDominant, MelodicPentatonic,
+        Count
     };
 
     ScaleQuantizer() = default;
@@ -254,47 +271,40 @@ public:
         if (inputHz <= 0.0f)
             return inputHz;
 
-        // Convert to MIDI note number (float)
-        const float midiNote = 69.0f + 12.0f * std::log2(inputHz / 440.0f);
-        const int nearestSemitone = (int)std::round(midiNote);
-        const int pitchClass = ((nearestSemitone % 12) + 12) % 12;
-        const int relativeClass = (pitchClass - key + 12) % 12;
+        const auto& preset = getTuningPreset(scale);
+        if (preset.ratios.empty())
+            return inputHz;
 
-        // Find nearest allowed pitch class in the scale
-        const auto& intervals = getScaleIntervals(scale);
-        int bestDist = 12;
-        int bestClass = pitchClass;
+        // Root frequency based on key (key 0 = C, key 9 = A = 440 Hz)
+        const double rootHz = 440.0 * std::pow(2.0, (double)(key - 9) / 12.0);
 
-        for (int interval : intervals)
+        // Search over several octaves to find nearest pitch
+        double bestDist = 1e9;
+        double bestHz = (double)inputHz;
+
+        for (int oct = -3; oct <= 5; ++oct)
         {
-            int dist = std::abs(relativeClass - interval);
-            dist = juce::jmin(dist, 12 - dist);
-            if (dist < bestDist)
+            const double octaveMult = std::pow(preset.octaveRatio, (double)oct);
+            for (double r : preset.ratios)
             {
-                bestDist = dist;
-                bestClass = (key + interval) % 12;
+                const double candidateHz = rootHz * octaveMult * r;
+                if (candidateHz <= 0.0)
+                    continue;
+                const double dist = std::abs(std::log2((double)inputHz / candidateHz));
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    bestHz = candidateHz;
+                }
             }
         }
 
-        // Convert back to frequency
-        const int targetNote = nearestSemitone - pitchClass + bestClass;
-        const float targetHz = 440.0f * std::pow(2.0f, (targetNote - 69.0f) / 12.0f);
-        return targetHz;
+        return (float)bestHz;
     }
 
     static const char* getScaleName(Scale s)
     {
-        switch (s)
-        {
-            case Scale::Chromatic:       return "Chromatic";
-            case Scale::Major:           return "Major";
-            case Scale::Minor:           return "Minor";
-            case Scale::Dorian:          return "Dorian";
-            case Scale::Mixolydian:      return "Mixolydian";
-            case Scale::PentatonicMajor: return "Pentatonic Major";
-            case Scale::PentatonicMinor: return "Pentatonic Minor";
-        }
-        return "Unknown";
+        return getTuningPreset(s).name;
     }
 
     static const char* getKeyName(int k)
@@ -303,31 +313,143 @@ public:
         return (k >= 0 && k < 12) ? names[k] : "--";
     }
 
+    static int getNumScales() { return (int)Scale::Count; }
+
+    // Category indices for menu organisation
+    static int getFirstStandardScale()   { return 0; }
+    static int getNumStandardScales()    { return 7; }
+    static int getFirstMicrotonalScale() { return 7; }
+    static int getNumMicrotonalScales()  { return 6; }
+    static int getFirstWorldScale()      { return 13; }
+    static int getNumWorldScales()       { return 11; }
+    static int getFirstInstrumentScale() { return 24; }
+    static int getNumInstrumentScales()  { return 4; }
+    static int getFirstHiphopScale()     { return 28; }
+    static int getNumHiphopScales()      { return 3; }
+
 private:
     Scale scale = Scale::Chromatic;
     int key = 0; // 0 = C
 
-    static const std::vector<int>& getScaleIntervals(Scale s)
+    static const TuningPreset& getTuningPreset(Scale s)
     {
-        static const std::vector<int> chromatic       = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
-        static const std::vector<int> major           = { 0, 2, 4, 5, 7, 9, 11 };
-        static const std::vector<int> minor           = { 0, 2, 3, 5, 7, 8, 10 };
-        static const std::vector<int> dorian          = { 0, 2, 3, 5, 7, 9, 10 };
-        static const std::vector<int> mixolydian      = { 0, 2, 4, 5, 7, 9, 10 };
-        static const std::vector<int> pentatonicMajor = { 0, 2, 4, 7, 9 };
-        static const std::vector<int> pentatonicMinor = { 0, 3, 5, 7, 10 };
+        // Helper: generate EDO ratios
+        static auto makeEdo = [](int divisions) {
+            std::vector<double> r;
+            r.reserve((size_t)divisions);
+            for (int i = 0; i < divisions; ++i)
+                r.push_back(std::pow(2.0, (double)i / (double)divisions));
+            return r;
+        };
 
-        switch (s)
-        {
-            case Scale::Chromatic:       return chromatic;
-            case Scale::Major:           return major;
-            case Scale::Minor:           return minor;
-            case Scale::Dorian:          return dorian;
-            case Scale::Mixolydian:      return mixolydian;
-            case Scale::PentatonicMajor: return pentatonicMajor;
-            case Scale::PentatonicMinor: return pentatonicMinor;
-        }
-        return chromatic;
+        // Helper: generate Bohlen-Pierce ratios (tritave divided into 13)
+        static auto makeBP = []() {
+            std::vector<double> r;
+            r.reserve(13);
+            for (int i = 0; i < 13; ++i)
+                r.push_back(std::pow(3.0, (double)i / 13.0));
+            return r;
+        };
+
+        // Helper: cents to ratio
+        static auto cents = [](double c) { return std::pow(2.0, c / 1200.0); };
+
+        // Helper: vector of cents to ratios
+        static auto fromCents = [](std::initializer_list<double> cs) {
+            std::vector<double> r;
+            for (double c : cs)
+                r.push_back(std::pow(2.0, c / 1200.0));
+            return r;
+        };
+
+        // Helper: just intonation ratios
+        static auto justRatios = [](std::initializer_list<double> rs) {
+            return std::vector<double>(rs);
+        };
+
+        static const TuningPreset presets[] = {
+            // ── Standard 12-TET (0-6) ──
+            { "Chromatic",       makeEdo(12), 2.0 },
+            { "Major",           justRatios({1, std::pow(2.0,2.0/12), std::pow(2.0,4.0/12), std::pow(2.0,5.0/12), std::pow(2.0,7.0/12), std::pow(2.0,9.0/12), std::pow(2.0,11.0/12)}), 2.0 },
+            { "Minor",           justRatios({1, std::pow(2.0,2.0/12), std::pow(2.0,3.0/12), std::pow(2.0,5.0/12), std::pow(2.0,7.0/12), std::pow(2.0,8.0/12), std::pow(2.0,10.0/12)}), 2.0 },
+            { "Dorian",          justRatios({1, std::pow(2.0,2.0/12), std::pow(2.0,3.0/12), std::pow(2.0,5.0/12), std::pow(2.0,7.0/12), std::pow(2.0,9.0/12), std::pow(2.0,10.0/12)}), 2.0 },
+            { "Mixolydian",      justRatios({1, std::pow(2.0,2.0/12), std::pow(2.0,4.0/12), std::pow(2.0,5.0/12), std::pow(2.0,7.0/12), std::pow(2.0,9.0/12), std::pow(2.0,10.0/12)}), 2.0 },
+            { "Pentatonic Major",justRatios({1, std::pow(2.0,2.0/12), std::pow(2.0,4.0/12), std::pow(2.0,7.0/12), std::pow(2.0,9.0/12)}), 2.0 },
+            { "Pentatonic Minor",justRatios({1, std::pow(2.0,3.0/12), std::pow(2.0,5.0/12), std::pow(2.0,7.0/12), std::pow(2.0,10.0/12)}), 2.0 },
+
+            // ── Microtonal EDO & Just (7-12) ──
+            { "24-TET (Quarter-Tones)", makeEdo(24), 2.0 },
+            { "22-EDO",                  makeEdo(22), 2.0 },
+            { "31-EDO",                  makeEdo(31), 2.0 },
+            { "Bohlen-Pierce",           makeBP(),     3.0 }, // tritave
+            { "Just Intonation (7-Limit)", justRatios({1.0, 16.0/15, 9.0/8, 6.0/5, 5.0/4, 4.0/3, 7.0/5, 3.0/2, 8.0/5, 5.0/3, 7.0/4, 15.0/8}), 2.0 },
+            { "Just Intonation (11-Limit)",justRatios({1.0, 16.0/15, 9.0/8, 6.0/5, 5.0/4, 4.0/3, 11.0/8, 3.0/2, 8.0/5, 5.0/3, 7.0/4, 11.0/6, 15.0/8}), 2.0 },
+
+            // ── World (13-23) ──
+            // Indian Classical: 22 Shruti just-intonation ratios
+            { "Indian Classical (22 Shruti)", justRatios({
+                1.0, 256.0/243, 16.0/15, 10.0/9, 9.0/8, 32.0/27, 6.0/5, 5.0/4,
+                81.0/64, 4.0/3, 27.0/20, 45.0/32, 3.0/2, 128.0/81, 8.0/5, 5.0/3,
+                27.0/16, 16.0/9, 9.0/5, 15.0/8, 243.0/128
+            }), 2.0 },
+            // Middle Eastern Maqam: 17-tone with quarter-tone intervals
+            { "Middle Eastern Maqam", fromCents({
+                0, 90, 150, 204, 294, 350, 408, 498, 588, 650, 702,
+                792, 850, 906, 996, 1050, 1110
+            }), 2.0 },
+            // Indonesian Gamelan Slendro: 5 near-equal divisions
+            { "Gamelan Slendro", fromCents({0, 231, 474, 717, 955}), 2.0 },
+            // Indonesian Gamelan Pelog: 7 unequal divisions
+            { "Gamelan Pelog", fromCents({0, 120, 258, 540, 663, 785, 945}), 2.0 },
+            // American Delta Blues: blue notes with quarter-tone bends
+            { "Delta Blues", fromCents({
+                0, 200, 300, 350, 400, 500, 550, 600, 700, 800, 900, 950, 1000, 1100, 1150
+            }), 2.0 },
+            // Georgian Adaptive: approximated 10-tone scale
+            { "Georgian Adaptive", fromCents({0, 150, 300, 400, 520, 670, 820, 970, 1080}), 2.0 },
+            // Chinese Pentatonic (Just Intonation)
+            { "Chinese Pentatonic (Just)", justRatios({1.0, 9.0/8, 5.0/4, 3.0/2, 5.0/3}), 2.0 },
+            // Japanese Hirajoshi
+            { "Japanese Hirajoshi", fromCents({0, 200, 340, 500, 700, 800, 1000, 1140}), 2.0 },
+            // Korean Pentatonic
+            { "Korean Pentatonic", fromCents({0, 200, 350, 500, 700, 900, 1050}), 2.0 },
+            // African Equidistant 5-tone
+            { "African 5-Tone (Equidistant)", fromCents({0, 240, 480, 720, 960}), 2.0 },
+            // African Equidistant 7-tone
+            { "African 7-Tone (Equidistant)", fromCents({0, 171, 343, 514, 686, 857, 1029}), 2.0 },
+
+            // ── Instruments (24-27) ──
+            // Sitar: 22 Shruti (same ratios as Indian Classical)
+            { "Sitar (22 Shruti)", justRatios({
+                1.0, 256.0/243, 16.0/15, 10.0/9, 9.0/8, 32.0/27, 6.0/5, 5.0/4,
+                81.0/64, 4.0/3, 27.0/20, 45.0/32, 3.0/2, 128.0/81, 8.0/5, 5.0/3,
+                27.0/16, 16.0/9, 9.0/5, 15.0/8, 243.0/128
+            }), 2.0 },
+            // Fretless Oud: extended maqam with finer quarter-tone resolution
+            { "Fretless Oud (Maqam Extended)", fromCents({
+                0, 50, 90, 150, 204, 250, 294, 350, 408, 450, 498, 550, 588,
+                650, 702, 750, 792, 850, 906, 950, 996, 1050, 1110, 1150
+            }), 2.0 },
+            // Bagpipe: Just Intonation Mixolydian (Highland bagpipe approximation)
+            { "Bagpipe (Just Mixolydian)", justRatios({1.0, 9.0/8, 5.0/4, 4.0/3, 3.0/2, 5.0/3, 16.0/9}), 2.0 },
+            // Honky-Tonk Piano: 12-TET with per-note detuning
+            { "Honky-Tonk Piano (Detuned)", fromCents({
+                3, 98, 204, 299, 402, 497, 601, 696, 802, 897, 1003, 1098
+            }), 2.0 },
+
+            // ── Hip-Hop (28-30) ──
+            // Trap Minor (Aeolian) — dark trap standard, ~80% of dark trap beats
+            { "Trap Minor (Aeolian)", justRatios({1, std::pow(2.0,2.0/12), std::pow(2.0,3.0/12), std::pow(2.0,5.0/12), std::pow(2.0,7.0/12), std::pow(2.0,8.0/12), std::pow(2.0,10.0/12)}), 2.0 },
+            // Phrygian Dominant — minor with flat 2nd, menacing/exotic dark energy
+            { "Phrygian Dominant (Dark Trap)", justRatios({1, std::pow(2.0,1.0/12), std::pow(2.0,3.0/12), std::pow(2.0,5.0/12), std::pow(2.0,7.0/12), std::pow(2.0,8.0/12), std::pow(2.0,10.0/12)}), 2.0 },
+            // Melodic Pentatonic — no half-steps, ideal for sung triplet flows
+            { "Melodic Pentatonic (Triplet Flow)", justRatios({1, std::pow(2.0,3.0/12), std::pow(2.0,5.0/12), std::pow(2.0,7.0/12), std::pow(2.0,10.0/12)}), 2.0 },
+        };
+
+        const int idx = (int)s;
+        if (idx >= 0 && idx < (int)Scale::Count)
+            return presets[idx];
+        return presets[0];
     }
 };
 

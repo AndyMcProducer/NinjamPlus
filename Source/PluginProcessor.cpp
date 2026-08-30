@@ -5985,6 +5985,14 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
                      .withInput  ("Input 6", juce::AudioChannelSet::stereo(), false)
                      .withInput  ("Input 7", juce::AudioChannelSet::stereo(), false)
                      .withInput  ("Input 8", juce::AudioChannelSet::stereo(), false)
+                     .withInput  ("Input 9", juce::AudioChannelSet::stereo(), false)
+                     .withInput  ("Input 10", juce::AudioChannelSet::stereo(), false)
+                     .withInput  ("Input 11", juce::AudioChannelSet::stereo(), false)
+                     .withInput  ("Input 12", juce::AudioChannelSet::stereo(), false)
+                     .withInput  ("Input 13", juce::AudioChannelSet::stereo(), false)
+                     .withInput  ("Input 14", juce::AudioChannelSet::stereo(), false)
+                     .withInput  ("Input 15", juce::AudioChannelSet::stereo(), false)
+                     .withInput  ("Input 16", juce::AudioChannelSet::stereo(), false)
                      .withOutput ("Output Main", juce::AudioChannelSet::stereo(), true)
                      .withOutput ("Output 2", juce::AudioChannelSet::stereo(), false)
                      .withOutput ("Output 3", juce::AudioChannelSet::stereo(), false)
@@ -7204,25 +7212,31 @@ void NinjamVst3AudioProcessor::broadcastIntervalSyncTag(const juce::String& targ
     // sent, so the receiver can deduct it from the buffer calculation.
     // The first send has offset 0; redundant retransmissions (mobile hotspot
     // mode) carry their actual offset so the timing math stays correct.
-    auto buildPayload = [&](double sendOffsetMs) -> juce::String
+    // Capture by value (copy) so the lambda is safe to call from timer callbacks
+    // after this function has returned.
+    const juce::String localUserId = userId.isNotEmpty() ? userId : currentUser;
+    const long long intervalAbs = intervalIndex.load();
+    auto buildPayload = [this, localUserId, tag, displayInterval, intervalAbs, bpi, beatIndex, intervalProgress](double sendOffsetMs) -> juce::String
     {
         juce::DynamicObject::Ptr obj = new juce::DynamicObject();
         obj->setProperty("type", "intervalSyncTag");
-        obj->setProperty("userId", userId.isNotEmpty() ? userId : currentUser);
+        obj->setProperty("userId", localUserId);
         obj->setProperty("tag", tag);
         obj->setProperty("intervalIndex", displayInterval);
-        obj->setProperty("intervalAbsolute", intervalIndex.load());
+        obj->setProperty("intervalAbsolute", intervalAbs);
         obj->setProperty("bpi", bpi);
         obj->setProperty("beatIndex", beatIndex);
         obj->setProperty("intervalProgress", intervalProgress);
         obj->setProperty("sendOffsetMs", sendOffsetMs);
-        obj->setProperty("eventId", "intervalTag:" + (userId.isNotEmpty() ? userId : currentUser) + ":" + juce::String(++sideSignalEventCounter));
+        obj->setProperty("eventId", "intervalTag:" + localUserId + ":" + juce::String(++sideSignalEventCounter));
         return juce::JSON::toString(juce::var(obj.get()));
     };
 
     // Primary transmission (offset 0)
     const juce::String payload = buildPayload(0.0);
-    if (mobileHotspotModeEnabled.load(std::memory_order_relaxed))
+    const bool vdoSyncOn = vdoVideoSyncEnabled.load(std::memory_order_relaxed)
+                         && !ninjamZapVideoEnabled.load(std::memory_order_relaxed);
+    if (mobileHotspotModeEnabled.load(std::memory_order_relaxed) && vdoSyncOn)
         sendSideSignal(safeTarget, "intervalSyncTag", payload);
     sendIntervalSignal("intervalSyncTag", payload, safeTarget);
 
@@ -7231,7 +7245,9 @@ void NinjamVst3AudioProcessor::broadcastIntervalSyncTag(const juce::String& targ
     // these duplicates are timing-accurate, not stale.
     // We use short offsets (150ms, 300ms) to stay well within the interval
     // even at low BPI/fast BPM.
-    if (mobileHotspotModeEnabled.load(std::memory_order_relaxed))
+    // Only send redundant copies when VDO sync is active — otherwise the
+    // receiver won't process them and we waste mobile bandwidth.
+    if (mobileHotspotModeEnabled.load(std::memory_order_relaxed) && vdoSyncOn)
     {
         const double sendTimeMs = juce::Time::getMillisecondCounterHiRes();
 
@@ -12077,7 +12093,7 @@ void NinjamVst3AudioProcessor::setAutoTuneQuality(int quality)
 
 void NinjamVst3AudioProcessor::setAutoTuneScale(int scale)
 {
-    autoTuneScale.store(juce::jlimit(0, 6, scale));
+    autoTuneScale.store(juce::jlimit(0, (int)ninjamplus::ScaleQuantizer::Scale::Count - 1, scale));
     if (autoTuneProcessor)
         autoTuneProcessor->setScale((ninjamplus::ScaleQuantizer::Scale)autoTuneScale.load());
 }
@@ -12915,6 +12931,30 @@ void NinjamVst3AudioProcessor::setMobileHotspotModeEnabled(bool shouldEnable)
 bool NinjamVst3AudioProcessor::isMobileHotspotModeEnabled() const
 {
     return mobileHotspotModeEnabled.load(std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::setDpiScaleSetting(int setting)
+{
+    dpiScaleSetting.store(juce::jlimit(0, 5, setting));
+}
+
+int NinjamVst3AudioProcessor::getDpiScaleSetting() const
+{
+    return dpiScaleSetting.load(std::memory_order_relaxed);
+}
+
+float NinjamVst3AudioProcessor::getDpiScaleFactor() const
+{
+    const int setting = dpiScaleSetting.load(std::memory_order_relaxed);
+    switch (setting)
+    {
+        case 1:  return 0.5f;   // 50%
+        case 2:  return 0.75f;  // 75%
+        case 3:  return 1.0f;   // 100%
+        case 4:  return 1.25f;  // 125%
+        case 5:  return 1.5f;   // 150%
+        default: return 0.0f;   // auto — let JUCE decide
+    }
 }
 
 void NinjamVst3AudioProcessor::setSshTunnelEnabled(bool shouldEnable)
@@ -17238,7 +17278,9 @@ bool NinjamVst3AudioProcessor::isBusesLayoutSupported (const BusesLayout& layout
 
     for (int i = 1; i < layouts.inputBuses.size(); ++i)
     {
-        if (!layouts.inputBuses[i].isDisabled() && layouts.inputBuses[i] != juce::AudioChannelSet::stereo())
+        if (!layouts.inputBuses[i].isDisabled()
+            && layouts.inputBuses[i] != juce::AudioChannelSet::stereo()
+            && layouts.inputBuses[i] != juce::AudioChannelSet::mono())
             return false;
     }
 
@@ -17253,7 +17295,7 @@ bool NinjamVst3AudioProcessor::isBusesLayoutSupported (const BusesLayout& layout
 
 bool NinjamVst3AudioProcessor::canAddBus (bool isInput) const
 {
-    const int maxBuses = isInput ? maxLocalChannels : maxAudioOutputBuses;
+    const int maxBuses = isInput ? maxAudioInputBuses : maxAudioOutputBuses;
     return getBusCount (isInput) < maxBuses;
 }
 
@@ -20919,6 +20961,7 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     state.setProperty("metronomeOutputChannel", getMetronomeOutputChannel(), nullptr);
     state.setProperty("transmitLocal", isTransmittingLocal(), nullptr);
     state.setProperty("mobileHotspotMode", isMobileHotspotModeEnabled(), nullptr);
+    state.setProperty("dpiScaleSetting", getDpiScaleSetting(), nullptr);
     state.setProperty("sshTunnelEnabled", isSshTunnelEnabled(), nullptr);
     state.setProperty("sshTunnelHost", getSshTunnelHost(), nullptr);
     state.setProperty("sshTunnelPort", getSshTunnelPort(), nullptr);
@@ -21031,6 +21074,7 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setMetronomeOutputChannel((int)state.getProperty("metronomeOutputChannel", 0));
     setTransmitLocal((bool)state.getProperty("transmitLocal", false));
     setMobileHotspotModeEnabled((bool)state.getProperty("mobileHotspotMode", false));
+    setDpiScaleSetting((int)state.getProperty("dpiScaleSetting", 0));
     setSshTunnelEnabled((bool)state.getProperty("sshTunnelEnabled", false));
     setSshTunnelHost(state.getProperty("sshTunnelHost", "").toString());
     setSshTunnelPort((int)state.getProperty("sshTunnelPort", 22));

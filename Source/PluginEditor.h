@@ -2082,6 +2082,7 @@ private:
     juce::Label usersLabel{ "Users", "Connected Users:" };
     LeftClickOnlyToggleButton spreadOutputsButton{ "Spread Outputs" };
     LeftClickOnlyTextButton usersPopoutButton{ "Popout" };
+    juce::Label maxChannelsLabel{ "MaxCh", "Max Ch: --" };
     UserListComponent userList;
     std::unique_ptr<juce::DocumentWindow> remoteUsersWindow;
     bool usersPoppedOut = false;

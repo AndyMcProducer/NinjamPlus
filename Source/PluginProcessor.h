@@ -244,6 +244,7 @@ public:
     void setLocalInputGain(float gain);
     float getLocalInputGain() const;
     static constexpr int maxLocalChannels = 8;
+    static constexpr int maxAudioInputBuses = 16;
     static constexpr int maxAudioOutputBuses = 16;
     static constexpr int maxRemoteChordUsers = 32;
     void setNumLocalChannels(int num);
@@ -508,6 +509,11 @@ public:
     int getSpreadOutputStartPair() const;
     void setMobileHotspotModeEnabled(bool shouldEnable);
     bool isMobileHotspotModeEnabled() const;
+
+    // DPI scaling: 0=auto, 1=50%, 2=75%, 3=100%, 4=125%, 5=150%
+    void setDpiScaleSetting(int setting);
+    int getDpiScaleSetting() const;
+    float getDpiScaleFactor() const;
 
     // SSH tunnel
     void setSshTunnelEnabled(bool shouldEnable);
@@ -1180,6 +1186,9 @@ private:
     std::atomic<bool> mobileHotspotModeEnabled { false };
     double lastMobileHotspotHeartbeatSendMs = 0.0;
     double lastMobileHotspotSyncRetransmitMs = 0.0;
+
+    // DPI scaling: 0 = auto (system default), 1-5 = 50/75/100/125/150%
+    std::atomic<int> dpiScaleSetting { 0 };
 
     // SSH tunnel
     std::atomic<bool> sshTunnelEnabled { false };
