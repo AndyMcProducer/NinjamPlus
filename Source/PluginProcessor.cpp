@@ -6237,6 +6237,7 @@ void NinjamVst3AudioProcessor::connectToServer(juce::String host, juce::String u
         remoteLatencyAverageByUser.clear();
         remoteLatencyFirmDelayMsByUser.clear();
         remoteVideoBufferRefreshIdByUser.clear();
+        lastSentBufferMsByUser.clear();
         videoBufferRefreshCounter = 0;
     }
     vdoRosterRevision.fetch_add(1, std::memory_order_relaxed);
@@ -6326,6 +6327,7 @@ void NinjamVst3AudioProcessor::disconnectFromServer()
         remoteLatencyAverageByUser.clear();
         remoteLatencyFirmDelayMsByUser.clear();
         remoteVideoBufferRefreshIdByUser.clear();
+        lastSentBufferMsByUser.clear();
         videoBufferRefreshCounter = 0;
     }
     vdoRosterRevision.fetch_add(1, std::memory_order_relaxed);
@@ -7631,6 +7633,7 @@ void NinjamVst3AudioProcessor::resetIntervalSyncTimingCache()
     remoteLatencyAverageByUser.clear();
     remoteLatencyFirmDelayMsByUser.clear();
     remoteVideoBufferRefreshIdByUser.clear();
+    lastSentBufferMsByUser.clear();
     videoBufferRefreshCounter = 0;
     lastRemoteServerLatencyMsByUser.clear();
     remoteServerRouteLatencyMsByUser.clear();
@@ -7654,6 +7657,7 @@ void NinjamVst3AudioProcessor::invalidateIntervalSyncLatencyState(bool keepRemot
     {
         remoteLatencyFirmDelayMsByUser.clear();
         remoteVideoBufferRefreshIdByUser.clear();
+        lastSentBufferMsByUser.clear();
         videoBufferRefreshCounter = 0;
         lastRemoteServerLatencyMsByUser.clear();
         remoteServerRouteLatencyMsByUser.clear();
@@ -10140,6 +10144,7 @@ bool NinjamVst3AudioProcessor::stopVdoVideoSync()
     {
         const juce::ScopedLock lock(intervalSyncAnnouncementLock);
         remoteVideoBufferRefreshIdByUser.clear();
+        lastSentBufferMsByUser.clear();
         recentVideoTimingChangeEventIds.clear();
     }
     if (wasEnabled)
@@ -10156,6 +10161,7 @@ void NinjamVst3AudioProcessor::stopAdvancedVideoClient()
     {
         const juce::ScopedLock lock(intervalSyncAnnouncementLock);
         remoteVideoBufferRefreshIdByUser.clear();
+        lastSentBufferMsByUser.clear();
         videoBufferRefreshCounter = 0;
     }
     clearZapVideoFrameState();
@@ -10463,8 +10469,11 @@ void NinjamVst3AudioProcessor::launchVideoSession(const juce::String& requestedR
                              .withParameter("helperVersion", getVersionString())
                              .withParameter("cacheBust", juce::String((juce::int64)juce::Time::getMillisecondCounter()));
 
-        // Mobile hotspot mode: force TURN relay + TCP to bypass UDP blocking
-        if (mobileHotspotModeEnabled.load(std::memory_order_relaxed))
+        // Force TURN relay + TCP to bypass UDP blocking.
+        // Triggered by Mobile Hotspot Mode (which also adds redundant sync tag
+        // retransmissions) or by VDO TURN Mode on its own.
+        if (mobileHotspotModeEnabled.load(std::memory_order_relaxed)
+            || vdoTurnModeEnabled.load(std::memory_order_relaxed))
         {
             helperUrl = helperUrl.withParameter("relay", "")
                                  .withParameter("tcp", "");
@@ -10529,8 +10538,10 @@ void NinjamVst3AudioProcessor::launchVideoSession(const juce::String& requestedR
              .withParameter("buffer2", "0")
              .withParameter("buffer", juce::String(launchBufferMs));
 
-    // Mobile hotspot mode: force TURN relay + TCP to bypass UDP blocking
-    if (mobileHotspotModeEnabled.load(std::memory_order_relaxed))
+    // Force TURN relay + TCP to bypass UDP blocking.
+    // Triggered by Mobile Hotspot Mode or VDO TURN Mode independently.
+    if (mobileHotspotModeEnabled.load(std::memory_order_relaxed)
+        || vdoTurnModeEnabled.load(std::memory_order_relaxed))
     {
         url = url.withParameter("relay", "")
                  .withParameter("tcp", "");
@@ -10632,6 +10643,8 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
         double lastIntervalSignalAgeMs = -1.0;
         double serverRouteAgeMs = -1.0;
         juce::uint64 bufferRefreshId = 0;
+        int lastSentBufferMs = -1;
+        bool shouldEmitBuffer = false;
         {
             const juce::ScopedLock lock(intervalSyncAnnouncementLock);
             auto firmIt = remoteLatencyFirmDelayMsByUser.find(senderKey);
@@ -10688,6 +10701,17 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
                 auto canonicalRefreshIt = remoteVideoBufferRefreshIdByUser.find(canonicalUserKey);
                 if (canonicalRefreshIt != remoteVideoBufferRefreshIdByUser.end())
                     bufferRefreshId = canonicalRefreshIt->second;
+            }
+            {
+                auto sentIt = lastSentBufferMsByUser.find(senderKey);
+                if (sentIt != lastSentBufferMsByUser.end())
+                    lastSentBufferMs = sentIt->second;
+                if (lastSentBufferMs < 0 && canonicalUserKey.isNotEmpty())
+                {
+                    auto canonicalSentIt = lastSentBufferMsByUser.find(canonicalUserKey);
+                    if (canonicalSentIt != lastSentBufferMsByUser.end())
+                        lastSentBufferMs = canonicalSentIt->second;
+                }
             }
             if (bufferMs < 0)
             {
@@ -10779,6 +10803,22 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
                         firmIntervalMeasurementMs = juce::jmax(firmIntervalMeasurementMs, (int)std::llround(state.firmAverageMs));
                 }
             }
+            // Only re-emit receiverBufferMs when the value changed meaningfully
+            // or a full refresh was requested. Re-sending the same/final buffer
+            // amount every 500ms causes VDO.Ninja to re-buffer (stop/start).
+            constexpr int bufferEmitDeltaThresholdMs = 50;
+            if (bufferMs >= 0)
+            {
+                shouldEmitBuffer = bufferRefreshId != 0
+                    || lastSentBufferMs < 0
+                    || std::abs(bufferMs - lastSentBufferMs) > bufferEmitDeltaThresholdMs;
+                if (shouldEmitBuffer)
+                {
+                    lastSentBufferMsByUser[senderKey] = bufferMs;
+                    if (canonicalUserKey.isNotEmpty())
+                        lastSentBufferMsByUser[canonicalUserKey] = bufferMs;
+                }
+            }
             // Diagnostic log per-user buffer decision
         }
 
@@ -10809,7 +10849,7 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
             userObj->setProperty("intervalSignalAgeMs", lastIntervalSignalAgeMs);
         if (serverRouteAgeMs >= 0.0)
             userObj->setProperty("serverRouteAgeMs", serverRouteAgeMs);
-        if (bufferMs >= 0)
+        if (shouldEmitBuffer)
         {
             userObj->setProperty("bufferTotalMs", (double)bufferMs);
             userObj->setProperty("senderBufferMs", 0.0);
@@ -11360,6 +11400,12 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
                 vdoRosterRevision.fetch_add(1, std::memory_order_relaxed);
                 intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
                 lastIntervalHelperPayloadWriteMs = 0.0;
+                {
+                    const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+                    remoteLatencyFirmDelayMsByUser.erase(removedUserKey);
+                    remoteVideoBufferRefreshIdByUser.erase(removedUserKey);
+                    lastSentBufferMsByUser.erase(removedUserKey);
+                }
             }
         }
         else
@@ -13011,6 +13057,16 @@ void NinjamVst3AudioProcessor::setMobileHotspotModeEnabled(bool shouldEnable)
 bool NinjamVst3AudioProcessor::isMobileHotspotModeEnabled() const
 {
     return mobileHotspotModeEnabled.load(std::memory_order_relaxed);
+}
+
+void NinjamVst3AudioProcessor::setVdoTurnModeEnabled(bool shouldEnable)
+{
+    vdoTurnModeEnabled.store(shouldEnable, std::memory_order_relaxed);
+}
+
+bool NinjamVst3AudioProcessor::isVdoTurnModeEnabled() const
+{
+    return vdoTurnModeEnabled.load(std::memory_order_relaxed);
 }
 
 void NinjamVst3AudioProcessor::setDpiScaleSetting(int setting)
@@ -21064,6 +21120,7 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     state.setProperty("metronomeOutputChannel", getMetronomeOutputChannel(), nullptr);
     state.setProperty("transmitLocal", isTransmittingLocal(), nullptr);
     state.setProperty("mobileHotspotMode", isMobileHotspotModeEnabled(), nullptr);
+    state.setProperty("vdoTurnMode", isVdoTurnModeEnabled(), nullptr);
     state.setProperty("dpiScaleSetting", getDpiScaleSetting(), nullptr);
     state.setProperty("sshTunnelEnabled", isSshTunnelEnabled(), nullptr);
     state.setProperty("sshTunnelHost", getSshTunnelHost(), nullptr);
@@ -21177,6 +21234,7 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setMetronomeOutputChannel((int)state.getProperty("metronomeOutputChannel", 0));
     setTransmitLocal((bool)state.getProperty("transmitLocal", false));
     setMobileHotspotModeEnabled((bool)state.getProperty("mobileHotspotMode", false));
+    setVdoTurnModeEnabled((bool)state.getProperty("vdoTurnMode", false));
     setDpiScaleSetting((int)state.getProperty("dpiScaleSetting", 0));
     setSshTunnelEnabled((bool)state.getProperty("sshTunnelEnabled", false));
     setSshTunnelHost(state.getProperty("sshTunnelHost", "").toString());

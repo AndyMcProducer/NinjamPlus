@@ -310,6 +310,7 @@ private:
         std::unique_ptr<AudioProcessorEditor> editor;
     };
 
+public:
     void showAudioSettingsDialog()
     {
         if (pluginHolder == nullptr || pluginHolder->processor == nullptr)
@@ -467,6 +468,18 @@ public:
        #endif
 
         mainWindow.reset (createWindow());
+
+        // First-run check: if firstrun has not been set, show the audio settings dialog
+        // so the user can configure their audio device before doing anything else.
+        if (auto* settings = appProperties.getUserSettings())
+        {
+            if (! settings->containsKey ("firstrun"))
+            {
+                settings->setValue ("firstrun", 0);
+                settings->saveIfNeeded();
+                mainWindow->showAudioSettingsDialog();
+            }
+        }
     }
 
     void shutdown() override

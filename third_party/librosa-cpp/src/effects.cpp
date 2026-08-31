@@ -41,7 +41,8 @@ ArrayXr time_stretch(
     Eigen::Index len_stretch = static_cast<Eigen::Index>(std::round(y.size() / rate));
 
     // Invert STFT
-    ArrayXr y_stretch = istft(D_stretch, hop_length, win_length, n_fft, window, center, len_stretch);
+    ArrayXr y_stretch = istft(D_stretch, hop_length, win_length, n_fft, window, center,
+                              static_cast<int>(len_stretch));
 
     return y_stretch;
 }

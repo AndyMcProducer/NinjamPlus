@@ -12394,9 +12394,10 @@ void NinjamVst3AudioProcessorEditor::showSshTunnelSettingsPopup()
 {
     auto* dialog = new juce::DialogWindow("SSH Tunnel Settings",
                                           juce::Colour(0xff1e2228), true, true);
+    dialog->setUsingNativeTitleBar(true);
 
     auto* content = new juce::Component();
-    content->setSize(420, 240);
+    content->setSize(420, 280);
 
     auto* enabledToggle = new juce::ToggleButton("Enable SSH Tunnel");
     enabledToggle->setToggleState(audioProcessor.isSshTunnelEnabled(), juce::dontSendNotification);
@@ -12456,11 +12457,11 @@ void NinjamVst3AudioProcessorEditor::showSshTunnelSettingsPopup()
     content->addAndMakeVisible(infoLabel);
 
     auto* saveButton = new juce::TextButton("Save");
-    saveButton->setBounds(240, 210, 80, 24);
+    saveButton->setBounds(240, 240, 80, 28);
     content->addAndMakeVisible(saveButton);
 
     auto* cancelButton = new juce::TextButton("Cancel");
-    cancelButton->setBounds(326, 210, 80, 24);
+    cancelButton->setBounds(326, 240, 80, 28);
     content->addAndMakeVisible(cancelButton);
 
     juce::Component::SafePointer<juce::DialogWindow> safeDialog(dialog);
@@ -12490,7 +12491,7 @@ void NinjamVst3AudioProcessorEditor::showSshTunnelSettingsPopup()
 
     dialog->setAlwaysOnTop(true);
     dialog->setContentOwned(content, true);
-    dialog->centreAroundComponent(this, 420, 240);
+    dialog->centreAroundComponent(this, 420, 280);
     dialog->setVisible(true);
     dialog->toFront(true);
     dialog->enterModalState(true, nullptr, true);
@@ -13452,6 +13453,7 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
     menu.addItem(42, "Enable Chord Detection", true, audioProcessor.isChordDetectionEnabled());
     menu.addItem(46, "Enable Sample Pads / Looper", true, audioProcessor.isSamplePadsFeatureEnabled());
     menu.addItem(48, "Mobile Hotspot Mode", true, audioProcessor.isMobileHotspotModeEnabled());
+    menu.addItem(63, "VDO TURN Mode", true, audioProcessor.isVdoTurnModeEnabled());
     menu.addItem(58, "Tunnel SSH", true, audioProcessor.isSshTunnelEnabled());
     menu.addItem(62, "Configure SSH Tunnel...");
     menu.addItem(49, "Automatically Reconnect", true, audioProcessor.isAutoReconnectEnabled());
@@ -13561,6 +13563,12 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
             if (result == 48)
             {
                 audioProcessor.setMobileHotspotModeEnabled(!audioProcessor.isMobileHotspotModeEnabled());
+                markPersistentSettingsDirty();
+                return;
+            }
+            if (result == 63)
+            {
+                audioProcessor.setVdoTurnModeEnabled(!audioProcessor.isVdoTurnModeEnabled());
                 markPersistentSettingsDirty();
                 return;
             }

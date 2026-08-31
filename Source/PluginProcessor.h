@@ -519,6 +519,12 @@ public:
     void setMobileHotspotModeEnabled(bool shouldEnable);
     bool isMobileHotspotModeEnabled() const;
 
+    // VDO TURN Mode: forces VDO.Ninja through TURN relay over TCP.
+    // Separate from Mobile Hotspot Mode so users on restricted networks
+    // can enable TURN without the redundant sync tag retransmissions.
+    void setVdoTurnModeEnabled(bool shouldEnable);
+    bool isVdoTurnModeEnabled() const;
+
     // DPI scaling: 0=auto, 1=50%, 2=75%, 3=100%, 4=125%, 5=150%
     void setDpiScaleSetting(int setting);
     int getDpiScaleSetting() const;
@@ -1193,6 +1199,7 @@ private:
     std::atomic<bool> intervalHelperPayloadForceWrite { false };
     std::atomic<juce::uint64> vdoRosterRevision { 0 };
     std::atomic<bool> mobileHotspotModeEnabled { false };
+    std::atomic<bool> vdoTurnModeEnabled { false };
     double lastMobileHotspotHeartbeatSendMs = 0.0;
     double lastMobileHotspotSyncRetransmitMs = 0.0;
 
@@ -1279,6 +1286,10 @@ private:
     mutable juce::CriticalSection zapVideoFrameLock;
     std::map<juce::String, int> remoteLatencyFirmDelayMsByUser;
     std::map<juce::String, juce::uint64> remoteVideoBufferRefreshIdByUser;
+    // Last bufferMs value actually emitted in the helper payload per user.
+    // Used to suppress redundant receiverBufferMs updates that cause VDO.Ninja
+    // to re-buffer (stop/start) when the value only fluctuates by a few ms.
+    std::map<juce::String, int> lastSentBufferMsByUser;
     std::map<juce::String, ZapVideoFrameInfo> remoteVideoFrameInfoByUser;
     std::map<juce::String, ZapVideoSenderTiming> zapVideoSenderTimingByStream;
     std::map<juce::String, juce::MemoryBlock> remoteVideoLatestJpegByUser;
