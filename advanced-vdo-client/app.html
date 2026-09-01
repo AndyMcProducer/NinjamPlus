@@ -1172,13 +1172,15 @@
         }
 
         function getIncomingVdoLatencyMs(data) {
+            // Exclude jitterBufferDelay/playoutDelay/renderDelay/videoPipelineLatency:
+            // these track the playout buffer controlled by setBufferDelay, so
+            // including them would create a feedback loop that halves the buffer.
             const latencyMs = getNonNegativeMessageMs(data, [
                 'cameraSendLatencyMs', 'vdoCameraLatencyMs', 'vdoSendLatencyMs',
                 'cameraLatencyMs', 'videoSendLatencyMs', 'senderVideoLatencyMs',
                 'sendLatencyMs', 'senderLatencyMs', 'captureLatencyMs', 'captureDelayMs',
                 'encodeLatencyMs', 'encoderLatencyMs', 'encodeDelayMs', 'encoderDelayMs',
-                'decodeLatencyMs', 'decoderLatencyMs', 'decodeDelayMs', 'decoderDelayMs',
-                'jitterBufferDelayMs', 'playoutDelayMs', 'renderDelayMs', 'videoPipelineLatencyMs'
+                'decodeLatencyMs', 'decoderLatencyMs', 'decodeDelayMs', 'decoderDelayMs'
             ]);
             return isFinite(latencyMs) ? clampLatencyMs(latencyMs) : NaN;
         }
@@ -1215,13 +1217,17 @@
         }
 
         function extractLatencyMsFromObject(objectValue) {
+            // Exclude jitterBufferDelay/playoutDelay/renderDelay from the direct
+            // lookup: these are the playout buffer we control via setBufferDelay,
+            // so including them would create a feedback loop that halves the
+            // correct buffer value. videoPipelineLatency is also excluded since
+            // it may aggregate the jitter buffer in some VDO builds.
             const directMs = getNumericProperty(objectValue, [
                 'cameraSendLatencyMs', 'vdoCameraLatencyMs', 'vdoSendLatencyMs',
                 'cameraLatencyMs', 'videoSendLatencyMs', 'senderVideoLatencyMs',
                 'sendLatencyMs', 'senderLatencyMs', 'captureLatencyMs', 'captureDelayMs',
                 'encodeLatencyMs', 'encoderLatencyMs', 'encodeDelayMs', 'encoderDelayMs',
-                'decodeLatencyMs', 'decoderLatencyMs', 'decodeDelayMs', 'decoderDelayMs',
-                'jitterBufferDelayMs', 'playoutDelayMs', 'renderDelayMs', 'videoPipelineLatencyMs'
+                'decodeLatencyMs', 'decoderLatencyMs', 'decodeDelayMs', 'decoderDelayMs'
             ]);
             if (isFinite(directMs)) {
                 return clampLatencyMs(directMs);
@@ -1232,8 +1238,7 @@
                 'cameraLatency', 'videoSendLatency', 'senderVideoLatency',
                 'sendLatency', 'senderLatency', 'captureLatency', 'captureDelay',
                 'encodeLatency', 'encoderLatency', 'encodeDelay', 'encoderDelay',
-                'decodeLatency', 'decoderLatency', 'decodeDelay', 'decoderDelay',
-                'jitterBufferDelay', 'playoutDelay', 'renderDelay', 'videoPipelineLatency'
+                'decodeLatency', 'decoderLatency', 'decodeDelay', 'decoderDelay'
             ]);
             if (isFinite(directSeconds)) {
                 return clampLatencyMs(directSeconds * 1000.0);
@@ -1251,14 +1256,15 @@
                 ['totalProcessingDelay'],
                 ['framesDecoded', 'framesReceived'],
                 500);
-            const jitterMs = getAverageCounterMs(objectValue,
-                ['jitterBufferDelay'],
-                ['jitterBufferEmittedCount', 'framesDecoded', 'framesReceived'],
-                800);
-            const targetJitterMs = getAverageCounterMs(objectValue,
-                ['jitterBufferTargetDelay'],
-                ['jitterBufferEmittedCount', 'framesDecoded', 'framesReceived'],
-                800);
+            // Do NOT include jitterBufferDelay or jitterBufferTargetDelay in the
+            // VDO pipeline latency estimate. setBufferDelay controls the jitter
+            // buffer target, so including it here would create a feedback loop:
+            //   setBufferDelay = total - (pipeline + jitterBuffer)
+            //   setBufferDelay ≈ jitterBuffer
+            //   => setBufferDelay = (total - pipeline) / 2
+            // The buffer would settle at half the correct value, causing video
+            // to arrive too early. Only uncontrollable pipeline stages (encode,
+            // decode, processing) should be subtracted from the total delay.
             let derivedMs = 0;
             let hasDerived = false;
             if (isFinite(encodeMs)) {
@@ -1271,10 +1277,6 @@
             }
             if (isFinite(processingMs)) {
                 derivedMs += processingMs;
-                hasDerived = true;
-            }
-            if (isFinite(jitterMs) || isFinite(targetJitterMs)) {
-                derivedMs += Math.max(isFinite(jitterMs) ? jitterMs : 0, isFinite(targetJitterMs) ? targetJitterMs : 0);
                 hasDerived = true;
             }
             if (hasDerived) {
