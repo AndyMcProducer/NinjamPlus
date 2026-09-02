@@ -627,6 +627,21 @@ public:
     bool isOpusSyncAvailable() const;
     juce::String getIntervalSyncStatusText() const;
 
+#if NINJAMPLUS_ENABLE_INTEGRATION_TESTS
+    // Starts the same loopback helper and synchronization path used by Video Room,
+    // without opening an external browser from the automated native soak test.
+    bool startVideoSyncForIntegrationTest();
+    int getVideoHelperPortForIntegrationTest() const;
+    int getReceivedRemoteSyncMarkersForIntegrationTest() const;
+    int getAcceptedRemoteSyncMarkersForIntegrationTest() const;
+    double getLatestIntervalStartMsForIntegrationTest();
+    juce::String getIntervalSyncSessionIdForIntegrationTest();
+    void injectIntervalSyncTagForIntegrationTest(const juce::String& sender, const juce::String& payload);
+    void requestVideoBufferRefreshForIntegrationTest();
+    int applyRemoteLatencyMeasurementForIntegrationTest(const juce::String& sender, int elapsedMs);
+    void setIntervalSyncTagArrivalOffsetForIntegrationTest(int offsetMs);
+#endif
+
 private:
     void cancelAutoReconnect(bool suppressUntilManualConnect);
     void scheduleAutoReconnect(double nowMs, const juce::String& reason);
@@ -1285,10 +1300,15 @@ private:
     std::atomic<double> lastNinjamZapVideoTimingBroadcastMs { 0.0 };
     mutable juce::CriticalSection zapVideoFrameLock;
     std::map<juce::String, int> remoteLatencyFirmDelayMsByUser;
-    std::map<juce::String, juce::uint64> remoteVideoBufferRefreshIdByUser;
-    // Last bufferMs value actually emitted in the helper payload per user.
-    // Used to suppress redundant receiverBufferMs updates that cause VDO.Ninja
-    // to re-buffer (stop/start) when the value only fluctuates by a few ms.
+    struct VideoBufferRefreshEvent
+    {
+        juce::uint64 id = 0;
+        double createdAtMs = 0.0;
+    };
+    std::map<juce::String, VideoBufferRefreshEvent> remoteVideoBufferRefreshIdByUser;
+    // Stable bufferMs value published in every helper snapshot per user.
+    // Raw measurements only advance it after a meaningful change, preventing
+    // small fluctuations from causing VDO.Ninja to re-buffer (stop/start).
     std::map<juce::String, int> lastSentBufferMsByUser;
     std::map<juce::String, ZapVideoFrameInfo> remoteVideoFrameInfoByUser;
     std::map<juce::String, ZapVideoSenderTiming> zapVideoSenderTimingByStream;
@@ -1313,7 +1333,22 @@ private:
     int lastBroadcastSyncTagMarkerBeat = -1;
     std::atomic<long long> lastProcessedIntervalMarkerKey { -1 };
     juce::CriticalSection intervalSyncAnnouncementLock;
+    std::atomic<juce::uint64> completedAudioIntervalGuidSequence { 0 };
+    std::atomic<juce::uint64> completedAudioIntervalGuidLow { 0 };
+    std::atomic<juce::uint64> completedAudioIntervalGuidHigh { 0 };
+    std::atomic<long long> completedAudioIntervalBoundarySampleCount { -1 };
+    std::atomic<juce::uint64> remoteAudioPlaybackBoundarySequence { 0 };
+    std::atomic<long long> remoteAudioPlaybackBoundarySampleCount { -1 };
+    juce::uint64 lastProcessedRemoteAudioPlaybackBoundarySequence = 0;
+    juce::String localIntervalSyncSessionId;
+    std::map<juce::String, juce::String> remoteIntervalSyncSessionIdByUser;
+    std::map<juce::String, std::deque<juce::String>> retiredRemoteIntervalSyncSessionIdsByUser;
     std::map<juce::String, long long> lastAnnouncedRemoteIntervalByUser;
+#if NINJAMPLUS_ENABLE_INTEGRATION_TESTS
+    std::atomic<int> integrationReceivedRemoteSyncMarkers { 0 };
+    std::atomic<int> integrationAcceptedRemoteSyncMarkers { 0 };
+    std::atomic<int> integrationIntervalSyncTagArrivalOffsetMs { 0 };
+#endif
     std::map<int, double> localIntervalStartMsByInterval;
     struct PendingRemoteIntervalStart
     {
@@ -1325,10 +1360,18 @@ private:
         int serverRouteLatencyMs = -1;
         juce::String senderKey;
         juce::String displaySender;
+        juce::String audioGuidHex;
         long long receivedSampleCount = -1;
         double receivedAtMs = -1.0;
     };
     std::map<juce::String, PendingRemoteIntervalStart> pendingRemoteIntervalStartsByUser;
+    struct RemoteAudioPlaybackBoundary
+    {
+        long long sampleCount = -1;
+        double observedAtMs = 0.0;
+    };
+    std::map<juce::String, std::map<juce::String, RemoteAudioPlaybackBoundary>>
+        remoteAudioPlaybackBoundariesByUser;
     std::map<juce::String, int> lastRemoteServerLatencyMsByUser;
     std::map<juce::String, int> remoteServerRouteLatencyMsByUser;
     std::map<juce::String, double> lastRemoteIntervalSignalSeenMsByUser;
@@ -1350,9 +1393,7 @@ private:
         double averageMs = 0.0;
         double firmAverageMs = 0.0;
         double lastMeasurementMs = -1.0;
-        int rejectedSpikeCount = 0;
-        int rejectedSpikeDirection = 0;
-        double rejectedSpikeSumMs = 0.0;
+        std::deque<double> recentMeasurementsMs;
     };
     std::map<juce::String, RemoteLatencyAverageState> remoteLatencyAverageByUser;
 
@@ -1473,9 +1514,19 @@ private:
     void broadcastIntervalSyncTag(const juce::String& target = "*", int markerBeatIndex = -1);
     void broadcastTransportProbe(const juce::String& target = "*");
     juce::String buildIntervalSyncTag(int interval, int length) const;
+    void captureCompletedAudioIntervalGuidFromAudioThread(NJClient* inst);
+    bool getCompletedAudioIntervalGuidForSyncTag(juce::String& audioGuidHex,
+                                                 double& boundaryToSendOffsetMs) const;
+    void processPendingRemoteAudioPlaybackBoundaries(double intervalDurationMs);
     void invalidateIntervalSyncLatencyState(bool keepRemoteServerLatency);
     void pruneDisconnectedRemoteSyncState();
     void processPendingIntervalSyncMarkers(int localMarkerBeat, long long localMarkerSampleCount, double intervalDurationMs);
+    int applyRemoteLatencyMeasurementLocked(const juce::String& senderKey, int elapsedMs,
+                                             int& averageMs, int& firmAverageMs);
+    void applyRemoteLatencyMeasurement(const juce::String& senderKey,
+                                       const PendingRemoteIntervalStart& pending,
+                                       int elapsedMs,
+                                       double measuredAtMs);
     void resetIntervalSyncTimingCache();
     bool consumeVideoTimingChangeEvent(const juce::String& eventId);
     void broadcastVideoTimingChange(double previousBpm, double newBpm, int bpi, int length, int timingDelayDeltaMs);

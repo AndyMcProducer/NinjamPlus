@@ -527,14 +527,13 @@
             cameraTargetsByUser: {},
             labelByStreamId: {},
             lastAppliedBufferByUser: {},
-            lastAppliedIntervalByUser: {},
             lastBufferRefreshIdByUser: {},
-            lastVoiceChatModeByUser: {},
-            bufferApplyRetryTimersByUser: {},
-            bufferApplyRetryAttemptsByUser: {},
-            bufferRefreshTimersByUser: {},
-            bufferRefreshPendingUntilByUser: {},
-            obsTilesByUser: {},
+			lastVoiceChatModeByUser: {},
+			bufferRefreshTimersByUser: {},
+			bufferRefreshPendingUntilByUser: {},
+			bufferApplyTimersByUser: {},
+			pendingBufferMsByUser: {},
+			obsTilesByUser: {},
             latencyMsByUser: {},
             latencyTargetMsByUser: {},
             latencyUpdatedAtByUser: {},
@@ -550,10 +549,11 @@
         };
 
         const manualOffsetsMs = {};
-        const remoteUserStaleMs = 12000;
-        const vdoLatencyStaleMs = 8000;
-        const vdoLatencyMaxStepMs = 50;
-        const bufferApplyRetryDelaysMs = [350, 900, 1800, 3200];
+		const remoteUserStaleMs = 12000;
+		const vdoLatencyStaleMs = 8000;
+		const vdoLatencyMaxStepMs = 50;
+		const bufferApplyDebounceMs = 150;
+		const bufferApplyDeadbandMs = 5;
 
         if (!appState.intervalSource) {
             appState.intervalSource = window.location.origin + '/intervals';
@@ -848,18 +848,6 @@
             return normalizeUserId(userKey) + ':' + (makeCameraTargetKey(target && target.streamId, target && target.targetId) || 'camera');
         }
 
-        function clearBufferApplyRetryState(userKey) {
-            const key = normalizeUserId(userKey);
-            if (!key) {
-                return;
-            }
-            if (vdoState.bufferApplyRetryTimersByUser[key]) {
-                clearTimeout(vdoState.bufferApplyRetryTimersByUser[key]);
-            }
-            delete vdoState.bufferApplyRetryTimersByUser[key];
-            delete vdoState.bufferApplyRetryAttemptsByUser[key];
-        }
-
         function clearEstimatedVdoLatency(userKey) {
             const key = normalizeUserId(userKey);
             if (!key) {
@@ -871,22 +859,21 @@
             delete vdoState.chunkStatsByUser[key];
         }
 
-        function resetBufferApplicationState(userKey) {
+		function resetBufferApplicationState(userKey) {
             const key = normalizeUserId(userKey);
             if (!key) {
                 return;
             }
             delete vdoState.lastAppliedBufferByUser[key];
-            delete vdoState.lastAppliedIntervalByUser[key];
             delete vdoState.lastBufferRefreshIdByUser[key];
-            clearBufferApplyRetryState(key);
             clearEstimatedVdoLatency(key);
             if (vdoState.bufferRefreshTimersByUser[key]) {
                 clearTimeout(vdoState.bufferRefreshTimersByUser[key]);
             }
-            delete vdoState.bufferRefreshTimersByUser[key];
-            delete vdoState.bufferRefreshPendingUntilByUser[key];
-        }
+			delete vdoState.bufferRefreshTimersByUser[key];
+			delete vdoState.bufferRefreshPendingUntilByUser[key];
+			cancelPendingBufferApply(key);
+		}
 
         function requestLocalBufferRefresh(userKey, reason) {
             const key = normalizeUserId(userKey);
@@ -1252,10 +1239,6 @@
                 ['totalDecodeTime'],
                 ['framesDecoded'],
                 300);
-            const processingMs = getAverageCounterMs(objectValue,
-                ['totalProcessingDelay'],
-                ['framesDecoded', 'framesReceived'],
-                500);
             // Do NOT include jitterBufferDelay or jitterBufferTargetDelay in the
             // VDO pipeline latency estimate. setBufferDelay controls the jitter
             // buffer target, so including it here would create a feedback loop:
@@ -1263,24 +1246,12 @@
             //   setBufferDelay ≈ jitterBuffer
             //   => setBufferDelay = (total - pipeline) / 2
             // The buffer would settle at half the correct value, causing video
-            // to arrive too early. Only uncontrollable pipeline stages (encode,
-            // decode, processing) should be subtracted from the total delay.
-            let derivedMs = 0;
-            let hasDerived = false;
-            if (isFinite(encodeMs)) {
-                derivedMs += encodeMs;
-                hasDerived = true;
-            }
-            if (isFinite(decodeMs)) {
-                derivedMs += decodeMs;
-                hasDerived = true;
-            }
-            if (isFinite(processingMs)) {
-                derivedMs += processingMs;
-                hasDerived = true;
-            }
-            if (hasDerived) {
-                return clampLatencyMs(derivedMs);
+            // to arrive too early. totalProcessingDelay also spans first-packet
+            // receipt through completed decoding, so it includes controlled
+            // receiver buffering. Only encode and decode are safe to subtract.
+            if (isFinite(encodeMs) || isFinite(decodeMs)) {
+                return clampLatencyMs((isFinite(encodeMs) ? encodeMs : 0)
+                    + (isFinite(decodeMs) ? decodeMs : 0));
             }
 
             return NaN;
@@ -1316,11 +1287,25 @@
                         : latencyMs;
                 }
 
-                const children = Array.isArray(objectValue) ? objectValue : Object.values(objectValue);
+                const children = Array.isArray(objectValue)
+                    ? objectValue.map(function (child, index) { return [String(index), child]; })
+                    : Object.entries(objectValue);
                 for (let i = 0; i < children.length; i++) {
-                    const child = children[i];
-                    if (child && typeof child === 'object') {
-                        visit(child, depth + 1, nextContext);
+					const childKey = children[i][0];
+					const child = children[i][1];
+					if (child && typeof child === 'object') {
+						let childContext = nextContext;
+						// VDO quick stats include our local streamID at the stats root,
+						// while stats.inbound is keyed by each remote stream ID. A known
+						// child stream must override that inherited local context.
+						if (resolveUserKeyFromPeerIds(childKey, '', '')) {
+							childContext = {
+                                streamId: childKey,
+                                targetId: nextContext.targetId,
+                                label: nextContext.label
+                            };
+                        }
+                        visit(child, depth + 1, childContext);
                     }
                 }
             }
@@ -1525,54 +1510,6 @@
             return sent;
         }
 
-        function scheduleBufferApplyRetries(userKey) {
-            const key = normalizeUserId(userKey);
-            if (!key || !userHasCameraTargets(key)) {
-                return false;
-            }
-
-            clearBufferApplyRetryState(key);
-            vdoState.bufferApplyRetryAttemptsByUser[key] = 0;
-
-            function hasTarget() {
-                return userHasCameraTargets(key);
-            }
-
-            function applyAfterRefresh() {
-                delete vdoState.bufferApplyRetryTimersByUser[key];
-                if (!hasTarget()) {
-                    clearBufferApplyRetryState(key);
-                    return;
-                }
-
-                sendTargetedRefresh(key);
-                vdoState.bufferApplyRetryTimersByUser[key] = setTimeout(function () {
-                    delete vdoState.bufferApplyRetryTimersByUser[key];
-                    if (!hasTarget()) {
-                        clearBufferApplyRetryState(key);
-                        return;
-                    }
-
-                    const desiredBufferMs = getDesiredBufferMs(key);
-                    if (sendTargetedBuffer(key, desiredBufferMs)) {
-                        vdoState.lastAppliedBufferByUser[key] = desiredBufferMs;
-                    }
-                    updateSyncStatus();
-
-                    const attempt = (vdoState.bufferApplyRetryAttemptsByUser[key] || 0) + 1;
-                    vdoState.bufferApplyRetryAttemptsByUser[key] = attempt;
-                    if (attempt >= bufferApplyRetryDelaysMs.length) {
-                        clearBufferApplyRetryState(key);
-                        return;
-                    }
-                    vdoState.bufferApplyRetryTimersByUser[key] = setTimeout(applyAfterRefresh, bufferApplyRetryDelaysMs[attempt]);
-                }, 150);
-            }
-
-            vdoState.bufferApplyRetryTimersByUser[key] = setTimeout(applyAfterRefresh, bufferApplyRetryDelaysMs[0]);
-            return true;
-        }
-
         function sendTargetedRefresh(userKey) {
             const targets = getUserCameraTargets(userKey);
             if (!targets.length) {
@@ -1603,7 +1540,7 @@
             return sent;
         }
 
-        function sendTargetedRemove(userKey) {
+		function sendTargetedRemove(userKey) {
             const key = normalizeUserId(userKey);
             if (!key) {
                 return false;
@@ -1612,20 +1549,63 @@
             // Do not post hangup/remove/hide commands into VDO from roster cleanup.
             // Some VDO builds treat those as a local page/session exit and show the
             // "file transfer in progress" unload confirmation when peers leave.
-            return false;
-        }
+			return false;
+		}
 
-        function scheduleBufferRefresh(userKey, refreshEventId, flushFirst) {
+		function cancelPendingBufferApply(userKey) {
+			const key = normalizeUserId(userKey);
+			if (!key) {
+				return;
+			}
+			if (vdoState.bufferApplyTimersByUser[key]) {
+				clearTimeout(vdoState.bufferApplyTimersByUser[key]);
+			}
+			delete vdoState.bufferApplyTimersByUser[key];
+			delete vdoState.pendingBufferMsByUser[key];
+		}
+
+		function schedulePendingBufferApply(userKey, bufferMs) {
+			const key = normalizeUserId(userKey);
+			if (!key || !isFinite(bufferMs)) {
+				return false;
+			}
+			vdoState.pendingBufferMsByUser[key] = Math.round(bufferMs);
+			if (vdoState.bufferApplyTimersByUser[key]) {
+				clearTimeout(vdoState.bufferApplyTimersByUser[key]);
+			}
+			vdoState.bufferApplyTimersByUser[key] = setTimeout(function () {
+				delete vdoState.bufferApplyTimersByUser[key];
+				delete vdoState.pendingBufferMsByUser[key];
+				if (!userHasCameraTargets(key)) {
+					return;
+				}
+				const desiredBufferMs = getDesiredBufferMs(key);
+				const lastAppliedBuffer = vdoState.lastAppliedBufferByUser[key];
+				if (typeof lastAppliedBuffer === 'number'
+					&& isFinite(lastAppliedBuffer)
+					&& Math.abs(desiredBufferMs - lastAppliedBuffer) < bufferApplyDeadbandMs) {
+					return;
+				}
+				if (sendTargetedBuffer(key, desiredBufferMs)) {
+					vdoState.lastAppliedBufferByUser[key] = desiredBufferMs;
+				}
+				updateSyncStatus();
+			}, bufferApplyDebounceMs);
+			return true;
+		}
+
+		function scheduleBufferRefresh(userKey, refreshEventId, flushFirst) {
             const key = normalizeUserId(userKey);
             const eventId = String(refreshEventId || '');
             if (!key || !eventId || vdoState.lastBufferRefreshIdByUser[key] === eventId) {
                 return false;
             }
-            if (!userHasCameraTargets(key)) {
-                return false;
-            }
-            vdoState.lastBufferRefreshIdByUser[key] = eventId;
-            clearBufferApplyRetryState(key);
+			if (!userHasCameraTargets(key)) {
+				return false;
+			}
+			cancelPendingBufferApply(key);
+			vdoState.lastBufferRefreshIdByUser[key] = eventId;
+            delete vdoState.lastAppliedBufferByUser[key];
             if (vdoState.bufferRefreshTimersByUser[key]) {
                 clearTimeout(vdoState.bufferRefreshTimersByUser[key]);
             }
@@ -1641,7 +1621,6 @@
                 const desiredBufferMs = getDesiredBufferMs(key);
                 if (sendTargetedBuffer(key, desiredBufferMs)) {
                     vdoState.lastAppliedBufferByUser[key] = desiredBufferMs;
-                    scheduleBufferApplyRetries(key);
                 }
                 updateSyncStatus();
             }, 150);
@@ -1657,7 +1636,7 @@
             postToVdo({ getStats: true });
         }
 
-        function applyPeerBuffers(force) {
+        function applyPeerBuffers() {
             const trackedUsers = getTrackedUserKeys();
             let linkedUsers = 0;
             for (let i = 0; i < trackedUsers.length; i++) {
@@ -1673,21 +1652,19 @@
                     continue;
                 }
                 const desiredBufferMs = getDesiredBufferMs(userKey);
-                if (!force && vdoState.lastAppliedBufferByUser[userKey] === desiredBufferMs) {
-                    continue;
-                }
-                const lastAppliedBuffer = vdoState.lastAppliedBufferByUser[userKey];
-                const hasAppliedBuffer = typeof lastAppliedBuffer === 'number' && isFinite(lastAppliedBuffer);
-                if (hasAppliedBuffer && lastAppliedBuffer !== desiredBufferMs) {
-                    if (sendTargetedBuffer(userKey, desiredBufferMs)) {
-                        vdoState.lastAppliedBufferByUser[userKey] = desiredBufferMs;
-                        scheduleBufferApplyRetries(userKey);
-                    }
-                    continue;
-                }
-                if (sendTargetedBuffer(userKey, desiredBufferMs)) {
+				const lastAppliedBuffer = vdoState.lastAppliedBufferByUser[userKey];
+				const hasAppliedBuffer = typeof lastAppliedBuffer === 'number' && isFinite(lastAppliedBuffer);
+				if (hasAppliedBuffer) {
+					if (Math.abs(desiredBufferMs - lastAppliedBuffer) < bufferApplyDeadbandMs) {
+						cancelPendingBufferApply(userKey);
+						continue;
+					}
+					schedulePendingBufferApply(userKey, desiredBufferMs);
+					continue;
+				}
+				cancelPendingBufferApply(userKey);
+				if (sendTargetedBuffer(userKey, desiredBufferMs)) {
                     vdoState.lastAppliedBufferByUser[userKey] = desiredBufferMs;
-                    scheduleBufferApplyRetries(userKey);
                 }
             }
             renderObsGrid();
@@ -1955,14 +1932,14 @@
                 deleteUserCameraTargets(userKey);
                 delete vdoState.lastAppliedBufferByUser[userKey];
                 delete vdoState.lastBufferRefreshIdByUser[userKey];
-                clearBufferApplyRetryState(userKey);
                 delete vdoState.lastVoiceChatModeByUser[userKey];
                 if (vdoState.bufferRefreshTimersByUser[userKey]) {
                     clearTimeout(vdoState.bufferRefreshTimersByUser[userKey]);
                 }
-                delete vdoState.bufferRefreshTimersByUser[userKey];
-                delete vdoState.bufferRefreshPendingUntilByUser[userKey];
-                delete vdoState.latencyMsByUser[userKey];
+				delete vdoState.bufferRefreshTimersByUser[userKey];
+				delete vdoState.bufferRefreshPendingUntilByUser[userKey];
+				cancelPendingBufferApply(userKey);
+				delete vdoState.latencyMsByUser[userKey];
                 delete vdoState.latencyTargetMsByUser[userKey];
                 delete vdoState.latencyUpdatedAtByUser[userKey];
                 delete vdoState.chunkStatsByUser[userKey];
@@ -2005,14 +1982,14 @@
                 delete vdoState.lastAppliedBufferByUser[userKey];
 
                 delete vdoState.lastBufferRefreshIdByUser[userKey];
-                clearBufferApplyRetryState(userKey);
                 delete vdoState.lastVoiceChatModeByUser[userKey];
                 if (vdoState.bufferRefreshTimersByUser[userKey]) {
                     clearTimeout(vdoState.bufferRefreshTimersByUser[userKey]);
                 }
-                delete vdoState.bufferRefreshTimersByUser[userKey];
-                delete vdoState.bufferRefreshPendingUntilByUser[userKey];
-                delete vdoState.latencyMsByUser[userKey];
+				delete vdoState.bufferRefreshTimersByUser[userKey];
+				delete vdoState.bufferRefreshPendingUntilByUser[userKey];
+				cancelPendingBufferApply(userKey);
+				delete vdoState.latencyMsByUser[userKey];
                 delete vdoState.latencyTargetMsByUser[userKey];
                 delete vdoState.latencyUpdatedAtByUser[userKey];
                 delete vdoState.chunkStatsByUser[userKey];
@@ -2084,11 +2061,6 @@
             const voiceChatModeChanged = typeof previousVoiceChatMode === 'boolean'
                 && previousVoiceChatMode !== nextVoiceChatMode;
             vdoState.lastVoiceChatModeByUser[normalizedUserKey] = nextVoiceChatMode;
-            const intervalKey = String(data.interval ?? '');
-            if (normalizedUserKey && intervalKey && vdoState.lastAppliedIntervalByUser[normalizedUserKey] !== intervalKey) {
-                vdoState.lastAppliedIntervalByUser[normalizedUserKey] = intervalKey;
-                delete vdoState.lastAppliedBufferByUser[normalizedUserKey];
-            }
             const diagnostics = buildSyncDiagnostics(data, receiverBufferMs);
             const incomingVdoLatencyMs = getIncomingVdoLatencyMs(data);
             if (isFinite(incomingVdoLatencyMs)) {
@@ -2111,10 +2083,6 @@
                 requestLocalBufferRefresh(normalizedUserKey, nextVoiceChatMode ? 'voiceChatOn' : 'voiceChatOff');
             }
             if (data.refreshBuffer && data.bufferRefreshEventId) {
-                const refreshUserKey = normalizeUserId(userKey);
-                if (refreshUserKey) {
-                    delete vdoState.lastAppliedBufferByUser[refreshUserKey];
-                }
                 scheduleBufferRefresh(userKey, data.bufferRefreshEventId, true);
             }
             return false;
@@ -2127,7 +2095,7 @@
                 handleIntervalMessage(item);
             }
             pruneInactiveUsers();
-            applyPeerBuffers(false);
+            applyPeerBuffers();
         }
 
         function startIntervalSource() {
@@ -2490,7 +2458,7 @@
             }
 
             if (changed || latencyChanged) {
-                applyPeerBuffers(true);
+                applyPeerBuffers();
             } else {
                 renderObsGrid();
                 updateSyncStatus();
@@ -2522,15 +2490,17 @@
             }
             setManualOffsetMs(userKey, offsetMs);
             if (!requestLocalBufferRefresh(userKey, 'manualOffset')) {
-                applyPeerBuffers(true);
+                applyPeerBuffers();
             }
         });
 
-        if (vdoFrame) {
-            vdoFrame.addEventListener('load', function () {
-                vdoState.iframeLoaded = true;
-                requestVdoRoster();
-                applyPeerBuffers(true);
+		if (vdoFrame) {
+			vdoFrame.addEventListener('load', function () {
+				vdoState.iframeLoaded = true;
+				requestVdoRoster();
+				Object.keys(vdoState.bufferApplyTimersByUser).forEach(cancelPendingBufferApply);
+				vdoState.lastAppliedBufferByUser = {};
+                applyPeerBuffers();
                 renderObsGrid();
                 if (vdoState.rosterTimerId) {
                     clearInterval(vdoState.rosterTimerId);
