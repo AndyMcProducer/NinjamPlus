@@ -59,6 +59,23 @@
             text-overflow: ellipsis;
             white-space: nowrap;
         }
+        .peer-route {
+            padding: 1px 4px;
+            border: 1px solid rgba(143,183,255,0.45);
+            border-radius: 4px;
+            color: #9fc1ff;
+            font-size: 9px;
+            font-weight: 700;
+            line-height: 1.2;
+            flex: 0 0 auto;
+        }
+        .peer-route:empty {
+            display: none;
+        }
+        .peer-route.fail {
+            border-color: rgba(207,67,67,0.65);
+            color: #ff8d8d;
+        }
         .peer-light {
             width: 11px;
             height: 11px;
@@ -316,6 +333,8 @@
         const roomFromServer = ninjamServer ? ninjamServer.replace(/\./g, '_') : '';
         const resolvedRoom = roomParam || roomFromServer || 'ninjam';
         const minimumBufferMs = 0;
+        const helperRequestToken = '__NINJAM_HELPER_TOKEN__';
+        const vdoPeerSyncEndpoint = '/vdo-peer-sync?token=' + encodeURIComponent(helperRequestToken);
         const obsMode = query.get('obs') === '1' || String(query.get('view') || '').toLowerCase() === 'obs';
         function normalizeBufferMode(value) {
             const mode = String(value || '').trim().toLowerCase();
@@ -544,6 +563,7 @@
             lastResolveSource: '',
             lastResolveDiagnostic: '',
             lastRosterRevision: '',
+            recentVdoPeerSyncEvents: {},
             bufferRefreshSequence: 0,
             rosterTimerId: 0
         };
@@ -658,8 +678,15 @@
                 String(data.intervalMeasurementSeen ? 1 : 0),
                 String(data.bufferCalculated ? 1 : 0),
                 String(data.serverRouteLatencyReady ? 1 : 0),
+                String(data.vdoPeerSyncReceived ? 1 : 0),
+                String(data.vdoPeerSyncAcked ? 1 : 0),
+                String(data.syncMessageReceived ? 1 : 0),
+                String(data.syncMessageAcked ? 1 : 0),
+                String(data.syncRoute || ''),
                 String(Math.round(Number(data.intervalSignalAgeMs ?? -1) / 1000)),
                 String(Math.round(Number(data.serverRouteAgeMs ?? -1) / 1000)),
+                String(Math.round(Number(data.vdoPeerSyncReceivedAgeMs ?? -1) / 1000)),
+                String(Math.round(Number(data.vdoPeerSyncAckAgeMs ?? -1) / 1000)),
                 (typeof bufferMs === 'number' && isFinite(bufferMs)) ? String(Math.round(bufferMs)) : ''
             ].join('|');
         }
@@ -1094,6 +1121,13 @@
                 || hasBuffer;
             const explicitServerRoute = boolProp(data, 'serverRouteLatencyReady');
             const hasServerRoute = explicitServerRoute !== null ? explicitServerRoute : isFinite(serverRouteLatencyMs);
+            const vdoPeerReceived = boolProp(data, 'vdoPeerSyncReceived') === true;
+            const vdoPeerAcked = boolProp(data, 'vdoPeerSyncAcked') === true;
+            const syncReceivedState = boolProp(data, 'syncMessageReceived');
+            const syncAckedState = boolProp(data, 'syncMessageAcked');
+            const syncMessageReceived = syncReceivedState !== null ? syncReceivedState : vdoPeerReceived;
+            const syncMessageAcked = syncAckedState !== null ? syncAckedState : vdoPeerAcked;
+            const syncRoute = String(data.syncRoute || '').trim().toUpperCase();
             const parts = [];
             if (!hasInterval) {
                 parts.push(isFinite(intervalSignalAgeMs) ? 'waiting local marker' : 'interval missing');
@@ -1107,9 +1141,27 @@
             } else {
                 parts.push(isFinite(serverRouteAgeMs) ? 'route aging' : 'route pending');
             }
+            if (vdoPeerReceived && vdoPeerAcked) {
+                parts.push('p2p ok');
+            } else if (vdoPeerReceived) {
+                parts.push('p2p rx');
+            } else if (vdoPeerAcked) {
+                parts.push('p2p ack');
+            }
+            const ok = hasInterval && hasBuffer;
+            const missingMessages = [];
+            if (!syncMessageReceived) {
+                missingMessages.push('NO RCV MSG');
+            }
+            if (!syncMessageAcked) {
+                missingMessages.push('NO SENT MSG');
+            }
             return {
-                ok: hasInterval && hasBuffer,
-                text: parts.join(' | ')
+                ok: ok,
+                text: parts.join(' | '),
+                route: syncRoute,
+                statusLabel: ok ? syncRoute
+                    : (missingMessages.length === 2 ? 'NO RCV / NO SENT' : (missingMessages[0] || 'BUFFER PENDING'))
             };
         }
 
@@ -1465,6 +1517,196 @@
             } catch (e) {
             }
             return false;
+        }
+
+        function localVdoSyncUserId() {
+            let value = String(appState.vdoSyncUserKey || appState.label || '').trim().toLowerCase();
+            const atIndex = value.indexOf('@');
+            if (atIndex > 0) {
+                value = value.substring(0, atIndex);
+            }
+            value = value.replace(/^anonymous:/, '');
+            value = value.replace(/^guest:/, '');
+            return value;
+        }
+
+        function pruneRecentVdoPeerSyncEvents() {
+            const cutoff = Date.now() - 120000;
+            const eventIds = Object.keys(vdoState.recentVdoPeerSyncEvents);
+            for (let i = 0; i < eventIds.length; i++) {
+                if (vdoState.recentVdoPeerSyncEvents[eventIds[i]] < cutoff) {
+                    delete vdoState.recentVdoPeerSyncEvents[eventIds[i]];
+                }
+            }
+        }
+
+        function rememberVdoPeerSyncEvent(eventId) {
+            const key = String(eventId || '').trim();
+            if (!key) {
+                return false;
+            }
+            pruneRecentVdoPeerSyncEvents();
+            if (vdoState.recentVdoPeerSyncEvents[key]) {
+                return false;
+            }
+            vdoState.recentVdoPeerSyncEvents[key] = Date.now();
+            return true;
+        }
+
+        function forwardVdoPeerSyncToNative(signalType, sender, payload) {
+            if (!signalType || !sender || !payload || typeof payload !== 'object') {
+                return Promise.resolve(false);
+            }
+            return fetch(vdoPeerSyncEndpoint, {
+                method: 'POST',
+                cache: 'no-store',
+                headers: { 'Content-Type': 'application/json;charset=UTF-8' },
+                body: JSON.stringify({
+                    version: 1,
+                    signalType: signalType,
+                    sender: sender,
+                    payload: payload
+                })
+            }).then(function (response) {
+                return response.ok;
+            }).catch(function () {
+                return false;
+            });
+        }
+
+        function sendVdoPeerSyncTag(data) {
+            const payload = data && data.payload && typeof data.payload === 'object' ? data.payload : null;
+            const eventId = payload ? String(payload.eventId || '').trim() : '';
+            const sentEventKey = 'sent:' + eventId;
+            pruneRecentVdoPeerSyncEvents();
+            if (!payload || !eventId || vdoState.recentVdoPeerSyncEvents[sentEventKey]) {
+                return false;
+            }
+
+            const queuedAt = Number(data.queuedAtWallClockMs);
+            const queuedAgeMs = isFinite(queuedAt) && queuedAt > 0 ? Math.max(0, Date.now() - queuedAt) : 0;
+            if (queuedAgeMs > 4000) {
+                return false;
+            }
+
+            const outboundPayload = Object.assign({}, payload);
+            const originalSendOffsetMs = Number(outboundPayload.sendOffsetMs);
+            outboundPayload.sendOffsetMs = Math.max(0,
+                (isFinite(originalSendOffsetMs) ? originalSendOffsetMs : 0) + queuedAgeMs);
+            const sent = postToVdo({
+                sendData: {
+                    ninjamPlusSync: {
+                        version: 1,
+                        signalType: 'intervalSyncTag',
+                        payload: outboundPayload
+                    }
+                },
+                type: 'pcs'
+            });
+            if (sent) {
+                vdoState.recentVdoPeerSyncEvents[sentEventKey] = Date.now();
+            }
+            return sent;
+        }
+
+        function extractVdoPeerSyncEnvelope(data) {
+            if (!data || !Object.prototype.hasOwnProperty.call(data, 'dataReceived')) {
+                return null;
+            }
+            let received = data.dataReceived;
+            if (typeof received === 'string') {
+                try {
+                    received = JSON.parse(received);
+                } catch (e) {
+                    return null;
+                }
+            }
+            if (!received || typeof received !== 'object'
+                || !received.ninjamPlusSync || typeof received.ninjamPlusSync !== 'object') {
+                return null;
+            }
+            return received.ninjamPlusSync;
+        }
+
+        function handleVdoPeerSyncData(data) {
+            const envelope = extractVdoPeerSyncEnvelope(data);
+            if (!envelope || Number(envelope.version) !== 1) {
+                return false;
+            }
+            const signalType = String(envelope.signalType || '').trim();
+            const payload = envelope.payload && typeof envelope.payload === 'object'
+                ? Object.assign({}, envelope.payload) : null;
+            const sender = payload ? String(payload.userId || '').trim() : '';
+            const senderKey = normalizeUserId(sender);
+            if (!payload || !senderKey || senderKey === normalizeUserId(localVdoSyncUserId())) {
+                return true;
+            }
+            const transportStreamId = String(data.streamID || data.streamId || '').trim();
+            const transportPeerId = String(data.UUID || data.uuid || '').trim();
+            const transportLabel = vdoState.labelByStreamId[transportStreamId]
+                || vdoState.labelByStreamId[transportPeerId]
+                || '';
+            const transportUserKey = resolveUserKeyFromPeerIds(
+                transportStreamId,
+                transportPeerId,
+                transportLabel);
+            if ((transportUserKey && normalizeUserId(transportUserKey) !== senderKey)
+                || (transportLabel && normalizeUserId(transportLabel) !== senderKey)) {
+                return true;
+            }
+
+            if (signalType === 'intervalSyncTag') {
+                const eventId = String(payload.eventId || '').trim();
+                if (payload.type !== 'intervalSyncTag' || !eventId
+                    || !rememberVdoPeerSyncEvent('tag:' + senderKey + ':' + eventId)) {
+                    return true;
+                }
+
+                payload.vdoPeerReceivedWallClockMs = Date.now();
+                const ackPayload = {
+                    type: 'intervalSyncAck',
+                    userId: localVdoSyncUserId(),
+                    targetUserId: sender,
+                    ackEventId: eventId,
+                    eventId: 'vdoPeerAck:' + localVdoSyncUserId() + ':' + eventId
+                };
+                const ackMessage = {
+                    sendData: {
+                        ninjamPlusSync: {
+                            version: 1,
+                            signalType: 'intervalSyncAck',
+                            payload: ackPayload
+                        }
+                    },
+                    type: 'pcs'
+                };
+                const peerUuid = String(data.UUID || data.uuid || '').trim();
+                const peerStreamId = String(data.streamID || data.streamId || '').trim();
+                if (peerUuid) {
+                    ackMessage.UUID = peerUuid;
+                } else if (peerStreamId) {
+                    ackMessage.streamID = peerStreamId;
+                }
+                forwardVdoPeerSyncToNative('intervalSyncTag', sender, payload).then(function (accepted) {
+                    if (accepted) {
+                        postToVdo(ackMessage);
+                    }
+                });
+                return true;
+            }
+
+            if (signalType === 'intervalSyncAck') {
+                const ackEventId = String(payload.ackEventId || '').trim();
+                const targetUserKey = normalizeUserId(payload.targetUserId || '');
+                if (payload.type !== 'intervalSyncAck' || !ackEventId
+                    || targetUserKey !== normalizeUserId(localVdoSyncUserId())
+                    || !rememberVdoPeerSyncEvent('ack:' + senderKey + ':' + ackEventId)) {
+                    return true;
+                }
+                forwardVdoPeerSyncToNative('intervalSyncAck', sender, payload);
+                return true;
+            }
+            return true;
         }
 
         function postToObsViewerFrame(tileKey, message) {
@@ -1860,7 +2102,8 @@
             const users = getTrackedUserKeys();
             for (let i = 0; i < users.length; i++) {
                 const userKey = users[i];
-                const diagnostics = ninjamSync.remoteDiagnostics[userKey] || { ok: false, text: 'interval pending' };
+                const diagnostics = ninjamSync.remoteDiagnostics[userKey]
+                    || { ok: false, text: 'interval pending', statusLabel: 'NO RCV / NO SENT' };
                 const chunkStats = vdoState.chunkStatsByUser[userKey] || {};
                 const chunkStatsFresh = typeof chunkStats.updatedAt === 'number' && (Date.now() - chunkStats.updatedAt) < 8000;
                 const videoDegraded = chunkStatsFresh && (chunkStats.rebuffering || chunkStats.awaitingKeyframe);
@@ -1902,11 +2145,18 @@
                 light.addEventListener('click', function () {
                     copyTextToClipboard(detailText).catch(function () {});
                 });
+                const route = document.createElement('span');
+                route.className = diagnostics.ok ? 'peer-route' : 'peer-route fail';
+                route.textContent = diagnostics.statusLabel || '';
+                route.title = diagnostics.ok
+                    ? (diagnostics.route ? ('Successful sync route: ' + diagnostics.route) : '')
+                    : diagnostics.statusLabel;
                 const name = document.createElement('span');
                 name.className = 'peer-light-name';
                 name.textContent = userKey;
                 name.title = detailText;
                 wrap.appendChild(light);
+                wrap.appendChild(route);
                 wrap.appendChild(name);
                 peerStatusValue.appendChild(wrap);
             }
@@ -2041,6 +2291,10 @@
                     typeof data.wallClockMs === 'number' ? data.wallClockMs : NaN
                 );
                 updateSyncStatus();
+                return false;
+            }
+            if (data.type === 'vdoPeerSyncTag') {
+                sendVdoPeerSyncTag(data);
                 return false;
             }
             if (data.type === 'activeRoster') {
@@ -2412,6 +2666,9 @@
             if (!data || typeof data !== 'object') {
                 return;
             }
+            if (handleVdoPeerSyncData(data)) {
+                return;
+            }
 
             let changed = false;
             changed = handleVdoChunkEvent(data) || changed;
@@ -2428,6 +2685,9 @@
             if (data.action === 'guest-connected' && data.streamID) {
                 const label = extractPeerLabel(data);
                 const targetId = data.UUID || data.streamID;
+                if (label && data.UUID) {
+                    vdoState.labelByStreamId[String(data.UUID)] = label;
+                }
                 const targetChanged = registerPeerTarget(data.streamID, label, targetId);
                 changed = targetChanged || changed;
                 if (!targetChanged) {
@@ -2437,9 +2697,15 @@
             } else if (data.action === 'push-connection' && data.streamID) {
                 if (data.value === false) {
                     changed = unregisterPeerTarget(data.streamID) || changed;
+                    if (data.UUID) {
+                        delete vdoState.labelByStreamId[String(data.UUID)];
+                    }
                 } else {
                     const label = extractPeerLabel(data);
                     const targetId = data.UUID || data.streamID;
+                    if (label && data.UUID) {
+                        vdoState.labelByStreamId[String(data.UUID)] = label;
+                    }
                     const targetChanged = registerPeerTarget(data.streamID, label, targetId);
                     changed = targetChanged || changed;
                     if (!targetChanged) {

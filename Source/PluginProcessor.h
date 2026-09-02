@@ -488,7 +488,8 @@ public:
 
     void sendSideSignal(const juce::String& target, const juce::String& type, const juce::String& payload);
     void sendIntervalSignal(const juce::String& type, const juce::String& payload, const juce::String& target = "*");
-    void processSyncSignal(const juce::String& sender, const juce::String& type, const juce::String& payload);
+    void processSyncSignal(const juce::String& sender, const juce::String& type, const juce::String& payload,
+                           const juce::String& syncRoute = {});
     void launchVideoSession(const juce::String& requestedRoom = {});
     void launchVideoSessionAsync();
     bool canChangeVdoRoomName();
@@ -1210,7 +1211,7 @@ private:
     juce::String currentUser;
     mutable juce::CriticalSection intervalHelperPayloadLock;
     juce::String intervalHelperPayload { "[]" };
-    double lastIntervalHelperPayloadWriteMs = 0.0;
+    std::atomic<double> lastIntervalHelperPayloadWriteMs { 0.0 };
     std::atomic<bool> intervalHelperPayloadForceWrite { false };
     std::atomic<juce::uint64> vdoRosterRevision { 0 };
     std::atomic<bool> mobileHotspotModeEnabled { false };
@@ -1330,7 +1331,9 @@ private:
     juce::String intervalSyncStatusText;
     std::atomic<long long> lastBroadcastIntervalTag { -1 };
     juce::String lastBroadcastSyncTagPayload;
+    std::deque<juce::String> recentIntervalSyncTagEventIds;
     int lastBroadcastSyncTagMarkerBeat = -1;
+    double lastBroadcastSyncTagWallClockMs = 0.0;
     std::atomic<long long> lastProcessedIntervalMarkerKey { -1 };
     juce::CriticalSection intervalSyncAnnouncementLock;
     std::atomic<juce::uint64> completedAudioIntervalGuidSequence { 0 };
@@ -1376,6 +1379,12 @@ private:
     std::map<juce::String, int> remoteServerRouteLatencyMsByUser;
     std::map<juce::String, double> lastRemoteIntervalSignalSeenMsByUser;
     std::map<juce::String, double> lastRemoteRouteProbeSeenMsByUser;
+    std::map<juce::String, double> lastVdoPeerSyncReceivedMsByUser;
+    std::map<juce::String, double> lastVdoPeerSyncAckMsByUser;
+    std::map<juce::String, double> lastSyncMessageReceivedMsByUser;
+    std::map<juce::String, double> lastSyncMessageAckMsByUser;
+    std::map<juce::String, juce::String> lastIntervalSyncRouteByUser;
+    std::deque<juce::String> recentIntervalSyncAckEventIds;
     std::map<juce::String, double> pendingTransportProbeSentMsById;
     std::map<juce::String, long long> remoteLatencyLastAppliedIntervalByUser;
     std::deque<juce::String> recentVideoTimingChangeEventIds;
@@ -1512,6 +1521,7 @@ private:
     void applyCodecPreference();
     void setIntervalSyncStatusText(const juce::String& text);
     void broadcastIntervalSyncTag(const juce::String& target = "*", int markerBeatIndex = -1);
+    bool handleVdoPeerSyncMessage(const juce::String& messageJson);
     void broadcastTransportProbe(const juce::String& target = "*");
     juce::String buildIntervalSyncTag(int interval, int length) const;
     void captureCompletedAudioIntervalGuidFromAudioThread(NJClient* inst);

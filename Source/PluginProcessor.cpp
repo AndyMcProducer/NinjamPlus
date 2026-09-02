@@ -96,7 +96,8 @@ public:
                          std::function<juce::String(const juce::String&)> zapBrowserCameraEnableIn,
                          std::function<juce::String()> zapBrowserCameraStateIn,
                          std::function<juce::String()> zapBrowserCameraDisableIn,
-                         std::function<bool(const juce::MemoryBlock&, const juce::String&, const juce::String&, bool, double, double, int, int)> zapBrowserFrameConsumerIn)
+                         std::function<bool(const juce::MemoryBlock&, const juce::String&, const juce::String&, bool, double, double, int, int)> zapBrowserFrameConsumerIn,
+                         std::function<bool(const juce::String&)> vdoPeerSyncConsumerIn)
         : juce::Thread("NINJAMVideoHelperServer"),
           intervalPayloadProvider(std::move(intervalPayloadProviderIn)),
           zapFrameListProvider(std::move(zapFrameListProviderIn)),
@@ -104,7 +105,8 @@ public:
           zapBrowserCameraEnable(std::move(zapBrowserCameraEnableIn)),
           zapBrowserCameraState(std::move(zapBrowserCameraStateIn)),
           zapBrowserCameraDisable(std::move(zapBrowserCameraDisableIn)),
-          zapBrowserFrameConsumer(std::move(zapBrowserFrameConsumerIn))
+          zapBrowserFrameConsumer(std::move(zapBrowserFrameConsumerIn)),
+          vdoPeerSyncConsumer(std::move(vdoPeerSyncConsumerIn))
     {
         reloadStaticContent();
     }
@@ -182,6 +184,7 @@ private:
     std::function<juce::String()> zapBrowserCameraState;
     std::function<juce::String()> zapBrowserCameraDisable;
     std::function<bool(const juce::MemoryBlock&, const juce::String&, const juce::String&, bool, double, double, int, int)> zapBrowserFrameConsumer;
+    std::function<bool(const juce::String&)> vdoPeerSyncConsumer;
     std::unique_ptr<juce::StreamingSocket> listener;
     std::atomic<int> listenPort { 0 };
     juce::String helperIndexHtml;
@@ -2190,6 +2193,50 @@ setInterval(refresh,33);
             return response;
         }
 
+        if (path == "/vdo-peer-sync")
+        {
+            HttpResponse response;
+            response.contentType = "application/json; charset=utf-8";
+            response.noStore = true;
+            if (method != "POST")
+            {
+                response.statusCode = 405;
+                response.statusText = "Method Not Allowed";
+                response.body = makeUtf8Body("{\"ok\":false,\"error\":\"POST required\"}");
+                return response;
+            }
+            if (getQueryParam(requestTarget, "token") != helperRequestToken)
+            {
+                response.statusCode = 403;
+                response.statusText = "Forbidden";
+                response.body = makeUtf8Body("{\"ok\":false,\"error\":\"invalid helper token\"}");
+                return response;
+            }
+            if (requestBody.getSize() == 0 || requestBody.getSize() > 64 * 1024)
+            {
+                response.statusCode = 413;
+                response.statusText = "Payload Too Large";
+                response.body = makeUtf8Body("{\"ok\":false,\"error\":\"invalid payload size\"}");
+                return response;
+            }
+
+            const juce::String messageJson = juce::String::fromUTF8(
+                static_cast<const char*>(requestBody.getData()), (int)requestBody.getSize());
+            if (vdoPeerSyncConsumer && vdoPeerSyncConsumer(messageJson))
+            {
+                response.statusCode = 204;
+                response.statusText = "No Content";
+                response.body.reset();
+            }
+            else
+            {
+                response.statusCode = 400;
+                response.statusText = "Bad Request";
+                response.body = makeUtf8Body("{\"ok\":false,\"error\":\"invalid peer sync message\"}");
+            }
+            return response;
+        }
+
         if (path == "/intervals")
         {
             HttpResponse response;
@@ -2278,6 +2325,7 @@ setInterval(refresh,33);
                                                 (int) ninjamplus::embedded::vdoIndexHtmlSize);
         helperAppHtml = juce::String::fromUTF8(reinterpret_cast<const char*>(ninjamplus::embedded::vdoAppHtml),
                                               (int) ninjamplus::embedded::vdoAppHtmlSize);
+        helperAppHtml = helperAppHtml.replace("__NINJAM_HELPER_TOKEN__", helperRequestToken);
 
         auto loadEmbeddedPng = [](juce::MemoryBlock& destination, const unsigned char* data, std::size_t size)
         {
@@ -4417,7 +4465,7 @@ namespace
     constexpr unsigned int kNinjamZapVideoMjpgFourcc = makeNjFourcc('M','J','P','G');
     constexpr int kNinjamZapVideoOnlyChannelFlag = NJClient::NJCLIENT_CHANNEL_FLAG_VIDEO_ONLY;
     constexpr const char* sideSignalChatPrefix = "__NINJAM_VST3_SIDESIGNAL__ ";
-    constexpr int remoteLatencyUpdateCadenceIntervals = 1;
+    constexpr int remoteLatencyUpdateCadenceIntervals = 8;
     // Fixed indices: 0=legacy audio, 1=hidden NJ+ control, 2=Opus multichannel lane, 3=voice.
     constexpr int kNinjamPlusControlChannelIndex = 1;
     constexpr int kVoiceChatChannelIndex = 3;
@@ -7208,6 +7256,91 @@ void NinjamVst3AudioProcessor::setIntervalSyncStatusText(const juce::String& tex
     intervalSyncStatusText = text;
 }
 
+bool NinjamVst3AudioProcessor::handleVdoPeerSyncMessage(const juce::String& messageJson)
+{
+    if (!vdoVideoSyncEnabled.load(std::memory_order_relaxed)
+        || ninjamZapVideoEnabled.load(std::memory_order_relaxed))
+        return false;
+
+    const juce::var parsed = juce::JSON::parse(messageJson);
+    auto* message = parsed.getDynamicObject();
+    if (message == nullptr)
+        return false;
+
+    const int version = (int)message->getProperty("version");
+    const juce::String signalType = message->getProperty("signalType").toString().trim();
+    const juce::var payloadValue = message->getProperty("payload");
+    auto* payloadObject = payloadValue.getDynamicObject();
+    if (version != 1 || payloadObject == nullptr)
+        return false;
+
+    juce::String sender = message->getProperty("sender").toString().trim();
+    const juce::String payloadSender = payloadObject->getProperty("userId").toString().trim();
+    if (sender.isEmpty())
+        sender = payloadSender;
+    if (payloadSender.isEmpty())
+        return false;
+
+    const juce::String senderKey = normaliseOpusPeerId(sender);
+    const juce::String payloadSenderKey = normaliseOpusPeerId(payloadSender);
+    const juce::String localUserKey = normaliseOpusPeerId(currentUser);
+    if (senderKey.isEmpty() || senderKey == localUserKey
+        || (payloadSenderKey.isNotEmpty() && payloadSenderKey != senderKey))
+        return false;
+
+    const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    const juce::String canonicalSenderKey = canonicalDelayUserKey(senderKey);
+    auto notePeerActivity = [this, &senderKey, &canonicalSenderKey, nowMs](auto& state)
+    {
+        state[senderKey] = nowMs;
+        if (canonicalSenderKey.isNotEmpty())
+            state[canonicalSenderKey] = nowMs;
+    };
+
+    if (signalType == "intervalSyncTag")
+    {
+        if (payloadObject->getProperty("type").toString() != "intervalSyncTag"
+            || payloadObject->getProperty("eventId").toString().trim().isEmpty())
+            return false;
+
+        {
+            const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+            notePeerActivity(lastVdoPeerSyncReceivedMsByUser);
+        }
+
+        processSyncSignal(sender, "intervalSyncTag", juce::JSON::toString(payloadValue, false), "VDO");
+        intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
+        lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
+        return true;
+    }
+
+    if (signalType == "intervalSyncAck")
+    {
+        const juce::String ackEventId = payloadObject->getProperty("ackEventId").toString().trim();
+        const juce::String targetUserKey = normaliseOpusPeerId(
+            payloadObject->getProperty("targetUserId").toString());
+        if (payloadObject->getProperty("type").toString() != "intervalSyncAck"
+            || ackEventId.isEmpty()
+            || targetUserKey.isEmpty()
+            || targetUserKey != localUserKey)
+            return false;
+
+        {
+            const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+            if (std::find(recentIntervalSyncTagEventIds.begin(), recentIntervalSyncTagEventIds.end(), ackEventId)
+                == recentIntervalSyncTagEventIds.end())
+                return false;
+            notePeerActivity(lastVdoPeerSyncAckMsByUser);
+        }
+        processSyncSignal(sender, "intervalSyncAck", juce::JSON::toString(payloadValue, false), "VDO");
+        intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
+        lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
+        return true;
+    }
+
+    return false;
+}
+
 void NinjamVst3AudioProcessor::captureCompletedAudioIntervalGuidFromAudioThread(NJClient* inst)
 {
     unsigned char guid[16] {};
@@ -7326,8 +7459,29 @@ void NinjamVst3AudioProcessor::broadcastIntervalSyncTag(const juce::String& targ
     };
 
     const juce::String payload = buildPayload(boundaryToSendOffsetMs);
+    const auto payloadValue = juce::JSON::parse(payload);
+    const auto* payloadObject = payloadValue.getDynamicObject();
+    const juce::String eventId = payloadObject != nullptr
+        ? payloadObject->getProperty("eventId").toString().trim() : juce::String();
     const bool vdoSyncOn = vdoVideoSyncEnabled.load(std::memory_order_relaxed)
                          && !ninjamZapVideoEnabled.load(std::memory_order_relaxed);
+    if (vdoSyncOn && videoHelperRunning.load(std::memory_order_relaxed))
+    {
+        {
+            const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+            lastBroadcastSyncTagPayload = payload;
+            lastBroadcastSyncTagMarkerBeat = beatIndex;
+            lastBroadcastSyncTagWallClockMs = (double)juce::Time::currentTimeMillis();
+            if (eventId.isNotEmpty())
+            {
+                recentIntervalSyncTagEventIds.push_back(eventId);
+                while (recentIntervalSyncTagEventIds.size() > 32)
+                    recentIntervalSyncTagEventIds.pop_front();
+            }
+        }
+        intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
+        lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
+    }
     if (mobileHotspotModeEnabled.load(std::memory_order_relaxed) && vdoSyncOn)
         sendSideSignal(safeTarget, "intervalSyncTag", payload);
     sendIntervalSignal("intervalSyncTag", payload, safeTarget);
@@ -7655,7 +7809,7 @@ void NinjamVst3AudioProcessor::setVoiceChatMode(bool enabled)
     {
         requestVideoBufferRefreshForMeasuredUsers();
         intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
-        lastIntervalHelperPayloadWriteMs = 0.0;
+        lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
     }
 }
 
@@ -7717,9 +7871,13 @@ void NinjamVst3AudioProcessor::resetIntervalSyncTimingCache()
     lastLatencyTimingBpi = -1;
     lastLatencyTimingLength = -1;
     lastLatencyTimingBpm = -1.0;
-    lastIntervalHelperPayloadWriteMs = 0.0;
+    lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
 
     const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+    lastBroadcastSyncTagPayload.clear();
+    recentIntervalSyncTagEventIds.clear();
+    lastBroadcastSyncTagMarkerBeat = -1;
+    lastBroadcastSyncTagWallClockMs = 0.0;
     remoteIntervalSyncSessionIdByUser.clear();
     retiredRemoteIntervalSyncSessionIdsByUser.clear();
     lastAnnouncedRemoteIntervalByUser.clear();
@@ -7737,6 +7895,12 @@ void NinjamVst3AudioProcessor::resetIntervalSyncTimingCache()
     remoteServerRouteLatencyMsByUser.clear();
     lastRemoteIntervalSignalSeenMsByUser.clear();
     lastRemoteRouteProbeSeenMsByUser.clear();
+    lastVdoPeerSyncReceivedMsByUser.clear();
+    lastVdoPeerSyncAckMsByUser.clear();
+    lastSyncMessageReceivedMsByUser.clear();
+    lastSyncMessageAckMsByUser.clear();
+    lastIntervalSyncRouteByUser.clear();
+    recentIntervalSyncAckEventIds.clear();
     recentVideoTimingChangeEventIds.clear();
 }
 
@@ -7745,6 +7909,10 @@ void NinjamVst3AudioProcessor::invalidateIntervalSyncLatencyState(bool keepRemot
     lastBroadcastIntervalTag.store(-1);
     lastProcessedIntervalMarkerKey.store(-1);
     const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+    lastBroadcastSyncTagPayload.clear();
+    recentIntervalSyncTagEventIds.clear();
+    lastBroadcastSyncTagMarkerBeat = -1;
+    lastBroadcastSyncTagWallClockMs = 0.0;
     lastAnnouncedRemoteIntervalByUser.clear();
     localIntervalStartMsByInterval.clear();
     pendingRemoteIntervalStartsByUser.clear();
@@ -7762,6 +7930,12 @@ void NinjamVst3AudioProcessor::invalidateIntervalSyncLatencyState(bool keepRemot
         remoteServerRouteLatencyMsByUser.clear();
         lastRemoteIntervalSignalSeenMsByUser.clear();
         lastRemoteRouteProbeSeenMsByUser.clear();
+        lastVdoPeerSyncReceivedMsByUser.clear();
+        lastVdoPeerSyncAckMsByUser.clear();
+        lastSyncMessageReceivedMsByUser.clear();
+        lastSyncMessageAckMsByUser.clear();
+        lastIntervalSyncRouteByUser.clear();
+        recentIntervalSyncAckEventIds.clear();
     }
 }
 
@@ -7825,6 +7999,21 @@ void NinjamVst3AudioProcessor::requestVideoBufferRefreshForMeasuredUsers()
                     continue;
 
                 remoteVideoBufferRefreshIdByUser[userDelay.first] = { refreshId, refreshCreatedAtMs };
+
+                // A helper reload or restart has no memory of which marker keys it
+                // already forwarded. Clear our record for this peer so the next
+                // incoming marker is accepted and re-measured rather than rejected
+                // as a stale duplicate.
+                lastAnnouncedRemoteIntervalByUser.erase(userDelay.first);
+                remoteLatencyLastAppliedIntervalByUser.erase(userDelay.first);
+                remoteLatencyAverageByUser.erase(userDelay.first);
+                for (auto it = pendingRemoteIntervalStartsByUser.begin(); it != pendingRemoteIntervalStartsByUser.end();)
+                {
+                    if (it->second.senderKey == userDelay.first)
+                        it = pendingRemoteIntervalStartsByUser.erase(it);
+                    else
+                        ++it;
+                }
                 refreshed = true;
             }
         }
@@ -7833,7 +8022,7 @@ void NinjamVst3AudioProcessor::requestVideoBufferRefreshForMeasuredUsers()
     if (refreshed)
     {
         intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
-        lastIntervalHelperPayloadWriteMs = 0.0;
+        lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
     }
 }
 
@@ -7946,6 +8135,22 @@ void NinjamVst3AudioProcessor::pruneDisconnectedRemoteSyncState()
             ++it;
     }
 
+    auto prunePeerTimestampMap = [&isActiveUserKey](auto& state)
+    {
+        for (auto it = state.begin(); it != state.end();)
+        {
+            if (!isActiveUserKey(it->first))
+                it = state.erase(it);
+            else
+                ++it;
+        }
+    };
+    prunePeerTimestampMap(lastVdoPeerSyncReceivedMsByUser);
+    prunePeerTimestampMap(lastVdoPeerSyncAckMsByUser);
+    prunePeerTimestampMap(lastSyncMessageReceivedMsByUser);
+    prunePeerTimestampMap(lastSyncMessageAckMsByUser);
+    prunePeerTimestampMap(lastIntervalSyncRouteByUser);
+
     for (auto it = remoteLatencyLastAppliedIntervalByUser.begin(); it != remoteLatencyLastAppliedIntervalByUser.end();)
     {
         if (!isActiveUserKey(it->first))
@@ -8048,7 +8253,7 @@ bool NinjamVst3AudioProcessor::ensureAdvancedVideoClientStarted()
     {
         videoHelperRunning.store(true);
         requestVideoBufferRefreshForMeasuredUsers();
-        lastIntervalHelperPayloadWriteMs = 0.0;
+        lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
         return true;
     }
 
@@ -8091,6 +8296,10 @@ bool NinjamVst3AudioProcessor::ensureAdvancedVideoClientStarted()
                    int height)
             {
                 return handleBrowserNinjamZapCameraFrame(encodedFrame, codecName, configBase64, keyFrame, browserAgeMs, encodeMs, width, height);
+            },
+            [this](const juce::String& messageJson)
+            {
+                return handleVdoPeerSyncMessage(messageJson);
             });
     }
 
@@ -8111,7 +8320,7 @@ bool NinjamVst3AudioProcessor::ensureAdvancedVideoClientStarted()
         {
             videoHelperRunning.store(true);
             requestVideoBufferRefreshForMeasuredUsers();
-            lastIntervalHelperPayloadWriteMs = 0.0;
+            lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
             return true;
         }
     }
@@ -8121,7 +8330,7 @@ bool NinjamVst3AudioProcessor::ensureAdvancedVideoClientStarted()
     advancedVideoServer.reset();
     advancedVideoHelperPort.store(0);
     videoHelperRunning.store(false);
-    lastIntervalHelperPayloadWriteMs = 0.0;
+    lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
     return false;
 }
 
@@ -8167,7 +8376,7 @@ juce::String NinjamVst3AudioProcessor::getIntervalSyncSessionIdForIntegrationTes
 
 void NinjamVst3AudioProcessor::injectIntervalSyncTagForIntegrationTest(const juce::String& sender, const juce::String& payload)
 {
-    processSyncSignal(sender, "intervalSyncTag", payload);
+    processSyncSignal(sender, "intervalSyncTag", payload, "NINJAM");
 }
 
 void NinjamVst3AudioProcessor::requestVideoBufferRefreshForIntegrationTest()
@@ -9641,7 +9850,7 @@ void NinjamVst3AudioProcessor::publishBrowserDecodedZapVideoFrame(const ZapVideo
                     infoIt->second.lastUpdateMs = nowMs;
                 }
 
-                lastIntervalHelperPayloadWriteMs = 0.0;
+                lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
                 if (configOnlyChunk)
                     return;
             }
@@ -9763,7 +9972,7 @@ void NinjamVst3AudioProcessor::publishBrowserDecodedZapVideoFrame(const ZapVideo
         remoteVideoFrameInfoByUser[job.streamKey] = info;
     }
 
-    lastIntervalHelperPayloadWriteMs = 0.0;
+    lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
 }
 
 void NinjamVst3AudioProcessor::publishDecodedZapVideoFrame(const ZapVideoDecodeJob& job,
@@ -9903,7 +10112,7 @@ void NinjamVst3AudioProcessor::publishDecodedZapVideoFrame(const ZapVideoDecodeJ
         remoteVideoFrameInfoByUser[job.streamKey] = info;
     }
 
-    lastIntervalHelperPayloadWriteMs = 0.0;
+    lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
 }
 
 void NinjamVst3AudioProcessor::processPendingNinjamZapVideoPlaybackSwap()
@@ -10118,7 +10327,7 @@ void NinjamVst3AudioProcessor::processPendingNinjamZapVideoPlaybackSwap()
     ninjamZapVideoPlaybackWorkPending.store(!zapVideoDecodedIntervalsByStream.empty()
                                             || !zapVideoDeferredPlaybackByStream.empty(),
                                             std::memory_order_release);
-    lastIntervalHelperPayloadWriteMs = 0.0;
+    lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
 }
 
 void NinjamVst3AudioProcessor::publishLocalNinjamZapCameraFrame(const juce::Image& frame,
@@ -10358,7 +10567,7 @@ bool NinjamVst3AudioProcessor::stopVdoVideoSync()
     const bool wasEnabled = vdoVideoSyncEnabled.exchange(false, std::memory_order_relaxed);
     vdoCarrierChannelConfigured.store(false, std::memory_order_release);
     intervalHelperPayloadForceWrite.store(false, std::memory_order_release);
-    lastIntervalHelperPayloadWriteMs = 0.0;
+    lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
     {
         const juce::ScopedLock lock(intervalHelperPayloadLock);
         intervalHelperPayload = "[]";
@@ -10378,7 +10587,7 @@ void NinjamVst3AudioProcessor::stopAdvancedVideoClient()
 {
     stopVdoVideoSync();
     videoHelperRunning.store(false);
-    lastIntervalHelperPayloadWriteMs = 0.0;
+    lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
     stopZapVideoDecodeWorker();
     {
         const juce::ScopedLock lock(intervalSyncAnnouncementLock);
@@ -10602,7 +10811,7 @@ void NinjamVst3AudioProcessor::launchVideoSession(const juce::String& requestedR
 
     const bool wasVdoSyncEnabled = vdoVideoSyncEnabled.exchange(true, std::memory_order_relaxed);
     intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
-    lastIntervalHelperPayloadWriteMs = 0.0;
+    lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
     if (!wasVdoSyncEnabled)
         resetIntervalSyncTimingCache();
     else
@@ -10812,6 +11021,7 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
     const double beatLength = (double)safeLength / (double)bpi;
     const double globalBeat = beatLength > 0.0 ? std::floor(globalUnit / beatLength) : 0.0;
     const juce::String syncTag = buildIntervalSyncTag(displayInterval, safeLength);
+    const double vdoPeerSyncFreshMs = juce::jmax(15000.0, (60000.0 / bpm) * (double)bpi * 2.5);
 
     juce::Array<juce::var> entries;
     juce::Array<juce::var> activeRoster;
@@ -10831,6 +11041,32 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
         infoObj->setProperty("bufferMode", "remote");
         infoObj->setProperty("voiceChatMode", false);
         entries.add(juce::var(infoObj.get()));
+    }
+
+    {
+        juce::String peerSyncPayload;
+        int markerBeat = -1;
+        double queuedWallClockMs = 0.0;
+        {
+            const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+            peerSyncPayload = lastBroadcastSyncTagPayload;
+            markerBeat = lastBroadcastSyncTagMarkerBeat;
+            queuedWallClockMs = lastBroadcastSyncTagWallClockMs;
+        }
+
+        const double queuedAgeMs = queuedWallClockMs > 0.0 ? wallClockMs - queuedWallClockMs : -1.0;
+        const juce::var peerSyncValue = juce::JSON::parse(peerSyncPayload);
+        if (peerSyncValue.getDynamicObject() != nullptr
+            && queuedAgeMs >= 0.0 && queuedAgeMs <= 4000.0)
+        {
+            juce::DynamicObject::Ptr peerSyncObj = new juce::DynamicObject();
+            peerSyncObj->setProperty("type", "vdoPeerSyncTag");
+            peerSyncObj->setProperty("signalType", "intervalSyncTag");
+            peerSyncObj->setProperty("payload", peerSyncValue);
+            peerSyncObj->setProperty("markerBeatIndex", markerBeat);
+            peerSyncObj->setProperty("queuedAtWallClockMs", queuedWallClockMs);
+            entries.add(juce::var(peerSyncObj.get()));
+        }
     }
 
     const int numUsers = ninjamClient.GetNumUsers();
@@ -10862,8 +11098,17 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
         int averageIntervalMeasurementMs = -1;
         int firmIntervalMeasurementMs = -1;
         bool intervalMeasurementSeen = false;
+        bool vdoPeerSyncReceived = false;
+        bool vdoPeerSyncAcked = false;
+        bool syncMessageReceived = false;
+        bool syncMessageAcked = false;
+        juce::String syncRoute;
         double lastIntervalSignalAgeMs = -1.0;
         double serverRouteAgeMs = -1.0;
+        double vdoPeerSyncReceivedAgeMs = -1.0;
+        double vdoPeerSyncAckAgeMs = -1.0;
+        double syncMessageReceivedAgeMs = -1.0;
+        double syncMessageAckAgeMs = -1.0;
         juce::uint64 bufferRefreshId = 0;
         int lastSentBufferMs = -1;
         int publishedBufferMs = -1;
@@ -10914,6 +11159,39 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
                 if (canonicalRouteSeenIt != lastRemoteRouteProbeSeenMsByUser.end())
                     serverRouteAgeMs = juce::jmax(0.0, nowMs - canonicalRouteSeenIt->second);
             }
+            auto findPeerSyncAge = [nowMs](const auto& state, const juce::String& key) -> double
+            {
+                auto it = state.find(key);
+                return it != state.end() ? juce::jmax(0.0, nowMs - it->second) : -1.0;
+            };
+            vdoPeerSyncReceivedAgeMs = findPeerSyncAge(lastVdoPeerSyncReceivedMsByUser, senderKey);
+            vdoPeerSyncAckAgeMs = findPeerSyncAge(lastVdoPeerSyncAckMsByUser, senderKey);
+            syncMessageReceivedAgeMs = findPeerSyncAge(lastSyncMessageReceivedMsByUser, senderKey);
+            syncMessageAckAgeMs = findPeerSyncAge(lastSyncMessageAckMsByUser, senderKey);
+            if (canonicalUserKey.isNotEmpty())
+            {
+                if (vdoPeerSyncReceivedAgeMs < 0.0)
+                    vdoPeerSyncReceivedAgeMs = findPeerSyncAge(lastVdoPeerSyncReceivedMsByUser, canonicalUserKey);
+                if (vdoPeerSyncAckAgeMs < 0.0)
+                    vdoPeerSyncAckAgeMs = findPeerSyncAge(lastVdoPeerSyncAckMsByUser, canonicalUserKey);
+                if (syncMessageReceivedAgeMs < 0.0)
+                    syncMessageReceivedAgeMs = findPeerSyncAge(lastSyncMessageReceivedMsByUser, canonicalUserKey);
+                if (syncMessageAckAgeMs < 0.0)
+                    syncMessageAckAgeMs = findPeerSyncAge(lastSyncMessageAckMsByUser, canonicalUserKey);
+            }
+            vdoPeerSyncReceived = vdoPeerSyncReceivedAgeMs >= 0.0
+                && vdoPeerSyncReceivedAgeMs <= vdoPeerSyncFreshMs;
+            vdoPeerSyncAcked = vdoPeerSyncAckAgeMs >= 0.0
+                && vdoPeerSyncAckAgeMs <= vdoPeerSyncFreshMs;
+            syncMessageReceived = syncMessageReceivedAgeMs >= 0.0
+                && syncMessageReceivedAgeMs <= vdoPeerSyncFreshMs;
+            syncMessageAcked = syncMessageAckAgeMs >= 0.0
+                && syncMessageAckAgeMs <= vdoPeerSyncFreshMs;
+            auto syncRouteIt = lastIntervalSyncRouteByUser.find(senderKey);
+            if (syncRouteIt == lastIntervalSyncRouteByUser.end() && canonicalUserKey.isNotEmpty())
+                syncRouteIt = lastIntervalSyncRouteByUser.find(canonicalUserKey);
+            if (syncRouteIt != lastIntervalSyncRouteByUser.end())
+                syncRoute = syncRouteIt->second;
             auto considerRefresh = [this, nowMs, &bufferRefreshId](const juce::String& key)
             {
                 auto refreshIt = remoteVideoBufferRefreshIdByUser.find(key);
@@ -11082,10 +11360,24 @@ void NinjamVst3AudioProcessor::writeIntervalHelperJson(int pos, int length)
         userObj->setProperty("bufferCalculated", bufferMs >= 0);
         userObj->setProperty("sideSignalMode", ninjamSideSignalServerSupported.load(std::memory_order_relaxed));
         userObj->setProperty("serverRouteLatencyReady", serverRouteLatencyMs >= 0);
+        userObj->setProperty("vdoPeerSyncReceived", vdoPeerSyncReceived);
+        userObj->setProperty("vdoPeerSyncAcked", vdoPeerSyncAcked);
+        userObj->setProperty("syncMessageReceived", syncMessageReceived);
+        userObj->setProperty("syncMessageAcked", syncMessageAcked);
+        if (syncRoute.isNotEmpty())
+            userObj->setProperty("syncRoute", syncRoute);
         if (lastIntervalSignalAgeMs >= 0.0)
             userObj->setProperty("intervalSignalAgeMs", lastIntervalSignalAgeMs);
         if (serverRouteAgeMs >= 0.0)
             userObj->setProperty("serverRouteAgeMs", serverRouteAgeMs);
+        if (vdoPeerSyncReceivedAgeMs >= 0.0)
+            userObj->setProperty("vdoPeerSyncReceivedAgeMs", vdoPeerSyncReceivedAgeMs);
+        if (vdoPeerSyncAckAgeMs >= 0.0)
+            userObj->setProperty("vdoPeerSyncAckAgeMs", vdoPeerSyncAckAgeMs);
+        if (syncMessageReceivedAgeMs >= 0.0)
+            userObj->setProperty("syncMessageReceivedAgeMs", syncMessageReceivedAgeMs);
+        if (syncMessageAckAgeMs >= 0.0)
+            userObj->setProperty("syncMessageAckAgeMs", syncMessageAckAgeMs);
         if (publishedBufferMs >= 0)
         {
             userObj->setProperty("bufferTotalMs", (double)publishedBufferMs);
@@ -11636,12 +11928,30 @@ std::vector<NinjamVst3AudioProcessor::UserInfo> NinjamVst3AudioProcessor::getCon
             {
                 vdoRosterRevision.fetch_add(1, std::memory_order_relaxed);
                 intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
-                lastIntervalHelperPayloadWriteMs = 0.0;
+                lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
                 {
                     const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+                    // Clear all sync state for this user so that if they rejoin
+                    // (or reconnect to the NINJAM server), they get a fresh
+                    // sync measurement with a flush, rather than reusing stale
+                    // averages and skipping the first-apply flush.
                     remoteLatencyFirmDelayMsByUser.erase(removedUserKey);
+                    remoteLatencyLastAppliedIntervalByUser.erase(removedUserKey);
+                    remoteLatencyAverageByUser.erase(removedUserKey);
                     remoteVideoBufferRefreshIdByUser.erase(removedUserKey);
                     lastSentBufferMsByUser.erase(removedUserKey);
+                    lastVdoPeerSyncReceivedMsByUser.erase(removedUserKey);
+                    lastVdoPeerSyncAckMsByUser.erase(removedUserKey);
+                    lastAnnouncedRemoteIntervalByUser.erase(removedUserKey);
+                    lastRemoteServerLatencyMsByUser.erase(removedUserKey);
+                    lastRemoteIntervalSignalSeenMsByUser.erase(removedUserKey);
+                    for (auto it = pendingRemoteIntervalStartsByUser.begin(); it != pendingRemoteIntervalStartsByUser.end();)
+                    {
+                        if (it->second.senderKey == removedUserKey)
+                            it = pendingRemoteIntervalStartsByUser.erase(it);
+                        else
+                            ++it;
+                    }
                 }
             }
         }
@@ -11746,6 +12056,11 @@ void NinjamVst3AudioProcessor::resetRemoteUserIndexState(int userIndex, const ju
         eraseForUser(remoteServerRouteLatencyMsByUser);
         eraseForUser(lastRemoteIntervalSignalSeenMsByUser);
         eraseForUser(lastRemoteRouteProbeSeenMsByUser);
+        eraseForUser(lastVdoPeerSyncReceivedMsByUser);
+        eraseForUser(lastVdoPeerSyncAckMsByUser);
+        eraseForUser(lastSyncMessageReceivedMsByUser);
+        eraseForUser(lastSyncMessageAckMsByUser);
+        eraseForUser(lastIntervalSyncRouteByUser);
         eraseForUser(remoteLatencyLastAppliedIntervalByUser);
         eraseForUser(remoteLatencyAverageByUser);
         eraseForUser(remoteLatencyFirmDelayMsByUser);
@@ -13226,6 +13541,7 @@ void NinjamVst3AudioProcessor::sendIntervalSignal(const juce::String& type, cons
     if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK) return;
 
     const bool isVdoSyncSignal = type == "intervalSyncTag"
+                              || type == "intervalSyncAck"
                               || type == "intervalTransportProbe"
                               || type == "intervalTransportProbeAck"
                               || type == "videoTimingChange";
@@ -17839,9 +18155,11 @@ int NinjamVst3AudioProcessor::LicenseAgreementCallback(void* userData, const cha
     return 0;
 }
 
-void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, const juce::String& type, const juce::String& payload)
+void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, const juce::String& type,
+                                                  const juce::String& payload, const juce::String& syncRoute)
 {
     const bool isVdoSyncSignal = type == "intervalSyncTag"
+                              || type == "intervalSyncAck"
                               || type == "intervalTransportProbe"
                               || type == "intervalTransportProbeAck"
                               || type == "videoTimingChange";
@@ -17849,6 +18167,48 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
         && (!vdoVideoSyncEnabled.load(std::memory_order_relaxed)
             || ninjamZapVideoEnabled.load(std::memory_order_relaxed)))
         return;
+
+    if (type == "intervalSyncAck")
+    {
+        const juce::var parsed = juce::JSON::parse(payload);
+        auto* obj = parsed.getDynamicObject();
+        if (obj == nullptr)
+            return;
+
+        const juce::String payloadUserId = obj->getProperty("userId").toString().trim();
+        const juce::String targetUserId = obj->getProperty("targetUserId").toString().trim();
+        const juce::String ackEventId = obj->getProperty("ackEventId").toString().trim();
+        const juce::String senderKey = normaliseOpusPeerId(sender);
+        const juce::String payloadSenderKey = normaliseOpusPeerId(payloadUserId);
+        const juce::String targetUserKey = normaliseOpusPeerId(targetUserId);
+        const juce::String localUserKey = normaliseOpusPeerId(currentUser);
+        if (senderKey.isEmpty() || payloadSenderKey != senderKey
+            || targetUserKey != localUserKey || ackEventId.isEmpty())
+            return;
+
+        const double nowMs = juce::Time::getMillisecondCounterHiRes();
+        const juce::String canonicalSenderKey = canonicalDelayUserKey(senderKey);
+        const juce::String ackKey = senderKey + ":" + ackEventId;
+        {
+            const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+            if (std::find(recentIntervalSyncTagEventIds.begin(), recentIntervalSyncTagEventIds.end(), ackEventId)
+                    == recentIntervalSyncTagEventIds.end()
+                || std::find(recentIntervalSyncAckEventIds.begin(), recentIntervalSyncAckEventIds.end(), ackKey)
+                    != recentIntervalSyncAckEventIds.end())
+                return;
+            recentIntervalSyncAckEventIds.push_back(ackKey);
+            while (recentIntervalSyncAckEventIds.size() > 128)
+                recentIntervalSyncAckEventIds.pop_front();
+            lastSyncMessageAckMsByUser[senderKey] = nowMs;
+            if (canonicalSenderKey.isNotEmpty())
+                lastSyncMessageAckMsByUser[canonicalSenderKey] = nowMs;
+        }
+        intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
+        lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
+        addSystemChatLine(sender + " confirmed our Sync Message via "
+                          + (syncRoute.isNotEmpty() ? syncRoute : "NINJAM") + ".");
+        return;
+    }
 
     if (type == "chatAttachment")
     {
@@ -18213,7 +18573,7 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
             remoteVideoBufferRefreshIdByUser[senderKey] = { refreshId, refreshCreatedAtMs };
             if (canonicalSenderKey.isNotEmpty())
                 remoteVideoBufferRefreshIdByUser[canonicalSenderKey] = { refreshId, refreshCreatedAtMs };
-            lastIntervalHelperPayloadWriteMs = 0.0;
+            lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
         }
 
         return;
@@ -18224,12 +18584,14 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
         juce::String payloadUserId;
         juce::String remoteSyncSessionId;
         juce::String remoteAudioGuidHex;
+        juce::String syncEventId;
         int remoteInterval = -1;
         int remoteIntervalAbsolute = -1;
         int remoteServerLatencyMs = -1;
         int remoteBpi = 0;
         int remoteBeat = -1;
         double sendOffsetMs = 0.0;
+        double vdoPeerReceivedWallClockMs = 0.0;
         const juce::var parsed = juce::JSON::parse(payload);
         if (auto* obj = parsed.getDynamicObject())
         {
@@ -18241,6 +18603,8 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                 remoteSyncSessionId = obj->getProperty("syncSessionId").toString().trim();
             if (obj->hasProperty("audioGuid"))
                 remoteAudioGuidHex = normaliseAudioGuidHex(obj->getProperty("audioGuid").toString());
+            if (obj->hasProperty("eventId"))
+                syncEventId = obj->getProperty("eventId").toString().trim();
             if (obj->hasProperty("intervalIndex"))
                 remoteInterval = (int)obj->getProperty("intervalIndex");
             if (obj->hasProperty("intervalAbsolute"))
@@ -18253,8 +18617,18 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                 remoteBeat = (int)obj->getProperty("beatIndex");
             if (obj->hasProperty("sendOffsetMs"))
                 sendOffsetMs = (double)obj->getProperty("sendOffsetMs");
+            if (obj->hasProperty("vdoPeerReceivedWallClockMs"))
+                vdoPeerReceivedWallClockMs = (double)obj->getProperty("vdoPeerReceivedWallClockMs");
         }
-        sendOffsetMs = std::isfinite(sendOffsetMs) ? juce::jlimit(0.0, 3000.0, sendOffsetMs) : 0.0;
+        sendOffsetMs = std::isfinite(sendOffsetMs) ? juce::jlimit(0.0, 4000.0, sendOffsetMs) : 0.0;
+        double receiveForwardOffsetMs = 0.0;
+        if (std::isfinite(vdoPeerReceivedWallClockMs) && vdoPeerReceivedWallClockMs > 0.0)
+        {
+            const double wallClockDeltaMs = (double)juce::Time::currentTimeMillis() - vdoPeerReceivedWallClockMs;
+            if (std::isfinite(wallClockDeltaMs) && wallClockDeltaMs >= 0.0 && wallClockDeltaMs <= 3000.0)
+                receiveForwardOffsetMs = wallClockDeltaMs;
+        }
+        const double totalRelayOffsetMs = juce::jlimit(0.0, 6000.0, sendOffsetMs + receiveForwardOffsetMs);
         const int localInterval = getIntervalIndex();
         juce::String status = "Interval Tag " + sender;
         if (remoteInterval >= 0)
@@ -18282,15 +18656,22 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                 integrationReceivedRemoteSyncMarkers.fetch_add(1, std::memory_order_relaxed);
 #endif
                 const double signalSeenMs = juce::Time::getMillisecondCounterHiRes();
-                // If this is a redundant retransmission (sendOffsetMs > 0),
-                // adjust the received time back by the offset so the buffer
-                // calculation is based on when the original was sent, not
-                // when this duplicate arrived.
-                double effectiveSignalSeenMs = signalSeenMs - sendOffsetMs;
+                // Adjust back to the actual browser data-channel arrival. This
+                // removes both sender helper polling time (included in sendOffsetMs)
+                // and receiver helper-to-native forwarding time.
+                double effectiveSignalSeenMs = signalSeenMs - totalRelayOffsetMs;
 #if NINJAMPLUS_ENABLE_INTEGRATION_TESTS
                 const int integrationArrivalOffsetMs = integrationIntervalSyncTagArrivalOffsetMs.load(std::memory_order_relaxed);
                 effectiveSignalSeenMs += (double)integrationArrivalOffsetMs;
 #endif
+
+                njplus_debug_log("SYNCRX route=%s sender=%s rInt=%d rBeat=%d sendOffset=%.1f forward=%.1f totalRelay=%.1f "
+                                 "rxWall=%.1f currentWall=%.1f signalSeen=%.1f effective=%.1f",
+                                 syncRoute.isNotEmpty() ? syncRoute.toRawUTF8() : "NINJAM",
+                                 sender.toRawUTF8(), remoteInterval, remoteBeat,
+                                 sendOffsetMs, receiveForwardOffsetMs, totalRelayOffsetMs,
+                                 vdoPeerReceivedWallClockMs, (double)juce::Time::currentTimeMillis(),
+                                 signalSeenMs, effectiveSignalSeenMs);
                 noteRemoteVideoRoomActivity(effectiveSignalSeenMs);
                 {
                     const juce::ScopedLock lock(intervalSyncAnnouncementLock);
@@ -18309,11 +18690,18 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                 const juce::String displaySender = sender.isNotEmpty() ? sender : (payloadUserId.isNotEmpty() ? payloadUserId : senderKey);
                 const double sampleRate = juce::jmax(1.0, getSampleRate());
                 long long receivedSampleCount = intervalSyncSampleCounter.load(std::memory_order_relaxed)
-                    - (long long)std::llround(sendOffsetMs * sampleRate / 1000.0);
+                    - (long long)std::llround(totalRelayOffsetMs * sampleRate / 1000.0);
 #if NINJAMPLUS_ENABLE_INTEGRATION_TESTS
                 receivedSampleCount += (long long)std::llround((double)integrationArrivalOffsetMs
                                                               * sampleRate / 1000.0);
 #endif
+
+                const long long localSampleNow = intervalSyncSampleCounter.load(std::memory_order_relaxed);
+                njplus_debug_log("SYNCRX2 sender=%s rInt=%d rKey=%lld currentSample=%lld receivedSample=%lld offsetSamples=%lld",
+                                 sender.toRawUTF8(), remoteInterval, remoteMarkerKey,
+                                 localSampleNow, receivedSampleCount,
+                                 (long long)std::llround(totalRelayOffsetMs * sampleRate / 1000.0));
+
                 bool retiredSession = false;
 
                 {
@@ -18354,6 +18742,9 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                                 erasePeerState(remoteAudioPlaybackBoundariesByUser);
                                 erasePeerState(remoteVideoBufferRefreshIdByUser);
                                 erasePeerState(lastSentBufferMsByUser);
+                                erasePeerState(lastSyncMessageReceivedMsByUser);
+                                erasePeerState(lastSyncMessageAckMsByUser);
+                                erasePeerState(lastIntervalSyncRouteByUser);
                                 for (auto pendingIt = pendingRemoteIntervalStartsByUser.begin(); pendingIt != pendingRemoteIntervalStartsByUser.end();)
                                 {
                                     if (pendingIt->second.senderKey == senderKey
@@ -18383,6 +18774,15 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                     {
                         shouldStorePending = true;
                         lastAnnouncedRemoteIntervalByUser[senderKey] = remoteMarkerKey;
+                        if (syncRoute.isNotEmpty())
+                        {
+                            lastIntervalSyncRouteByUser[senderKey] = syncRoute;
+                            if (canonicalSenderKey.isNotEmpty())
+                                lastIntervalSyncRouteByUser[canonicalSenderKey] = syncRoute;
+                        }
+                        lastSyncMessageReceivedMsByUser[senderKey] = signalSeenMs;
+                        if (canonicalSenderKey.isNotEmpty())
+                            lastSyncMessageReceivedMsByUser[canonicalSenderKey] = signalSeenMs;
                     }
                 }
 
@@ -18417,6 +18817,25 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                     pending.audioGuidHex = remoteAudioGuidHex;
                     pending.receivedSampleCount = receivedSampleCount;
                     pending.receivedAtMs = effectiveSignalSeenMs;
+                }
+                if (shouldStorePending)
+                {
+                    const juce::String routeLabel = syncRoute.isNotEmpty() ? syncRoute : "NINJAM";
+                    addSystemChatLine("Received Sync Message from " + displaySender + " via " + routeLabel + ".");
+                    if (routeLabel != "VDO" && syncEventId.isNotEmpty())
+                    {
+                        juce::DynamicObject::Ptr ackObj = new juce::DynamicObject();
+                        ackObj->setProperty("type", "intervalSyncAck");
+                        ackObj->setProperty("userId", localUserKey.isNotEmpty() ? localUserKey : currentUser);
+                        ackObj->setProperty("targetUserId", senderKey);
+                        ackObj->setProperty("ackEventId", syncEventId);
+                        ackObj->setProperty("eventId", "intervalSyncAck:" + localUserKey + ":" + syncEventId);
+                        const juce::String ackPayload = juce::JSON::toString(juce::var(ackObj.get()), true);
+                        if (routeLabel == "SIDE")
+                            sendSideSignal(sender, "intervalSyncAck", ackPayload);
+                        else
+                            sendIntervalSignal("intervalSyncAck", ackPayload, sender);
+                    }
                 }
             }
         }
@@ -18565,7 +18984,7 @@ void NinjamVst3AudioProcessor::ChatMessage_Callback(void* userData, NJClient* in
         if (type == "opusSyncSupport")
             return processOpusSyncSupport(sender, payload, outEventId);
         juce::ignoreUnused(outEventId);
-        self->processSyncSignal(sender, type, payload);
+        self->processSyncSignal(sender, type, payload, "SIDE");
         return true;
     };
     // nparms is the static array size (always 5); count only non-null entries
@@ -20467,7 +20886,7 @@ void NinjamVst3AudioProcessor::processPendingMediaItems()
                 if (type == "mobileHotspotKeepalive")
                     continue;
                 if (type.isNotEmpty() && payload.isNotEmpty())
-                    processSyncSignal(sender, type, payload);
+                    processSyncSignal(sender, type, payload, "NINJAM");
             }
             continue;
         }
@@ -21706,20 +22125,49 @@ void NinjamVst3AudioProcessor::applyRemoteLatencyMeasurement(
 
     // A short rolling median rejects isolated and bursty side-signal jitter
     // without repeatedly rebasing the long-lived receiver buffer.
+    // The effectiveSignalSeenMs in the receive path already adjusts for
+    // the VDO helper relay delay, so do not add route latency again.
     const int correctedDelayMs = applyRemoteLatencyMeasurementLocked(senderKey, elapsedMs,
-                                                                      averageMs, firmAverageMs);
+                                                                     averageMs, firmAverageMs);
     long long priorAppliedMarker = std::numeric_limits<long long>::min();
     auto appliedIt = remoteLatencyLastAppliedIntervalByUser.find(senderKey);
     if (appliedIt != remoteLatencyLastAppliedIntervalByUser.end())
         priorAppliedMarker = appliedIt->second;
     const bool isFirstAppliedDelay = (appliedIt == remoteLatencyLastAppliedIntervalByUser.end());
-    bool shouldApply = isFirstAppliedDelay;
-    if (!shouldApply)
+    bool shouldApply = false;
+    if (isFirstAppliedDelay)
     {
+        // First buffer: wait until the rolling median has enough samples
+        // (firmAverageMs >= 0 means sampleCount >= 3) to produce a
+        // stable value, then flush + set.
+        shouldApply = (firmAverageMs >= 0);
+    }
+    else
+    {
+        // Subsequent applies: only flush + set when the firm average
+        // differs significantly from the current buffer AND we have
+        // enough confirming readings (sampleCount >= 8).
         const long long markerDelta = sourceMarkerKey - priorAppliedMarker;
-        const bool cadenceReached = markerDelta >= remoteLatencyUpdateCadenceIntervals;
         const bool markerSequenceReset = sourceMarkerKey + intervalSyncMarkerKeyBeatStride < priorAppliedMarker;
-        shouldApply = cadenceReached || markerSequenceReset;
+        if (markerSequenceReset)
+        {
+            shouldApply = true;
+        }
+        else if (markerDelta >= 1)
+        {
+            int currentBufferMs = -1;
+            auto bufIt = remoteLatencyFirmDelayMsByUser.find(senderKey);
+            if (bufIt != remoteLatencyFirmDelayMsByUser.end())
+                currentBufferMs = bufIt->second;
+            if (currentBufferMs >= 0)
+            {
+                const int deltaMs = std::abs(correctedDelayMs - currentBufferMs);
+                auto& avgState = remoteLatencyAverageByUser[senderKey];
+                const bool enoughReadings = avgState.sampleCount >= 8;
+                const bool significantChange = deltaMs > 200;
+                shouldApply = enoughReadings && significantChange;
+            }
+        }
     }
     if (!shouldApply)
         return;
@@ -21733,14 +22181,17 @@ void NinjamVst3AudioProcessor::applyRemoteLatencyMeasurement(
     remoteLatencyLastAppliedIntervalByUser[senderKey] = sourceMarkerKey;
     if (canonicalSenderKey.isNotEmpty())
         remoteLatencyLastAppliedIntervalByUser[canonicalSenderKey] = sourceMarkerKey;
-    if (isFirstAppliedDelay && vdoVideoSyncEnabled.load(std::memory_order_relaxed) && videoHelperRunning.load())
+    if (vdoVideoSyncEnabled.load(std::memory_order_relaxed) && videoHelperRunning.load())
     {
+        // We only reach here on first apply or when the firm average
+        // differs from the current buffer by > 200ms with 8+ readings.
+        // Always flush so the camera vanishes and re-buffers.
         const auto refreshId = ++videoBufferRefreshCounter;
         remoteVideoBufferRefreshIdByUser[senderKey] = { refreshId, measuredAtMs };
         if (canonicalSenderKey.isNotEmpty())
             remoteVideoBufferRefreshIdByUser[canonicalSenderKey] = { refreshId, measuredAtMs };
         intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
-        lastIntervalHelperPayloadWriteMs = 0.0;
+        lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
     }
 }
 
@@ -21941,7 +22392,34 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
                 const bool waitForAudioGuid = candidate.audioGuidHex.isNotEmpty()
                     && hasAudioGuidHistory
                     && pendingAgeMs < safeIntervalDurationMs * 1.5;
+                // Defer markers that arrived too close to this boundary. If the
+                // sync message arrived within the last 100ms of this boundary
+                // (or at exactly this boundary), the remote audio for that
+                // interval hasn't played yet — it plays at the NEXT boundary.
+                // Processing it now would give a near-zero elapsed time and an
+                // incorrect buffer of 0.
+                const bool hasReceiveTime = candidate.receivedAtMs > 0.0;
+                const bool tooRecent = hasReceiveTime && pendingAgeMs < 100.0;
+                // For users we haven't measured yet (first sync), require the
+                // marker to be at least half an interval old. When a client
+                // joins mid-interval, the existing client's sync message for
+                // that interval is already stale — it was sent at the start
+                // of an interval that's in progress. Using it would give a
+                // partial-interval elapsed time and a too-low buffer. Waiting
+                // for a marker that's at least half an interval old ensures
+                // we measure close to a full interval.
+                const bool hasPriorMeasurement = remoteLatencyLastAppliedIntervalByUser.find(candidateSenderKey)
+                        != remoteLatencyLastAppliedIntervalByUser.end()
+                    || (canonicalSenderKey.isNotEmpty()
+                        && remoteLatencyLastAppliedIntervalByUser.find(canonicalSenderKey)
+                            != remoteLatencyLastAppliedIntervalByUser.end());
+                const bool needsFullInterval = !hasPriorMeasurement;
+                const bool tooFreshForFirst = needsFullInterval
+                    && hasReceiveTime
+                    && pendingAgeMs < safeIntervalDurationMs * 0.5;
                 if (!waitForAudioGuid
+                    && !tooRecent
+                    && !tooFreshForFirst
                     && candidate.remoteBeat == safeLocalMarkerBeat
                     && candidate.receivedSampleCount <= localMarkerSampleCount)
                 {
@@ -21959,6 +22437,12 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
         }
         if (senderKey.isEmpty() || (pending.receivedSampleCount < 0 && pending.receivedAtMs <= 0.0))
             continue;
+
+        // Wall-clock is the primary timing source. The sample counter is only
+        // updated from the audio thread, so reading it from the timer thread
+        // introduces jitter equal to the audio block size. The high-resolution
+        // wall clock is monotonic and has sub-ms resolution on Windows via
+        // getMillisecondCounterHiRes(), which is sufficient for interval sync.
         double elapsedToNextLocalMarkerMs = -1.0;
         if (pending.receivedAtMs > 0.0 && localMarkerAtMs >= pending.receivedAtMs)
         {
@@ -21967,10 +22451,11 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
         else if (pending.receivedSampleCount >= 0)
         {
             const long long elapsedSamples = localMarkerSampleCount - pending.receivedSampleCount;
-            if (elapsedSamples < 0)
-                continue;
-            const double sampleRate = juce::jmax(1.0, getSampleRate());
-            elapsedToNextLocalMarkerMs = ((double)elapsedSamples / sampleRate) * 1000.0;
+            if (elapsedSamples >= 0)
+            {
+                const double sampleRate = juce::jmax(1.0, getSampleRate());
+                elapsedToNextLocalMarkerMs = ((double)elapsedSamples / sampleRate) * 1000.0;
+            }
         }
         const double outlierLimitMs = safeIntervalDurationMs * 2.0;
         if (!std::isfinite(elapsedToNextLocalMarkerMs) || elapsedToNextLocalMarkerMs < 0.0 || elapsedToNextLocalMarkerMs > outlierLimitMs)
@@ -21984,10 +22469,12 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
             const juce::ScopedLock lock(intervalSyncAnnouncementLock);
             // A short rolling median rejects isolated and bursty side-signal jitter
             // without repeatedly rebasing the long-lived receiver buffer.
+            // The effectiveSignalSeenMs in the receive path already adjusts for
+            // the VDO helper relay delay (sendOffsetMs + receiveForwardOffsetMs),
+            // so the measured elapsed time is already comparable to the NINJAM
+            // route. Do not add route latency again.
             correctedDelayMs = applyRemoteLatencyMeasurementLocked(senderKey, elapsedMs,
                                                                     averageMs, firmAverageMs);
-            // The measured elapsed time already includes the full end-to-end path
-            // (remote user → server → us), so do not add route latency again.
         }
         if (correctedDelayMs >= 0)
         {
@@ -22000,16 +22487,49 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
             if (appliedIt != remoteLatencyLastAppliedIntervalByUser.end())
                 priorAppliedMarker = appliedIt->second;
             const bool isFirstAppliedDelay = (appliedIt == remoteLatencyLastAppliedIntervalByUser.end());
-            bool shouldApply = isFirstAppliedDelay;
-            if (!shouldApply)
+            bool shouldApply = false;
+            if (isFirstAppliedDelay)
             {
+                // First buffer: wait until the rolling median has enough samples
+                // (firmAverageMs >= 0 means sampleCount >= 3) to produce a
+                // stable value, then flush + set.
+                shouldApply = (firmAverageMs >= 0);
+            }
+            else
+            {
+                // Subsequent applies: only flush + set when the firm average
+                // differs significantly from the current buffer AND we have
+                // enough confirming readings (sampleCount >= 8). This avoids
+                // repeatedly flushing the camera for small drift.
                 const long long markerDelta = sourceMarkerKey - priorAppliedMarker;
-                const bool cadenceReached = markerDelta >= remoteLatencyUpdateCadenceIntervals;
                 const bool markerSequenceReset = sourceMarkerKey + intervalSyncMarkerKeyBeatStride < priorAppliedMarker;
-                shouldApply = cadenceReached || markerSequenceReset;
+                if (markerSequenceReset)
+                {
+                    shouldApply = true;
+                }
+                else if (markerDelta >= 1)
+                {
+                    int currentBufferMs = -1;
+                    auto bufIt = remoteLatencyFirmDelayMsByUser.find(senderKey);
+                    if (bufIt != remoteLatencyFirmDelayMsByUser.end())
+                        currentBufferMs = bufIt->second;
+                    if (currentBufferMs >= 0)
+                    {
+                        const int deltaMs = std::abs(correctedDelayMs - currentBufferMs);
+                        auto& avgState = remoteLatencyAverageByUser[senderKey];
+                        const bool enoughReadings = avgState.sampleCount >= 8;
+                        const bool significantChange = deltaMs > 200;
+                        shouldApply = enoughReadings && significantChange;
+                    }
+                }
             }
             if (shouldApply)
             {
+                int previousBufferMs = -1;
+                auto prevBufIt = remoteLatencyFirmDelayMsByUser.find(senderKey);
+                if (prevBufIt != remoteLatencyFirmDelayMsByUser.end())
+                    previousBufferMs = prevBufIt->second;
+
                 remoteLatencyFirmDelayMsByUser[senderKey] = correctedDelayMs;
                 if (canonicalSenderKey.isNotEmpty())
                     remoteLatencyFirmDelayMsByUser[canonicalSenderKey] = correctedDelayMs;
@@ -22019,14 +22539,34 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
                 remoteLatencyLastAppliedIntervalByUser[senderKey] = sourceMarkerKey;
                 if (canonicalSenderKey.isNotEmpty())
                     remoteLatencyLastAppliedIntervalByUser[canonicalSenderKey] = sourceMarkerKey;
-                if (isFirstAppliedDelay && vdoVideoSyncEnabled.load(std::memory_order_relaxed) && videoHelperRunning.load())
+
+                njplus_debug_log("SYNCAPPLY sender=%s srcInt=%d elapsed=%d avg=%d firm=%d corrected=%d priorKey=%lld",
+                                 senderKey.toRawUTF8(), sourceInterval, elapsedMs,
+                                 averageMs, firmAverageMs, correctedDelayMs, priorAppliedMarker);
+                setIntervalSyncStatusText("Buffer " + senderKey + " " + juce::String(correctedDelayMs)
+                                          + "ms (raw " + juce::String(elapsedMs)
+                                          + " firm " + juce::String(firmAverageMs) + ")");
+
+                if (isFirstAppliedDelay || std::abs(correctedDelayMs - previousBufferMs) > 50)
                 {
+                    addSystemChatLine("Sync buffer for " + senderKey + " set to "
+                                      + juce::String(correctedDelayMs) + " ms"
+                                      + " (raw " + juce::String(elapsedMs)
+                                      + ", firm " + juce::String(firmAverageMs) + ").");
+                }
+
+                if (vdoVideoSyncEnabled.load(std::memory_order_relaxed) && videoHelperRunning.load())
+                {
+                    // We only reach here on first apply or when the firm average
+                    // differs from the current buffer by > 200ms with 8+ readings.
+                    // Always flush so the camera vanishes, shows the circle timer
+                    // while it re-buffers to the new amount.
                     const auto refreshId = ++videoBufferRefreshCounter;
                     remoteVideoBufferRefreshIdByUser[senderKey] = { refreshId, localMarkerAtMs };
                     if (canonicalSenderKey.isNotEmpty())
                         remoteVideoBufferRefreshIdByUser[canonicalSenderKey] = { refreshId, localMarkerAtMs };
                     intervalHelperPayloadForceWrite.store(true, std::memory_order_release);
-                    lastIntervalHelperPayloadWriteMs = 0.0;
+                    lastIntervalHelperPayloadWriteMs.store(0.0, std::memory_order_release);
                 }
             }
         }
@@ -22629,13 +23169,14 @@ void NinjamVst3AudioProcessor::timerCallback()
         {
             forceIntervalHelperPayloadWrite = intervalHelperPayloadForceWrite.exchange(false, std::memory_order_acq_rel)
                 || forceIntervalHelperPayloadWrite;
-            const double elapsedSinceHelperWriteMs = nowMs - lastIntervalHelperPayloadWriteMs;
+            const double previousHelperWriteMs = lastIntervalHelperPayloadWriteMs.load(std::memory_order_acquire);
+            const double elapsedSinceHelperWriteMs = nowMs - previousHelperWriteMs;
             if (forceIntervalHelperPayloadWrite
-                || lastIntervalHelperPayloadWriteMs <= 0.0
+                || previousHelperWriteMs <= 0.0
                 || elapsedSinceHelperWriteMs >= intervalHelperPayloadMinWriteMs)
             {
                 stepStartMs = juce::Time::getMillisecondCounterHiRes();
-                lastIntervalHelperPayloadWriteMs = nowMs;
+                lastIntervalHelperPayloadWriteMs.store(nowMs, std::memory_order_release);
                 writeIntervalHelperJson(pos, length);
                 perfHelperWrote = true;
                 noteSlowIntervalStep("helperJson", juce::Time::getMillisecondCounterHiRes() - stepStartMs);

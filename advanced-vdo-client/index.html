@@ -127,6 +127,23 @@
             background: #3ed06e;
             box-shadow: 0 0 7px rgba(62,208,110,0.75);
         }
+        .peer-route {
+            padding: 1px 4px;
+            border: 1px solid rgba(143,183,255,0.45);
+            border-radius: 4px;
+            color: #9fc1ff;
+            font-size: 9px;
+            font-weight: 700;
+            line-height: 1.2;
+            flex: 0 0 auto;
+        }
+        .peer-route:empty {
+            display: none;
+        }
+        .peer-route.fail {
+            border-color: rgba(207,67,67,0.65);
+            color: #ff8d8d;
+        }
         .peer-light:focus-visible {
             outline: 2px solid #8fb7ff;
             outline-offset: 2px;
@@ -1036,6 +1053,14 @@
             light.className = ok ? 'peer-light ok' : 'peer-light';
             light.title = copyText + '\nClick to copy';
             light.setAttribute('aria-label', copyText);
+            const route = document.getElementById('peer-sync-route-' + key.replace(/[^a-zA-Z0-9_-]/g, '_'));
+            if (route) {
+                route.className = ok ? 'peer-route' : 'peer-route fail';
+                route.textContent = sync && sync.statusLabel ? sync.statusLabel : 'NO RCV / NO SENT';
+                route.title = ok && sync && sync.route
+                    ? ('Successful sync route: ' + sync.route)
+                    : route.textContent;
+            }
         }
 
         function boolProp(msg, key) {
@@ -1052,6 +1077,13 @@
                 || hasBuffer;
             const explicitServerRoute = boolProp(msg, 'serverRouteLatencyReady');
             const hasServerRoute = explicitServerRoute !== null ? explicitServerRoute : isFinite(serverRouteLatencyMs);
+            const vdoPeerReceived = boolProp(msg, 'vdoPeerSyncReceived') === true;
+            const vdoPeerAcked = boolProp(msg, 'vdoPeerSyncAcked') === true;
+            const syncReceivedState = boolProp(msg, 'syncMessageReceived');
+            const syncAckedState = boolProp(msg, 'syncMessageAcked');
+            const syncMessageReceived = syncReceivedState !== null ? syncReceivedState : vdoPeerReceived;
+            const syncMessageAcked = syncAckedState !== null ? syncAckedState : vdoPeerAcked;
+            const syncRoute = String(msg.syncRoute || '').trim().toUpperCase();
             const parts = [];
             if (!hasInterval) {
                 parts.push(isFinite(intervalSignalAgeMs) ? 'waiting local marker' : 'interval missing');
@@ -1065,9 +1097,27 @@
             } else {
                 parts.push(isFinite(serverRouteAgeMs) ? 'route aging' : 'route pending');
             }
+            if (vdoPeerReceived && vdoPeerAcked) {
+                parts.push('p2p ok');
+            } else if (vdoPeerReceived) {
+                parts.push('p2p rx');
+            } else if (vdoPeerAcked) {
+                parts.push('p2p ack');
+            }
+            const ok = hasInterval && hasBuffer;
+            const missingMessages = [];
+            if (!syncMessageReceived) {
+                missingMessages.push('NO RCV MSG');
+            }
+            if (!syncMessageAcked) {
+                missingMessages.push('NO SENT MSG');
+            }
             return {
-                ok: hasInterval && hasBuffer,
-                text: parts.join(' | ')
+                ok: ok,
+                text: parts.join(' | '),
+                route: syncRoute,
+                statusLabel: ok ? syncRoute
+                    : (missingMessages.length === 2 ? 'NO RCV / NO SENT' : (missingMessages[0] || 'BUFFER PENDING'))
             };
         }
 
@@ -1114,6 +1164,13 @@
                 String(msg.eventId ?? ''),
                 String(msg.bufferRefreshEventId ?? ''),
                 String(msg.refreshBuffer ? 1 : 0),
+                String(msg.vdoPeerSyncReceived ? 1 : 0),
+                String(msg.vdoPeerSyncAcked ? 1 : 0),
+                String(msg.syncMessageReceived ? 1 : 0),
+                String(msg.syncMessageAcked ? 1 : 0),
+                String(msg.syncRoute || ''),
+                String(Math.round(Number(msg.vdoPeerSyncReceivedAgeMs ?? -1) / 1000)),
+                String(Math.round(Number(msg.vdoPeerSyncAckAgeMs ?? -1) / 1000)),
                 isFinite(bufferVal) ? String(Math.round(bufferVal)) : ''
             ].join('|');
         }
@@ -1216,6 +1273,9 @@
                 const statusLight = document.createElement('button');
                 statusLight.type = 'button';
                 statusLight.id = 'peer-sync-light-' + userId.replace(/[^a-zA-Z0-9_-]/g, '_');
+                const routeEl = document.createElement('span');
+                routeEl.className = 'peer-route';
+                routeEl.id = 'peer-sync-route-' + userId.replace(/[^a-zA-Z0-9_-]/g, '_');
                 const syncLight = function () {
                     const sync = getSyncDiagnostics(userId);
                     const ok = !!(sync && sync.ok);
@@ -1223,6 +1283,11 @@
                     statusLight.className = ok ? 'peer-light ok' : 'peer-light';
                     statusLight.title = copyText + '\nClick to copy';
                     statusLight.setAttribute('aria-label', copyText);
+                    routeEl.className = ok ? 'peer-route' : 'peer-route fail';
+                    routeEl.textContent = sync && sync.statusLabel ? sync.statusLabel : 'NO RCV / NO SENT';
+                    routeEl.title = ok && sync && sync.route
+                        ? ('Successful sync route: ' + sync.route)
+                        : routeEl.textContent;
                 };
                 statusLight.addEventListener('click', function () {
                     copyTextToClipboard(getSyncDiagnosticCopyText(userId))
@@ -1278,6 +1343,7 @@
                 });
 
                 wrap.appendChild(statusLight);
+                wrap.appendChild(routeEl);
                 wrap.appendChild(nameEl);
                 wrap.appendChild(minusBtn);
                 wrap.appendChild(plusBtn);

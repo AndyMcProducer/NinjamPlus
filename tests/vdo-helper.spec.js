@@ -429,3 +429,271 @@ test("reconnects user discovery after a websocket closes", async ({ page }) => {
 	await page.evaluate(() => window.createdWebSockets[0].onclose());
 	await expect.poll(() => page.evaluate(() => window.createdWebSockets.length)).toBeGreaterThan(initialCount);
 });
+
+test("broadcasts each native interval marker once over the VDO peer data channel", async ({ page }) => {
+	await page.addInitScript(() => {
+		window.createdWebSockets = [];
+		window.WebSocket = class MockWebSocket {
+			constructor(url) {
+				this.url = url;
+				window.createdWebSockets.push(this);
+				setTimeout(() => this.onopen && this.onopen(), 0);
+			}
+			close() {}
+		};
+	});
+	await page.goto(helperUrl({
+		label: "local-user",
+		vdoSyncUserKey: "local-user",
+		intervalSource: "ws://sync.test/intervals",
+	}));
+	const frame = await vdoFrame(page);
+	const appFrame = frame.parentFrame();
+	await expect.poll(() => appFrame.evaluate(() => window.createdWebSockets.length)).toBeGreaterThan(0);
+	await frame.evaluate(() => { window.received = []; });
+
+	const marker = {
+		type: "vdoPeerSyncTag",
+		signalType: "intervalSyncTag",
+		queuedAtWallClockMs: Date.now(),
+		payload: {
+			type: "intervalSyncTag",
+			userId: "local-user",
+			syncSessionId: "session-local",
+			intervalIndex: 4,
+			intervalAbsolute: 12,
+			bpi: 16,
+			beatIndex: 0,
+			sendOffsetMs: 7,
+			eventId: "intervalTag:local-user:1",
+		},
+	};
+	await appFrame.evaluate((payload) => {
+		window.createdWebSockets[0].onmessage({ data: JSON.stringify(payload) });
+	}, marker);
+	await expect.poll(() => frame.evaluate(() => window.received.filter((message) => message?.sendData?.ninjamPlusSync).length)).toBe(1);
+
+	const sent = await frame.evaluate(() => window.received.find((message) => message?.sendData?.ninjamPlusSync));
+	expect(sent.type).toBe("pcs");
+	expect(sent.sendData.ninjamPlusSync.version).toBe(1);
+	expect(sent.sendData.ninjamPlusSync.signalType).toBe("intervalSyncTag");
+	expect(sent.sendData.ninjamPlusSync.payload.eventId).toBe(marker.payload.eventId);
+	expect(sent.sendData.ninjamPlusSync.payload.sendOffsetMs).toBeGreaterThanOrEqual(marker.payload.sendOffsetMs);
+
+	await appFrame.evaluate((payload) => {
+		window.createdWebSockets[0].onmessage({ data: JSON.stringify(payload) });
+	}, marker);
+	await page.waitForTimeout(200);
+	expect(await frame.evaluate(() => window.received.filter((message) => message?.sendData?.ninjamPlusSync).length)).toBe(1);
+});
+
+test("forwards received peer markers and targeted acknowledgements to native", async ({ page }) => {
+	const forwarded = [];
+	await page.route("**/vdo-peer-sync?**", async (route) => {
+		forwarded.push(JSON.parse(route.request().postData()));
+		await route.fulfill({ status: 204, body: "" });
+	});
+	await page.goto(helperUrl({ label: "Local User", vdoSyncUserKey: "local user" }));
+	const frame = await vdoFrame(page);
+	await frame.evaluate(() => {
+		window.received = [];
+		parent.postMessage({
+			action: "guest-connected",
+			streamID: "remote-stream",
+			UUID: "remote-peer-uuid",
+			value: { label: "Remote User" },
+		}, "*");
+	});
+
+	const tagEnvelope = {
+		version: 1,
+		signalType: "intervalSyncTag",
+		payload: {
+			type: "intervalSyncTag",
+			userId: "remote user",
+			syncSessionId: "session-remote",
+			intervalIndex: 4,
+			intervalAbsolute: 9,
+			bpi: 16,
+			beatIndex: 0,
+			sendOffsetMs: 10,
+			eventId: "intervalTag:remote user:7",
+		},
+	};
+	await frame.evaluate((ninjamPlusSync) => {
+		parent.postMessage({ dataReceived: { ninjamPlusSync }, UUID: "remote-peer-uuid" }, "*");
+	}, tagEnvelope);
+	await expect.poll(() => forwarded.length).toBe(1);
+
+	expect(forwarded[0].version).toBe(1);
+	expect(forwarded[0].signalType).toBe("intervalSyncTag");
+	expect(forwarded[0].sender).toBe("remote user");
+	expect(forwarded[0].payload.vdoPeerReceivedWallClockMs).toEqual(expect.any(Number));
+	const ack = await frame.evaluate(() => window.received.find((message) => message?.sendData?.ninjamPlusSync?.signalType === "intervalSyncAck"));
+	expect(ack.type).toBe("pcs");
+	expect(ack.UUID).toBe("remote-peer-uuid");
+	expect(ack.sendData.ninjamPlusSync.payload.userId).toBe("local user");
+	expect(ack.sendData.ninjamPlusSync.payload.targetUserId).toBe("remote user");
+	expect(ack.sendData.ninjamPlusSync.payload.ackEventId).toBe(tagEnvelope.payload.eventId);
+
+	await frame.evaluate((ninjamPlusSync) => {
+		parent.postMessage({ dataReceived: { ninjamPlusSync }, UUID: "remote-peer-uuid" }, "*");
+	}, tagEnvelope);
+	await page.waitForTimeout(200);
+	expect(forwarded).toHaveLength(1);
+
+	const spoofedTag = structuredClone(tagEnvelope);
+	spoofedTag.payload.userId = "another user";
+	spoofedTag.payload.eventId = "intervalTag:another user:8";
+	await frame.evaluate((ninjamPlusSync) => {
+		parent.postMessage({ dataReceived: { ninjamPlusSync }, UUID: "remote-peer-uuid" }, "*");
+	}, spoofedTag);
+	await page.waitForTimeout(200);
+	expect(forwarded).toHaveLength(1);
+
+	const wrongTargetAck = {
+		version: 1,
+		signalType: "intervalSyncAck",
+		payload: {
+			type: "intervalSyncAck",
+			userId: "remote user",
+			targetUserId: "another user",
+			ackEventId: "intervalTag:local user:3",
+			eventId: "vdoPeerAck:remote user:3",
+		},
+	};
+	await frame.evaluate((ninjamPlusSync) => {
+		parent.postMessage({ dataReceived: { ninjamPlusSync }, UUID: "remote-peer-uuid" }, "*");
+	}, wrongTargetAck);
+	await page.waitForTimeout(200);
+	expect(forwarded).toHaveLength(1);
+
+	const targetedAck = structuredClone(wrongTargetAck);
+	targetedAck.payload.targetUserId = "local user";
+	await frame.evaluate((ninjamPlusSync) => {
+		parent.postMessage({ dataReceived: { ninjamPlusSync }, UUID: "remote-peer-uuid" }, "*");
+	}, targetedAck);
+	await expect.poll(() => forwarded.length).toBe(2);
+	expect(forwarded[1].version).toBe(1);
+	expect(forwarded[1].signalType).toBe("intervalSyncAck");
+	expect(forwarded[1].sender).toBe("remote user");
+	expect(forwarded[1].payload.targetUserId).toBe("local user");
+});
+
+test("does not acknowledge a peer marker rejected by native", async ({ page }) => {
+	await page.route("**/vdo-peer-sync?**", async (route) => {
+		await route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({ ok: false }) });
+	});
+	await page.goto(helperUrl({ label: "local-user", vdoSyncUserKey: "local-user" }));
+	const frame = await vdoFrame(page);
+	await frame.evaluate(() => { window.received = []; });
+	await frame.evaluate(() => {
+		parent.postMessage({
+			dataReceived: {
+				ninjamPlusSync: {
+					version: 1,
+					signalType: "intervalSyncTag",
+					payload: {
+						type: "intervalSyncTag",
+						userId: "remote-user",
+						intervalIndex: 1,
+						bpi: 16,
+						beatIndex: 0,
+						eventId: "intervalTag:remote-user:rejected",
+					},
+				},
+			},
+			UUID: "remote-peer-uuid",
+		}, "*");
+	});
+	await page.waitForTimeout(300);
+	expect(await frame.evaluate(() => window.received.some((message) => message?.sendData?.ninjamPlusSync?.signalType === "intervalSyncAck"))).toBe(false);
+});
+
+test("shows a green peer light after bidirectional P2P sync produces a buffer", async ({ page }) => {
+	await page.addInitScript(() => {
+		window.createdWebSockets = [];
+		window.WebSocket = class MockWebSocket {
+			constructor(url) {
+				this.url = url;
+				window.createdWebSockets.push(this);
+				setTimeout(() => this.onopen && this.onopen(), 0);
+			}
+			close() {}
+		};
+	});
+	await page.goto(helperUrl({
+		label: "local-user",
+		vdoSyncUserKey: "local-user",
+		intervalSource: "ws://sync.test/intervals",
+	}));
+	const frame = await vdoFrame(page);
+	const appFrame = frame.parentFrame();
+	await expect.poll(() => appFrame.evaluate(() => window.createdWebSockets.length)).toBeGreaterThan(0);
+	await frame.evaluate(() => parent.postMessage({ streamIDs: { remote_stream: "remote-user" } }, "*"));
+	await appFrame.evaluate(() => {
+		window.createdWebSockets[0].onmessage({
+			data: JSON.stringify({
+				type: "videoTimecode",
+				userId: "remote-user",
+				interval: 3,
+				timecode: 0,
+				intervalMeasurementSeen: true,
+				bufferCalculated: true,
+				receiverBufferMs: 800,
+				receiverBufferFinal: true,
+				serverRouteLatencyReady: true,
+				vdoPeerSyncReceived: true,
+				vdoPeerSyncAcked: true,
+				syncRoute: "VDO",
+			}),
+		});
+	});
+	const light = appFrame.locator(".peer-light.ok").first();
+	await expect(light).toBeVisible();
+	await expect(light).toHaveAttribute("aria-label", /p2p ok/);
+	await expect(appFrame.locator(".peer-route").filter({ hasText: "VDO" }).first()).toBeVisible();
+});
+
+test("shows the successful sync route beside the outer page peer light", async ({ page }) => {
+	await page.route("**/intervals", async (route) => {
+		await route.fulfill({
+			status: 200,
+			contentType: "application/json",
+			body: JSON.stringify([{
+				type: "videoTimecode",
+				userId: "route-user",
+				userKey: "route-user",
+				interval: 2,
+				timecode: 0,
+				intervalMeasurementSeen: true,
+				bufferCalculated: true,
+				receiverBufferMs: 700,
+				receiverBufferFinal: true,
+				syncRoute: "SIDE",
+			}]),
+		});
+	});
+	await page.goto(helperUrl());
+	const routeBadge = page.locator("#peer-sync-route-route-user");
+	await expect(routeBadge).toHaveText("SIDE");
+	await expect(routeBadge).toBeVisible();
+});
+
+test("shows which sync message direction is missing beside a red light", async ({ page }) => {
+	await page.route("**/intervals", async (route) => {
+		await route.fulfill({
+			status: 200,
+			contentType: "application/json",
+			body: JSON.stringify([
+				{ type: "videoTimecode", userId: "missing-receive", interval: 1, syncMessageReceived: false, syncMessageAcked: true },
+				{ type: "videoTimecode", userId: "missing-send", interval: 1, syncMessageReceived: true, syncMessageAcked: false },
+				{ type: "videoTimecode", userId: "missing-both", interval: 1, syncMessageReceived: false, syncMessageAcked: false },
+			]),
+		});
+	});
+	await page.goto(helperUrl());
+	await expect(page.locator("#peer-sync-route-missing-receive")).toHaveText("NO RCV MSG");
+	await expect(page.locator("#peer-sync-route-missing-send")).toHaveText("NO SENT MSG");
+	await expect(page.locator("#peer-sync-route-missing-both")).toHaveText("NO RCV / NO SENT");
+});
