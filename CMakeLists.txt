@@ -131,6 +131,8 @@ include("${abletonlink_SOURCE_DIR}/AbletonLinkConfig.cmake")
 
 set(NINJAM_PLUGIN_FORMATS VST3 Standalone)
 
+option(NINJAMPLUS_BUILD_INTEGRATION_TESTS "Build the native two-client NINJAM/VDO sync soak test" OFF)
+
 if (APPLE)
     list(APPEND NINJAM_PLUGIN_FORMATS AU)
 endif()
@@ -393,12 +395,67 @@ target_compile_definitions(NINJAM_VST3 PRIVATE
     _CRT_SECURE_NO_WARNINGS
     _WINSOCK_DEPRECATED_NO_WARNINGS
     JUCE_VST3_CAN_REPLACE_VST2=0
+    $<$<BOOL:${NINJAMPLUS_BUILD_INTEGRATION_TESTS}>:NINJAMPLUS_ENABLE_INTEGRATION_TESTS=1>
     $<$<BOOL:${WIN32}>:JUCE_ASIO=1>
 )
 
 if (WIN32)
     target_sources(NINJAM_VST3 PRIVATE ${WDL_ROOT}/win32_utf8.c)
     target_link_libraries(NINJAM_VST3 PRIVATE ws2_32 winmm)
+endif()
+
+if (NINJAMPLUS_BUILD_INTEGRATION_TESTS)
+    juce_add_console_app(NINJAMplus_SyncSoakTest
+        PRODUCT_NAME "NINJAMplus Sync Soak Test")
+    target_sources(NINJAMplus_SyncSoakTest PRIVATE tests/native-sync-soak.cpp)
+    target_include_directories(NINJAMplus_SyncSoakTest PRIVATE
+        Source
+        "${CMAKE_CURRENT_BINARY_DIR}/NINJAM_VST3_artefacts/JuceLibraryCode"
+        ${NINJAM_ROOT}
+        ${NINJAM_ROOT}/ninjam
+        ${WDL_ROOT}
+        ${ogg_SOURCE_DIR}/include
+        ${vorbis_SOURCE_DIR}/include
+        ${vorbis_SOURCE_DIR}/lib
+        ${opus_SOURCE_DIR}/include
+        third_party/chord-detector/src
+        third_party/chord-detector/libs/kiss_fft130
+        third_party/chord-detector
+        third_party/rubberband
+        third_party/librosa-cpp/include
+        third_party/librosa-cpp/src
+        third_party/librosa-cpp/vendor
+        third_party/librosa-cpp/modules/eigen
+        third_party/librosa-cpp/modules/pocketfft
+        $<$<BOOL:${WIN32}>:${asiosdk_SOURCE_DIR}/common>
+        $<$<BOOL:${WIN32}>:${asiosdk_SOURCE_DIR}/host>)
+    target_compile_definitions(NINJAMplus_SyncSoakTest PRIVATE
+        NINJAMPLUS_ENABLE_INTEGRATION_TESTS=1
+        JUCE_MODAL_LOOPS_PERMITTED=1
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CAMERA=1
+        JUCE_USE_CURL=0
+        JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
+        NINJAMPLUS_HAS_LIBVPX=0
+        NINJAMPLUS_HAS_LIBROSA=1
+        NINJAMPLUS_HAS_ONNX_CHORDS=0
+        NINJAMPLUS_HAS_PROVIDEO=0
+        NINJAMPLUS_HAS_H264_DECODE=0
+        NINJAMPLUS_FORCE_INTERNAL_VORBIS
+        WDL_NO_DEFINE_MINMAX
+        _LICE_NO_SYSBITMAPS_
+        USE_KISS_FFT
+        _CRT_SECURE_NO_WARNINGS
+        _WINSOCK_DEPRECATED_NO_WARNINGS)
+    target_link_libraries(NINJAMplus_SyncSoakTest PRIVATE
+        NINJAM_VST3
+        juce::juce_audio_utils
+        juce::juce_audio_processors
+        juce::juce_gui_basics
+        juce::juce_gui_extra)
+    if (WIN32)
+        target_link_libraries(NINJAMplus_SyncSoakTest PRIVATE ws2_32 winmm)
+    endif()
 endif()
 
 if (TARGET NINJAM_VST3_Standalone)

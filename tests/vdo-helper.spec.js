@@ -180,6 +180,235 @@ test("applies the exact NINJAM buffer and compensates measured video pipeline ch
 	})).toBeGreaterThan(0);
 });
 
+test("does not reapply a stable buffer for every interval or duplicate refresh", async ({ page }) => {
+	await page.addInitScript(() => {
+		window.createdWebSockets = [];
+		window.WebSocket = class MockWebSocket {
+			constructor(url) {
+				this.url = url;
+				window.createdWebSockets.push(this);
+				setTimeout(() => this.onopen && this.onopen(), 0);
+			}
+			close() {}
+		};
+	});
+	await page.goto(helperUrl({ intervalSource: "ws://sync.test/intervals" }));
+	const frame = await vdoFrame(page);
+	const appFrame = frame.parentFrame();
+	await expect.poll(() => appFrame.evaluate(() => window.createdWebSockets.length)).toBeGreaterThan(0);
+
+	const sendInterval = (interval, extra = {}) => appFrame.evaluate(({ interval, extra }) => {
+		window.createdWebSockets[0].onmessage({
+			data: JSON.stringify({
+				type: "videoTimecode",
+				userId: "tester",
+				interval,
+				timecode: 0,
+				bufferCalculated: true,
+				receiverBufferMs: 800,
+				receiverBufferFinal: true,
+				...extra,
+			}),
+		});
+	}, { interval, extra });
+
+	await sendInterval(1);
+	await frame.evaluate(() => parent.postMessage({ streamIDs: { remote_stream: "tester" } }, "*"));
+	await expect.poll(() => frame.evaluate(() => window.received.filter((m) => m && m.setBufferDelay === 800).length)).toBeGreaterThan(0);
+	await frame.evaluate(() => { window.received = []; });
+
+	for (let interval = 2; interval <= 13; interval += 1) {
+		await sendInterval(interval);
+	}
+	await page.waitForTimeout(500);
+	expect(await frame.evaluate(() => window.received.filter((m) => m && "setBufferDelay" in m))).toEqual([]);
+
+	// A transient payload without buffer state must not erase the last value or
+	// cause a fallback/default command.
+	await sendInterval(14, { receiverBufferMs: undefined });
+	await page.waitForTimeout(500);
+	expect(await frame.evaluate(() => window.received.filter((m) => m && "setBufferDelay" in m))).toEqual([]);
+
+	await sendInterval(15, { refreshBuffer: true, bufferRefreshEventId: "refresh:tester:1" });
+	await page.waitForTimeout(250);
+	await frame.evaluate(() => { window.received = []; });
+	await sendInterval(15, { refreshBuffer: true, bufferRefreshEventId: "refresh:tester:1" });
+	await page.waitForTimeout(500);
+	expect(await frame.evaluate(() => window.received.filter((m) => m && "setBufferDelay" in m))).toEqual([]);
+});
+
+test("recovers stable buffer state after a real HTTP-polling helper reload", async ({ page }) => {
+	let interval = 1;
+	await page.route("**/snapshot-intervals", async (route) => {
+		await route.fulfill({
+			status: 200,
+			contentType: "application/json",
+			body: JSON.stringify([{
+				type: "videoTimecode",
+				userId: "tester",
+				interval: interval++,
+				timecode: 0,
+				bufferCalculated: true,
+				receiverBufferMs: 800,
+				receiverBufferFinal: true,
+			}]),
+		});
+	});
+
+	await page.goto(helperUrl({
+		intervalSource: "http://127.0.0.1:8188/snapshot-intervals",
+		intervalPollMs: "100",
+	}));
+	let frame = await vdoFrame(page);
+	await frame.evaluate(() => parent.postMessage({ streamIDs: { remote_stream: "tester" } }, "*"));
+	await expect.poll(() => frame.evaluate(() => window.received.filter((m) => m && m.setBufferDelay === 800).length)).toBeGreaterThan(0);
+	await frame.evaluate(() => { window.received = []; });
+	await page.waitForTimeout(500);
+	expect(await frame.evaluate(() => window.received.filter((m) => m && "setBufferDelay" in m))).toEqual([]);
+
+	await page.reload();
+	frame = await vdoFrame(page);
+	await frame.evaluate(() => parent.postMessage({ streamIDs: { remote_stream: "tester" } }, "*"));
+	await expect.poll(() => frame.evaluate(() => window.received.filter((m) => m && m.setBufferDelay === 800).length)).toBeGreaterThan(0);
+});
+
+test("uses only uncontrollable WebRTC encode and decode latency", async ({ page }) => {
+	await page.addInitScript(() => {
+		window.createdWebSockets = [];
+		window.WebSocket = class MockWebSocket {
+			constructor(url) {
+				this.url = url;
+				window.createdWebSockets.push(this);
+				setTimeout(() => this.onopen && this.onopen(), 0);
+			}
+			close() {}
+		};
+	});
+	await page.goto(helperUrl({ intervalSource: "ws://sync.test/intervals" }));
+	const frame = await vdoFrame(page);
+	const appFrame = frame.parentFrame();
+	await expect.poll(() => appFrame.evaluate(() => window.createdWebSockets.length)).toBeGreaterThan(0);
+	await appFrame.evaluate(() => {
+		window.createdWebSockets[0].onmessage({
+			data: JSON.stringify({
+				type: "videoTimecode",
+				userId: "tester",
+				interval: 1,
+				timecode: 0,
+				bufferCalculated: true,
+				receiverBufferMs: 1000,
+				receiverBufferFinal: true,
+			}),
+		});
+	});
+	await frame.evaluate(() => parent.postMessage({ streamIDs: { remote_stream: "tester" } }, "*"));
+	await expect.poll(() => frame.evaluate(() => window.received.filter((m) => m && m.setBufferDelay === 1000).length)).toBeGreaterThan(0);
+	await frame.evaluate(() => { window.received = []; });
+
+	await frame.evaluate(() => {
+		parent.postMessage({
+			streamID: "remote_stream",
+			label: "tester",
+			totalEncodeTime: 0.2,
+			framesEncoded: 10,
+			totalDecodeTime: 0.3,
+			totalProcessingDelay: 0.5,
+			framesDecoded: 10,
+		}, "*");
+	});
+	// totalProcessingDelay spans first-packet receipt through decode and therefore
+	// includes the receiver jitter buffer controlled by setBufferDelay. It must not
+	// replace or be added to the decoder-only measurement.
+	await expect.poll(() => frame.evaluate(() => window.received.filter((m) => m && m.setBufferDelay === 950).length)).toBeGreaterThan(0);
+	expect(await frame.evaluate(() => window.received.some((m) => m && (m.setBufferDelay === 930 || m.setBufferDelay === 900)))).toBe(false);
+});
+
+test("maps VDO quick-stat stream keys to decoder-only peer latency", async ({ page }) => {
+	await page.addInitScript(() => {
+		window.createdWebSockets = [];
+		window.WebSocket = class MockWebSocket {
+			constructor(url) {
+				this.url = url;
+				window.createdWebSockets.push(this);
+				setTimeout(() => this.onopen && this.onopen(), 0);
+			}
+			close() {}
+		};
+	});
+	await page.goto(helperUrl({ intervalSource: "ws://sync.test/intervals" }));
+	const frame = await vdoFrame(page);
+	const appFrame = frame.parentFrame();
+	await expect.poll(() => appFrame.evaluate(() => window.createdWebSockets.length)).toBeGreaterThan(0);
+	await appFrame.evaluate(() => {
+		window.createdWebSockets[0].onmessage({
+			data: JSON.stringify({
+				type: "videoTimecode",
+				userId: "tester",
+				interval: 1,
+				timecode: 0,
+				bufferCalculated: true,
+				receiverBufferMs: 1000,
+				receiverBufferFinal: true,
+			}),
+		});
+	});
+	await frame.evaluate(() => parent.postMessage({ streamIDs: { remote_stream: "tester" } }, "*"));
+	await expect.poll(() => frame.evaluate(() => window.received.filter((m) => m && m.setBufferDelay === 1000).length)).toBeGreaterThan(0);
+	await frame.evaluate(() => { window.received = []; });
+
+	await frame.evaluate(() => {
+		parent.postMessage({
+			stats: {
+				streamID: "local_stream",
+				inbound: {
+					remote_stream: {
+						chunked_mode_video: {
+							decodeLatencyMs: 25,
+							Jitter_Buffer_ms: 400,
+							Added_Buffer_Delay_ms: 350,
+							Total_Playout_Delay_ms: 800,
+						},
+					},
+				},
+			},
+		}, "*");
+	});
+
+	await expect.poll(() => frame.evaluate(() => window.received.filter((m) => m && m.setBufferDelay === 975).length)).toBeGreaterThan(0);
+	expect(await frame.evaluate(() => window.received.some((m) => m && (m.setBufferDelay === 600 || m.setBufferDelay === 200)))).toBe(false);
+
+	await frame.evaluate(() => { window.received = []; });
+	await frame.evaluate(() => {
+		parent.postMessage({
+			stats: {
+				streamID: "local_stream",
+				inbound: {
+					remote_stream: { chunked_mode_video: { decodeLatencyMs: 28 } },
+				},
+			},
+		}, "*");
+	});
+	await page.waitForTimeout(350);
+	expect(await frame.evaluate(() => window.received.filter((m) => m && "setBufferDelay" in m))).toEqual([]);
+
+	await frame.evaluate(() => {
+		[80, 130, 180].forEach((decodeLatencyMs) => {
+			parent.postMessage({
+				stats: {
+					streamID: "local_stream",
+					inbound: {
+						remote_stream: { chunked_mode_video: { decodeLatencyMs } },
+					},
+				},
+			}, "*");
+		});
+	});
+	await page.waitForTimeout(500);
+	const debouncedUpdates = await frame.evaluate(() => window.received.filter((m) => m && "setBufferDelay" in m));
+	expect(debouncedUpdates).toHaveLength(1);
+	expect(debouncedUpdates[0].setBufferDelay).toBe(888);
+});
+
 test("reconnects user discovery after a websocket closes", async ({ page }) => {
 	await page.addInitScript(() => {
 		window.createdWebSockets = [];
