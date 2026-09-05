@@ -7,7 +7,7 @@ modes, all 16 helper tests, and Release standalone/VST3 builds. The additional
 VDO receiver-clock fix also passes the previously reproduced delayed-join case:
 after removing a 1000 ms delivery delay, rendered video changed from 9644 to
 8644 ms without reload. This VDO change is in the separate root webrtc.js checkout
-and requires an alpha release; it is not part of the NINJAM binary or this PR's
+and is now deployed and verified on alpha; it is not part of the NINJAM binary or this PR's
 production changes. Details and limits follow, including historical failed tests.
 
 ## Confirmed missing recording interval
@@ -277,8 +277,15 @@ or reconnect. Persistent one-way path delay is still inseparable from clock skew
 using these samples; this fix removes excess initial delay once fresher samples
 arrive. It does not promise zero-offset calibration on arbitrary networks.
 
+Steve then deployed the new receiver-clock code to alpha. A fresh script fetch
+and active receiver inspection confirmed the fix. Repeating the same delayed join
+on deployed alpha measured median 9649 ms before transport recovery and 8652 ms
+afterward (75 samples, range 8640-8681 ms), with timedelta falling from 1003 to
+1.4 ms and no active rebuffering. Concurrent native waveform correlation measured
+audio near 8621 ms. The extra second was removed on the deployed player as well.
+
 The native fixes are in this PR; this receiver fix and the earlier VDO-specific
-changes remain in the separate webrtc.js checkout for Steve's alpha deployment.
+changes are in the separate webrtc.js checkout and Steve's alpha deployment.
 The first displayed near-live frame during buffer fill remains a limitation, so
 these concrete fixes are not a guarantee of synchronized first-frame presentation.
 
