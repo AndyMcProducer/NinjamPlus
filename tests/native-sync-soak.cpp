@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -11,6 +12,37 @@
 #include <atomic>
 #include <thread>
 #include <vector>
+
+int NinjamVst3AudioProcessor::measurePendingIntervalForIntegrationTest(int ageMs, bool withAudioGuid, bool hasPlaybackBoundary)
+{
+    const juce::String sender = "startup-probe";
+    const juce::String pendingKey = sender + ":0";
+    const juce::String guid = "0123456789abcdef0123456789abcdef";
+    const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    constexpr long long playbackSample = 100000;
+    {
+        const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+        auto& pending = pendingRemoteIntervalStartsByUser[pendingKey];
+        pending.senderKey = sender;
+        pending.remoteInterval = 0;
+        pending.remoteBeat = 0;
+        pending.receivedAtMs = nowMs - ageMs;
+        pending.receivedSampleCount = playbackSample - (long long)std::llround(ageMs * getSampleRate() / 1000.0);
+        pending.audioGuidHex = withAudioGuid ? guid : juce::String();
+        if (hasPlaybackBoundary)
+            remoteAudioPlaybackBoundariesByUser[sender][guid] = { playbackSample, nowMs };
+    }
+    processPendingRemoteAudioPlaybackBoundaries(2000.0);
+    processPendingIntervalSyncMarkers(0, playbackSample, 2000.0);
+    const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+    const auto measured = remoteLatencyAverageByUser.find(sender);
+    const int result = measured == remoteLatencyAverageByUser.end()
+        ? -1 : (int)std::llround(measured->second.lastMeasurementMs);
+    pendingRemoteIntervalStartsByUser.erase(pendingKey);
+    remoteAudioPlaybackBoundariesByUser.erase(sender);
+    remoteLatencyAverageByUser.erase(sender);
+    return result;
+}
 
 namespace
 {
@@ -60,19 +92,53 @@ struct Client
             juce::AudioBuffer<float> audio(audioChannels, blockSize);
             juce::MidiBuffer midi;
             bool firstBlock = true;
+            const double blockDurationMs = blockSize * 1000.0 / sampleRate;
+            double nextBlockMs = juce::Time::getMillisecondCounterHiRes();
+            std::ofstream inputCapture, outputCapture, clockCapture;
+            juce::uint32 noiseState = 57;
+            if (captureLiveProbe)
+            {
+                const auto base = "test-results/live-" + name.toStdString();
+                inputCapture.open(base + "-input.f32", std::ios::binary);
+                outputCapture.open(base + "-output.f32", std::ios::binary);
+                clockCapture.open(base + "-clock.txt");
+            }
             while (audioRunning.load())
             {
                 audio.clear();
                 midi.clear();
+                if (captureLiveProbe)
+                {
+                    clockCapture << juce::Time::currentTimeMillis() << '\n';
+                    if (name == "alpha")
+                    {
+                        for (int sample = 0; sample < blockSize; ++sample)
+                        {
+                            noiseState ^= noiseState << 13;
+                            noiseState ^= noiseState >> 17;
+                            noiseState ^= noiseState << 5;
+                            audio.setSample(0, sample, ((float)(noiseState & 65535u) / 32768.0f - 1.0f) * 0.2f);
+                        }
+                    }
+                    inputCapture.write(reinterpret_cast<const char*>(audio.getReadPointer(0)), blockSize * sizeof(float));
+                }
                 if (firstBlock)
                     std::cout << "phase: " << name << " first audio-thread processBlock" << std::endl;
                 processor.processBlock(audio, midi);
+                if (captureLiveProbe)
+                    outputCapture.write(reinterpret_cast<const char*>(audio.getReadPointer(0)), blockSize * sizeof(float));
                 if (firstBlock)
                 {
                     std::cout << "phase: " << name << " first audio-thread processBlock complete" << std::endl;
                     firstBlock = false;
                 }
-                juce::Thread::sleep(10);
+                // Model an audio device's sample clock. Sleeping a full block
+                // after processing adds CPU time to every block and makes the
+                // sample clock drift away from the wall-clock sync markers.
+                nextBlockMs += blockDurationMs;
+                const double waitMs = nextBlockMs - juce::Time::getMillisecondCounterHiRes();
+                if (waitMs > 0.0)
+                    juce::Thread::sleep((int)std::ceil(waitMs));
             }
         });
     }
@@ -90,6 +156,7 @@ struct Client
     int audioChannels = 2;
     std::atomic<bool> audioRunning { false };
     std::thread audioThread;
+    bool captureLiveProbe = false;
 };
 
 struct RemoteObservation
@@ -242,6 +309,20 @@ int medianOfLastFive(const std::vector<int>& values)
 
 bool verifyRemoteLatencyJitterFilter(NinjamVst3AudioProcessor& processor)
 {
+    bool startupOk = true;
+    for (const int outlier : { 0, 16000 })
+    {
+        const auto key = "startup-outlier-" + juce::String(outlier);
+        processor.applyRemoteLatencyMeasurementForIntegrationTest(key, outlier);
+        processor.applyRemoteLatencyMeasurementForIntegrationTest(key, 800);
+        const int firstStable = processor.applyRemoteLatencyMeasurementForIntegrationTest(key, 800);
+        if (firstStable != 800)
+        {
+            std::cerr << "FAIL: first stable buffer retained startup outlier " << outlier
+                      << ": expected 800, got " << firstStable << std::endl;
+            startupOk = false;
+        }
+    }
     juce::uint32 state = 57;
     int minimumSettledMs = std::numeric_limits<int>::max();
     int maximumSettledMs = std::numeric_limits<int>::min();
@@ -263,7 +344,7 @@ bool verifyRemoteLatencyJitterFilter(NinjamVst3AudioProcessor& processor)
     int shiftedMs = -1;
     for (int sample = 0; sample < 24; ++sample)
         shiftedMs = processor.applyRemoteLatencyMeasurementForIntegrationTest("persistent-shift-probe", sample < 10 ? 800 : 900);
-    return shiftedMs >= 870;
+    return startupOk && shiftedMs >= 870;
 }
 
 juce::String guidString(const unsigned char guid[16])
@@ -360,7 +441,7 @@ int main(int argc, char* argv[])
     std::cout << "phase: initialise" << std::endl;
 
     if (argc < 2)
-        return fail("usage: NINJAMplus_SyncSoakTest <path-to-ninjamsrv>");
+        return fail("usage: NINJAMplus_SyncSoakTest <path-to-ninjamsrv> [--near-boundary | --live-vdo]");
 
     const juce::File serverExecutable(juce::String::fromUTF8(argv[1]));
     if (!serverExecutable.existsAsFile())
@@ -378,6 +459,7 @@ int main(int argc, char* argv[])
         return fail("could not create temporary test directory");
 
     const juce::File configFile = tempRoot.getChildFile("soak.cfg");
+    const bool liveVdo = argc >= 3 && juce::String::fromUTF8(argv[2]) == "--live-vdo";
     const juce::String config =
         "Port " + juce::String(serverPort) + "\n"
         "MaxUsers 8\n"
@@ -387,8 +469,7 @@ int main(int argc, char* argv[])
         "ACL 127.0.0.1/32 allow\n"
         "User alpha testpass *\n"
         "User bravo testpass *\n"
-        "DefaultBPM 200\n"
-        "DefaultBPI 2\n";
+        + juce::String(liveVdo ? "DefaultBPM 120\nDefaultBPI 16\n" : "DefaultBPM 200\nDefaultBPI 2\n");
     if (!configFile.replaceWithText(config))
         return fail("could not write local NINJAM server config");
 
@@ -404,12 +485,55 @@ int main(int argc, char* argv[])
     }
     std::cout << "phase: server listening on " << serverPort << std::endl;
 
+    if (liveVdo)
+    {
+        const juce::String room = "njplusbern" + juce::String(juce::Time::currentTimeMillis());
+        const auto stopFile = juce::File::getCurrentWorkingDirectory().getChildFile("test-results/live-stop");
+        stopFile.deleteFile();
+        auto alphaOwner = std::make_unique<Client>("alpha");
+        auto bravoOwner = std::make_unique<Client>("bravo");
+        auto& alpha = *alphaOwner;
+        auto& bravo = *bravoOwner;
+        int liveResult = 0;
+        for (auto* client : { &alpha, &bravo })
+        {
+            client->captureLiveProbe = true;
+            client->processor.setMetronomeMuted(true);
+            client->processor.setLocalMonitorEnabled(false);
+            client->processor.setLocalChannelInput(0, 0);
+            client->processor.setLocalChannelGain(0, 1.0f);
+            client->processor.setTransmitLocal(true);
+            client->startAudio();
+            client->processor.connectToServer("127.0.0.1:" + juce::String(serverPort), client->name, "testpass");
+            if (!waitForConnected({ &alpha, &bravo }, 100))
+                pump({ &alpha, &bravo }, 500);
+        }
+        if (!waitForConnected({ &alpha, &bravo }, 5000))
+            liveResult = fail("live clients did not connect");
+        if (liveResult == 0)
+        {
+            alpha.processor.launchVideoSession(room);
+            pump({ &alpha, &bravo }, 1500);
+            bravo.processor.launchVideoSession(room);
+            std::cout << "LIVE room=" << room
+                      << " alphaPort=" << alpha.processor.getVideoHelperPortForIntegrationTest()
+                      << " bravoPort=" << bravo.processor.getVideoHelperPortForIntegrationTest() << std::endl;
+            const auto deadline = juce::Time::getMillisecondCounterHiRes() + 900000.0;
+            while (!stopFile.existsAsFile() && juce::Time::getMillisecondCounterHiRes() < deadline)
+                pump({ &alpha, &bravo }, 100);
+        }
+        alpha.stopAudio();
+        bravo.stopAudio();
+        server.kill();
+        tempRoot.deleteRecursively();
+        return liveResult;
+    }
+
     int result = 0;
     {
         auto alpha = std::make_unique<Client>("alpha");
         std::cout << "phase: alpha processor created" << std::endl;
-        if (result == 0 && !verifyRemoteLatencyJitterFilter(alpha->processor))
-            result = fail("remote latency filter did not reject 0-80 ms jitter or adapt to a persistent shift");
+        const bool filterOk = verifyRemoteLatencyJitterFilter(alpha->processor);
         alpha->processor.setMobileHotspotModeEnabled(true);
         alpha->processor.connectToServer("127.0.0.1:" + juce::String(serverPort), "alpha", "testpass");
         std::cout << "phase: alpha connecting" << std::endl;
@@ -417,7 +541,31 @@ int main(int argc, char* argv[])
             result = fail("alpha did not connect");
         if (result == 0 && !alpha->processor.startVideoSyncForIntegrationTest())
             result = fail("alpha loopback video helper did not start");
+        if (alpha->processor.getClient().GetStatus() == NJClient::NJC_STATUS_OK)
+        {
+            const int shortPhase = alpha->processor.measurePendingIntervalForIntegrationTest(250, false, false);
+            const int waitingForAudio = alpha->processor.measurePendingIntervalForIntegrationTest(1250, true, false);
+            const int matchedAudio = alpha->processor.measurePendingIntervalForIntegrationTest(250, true, true);
+            const int missingAudioTimeout = alpha->processor.measurePendingIntervalForIntegrationTest(3500, true, false);
+            const int boundaryGuard = alpha->processor.measurePendingIntervalForIntegrationTest(50, false, false);
+            if (shortPhase < 2240 || shortPhase > 2300)
+                result = fail("fallback buffer did not include the recording interval plus the valid short playback phase");
+            if (waitingForAudio != -1)
+                result = fail("first audio GUID marker was consumed before its playback boundary existed");
+            if (matchedAudio != 2250)
+                result = fail("audio GUID buffer measured from recording completion instead of capture start");
+            if (missingAudioTimeout != 4000)
+                result = fail("missing audio GUID did not time out to the full capture-to-playback fallback");
+            if (boundaryGuard != -1)
+                result = fail("fallback lost its near-boundary guard");
+            if (result == 0)
+                std::cout << "PASS: startup phase, audio GUID matching, timeout, and boundary regressions" << std::endl;
+        }
         std::cout << "phase: alpha helper port=" << alpha->processor.getVideoHelperPortForIntegrationTest() << std::endl;
+        if (!filterOk)
+            result = fail("remote latency filter failed startup, jitter, or persistent-shift regression");
+        else
+            std::cout << "PASS: startup outliers, jitter, and persistent-shift regressions" << std::endl;
         if (result == 0)
         {
             std::cout << "phase: alpha connected" << std::endl;
@@ -449,7 +597,23 @@ int main(int argc, char* argv[])
         if (result == 0)
         {
             std::cout << "phase: bravo connected" << std::endl;
-            bravo->startAudio();
+            if (argc >= 3 && juce::String::fromUTF8(argv[2]) == "--near-boundary")
+            {
+                const double deadline = juce::Time::getMillisecondCounterHiRes() + 2000.0;
+                while (alpha->processor.getIntervalProgress() < 0.94f
+                       || alpha->processor.getIntervalProgress() > 0.98f)
+                {
+                    if (juce::Time::getMillisecondCounterHiRes() >= deadline)
+                    {
+                        result = fail("could not align the staggered join near alpha's boundary");
+                        break;
+                    }
+                    pump({ alpha.get(), bravo.get() }, 1);
+                }
+                std::cout << "phase: near-boundary join at " << alpha->processor.getIntervalProgress() << std::endl;
+            }
+            if (result == 0)
+                bravo->startAudio();
         }
 
         AudioGuidTimingTracker audioGuidTiming;
@@ -513,8 +677,8 @@ int main(int argc, char* argv[])
             * (double)juce::jmax(1, alpha->processor.getBPI()) * 1000.0;
         const double alphaIntervalStartMs = alpha->processor.getLatestIntervalStartMsForIntegrationTest();
         const double bravoIntervalStartMs = bravo->processor.getLatestIntervalStartMsForIntegrationTest();
-        const double expectedAlphaBufferMs = positiveModulo(alphaIntervalStartMs - bravoIntervalStartMs, intervalDurationMs);
-        const double expectedBravoBufferMs = positiveModulo(bravoIntervalStartMs - alphaIntervalStartMs, intervalDurationMs);
+        const double expectedAlphaBufferMs = intervalDurationMs + positiveModulo(alphaIntervalStartMs - bravoIntervalStartMs, intervalDurationMs);
+        const double expectedBravoBufferMs = intervalDurationMs + positiveModulo(bravoIntervalStartMs - alphaIntervalStartMs, intervalDurationMs);
         std::cout << "staggered join: alpha interval=" << alpha->processor.getIntervalIndex()
                   << " bravo interval=" << bravo->processor.getIntervalIndex()
                   << " alpha->bravo buffer=" << stableAlphaBufferMs
@@ -557,8 +721,8 @@ int main(int argc, char* argv[])
         if (result == 0 && audioGuidTiming.alphaPlaybackDelayMs.empty())
             result = fail("did not observe bravo's audio GUID entering alpha playback");
         if (result == 0
-            && std::abs((double)stableAlphaBufferMs - audioGuidTiming.alphaPlaybackDelayMs.back()) > 120.0)
-            result = fail("side-signal jitter moved alpha's buffer one interval away from actual audio playback");
+            && std::abs((double)stableAlphaBufferMs - (intervalDurationMs + audioGuidTiming.alphaPlaybackDelayMs.back())) > 120.0)
+            result = fail("receiver buffer did not include recording duration before actual audio GUID playback");
 
         // Mobile-hotspot mode sends the primary tag plus +150 ms and +300 ms
         // retransmissions. More than ten accepted markers proves the long soak;
@@ -584,6 +748,8 @@ int main(int argc, char* argv[])
             // present for the next poll, then expire without requiring an ACK.
             pump({ alpha.get(), bravo.get() }, 700);
             const auto retainedRefresh = observeRemote(alpha->processor.getVideoHelperPortForIntegrationTest(), "bravo");
+            if (retainedRefresh.intervalSampleCount < alphaSeesBravo.intervalSampleCount)
+                result = fail("helper refresh discarded established native sync measurements");
             if (retainedRefresh.refreshEventId.isEmpty())
                 result = fail("a skipped helper poll lost the buffer refresh event");
             if (result == 0)
@@ -595,7 +761,9 @@ int main(int argc, char* argv[])
             }
             if (result == 0)
             {
-                pump({ alpha.get(), bravo.get() }, 700);
+                // Expiry is 1500 ms, but HTTP serves a cached snapshot refreshed
+                // every 500 ms. Allow that publication cycle before asserting.
+                pump({ alpha.get(), bravo.get() }, 1000);
                 const auto expiredRefresh = observeRemote(alpha->processor.getVideoHelperPortForIntegrationTest(), "bravo");
                 if (expiredRefresh.refreshEventId.isNotEmpty())
                     result = fail("the retained buffer refresh event did not expire");
