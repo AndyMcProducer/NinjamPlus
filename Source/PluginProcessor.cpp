@@ -8000,20 +8000,9 @@ void NinjamVst3AudioProcessor::requestVideoBufferRefreshForMeasuredUsers()
 
                 remoteVideoBufferRefreshIdByUser[userDelay.first] = { refreshId, refreshCreatedAtMs };
 
-                // A helper reload or restart has no memory of which marker keys it
-                // already forwarded. Clear our record for this peer so the next
-                // incoming marker is accepted and re-measured rather than rejected
-                // as a stale duplicate.
-                lastAnnouncedRemoteIntervalByUser.erase(userDelay.first);
-                remoteLatencyLastAppliedIntervalByUser.erase(userDelay.first);
-                remoteLatencyAverageByUser.erase(userDelay.first);
-                for (auto it = pendingRemoteIntervalStartsByUser.begin(); it != pendingRemoteIntervalStartsByUser.end();)
-                {
-                    if (it->second.senderKey == userDelay.first)
-                        it = pendingRemoteIntervalStartsByUser.erase(it);
-                    else
-                        ++it;
-                }
+                // Refresh the player without resetting native timing or duplicate
+                // suppression. Helper reloads do not restart the peer's audio or
+                // interval counter; actual reconnects reset state separately.
                 refreshed = true;
             }
         }
@@ -8397,6 +8386,7 @@ void NinjamVst3AudioProcessor::setIntervalSyncTagArrivalOffsetForIntegrationTest
 {
     integrationIntervalSyncTagArrivalOffsetMs.store(juce::jlimit(0, 500, offsetMs), std::memory_order_relaxed);
 }
+
 #endif
 
 bool NinjamVst3AudioProcessor::ensureZapVideoClientStarted()
@@ -22085,7 +22075,9 @@ int NinjamVst3AudioProcessor::applyRemoteLatencyMeasurementLocked(const juce::St
         avgState.sumMs += measurementMs;
     avgState.averageMs = avgState.sumMs / (double)juce::jmax((size_t)1, avgState.recentMeasurementsMs.size());
 
-    if (avgState.sampleCount == 1)
+    // Seed the first publishable value from the three-sample median. Smoothing
+    // from sample one would retain a bad startup reading for many intervals.
+    if (avgState.sampleCount <= 3)
         avgState.firmAverageMs = medianMs;
     else
         avgState.firmAverageMs = (avgState.firmAverageMs * 0.88) + (medianMs * 0.12);
@@ -22337,10 +22329,14 @@ void NinjamVst3AudioProcessor::processPendingRemoteAudioPlaybackBoundaries(doubl
             || measuredDelayMs < -safeIntervalDurationMs
             || measuredDelayMs > safeIntervalDurationMs * 2.0)
             continue;
+        // The tag identifies the interval that just FINISHED recording. Its
+        // first audio sample was captured one interval before the tag's origin.
+        // Video delay must cover capture-to-playback, not completion-to-playback.
+        const double captureToPlaybackMs = safeIntervalDurationMs + measuredDelayMs;
         applyRemoteLatencyMeasurement(matched.senderKey, matched.pending,
                                       (int)std::llround(juce::jlimit(0.0,
-                                                                   safeIntervalDurationMs * 2.0,
-                                                                   measuredDelayMs)),
+                                                                   safeIntervalDurationMs * 3.0,
+                                                                   captureToPlaybackMs)),
                                       nowMs);
     }
 }
@@ -22379,18 +22375,11 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
             for (auto it = pendingRemoteIntervalStartsByUser.begin(); it != pendingRemoteIntervalStartsByUser.end(); ++it)
             {
                 const auto& candidate = it->second;
-                const auto candidateSenderKey = candidate.senderKey.isNotEmpty()
-                    ? candidate.senderKey : it->first.upToFirstOccurrenceOf(":", false, false);
-                const auto canonicalSenderKey = canonicalDelayUserKey(candidateSenderKey);
-                const bool hasAudioGuidHistory = remoteAudioPlaybackBoundariesByUser.find(candidateSenderKey)
-                        != remoteAudioPlaybackBoundariesByUser.end()
-                    || (canonicalSenderKey.isNotEmpty()
-                        && remoteAudioPlaybackBoundariesByUser.find(canonicalSenderKey)
-                            != remoteAudioPlaybackBoundariesByUser.end());
                 const double pendingAgeMs = candidate.receivedAtMs > 0.0
                     ? juce::jmax(0.0, localMarkerAtMs - candidate.receivedAtMs) : 0.0;
+                // The first GUID needs the same chance to reach audio playback
+                // as later GUIDs. An empty history is normal during startup.
                 const bool waitForAudioGuid = candidate.audioGuidHex.isNotEmpty()
-                    && hasAudioGuidHistory
                     && pendingAgeMs < safeIntervalDurationMs * 1.5;
                 // Defer markers that arrived too close to this boundary. If the
                 // sync message arrived within the last 100ms of this boundary
@@ -22400,26 +22389,10 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
                 // incorrect buffer of 0.
                 const bool hasReceiveTime = candidate.receivedAtMs > 0.0;
                 const bool tooRecent = hasReceiveTime && pendingAgeMs < 100.0;
-                // For users we haven't measured yet (first sync), require the
-                // marker to be at least half an interval old. When a client
-                // joins mid-interval, the existing client's sync message for
-                // that interval is already stale — it was sent at the start
-                // of an interval that's in progress. Using it would give a
-                // partial-interval elapsed time and a too-low buffer. Waiting
-                // for a marker that's at least half an interval old ensures
-                // we measure close to a full interval.
-                const bool hasPriorMeasurement = remoteLatencyLastAppliedIntervalByUser.find(candidateSenderKey)
-                        != remoteLatencyLastAppliedIntervalByUser.end()
-                    || (canonicalSenderKey.isNotEmpty()
-                        && remoteLatencyLastAppliedIntervalByUser.find(canonicalSenderKey)
-                            != remoteLatencyLastAppliedIntervalByUser.end());
-                const bool needsFullInterval = !hasPriorMeasurement;
-                const bool tooFreshForFirst = needsFullInterval
-                    && hasReceiveTime
-                    && pendingAgeMs < safeIntervalDurationMs * 0.5;
+                // Peers have independent interval phases. A first measurement
+                // below half an interval is valid; deferring it adds an interval.
                 if (!waitForAudioGuid
                     && !tooRecent
-                    && !tooFreshForFirst
                     && candidate.remoteBeat == safeLocalMarkerBeat
                     && candidate.receivedSampleCount <= localMarkerSampleCount)
                 {
@@ -22460,7 +22433,10 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
         const double outlierLimitMs = safeIntervalDurationMs * 2.0;
         if (!std::isfinite(elapsedToNextLocalMarkerMs) || elapsedToNextLocalMarkerMs < 0.0 || elapsedToNextLocalMarkerMs > outlierLimitMs)
             continue;
-        const int elapsedMs = (int)std::llround(juce::jlimit(0.0, safeIntervalDurationMs, elapsedToNextLocalMarkerMs));
+        // Legacy tags also mark the end of the recorded audio interval. Include
+        // its duration before adding the phase until our playback boundary.
+        const int elapsedMs = (int)std::llround(safeIntervalDurationMs
+            + juce::jlimit(0.0, safeIntervalDurationMs, elapsedToNextLocalMarkerMs));
         int averageMs = -1;
         int firmAverageMs = -1;
         int correctedDelayMs = -1;

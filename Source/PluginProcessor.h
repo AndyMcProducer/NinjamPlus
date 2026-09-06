@@ -640,6 +640,7 @@ public:
     void injectIntervalSyncTagForIntegrationTest(const juce::String& sender, const juce::String& payload);
     void requestVideoBufferRefreshForIntegrationTest();
     int applyRemoteLatencyMeasurementForIntegrationTest(const juce::String& sender, int elapsedMs);
+    int measurePendingIntervalForIntegrationTest(int ageMs, bool withAudioGuid, bool hasPlaybackBoundary);
     void setIntervalSyncTagArrivalOffsetForIntegrationTest(int offsetMs);
 #endif
 

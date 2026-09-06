@@ -2,6 +2,8 @@ const { defineConfig, devices } = require("@playwright/test");
 
 module.exports = defineConfig({
 	testDir: "./tests",
+	// Keep browser cleanup from deleting native audio captures and validation logs.
+	outputDir: "./test-results/playwright",
 	timeout: 30000,
 	expect: { timeout: 5000 },
 	workers: 1,
