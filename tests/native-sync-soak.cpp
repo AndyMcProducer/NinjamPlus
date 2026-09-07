@@ -44,6 +44,126 @@ int NinjamVst3AudioProcessor::measurePendingIntervalForIntegrationTest(int ageMs
     return result;
 }
 
+bool NinjamVst3AudioProcessor::testNtpPlaybackCorrelationForIntegrationTest()
+{
+    // No server, camera, or NTP availability is needed for these timing cases.
+    if (ntpSyncFuture.valid())
+        ntpSyncFuture.wait();
+    const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    constexpr double sourceNtpMs = 1700000000000.0;
+    const juce::String guid = "0123456789abcdef0123456789abcdef";
+    auto queue = [&](const juce::String& user, double captureMs)
+    {
+        PendingRemoteIntervalStart pending;
+        pending.senderKey = user;
+        pending.remoteInterval = 1;
+        pending.remoteBeat = 0;
+        pending.audioGuidHex = guid;
+        pending.ntpSynced = true;
+        pending.ntpBpi1TimeMs = captureMs;
+        pending.receivedSampleCount = 1000000; // deliberately after playback
+        pending.receivedAtMs = nowMs;
+        pendingRemoteIntervalStartsByUser[user + ":1"] = pending;
+    };
+    auto check = [](bool condition, const char* message)
+    {
+        if (!condition)
+            std::cerr << "FAIL: " << message << std::endl;
+        return condition;
+    };
+    queue("alpha", sourceNtpMs);
+    remoteAudioPlaybackBoundariesByUser["alpha"]["wrong-guid"] = { 1000, nowMs, sourceNtpMs + 100.0 };
+    processPendingRemoteAudioPlaybackBoundaries(2000.0);
+    if (!check(remoteLatencyFirmDelayMsByUser.count("alpha") == 0
+               && pendingRemoteIntervalStartsByUser.count("alpha:1") == 1,
+               "must wait for the exact audio GUID")) return false;
+
+    // Timer/message arrival and the current interval are intentionally much later.
+    currentAudioIntervalStartNtpMs.store(sourceNtpMs + 9500.0);
+    localNtpIntervalStartMsByInterval[getDisplayIntervalIndex()] = sourceNtpMs + 9500.0;
+    remoteAudioPlaybackBoundariesByUser["alpha"][guid] = { 1000, nowMs - 5000.0, sourceNtpMs + 2500.0 };
+    vdoVideoSyncEnabled.store(true);
+    videoHelperRunning.store(true);
+    processPendingRemoteAudioPlaybackBoundaries(2000.0);
+    videoHelperRunning.store(false);
+    vdoVideoSyncEnabled.store(false);
+    if (!check(remoteVideoBufferRefreshIdByUser.count("alpha") != 0
+               && intervalHelperPayloadForceWrite.load(),
+               "NTP buffer must request a VDO helper refresh")) return false;
+    if (!check(remoteLatencyFirmDelayMsByUser["alpha"] == 2500,
+               "late tag must use stored playback NTP, not arrival or current interval")) return false;
+    queue("alpha", sourceNtpMs - 1000.0);
+    processPendingRemoteAudioPlaybackBoundaries(2000.0);
+    if (!check(remoteLatencyFirmDelayMsByUser["alpha"] == 2500,
+               "duplicate must not rebuffer a synchronized peer")) return false;
+
+    // A provisional legacy estimate must not prevent the first NTP correction.
+    remoteLatencyFirmDelayMsByUser["beta"] = 1500;
+    remoteLatencyLastAppliedIntervalByUser["beta"] = 0;
+    queue("beta", sourceNtpMs);
+    remoteAudioPlaybackBoundariesByUser["beta"][guid] = { 1000, nowMs, sourceNtpMs + 3700.0 };
+    processPendingRemoteAudioPlaybackBoundaries(2000.0);
+    if (!check(remoteLatencyFirmDelayMsByUser["beta"] == 3700
+               && remoteLatencyFirmDelayMsByUser["alpha"] == 2500,
+               "each peer must retain its own delay")) return false;
+
+    for (const double invalidPlayback : { 0.0, sourceNtpMs - 1.0, sourceNtpMs + 120001.0,
+                                          std::numeric_limits<double>::quiet_NaN() })
+    {
+        queue("invalid", sourceNtpMs);
+        remoteAudioPlaybackBoundariesByUser["invalid"][guid] = { 1000, nowMs, invalidPlayback };
+        processPendingRemoteAudioPlaybackBoundaries(2000.0);
+        if (!check(remoteLatencyFirmDelayMsByUser.count("invalid") == 0,
+                   "invalid clock must not lock in zero or excessive buffer")) return false;
+    }
+
+    invalidateIntervalSyncLatencyState(false);
+    queue("alpha", sourceNtpMs);
+    remoteAudioPlaybackBoundariesByUser["alpha"][guid] = { 1000, nowMs, sourceNtpMs + 4200.0 };
+    processPendingRemoteAudioPlaybackBoundaries(2000.0);
+    if (!check(remoteLatencyFirmDelayMsByUser["alpha"] == 4200,
+               "timing/session reset must allow a fresh NTP delay")) return false;
+
+    ntpSynced.store(true);
+    ntpOffsetMs.store(0.0);
+    restartVdoSyncForTimingChange(140.0, 16);
+    if (!check(remoteLatencyFirmDelayMsByUser.empty() && remoteNtpBufferAppliedByUser.empty()
+               && pendingRemoteIntervalStartsByUser.empty() && forceIntervalSyncResend.load(),
+               "BPM change must invalidate every peer and request fresh sync messages")) return false;
+    const double changedAtNtpMs = earliestVdoSyncCaptureNtpMs;
+    queue("alpha", changedAtNtpMs - 1000.0);
+    remoteAudioPlaybackBoundariesByUser["alpha"][guid] = { 1000, nowMs, changedAtNtpMs + 2500.0 };
+    processPendingRemoteAudioPlaybackBoundaries(2000.0);
+    if (!check(remoteLatencyFirmDelayMsByUser.count("alpha") == 0,
+               "old-tempo recording must not satisfy the new BPM sync")) return false;
+    queue("alpha", changedAtNtpMs + 100.0);
+    processPendingRemoteAudioPlaybackBoundaries(2000.0);
+    if (!check(remoteLatencyFirmDelayMsByUser["alpha"] == 2400,
+               "fresh post-BPM audio must calculate a new buffer")) return false;
+    forceIntervalSyncResend.store(false);
+    restartVdoSyncForTimingChange(140.0, 16);
+    if (!check(remoteLatencyFirmDelayMsByUser["alpha"] == 2400 && !forceIntervalSyncResend.load(),
+               "same-tempo announcements from other peers must not erase fresh sync")) return false;
+    restartVdoSyncForTimingChange(100.0, 16);
+    if (!check(remoteLatencyFirmDelayMsByUser.empty() && forceIntervalSyncResend.load(),
+               "a subsequent BPM change must restart synchronization again")) return false;
+
+    // Exercise the sender's coherent completed-GUID/start-time snapshot.
+    completedAudioIntervalGuidLow.store(1);
+    completedAudioIntervalGuidHigh.store(2);
+    completedAudioIntervalBoundarySampleCount.store(0);
+    completedAudioIntervalStartNtpMs.store(sourceNtpMs);
+    intervalSyncSampleCounter.store(480);
+    juce::String emittedGuid;
+    double offsetMs = 0.0, captureMs = 0.0;
+    if (!check(getCompletedAudioIntervalGuidForSyncTag(emittedGuid, offsetMs, captureMs)
+               && captureMs == sourceNtpMs && std::abs(offsetMs - 10.0) < 0.001,
+               "completed audio GUID must carry its own capture timestamp")) return false;
+    std::cout << "PASS: NTP GUID matching, late arrival, duplicate, per-peer, invalid clock, BPM restart, and sender timestamp regressions"
+              << std::endl;
+    return true;
+}
+
 namespace
 {
 constexpr double sampleRate = 48000.0;
@@ -439,6 +559,14 @@ int main(int argc, char* argv[])
 {
     juce::ScopedJuceInitialiser_GUI juceInitialiser;
     std::cout << "phase: initialise" << std::endl;
+
+    if (argc >= 2 && juce::String::fromUTF8(argv[1]) == "--ntp-regression")
+    {
+        auto processor = std::make_unique<NinjamVst3AudioProcessor>();
+        processor->stopTimer();
+        processor->setRateAndBufferSizeDetails(48000.0, 480);
+        return processor->testNtpPlaybackCorrelationForIntegrationTest() ? 0 : 1;
+    }
 
     if (argc < 2)
         return fail("usage: NINJAMplus_SyncSoakTest <path-to-ninjamsrv> [--near-boundary | --live-vdo]");

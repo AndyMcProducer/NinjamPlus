@@ -21,6 +21,7 @@
 #include "AutoTune.h"
 #include "SshTunnel.h"
 #include "SessionRecorder.h"
+#include "NtpClient.h"
 
 #ifndef NINJAMPLUS_HAS_H264_DECODE
 #define NINJAMPLUS_HAS_H264_DECODE 0
@@ -520,6 +521,15 @@ public:
     void setMobileHotspotModeEnabled(bool shouldEnable);
     bool isMobileHotspotModeEnabled() const;
 
+    // Show system/log messages in chat (sync messages, NTP status, etc.)
+    void setShowSystemChatLogsEnabled(bool shouldEnable);
+    bool isShowSystemChatLogsEnabled() const;
+
+    // NTP clock sync accessors for UI display
+    bool isNtpSynced() const;
+    bool isNtpSyncInProgress() const;
+    double getNtpOffsetMs() const;
+
     // VDO TURN Mode: forces VDO.Ninja through TURN relay over TCP.
     // Separate from Mobile Hotspot Mode so users on restricted networks
     // can enable TURN without the redundant sync tag retransmissions.
@@ -640,6 +650,7 @@ public:
     void injectIntervalSyncTagForIntegrationTest(const juce::String& sender, const juce::String& payload);
     void requestVideoBufferRefreshForIntegrationTest();
     int applyRemoteLatencyMeasurementForIntegrationTest(const juce::String& sender, int elapsedMs);
+    bool testNtpPlaybackCorrelationForIntegrationTest();
     int measurePendingIntervalForIntegrationTest(int ageMs, bool withAudioGuid, bool hasPlaybackBoundary);
     void setIntervalSyncTagArrivalOffsetForIntegrationTest(int offsetMs);
 #endif
@@ -1217,6 +1228,7 @@ private:
     std::atomic<juce::uint64> vdoRosterRevision { 0 };
     std::atomic<bool> mobileHotspotModeEnabled { false };
     std::atomic<bool> vdoTurnModeEnabled { false };
+    std::atomic<bool> showSystemChatLogsEnabled { false };
     double lastMobileHotspotHeartbeatSendMs = 0.0;
     double lastMobileHotspotSyncRetransmitMs = 0.0;
 
@@ -1337,6 +1349,9 @@ private:
     double lastBroadcastSyncTagWallClockMs = 0.0;
     std::atomic<long long> lastProcessedIntervalMarkerKey { -1 };
     juce::CriticalSection intervalSyncAnnouncementLock;
+    std::atomic<double> currentAudioIntervalStartNtpMs { 0.0 };
+    std::atomic<double> completedAudioIntervalStartNtpMs { 0.0 };
+    std::atomic<double> remoteAudioPlaybackBoundaryNtpMs { 0.0 };
     std::atomic<juce::uint64> completedAudioIntervalGuidSequence { 0 };
     std::atomic<juce::uint64> completedAudioIntervalGuidLow { 0 };
     std::atomic<juce::uint64> completedAudioIntervalGuidHigh { 0 };
@@ -1354,6 +1369,7 @@ private:
     std::atomic<int> integrationIntervalSyncTagArrivalOffsetMs { 0 };
 #endif
     std::map<int, double> localIntervalStartMsByInterval;
+    std::map<int, double> localNtpIntervalStartMsByInterval;
     struct PendingRemoteIntervalStart
     {
         int remoteInterval = -1;
@@ -1367,12 +1383,18 @@ private:
         juce::String audioGuidHex;
         long long receivedSampleCount = -1;
         double receivedAtMs = -1.0;
+        // NTP-aligned absolute time (ms since Unix epoch) at which the
+        // remote sender's BPI1 started. Zero if the sender doesn't have
+        // NTP sync. Used for one-shot buffer calculation.
+        double ntpBpi1TimeMs = 0.0;
+        bool ntpSynced = false;
     };
     std::map<juce::String, PendingRemoteIntervalStart> pendingRemoteIntervalStartsByUser;
     struct RemoteAudioPlaybackBoundary
     {
         long long sampleCount = -1;
         double observedAtMs = 0.0;
+        double ntpTimeMs = 0.0;
     };
     std::map<juce::String, std::map<juce::String, RemoteAudioPlaybackBoundary>>
         remoteAudioPlaybackBoundariesByUser;
@@ -1388,12 +1410,18 @@ private:
     std::deque<juce::String> recentIntervalSyncAckEventIds;
     std::map<juce::String, double> pendingTransportProbeSentMsById;
     std::map<juce::String, long long> remoteLatencyLastAppliedIntervalByUser;
+    std::map<juce::String, bool> remoteNtpBufferAppliedByUser;
     std::deque<juce::String> recentVideoTimingChangeEventIds;
     int lastLatencyTimingBpi = -1;
     int lastLatencyTimingLength = -1;
     double lastLatencyTimingBpm = -1.0;
+    double lastVdoSyncResetBpm = -1.0;
+    int lastVdoSyncResetBpi = -1;
+    double earliestVdoSyncCaptureNtpMs = 0.0;
     double lastServerLatencyProbeAttemptMs = 0.0;
     double lastRemoteSyncUserPruneMs = 0.0;
+    std::set<juce::String> knownActiveSyncUserKeys;
+    std::atomic<bool> forceIntervalSyncResend { false };
     double lastIntervalSyncFallbackSubscriptionMs = 0.0;
     double lastNinjamPlusControlSubscriptionMs = 0.0;
     struct RemoteLatencyAverageState
@@ -1406,6 +1434,13 @@ private:
         std::deque<double> recentMeasurementsMs;
     };
     std::map<juce::String, RemoteLatencyAverageState> remoteLatencyAverageByUser;
+
+    // NTP clock sync state for VDO buffer sync
+    NtpClient ntpClient;
+    std::atomic<double> ntpOffsetMs { 0.0 };
+    std::atomic<bool> ntpSynced { false };
+    std::atomic<bool> ntpSyncInProgress { false };
+    std::future<void> ntpSyncFuture;
 
     struct PendingMediaItem
     {
@@ -1527,7 +1562,8 @@ private:
     juce::String buildIntervalSyncTag(int interval, int length) const;
     void captureCompletedAudioIntervalGuidFromAudioThread(NJClient* inst);
     bool getCompletedAudioIntervalGuidForSyncTag(juce::String& audioGuidHex,
-                                                 double& boundaryToSendOffsetMs) const;
+                                                 double& boundaryToSendOffsetMs,
+                                                 double& captureStartNtpMs) const;
     void processPendingRemoteAudioPlaybackBoundaries(double intervalDurationMs);
     void invalidateIntervalSyncLatencyState(bool keepRemoteServerLatency);
     void pruneDisconnectedRemoteSyncState();
@@ -1536,11 +1572,12 @@ private:
                                              int& averageMs, int& firmAverageMs);
     void applyRemoteLatencyMeasurement(const juce::String& senderKey,
                                        const PendingRemoteIntervalStart& pending,
-                                       int elapsedMs,
-                                       double measuredAtMs);
+                                       double playbackNtpMs,
+                                       double measuredAtMs, int elapsedMs = -1);
     void resetIntervalSyncTimingCache();
     bool consumeVideoTimingChangeEvent(const juce::String& eventId);
     void broadcastVideoTimingChange(double previousBpm, double newBpm, int bpi, int length, int timingDelayDeltaMs);
+    void restartVdoSyncForTimingChange(double bpm, int bpi);
     void requestVideoBufferRefreshForMeasuredUsers();
     bool isAdvancedVideoClientAvailable(int port) const;
     bool ensureAdvancedVideoClientStarted();

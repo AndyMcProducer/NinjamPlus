@@ -2039,6 +2039,7 @@ private:
     // UI components
     EditorBackgroundComponent backgroundComponent;
     juce::Label statusLabel;
+    juce::Label onlineClockLabel;
     
     // Login
     juce::Label serverLabel{ "Server", "Server:" };

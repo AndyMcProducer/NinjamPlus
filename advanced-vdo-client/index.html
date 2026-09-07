@@ -1303,6 +1303,16 @@
                 plusBtn.type = 'button';
                 plusBtn.textContent = '+20';
 
+                const bpiMinusBtn = document.createElement('button');
+                bpiMinusBtn.type = 'button';
+                bpiMinusBtn.textContent = 'BPI -';
+                bpiMinusBtn.title = 'Deduct 1 beat (60000/BPM ms) from the sync offset';
+
+                const bpiPlusBtn = document.createElement('button');
+                bpiPlusBtn.type = 'button';
+                bpiPlusBtn.textContent = 'BPI +';
+                bpiPlusBtn.title = 'Add 1 beat (60000/BPM ms) to the sync offset';
+
                 const resetBtn = document.createElement('button');
                 resetBtn.type = 'button';
                 resetBtn.textContent = 'Reset';
@@ -1336,6 +1346,24 @@
                     syncOffset();
                     pushOffsetToFrame(userId);
                 });
+                bpiMinusBtn.addEventListener('click', function () {
+                    const bpm = (intervalInfo && typeof intervalInfo.bpm === 'number' && intervalInfo.bpm > 0) ? intervalInfo.bpm : 0;
+                    const beatMs = bpm > 0 ? Math.round(60000 / bpm) : 0;
+                    if (beatMs > 0) {
+                        setOffsetMs(userId, getOffsetMs(userId) - beatMs);
+                        syncOffset();
+                        pushOffsetToFrame(userId);
+                    }
+                });
+                bpiPlusBtn.addEventListener('click', function () {
+                    const bpm = (intervalInfo && typeof intervalInfo.bpm === 'number' && intervalInfo.bpm > 0) ? intervalInfo.bpm : 0;
+                    const beatMs = bpm > 0 ? Math.round(60000 / bpm) : 0;
+                    if (beatMs > 0) {
+                        setOffsetMs(userId, getOffsetMs(userId) + beatMs);
+                        syncOffset();
+                        pushOffsetToFrame(userId);
+                    }
+                });
                 resetBtn.addEventListener('click', function () {
                     setOffsetMs(userId, 0);
                     syncOffset();
@@ -1347,6 +1375,8 @@
                 wrap.appendChild(nameEl);
                 wrap.appendChild(minusBtn);
                 wrap.appendChild(plusBtn);
+                wrap.appendChild(bpiMinusBtn);
+                wrap.appendChild(bpiPlusBtn);
                 wrap.appendChild(resetBtn);
                 metricsEl.appendChild(offsetEl);
                 metricsEl.appendChild(latencyEl);

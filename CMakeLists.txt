@@ -190,6 +190,8 @@ target_sources(NINJAM_VST3 PRIVATE
     Source/SshTunnel.cpp
     Source/SessionRecorder.h
     Source/SessionRecorder.cpp
+    Source/NtpClient.h
+    Source/NtpClient.cpp
     
     # NINJAM Core
     ${NINJAM_ROOT}/ninjam/njclient.cpp
