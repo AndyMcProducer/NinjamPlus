@@ -1,5 +1,13 @@
 #include "NtpClient.h"
 
+#if !defined(_WIN32)
+#include <netdb.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
+#include <cstring>
+
 NtpClient::NtpClient() {}
 NtpClient::~NtpClient() {}
 

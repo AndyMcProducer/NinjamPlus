@@ -2,13 +2,15 @@
 // This replaces only media acquisition; signaling, encoding, transport, buffering,
 // and rendering are the unmodified VDO player. Closing the test tab removes it.
 (() => {
+    // Keep the measurement clock independent of later Date.now fault injection.
+    const timestampNow = Date.now.bind(Date);
     const canvas = document.createElement("canvas");
     canvas.width = 1280;
     canvas.height = 720;
     const ctx = canvas.getContext("2d");
     const label = new URLSearchParams(location.search).get("label");
     function draw() {
-        const now = Date.now();
+        const now = timestampNow();
         ctx.fillStyle = label === "alpha" ? "#234e85" : "#853423";
         ctx.fillRect(0, 0, 1280, 720);
         ctx.fillStyle = "white";
@@ -44,7 +46,7 @@
         }
         return result;
     };
-    const probe = window.__njLiveProbe = { canvas, stream, timer, originalGet, originalEnum, started: Date.now(), samples: [] };
+    const probe = window.__njLiveProbe = { canvas, stream, timer, originalGet, originalEnum, started: timestampNow(), samples: [] };
     const scratch = document.createElement("canvas");
     scratch.width = 1280;
     scratch.height = 720;
@@ -61,7 +63,7 @@
                     else time = ((time << 1) | value) >>> 0;
                 }
                 if (header === 0xa5) {
-                    const now = Date.now();
+                    const now = timestampNow();
                     probe.samples.push({ now, id: el.id, tag: el.tagName, delay: ((now >>> 0) - time) >>> 0 });
                 }
             } catch (_) { /* No decoded frame yet. */ }

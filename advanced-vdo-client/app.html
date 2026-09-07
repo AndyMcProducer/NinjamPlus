@@ -540,6 +540,8 @@
         };
 
         const vdoState = {
+            knownStreams: {},
+            announcedStreams: {},
             iframeLoaded: false,
             streamIdByUser: {},
             targetIdByUser: {},
@@ -771,6 +773,9 @@
             if (!key) {
                 return false;
             }
+            Object.keys(vdoState.knownStreams).forEach(function (streamId) {
+                if (vdoState.knownStreams[streamId].userKey === key) delete vdoState.knownStreams[streamId];
+            });
             const targets = getUserCameraTargets(key);
             for (let i = 0; i < targets.length; i++) {
                 if (targets[i].streamId) {
@@ -842,6 +847,9 @@
                     delete vdoState.cameraTargetsByUser[userKey];
                 }
                 if (userChanged) {
+                    // Do not let the legacy primary-target fallback resurrect a removed camera.
+                    delete vdoState.streamIdByUser[userKey];
+                    delete vdoState.targetIdByUser[userKey];
                     updatePrimaryCameraTarget(userKey);
                     resetBufferApplicationState(userKey);
                     changed = true;
@@ -989,6 +997,7 @@
             if (!userKey) {
                 return false;
             }
+            vdoState.knownStreams[cleanStreamId] = { userKey: userKey, missingSince: 0, lastRequestAt: 0 };
             const targetId = String(explicitTargetId || cleanStreamId).trim();
             const mappingSource = vdoState.lastResolveSource || 'label';
             const bufferMode = normalizeCameraBufferMode(explicitBufferMode || cameraLabelBufferMode(label));
@@ -1008,7 +1017,13 @@
         }
 
         function unregisterPeerTarget(streamId) {
-            return removeCameraTargetByStreamId(streamId);
+            const key = String(streamId || '').trim();
+            // A disconnect can precede native user discovery. Do not replay
+            // the old roster entry once that user becomes resolvable.
+            delete vdoState.announcedStreams[key];
+            const known = vdoState.knownStreams[key];
+            if (known && !known.missingSince) known.missingSince = Date.now();
+            return removeCameraTargetByStreamId(key);
         }
 
         function getStringProperty(objectValue, keyNames) {
@@ -1836,7 +1851,7 @@
 			return true;
 		}
 
-		function scheduleBufferRefresh(userKey, refreshEventId, flushFirst) {
+		function scheduleBufferRefresh(userKey, refreshEventId, resetLatency) {
             const key = normalizeUserId(userKey);
             const eventId = String(refreshEventId || '');
             if (!key || !eventId || vdoState.lastBufferRefreshIdByUser[key] === eventId) {
@@ -1852,10 +1867,11 @@
                 clearTimeout(vdoState.bufferRefreshTimersByUser[key]);
             }
             vdoState.bufferRefreshPendingUntilByUser[key] = Date.now() + 150;
-            if (flushFirst) {
+            if (resetLatency) {
                 clearEstimatedVdoLatency(key);
-                sendTargetedBuffer(key, minimumBufferMs);
             }
+            // Refresh the receiver without briefly requesting live playback.
+            // A zero target discards valid delayed GOPs and forces a full refill.
             sendTargetedRefresh(key);
             vdoState.bufferRefreshTimersByUser[key] = setTimeout(function () {
                 delete vdoState.bufferRefreshTimersByUser[key];
@@ -1876,9 +1892,35 @@
             postToVdo({ getStreamIDs: true });
             postToVdo({ getDetailedState: true });
             postToVdo({ getStats: true });
+            const now = Date.now();
+            Object.keys(vdoState.knownStreams).forEach(function (streamId) {
+                const known = vdoState.knownStreams[streamId];
+                const seenAt = ninjamSync.userLastSeenAt[known.userKey];
+                if (typeof seenAt !== 'number' || now - seenAt > remoteUserStaleMs) {
+                    delete vdoState.knownStreams[streamId];
+                    return;
+                }
+                if (!known.missingSince || now - known.missingSince < 15000
+                    || (known.lastRequestAt && now - known.lastRequestAt < 30000)) return;
+                // Re-watch only a stream previously advertised by this peer.
+                // This API requests reception; it does not restart local capture.
+                // Older VDO builds can retain a waiting flag after the receiver
+                // has disappeared. Clear only this known, absent stream's flag.
+                postEvalToVdo('(function(){var id=' + JSON.stringify(streamId)
+                    + ';if(typeof session!=="object")return;'
+                    + 'for(var key in session.rpcs){if(session.rpcs[key].streamID===id)return;}'
+                    + 'if(session.waitingWatchList)delete session.waitingWatchList[id];})();');
+                if (postToVdo({ requestStream: streamId })) known.lastRequestAt = now;
+            });
         }
 
         function applyPeerBuffers() {
+            // A camera roster can arrive before its first native interval snapshot.
+            Object.keys(vdoState.announcedStreams).forEach(function (streamId) {
+                if (!vdoState.knownStreams[streamId]) {
+                    registerPeerTarget(streamId, vdoState.announcedStreams[streamId], streamId);
+                }
+            });
             const trackedUsers = getTrackedUserKeys();
             let linkedUsers = 0;
             for (let i = 0; i < trackedUsers.length; i++) {
@@ -2106,7 +2148,11 @@
                     || { ok: false, text: 'interval pending', statusLabel: 'NO RCV / NO SENT' };
                 const chunkStats = vdoState.chunkStatsByUser[userKey] || {};
                 const chunkStatsFresh = typeof chunkStats.updatedAt === 'number' && (Date.now() - chunkStats.updatedAt) < 8000;
-                const videoDegraded = chunkStatsFresh && (chunkStats.rebuffering || chunkStats.awaitingKeyframe);
+                const videoMissing = !userHasCameraTargets(userKey);
+                const videoDegraded = videoMissing || (chunkStatsFresh && (chunkStats.rebuffering || chunkStats.awaitingKeyframe));
+                const videoStatus = videoMissing ? 'video missing' : (videoDegraded ? 'video buffering' : 'video connected');
+                if (window.parent !== window) window.parent.postMessage({ type: 'ninjamVideoHealth', userId: userKey,
+                    ok: !videoDegraded, text: videoStatus }, window.location.origin);
                 const wrap = document.createElement('span');
                 wrap.className = 'peer-light-wrap';
                 const light = document.createElement('button');
@@ -2139,7 +2185,7 @@
                 const chunkEventText = (chunkEvent && (Date.now() - chunkEvent.updatedAt) < 8000)
                     ? (' | last chunk ' + chunkEvent.direction + ' ' + chunkEvent.type + ' ts ' + formatMaybeMs(chunkEvent.ts))
                     : '';
-                const detailText = userKey + ': ' + diagnostics.text + vdoText + chunkText + ' | map ' + mappingSource + mappingDiagnostic + chunkEventText;
+                const detailText = userKey + ': ' + diagnostics.text + ' | ' + videoStatus + vdoText + chunkText + ' | map ' + mappingSource + mappingDiagnostic + chunkEventText;
                 light.title = detailText + '\nClick to copy';
                 light.setAttribute('aria-label', detailText);
                 light.addEventListener('click', function () {
@@ -2676,6 +2722,13 @@
 
             if (data.streamIDs && typeof data.streamIDs === 'object') {
                 const entries = Object.entries(data.streamIDs);
+                vdoState.announcedStreams = Object.assign({}, data.streamIDs);
+                Object.keys(vdoState.knownStreams).forEach(function (streamId) {
+                    if (Object.prototype.hasOwnProperty.call(data.streamIDs, streamId)) return;
+                    const known = vdoState.knownStreams[streamId];
+                    if (!known.missingSince) known.missingSince = Date.now();
+                    changed = unregisterPeerTarget(streamId) || changed;
+                });
                 for (let i = 0; i < entries.length; i++) {
                     const entry = entries[i];
                     changed = registerPeerTarget(entry[0], entry[1], entry[0]) || changed;

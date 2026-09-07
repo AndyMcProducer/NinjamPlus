@@ -19,7 +19,7 @@ int NinjamVst3AudioProcessor::measurePendingIntervalForIntegrationTest(int ageMs
     const juce::String pendingKey = sender + ":0";
     const juce::String guid = "0123456789abcdef0123456789abcdef";
     const double nowMs = juce::Time::getMillisecondCounterHiRes();
-    constexpr long long playbackSample = 100000;
+    constexpr long long playbackSample = 1000000;
     {
         const juce::ScopedLock lock(intervalSyncAnnouncementLock);
         auto& pending = pendingRemoteIntervalStartsByUser[pendingKey];
@@ -34,6 +34,18 @@ int NinjamVst3AudioProcessor::measurePendingIntervalForIntegrationTest(int ageMs
     }
     processPendingRemoteAudioPlaybackBoundaries(2000.0);
     processPendingIntervalSyncMarkers(0, playbackSample, 2000.0);
+    bool diagnosticEvidenceValid = !hasPlaybackBoundary;
+    if (hasPlaybackBoundary)
+    {
+        const auto diagnostic = getSyncDiagnosticState();
+        const auto measurements = diagnostic.getProperty("measurements", juce::var());
+        if (const auto* entries = measurements.getArray())
+            for (const auto& entry : *entries)
+                if (entry.getProperty("audioGuid", juce::var()).toString() == guid)
+                    diagnosticEvidenceValid = entry.getProperty("basis", juce::var()).toString() == "audio-guid"
+                        && (juce::int64) entry.getProperty("playbackSample", juce::var()) == playbackSample
+                        && (double) entry.getProperty("captureIntervalMs", juce::var()) == 2000.0;
+    }
     const juce::ScopedLock lock(intervalSyncAnnouncementLock);
     const auto measured = remoteLatencyAverageByUser.find(sender);
     const int result = measured == remoteLatencyAverageByUser.end()
@@ -41,7 +53,62 @@ int NinjamVst3AudioProcessor::measurePendingIntervalForIntegrationTest(int ageMs
     pendingRemoteIntervalStartsByUser.erase(pendingKey);
     remoteAudioPlaybackBoundariesByUser.erase(sender);
     remoteLatencyAverageByUser.erase(sender);
-    return result;
+    return diagnosticEvidenceValid ? result : -2;
+}
+
+bool NinjamVst3AudioProcessor::verifyLateAudioGuidForIntegrationTest()
+{
+    const juce::String sender = "late-guid-probe";
+    constexpr long long playbackSample = 1000000;
+    bool ok = true;
+    for (int marker = 0; marker < 3; ++marker)
+    {
+        const auto key = sender + ":" + juce::String(marker);
+        const auto guid = juce::String::repeatedString("a", 31) + juce::String(marker);
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        auto& pending = pendingRemoteIntervalStartsByUser[key];
+        pending.senderKey = sender;
+        pending.remoteInterval = marker;
+        pending.audioGuidHex = guid;
+        pending.receivedAtMs = now - 3990.0;
+        pending.receivedSampleCount = playbackSample - (long long)std::llround(3990.0 * getSampleRate() / 1000.0);
+        // Repeated timer/beat polls must neither consume nor measure an
+        // unmatched GUID, even after the former 1.5-interval timeout.
+        processPendingIntervalSyncMarkers(0, playbackSample, 2000.0);
+        processPendingIntervalSyncMarkers(0, playbackSample, 2000.0);
+        const auto before = remoteLatencyAverageByUser.find(sender);
+        ok = ok && pendingRemoteIntervalStartsByUser.count(key) == 1
+            && remoteLatencyFirmDelayMsByUser.count(sender) == 0
+            && (before == remoteLatencyAverageByUser.end() ? 0 : before->second.sampleCount) == marker;
+        remoteAudioPlaybackBoundariesByUser[sender][guid] = { playbackSample, now };
+        processPendingRemoteAudioPlaybackBoundaries(2000.0);
+        processPendingRemoteAudioPlaybackBoundaries(2000.0);
+        const auto after = remoteLatencyAverageByUser.find(sender);
+        ok = ok && after != remoteLatencyAverageByUser.end()
+            && after->second.sampleCount == marker + 1
+            && std::abs(after->second.lastMeasurementMs - 5990.0) < 1.0
+            && after->second.measurementBasis == "audio-guid"
+            && pendingRemoteIntervalStartsByUser.count(key) == 0;
+    }
+    const auto published = remoteLatencyFirmDelayMsByUser.find(sender);
+    ok = ok && published != remoteLatencyFirmDelayMsByUser.end() && published->second == 5990;
+    auto& expired = pendingRemoteIntervalStartsByUser[sender + ":expired"];
+    expired.senderKey = sender;
+    expired.audioGuidHex = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    expired.receivedSampleCount = 1;
+    expired.receivedAtMs = juce::Time::getMillisecondCounterHiRes() - 6100.0;
+    processPendingIntervalSyncMarkers(0, playbackSample, 2000.0);
+    ok = ok && pendingRemoteIntervalStartsByUser.count(sender + ":expired") == 0;
+    for (int marker = 0; marker < 3; ++marker)
+        pendingRemoteIntervalStartsByUser.erase(sender + ":" + juce::String(marker));
+    remoteAudioPlaybackBoundariesByUser.erase(sender);
+    remoteLatencyAverageByUser.erase(sender);
+    remoteLatencyFirmDelayMsByUser.erase(sender);
+    remoteLatencyLastAppliedIntervalByUser.erase(sender);
+    lastRemoteServerLatencyMsByUser.erase(sender);
+    remoteVideoBufferRefreshIdByUser.erase(sender);
+    std::cout << (ok ? "PASS" : "FAIL") << ": late GUID retained, matched once, published 5990 ms, expired when absent" << std::endl;
+    return ok;
 }
 
 bool NinjamVst3AudioProcessor::testNtpPlaybackCorrelationForIntegrationTest()
@@ -215,7 +282,7 @@ struct Client
             const double blockDurationMs = blockSize * 1000.0 / sampleRate;
             double nextBlockMs = juce::Time::getMillisecondCounterHiRes();
             std::ofstream inputCapture, outputCapture, clockCapture;
-            juce::uint32 noiseState = 57;
+            juce::uint32 noiseState = name == "alpha" ? 57 : 93;
             if (captureLiveProbe)
             {
                 const auto base = "test-results/live-" + name.toStdString();
@@ -230,7 +297,7 @@ struct Client
                 if (captureLiveProbe)
                 {
                     clockCapture << juce::Time::currentTimeMillis() << '\n';
-                    if (name == "alpha")
+                    // Independent source signals allow correlation in both directions.
                     {
                         for (int sample = 0; sample < blockSize; ++sample)
                         {
@@ -241,6 +308,20 @@ struct Client
                         }
                     }
                     inputCapture.write(reinterpret_cast<const char*>(audio.getReadPointer(0)), blockSize * sizeof(float));
+                }
+                if (referenceTone)
+                {
+                    const double wallMs = (double)juce::Time::currentTimeMillis();
+                    for (int sample = 0; sample < blockSize; ++sample)
+                    {
+                        const double atMs = wallMs + sample * 1000.0 / sampleRate;
+                        const auto event = (long long)std::floor(atMs / 5000.0);
+                        const double phaseMs = atMs - (double)event * 5000.0;
+                        const double frequency = 660.0 + (double)(event % 5) * 110.0;
+                        const double envelope = phaseMs < 100.0
+                            ? juce::jlimit(0.0, 1.0, juce::jmin(phaseMs / 5.0, (100.0 - phaseMs) / 5.0)) : 0.0;
+                        audio.setSample(0, sample, (float)(0.15 * envelope * std::sin(phaseMs * frequency * juce::MathConstants<double>::twoPi / 1000.0)));
+                    }
                 }
                 if (firstBlock)
                     std::cout << "phase: " << name << " first audio-thread processBlock" << std::endl;
@@ -277,6 +358,7 @@ struct Client
     std::atomic<bool> audioRunning { false };
     std::thread audioThread;
     bool captureLiveProbe = false;
+    bool referenceTone = false;
 };
 
 struct RemoteObservation
@@ -464,7 +546,30 @@ bool verifyRemoteLatencyJitterFilter(NinjamVst3AudioProcessor& processor)
     int shiftedMs = -1;
     for (int sample = 0; sample < 24; ++sample)
         shiftedMs = processor.applyRemoteLatencyMeasurementForIntegrationTest("persistent-shift-probe", sample < 10 ? 800 : 900);
-    return startupOk && shiftedMs >= 870;
+    bool recoveryOk = true;
+    const auto checkRecovery = [&](const juce::String& key, int baseline, const std::vector<int>& readings,
+                                   int expected, int tolerance)
+    {
+        for (int i = 0; i < 12; ++i)
+            processor.applyRemoteLatencyMeasurementForIntegrationTest(key, baseline);
+        int actual = baseline;
+        for (const int reading : readings)
+            actual = processor.applyRemoteLatencyMeasurementForIntegrationTest(key, reading);
+        std::cout << "filter replay " << key << ": " << actual << " ms (expected " << expected << ")" << std::endl;
+        if (std::abs(actual - expected) > tolerance)
+            recoveryOk = false;
+    };
+    // Raw GUID delays from the TURN/UDP dynamic-network recovery recording.
+    // The audio waveform measured 3826 ms; route smoothing is already included
+    // in these inputs. Do not add another long settling tail in this filter.
+    checkRecovery("udp-recovery", 4629,
+                  { 4629, 4386, 4225, 4096, 4012, 3923, 3932, 3915, 3873, 3849, 3861 }, 3826, 200);
+    checkRecovery("step-down", 9000, { 5050, 5080, 5040, 5060, 5055 }, 5053, 50);
+    checkRecovery("step-up", 5053, { 9000, 9030, 8990, 9010, 9005 }, 9000, 50);
+    // Preserve the nine-reading median's rejection of up to four bad readings.
+    checkRecovery("burst-down", 9000, { 5050, 5050, 5050, 5050, 9000, 9000, 9000, 9000, 9000 }, 9000, 0);
+    checkRecovery("burst-up", 5053, { 9000, 9000, 9000, 9000, 5053, 5053, 5053, 5053, 5053 }, 5053, 0);
+    return startupOk && shiftedMs >= 870 && recoveryOk;
 }
 
 juce::String guidString(const unsigned char guid[16])
@@ -568,8 +673,14 @@ int main(int argc, char* argv[])
         return processor->testNtpPlaybackCorrelationForIntegrationTest() ? 0 : 1;
     }
 
+    if (argc == 2 && juce::String::fromUTF8(argv[1]) == "--filter-only")
+    {
+        auto processor = std::make_unique<NinjamVst3AudioProcessor>();
+        return verifyRemoteLatencyJitterFilter(*processor) ? 0 : fail("latency filter regression");
+    }
+
     if (argc < 2)
-        return fail("usage: NINJAMplus_SyncSoakTest <path-to-ninjamsrv> [--near-boundary | --live-vdo]");
+        return fail("usage: NINJAMplus_SyncSoakTest <path-to-ninjamsrv> [--near-boundary | --live-vdo [--hotspot] [--bpm=120]]");
 
     const juce::File serverExecutable(juce::String::fromUTF8(argv[1]));
     if (!serverExecutable.existsAsFile())
@@ -588,16 +699,27 @@ int main(int argc, char* argv[])
 
     const juce::File configFile = tempRoot.getChildFile("soak.cfg");
     const bool liveVdo = argc >= 3 && juce::String::fromUTF8(argv[2]) == "--live-vdo";
+    bool liveHotspot = false;
+    int liveBpm = 120;
+    int liveDurationSeconds = 900;
+    for (int arg = 3; arg < argc; ++arg)
+    {
+        const auto option = juce::String::fromUTF8(argv[arg]);
+        if (option == "--hotspot") liveHotspot = true;
+        else if (option.startsWith("--duration-seconds=")) liveDurationSeconds = juce::jlimit(30, 3600, option.fromFirstOccurrenceOf("=", false, false).getIntValue());
+        else if (option.startsWith("--bpm=")) liveBpm = juce::jlimit(40, 240, option.fromFirstOccurrenceOf("=", false, false).getIntValue());
+    }
     const juce::String config =
         "Port " + juce::String(serverPort) + "\n"
         "MaxUsers 8\n"
         "MaxChannels 32 4\n"
         "AnonymousUsers no\n"
         "AllowHiddenUsers yes\n"
+        "SetVotingThreshold 50\n"
         "ACL 127.0.0.1/32 allow\n"
         "User alpha testpass *\n"
         "User bravo testpass *\n"
-        + juce::String(liveVdo ? "DefaultBPM 120\nDefaultBPI 16\n" : "DefaultBPM 200\nDefaultBPI 2\n");
+        + (liveVdo ? "DefaultBPM " + juce::String(liveBpm) + "\nDefaultBPI 16\n" : juce::String("DefaultBPM 200\nDefaultBPI 2\n"));
     if (!configFile.replaceWithText(config))
         return fail("could not write local NINJAM server config");
 
@@ -613,11 +735,58 @@ int main(int argc, char* argv[])
     }
     std::cout << "phase: server listening on " << serverPort << std::endl;
 
+    if (argc >= 5 && juce::String::fromUTF8(argv[2]) == "--reference-public")
+    {
+        Client reference("anonymous:SteveReference");
+        reference.referenceTone = true;
+        reference.processor.setMobileHotspotModeEnabled(true);
+        reference.processor.setMetronomeMuted(true);
+        reference.processor.setLocalMonitorEnabled(false);
+        reference.processor.setLocalChannelInput(0, 0);
+        reference.processor.setLocalChannelGain(0, 1.0f);
+        reference.processor.setTransmitLocal(true);
+        // This explicit diagnostic mode has no editor in which to show the
+        // already-authorized room's license prompt. Print it to the operator.
+        reference.processor.getClient().LicenseAgreementCallback = [](void*, const char* license) -> int
+        {
+            std::cout << "REFERENCE server license: " << (license != nullptr ? license : "") << std::endl;
+            return 1;
+        };
+        reference.processor.getClient().LicenseAgreement_User = nullptr;
+        reference.startAudio();
+        reference.processor.connectToServer(juce::String::fromUTF8(argv[3]), reference.name, {});
+        if (!waitForConnected({ &reference }, 60000))
+        {
+            server.kill();
+            return fail("reference client did not connect: " + juce::String(reference.processor.getClient().GetErrorStr()));
+        }
+        reference.processor.launchVideoSession(juce::String::fromUTF8(argv[4]));
+        const auto stop = juce::File::getCurrentWorkingDirectory().getChildFile("test-results/reference-stop");
+        stop.deleteFile();
+        const auto status = juce::File::getCurrentWorkingDirectory().getChildFile("test-results/reference-status.json");
+        const auto deadline = juce::Time::getMillisecondCounterHiRes() + 600000.0;
+        std::cout << "REFERENCE: generated 100ms tone every five seconds; no microphone; port="
+                  << reference.processor.getVideoHelperPortForIntegrationTest() << std::endl;
+        while (!stop.existsAsFile() && juce::Time::getMillisecondCounterHiRes() < deadline)
+        {
+            pump({ &reference }, 250);
+            status.replaceWithText(juce::JSON::toString(reference.processor.getSyncDiagnosticState()));
+        }
+        reference.stopAudio();
+        reference.processor.disconnectFromServer();
+        server.kill();
+        return 0;
+    }
+
     if (liveVdo)
     {
         const juce::String room = "njplusbern" + juce::String(juce::Time::currentTimeMillis());
         const auto stopFile = juce::File::getCurrentWorkingDirectory().getChildFile("test-results/live-stop");
         stopFile.deleteFile();
+        const auto bpmFile = juce::File::getCurrentWorkingDirectory().getChildFile("test-results/live-bpm");
+        bpmFile.deleteFile();
+        const auto bpiFile = juce::File::getCurrentWorkingDirectory().getChildFile("test-results/live-bpi");
+        bpiFile.deleteFile();
         auto alphaOwner = std::make_unique<Client>("alpha");
         auto bravoOwner = std::make_unique<Client>("bravo");
         auto& alpha = *alphaOwner;
@@ -626,6 +795,7 @@ int main(int argc, char* argv[])
         for (auto* client : { &alpha, &bravo })
         {
             client->captureLiveProbe = true;
+            client->processor.setMobileHotspotModeEnabled(liveHotspot);
             client->processor.setMetronomeMuted(true);
             client->processor.setLocalMonitorEnabled(false);
             client->processor.setLocalChannelInput(0, 0);
@@ -644,11 +814,49 @@ int main(int argc, char* argv[])
             pump({ &alpha, &bravo }, 1500);
             bravo.processor.launchVideoSession(room);
             std::cout << "LIVE room=" << room
+                      << " hotspot=" << liveHotspot << " bpm=" << liveBpm
                       << " alphaPort=" << alpha.processor.getVideoHelperPortForIntegrationTest()
                       << " bravoPort=" << bravo.processor.getVideoHelperPortForIntegrationTest() << std::endl;
-            const auto deadline = juce::Time::getMillisecondCounterHiRes() + 900000.0;
+            const auto deadline = juce::Time::getMillisecondCounterHiRes() + liveDurationSeconds * 1000.0;
+            const auto diagnosticsFile = juce::File::getCurrentWorkingDirectory().getChildFile("test-results/live-native-diagnostics.jsonl");
+            diagnosticsFile.replaceWithText({});
+            double nextDiagnostics = 0.0;
             while (!stopFile.existsAsFile() && juce::Time::getMillisecondCounterHiRes() < deadline)
+            {
+                const auto diagnosticNow = juce::Time::getMillisecondCounterHiRes();
+                if (diagnosticNow >= nextDiagnostics)
+                {
+                    nextDiagnostics = diagnosticNow + 1000.0;
+                    juce::DynamicObject::Ptr snapshot = new juce::DynamicObject();
+                    snapshot->setProperty("at", juce::Time::currentTimeMillis());
+                    snapshot->setProperty("alpha", alpha.processor.getSyncDiagnosticState());
+                    snapshot->setProperty("bravo", bravo.processor.getSyncDiagnosticState());
+                    diagnosticsFile.appendText(juce::JSON::toString(juce::var(snapshot.get()), true) + "\n");
+                }
+                if (bpmFile.existsAsFile())
+                {
+                    const int requestedBpm = bpmFile.loadFileAsString().trim().getIntValue();
+                    bpmFile.deleteFile();
+                    if (requestedBpm >= 40 && requestedBpm <= 240)
+                    {
+                        alpha.processor.sendChatMessage("!vote bpm " + juce::String(requestedBpm));
+                        bravo.processor.sendChatMessage("!vote bpm " + juce::String(requestedBpm));
+                        std::cout << "LIVE requested bpm=" << requestedBpm << std::endl;
+                    }
+                }
+                if (bpiFile.existsAsFile())
+                {
+                    const int requestedBpi = bpiFile.loadFileAsString().trim().getIntValue();
+                    bpiFile.deleteFile();
+                    if (requestedBpi >= 1 && requestedBpi <= 64)
+                    {
+                        alpha.processor.sendChatMessage("!vote bpi " + juce::String(requestedBpi));
+                        bravo.processor.sendChatMessage("!vote bpi " + juce::String(requestedBpi));
+                        std::cout << "LIVE requested bpi=" << requestedBpi << std::endl;
+                    }
+                }
                 pump({ &alpha, &bravo }, 100);
+            }
         }
         alpha.stopAudio();
         bravo.stopAudio();
@@ -671,19 +879,25 @@ int main(int argc, char* argv[])
             result = fail("alpha loopback video helper did not start");
         if (alpha->processor.getClient().GetStatus() == NJClient::NJC_STATUS_OK)
         {
+            if (!alpha->processor.verifyLateAudioGuidForIntegrationTest())
+                result = fail("late audio GUID was lost or replaced by an unverified playback estimate");
             const int shortPhase = alpha->processor.measurePendingIntervalForIntegrationTest(250, false, false);
             const int waitingForAudio = alpha->processor.measurePendingIntervalForIntegrationTest(1250, true, false);
             const int matchedAudio = alpha->processor.measurePendingIntervalForIntegrationTest(250, true, true);
             const int missingAudioTimeout = alpha->processor.measurePendingIntervalForIntegrationTest(3500, true, false);
             const int boundaryGuard = alpha->processor.measurePendingIntervalForIntegrationTest(50, false, false);
+            const int lateGuidPending = alpha->processor.measurePendingIntervalForIntegrationTest(3990, true, false);
+            const int lateGuidMatched = alpha->processor.measurePendingIntervalForIntegrationTest(3990, true, true);
+            if (lateGuidPending != -1 || lateGuidMatched != 5990)
+                result = fail("late GUID must stay unmeasured until actual playback establishes 5990 ms");
             if (shortPhase < 2240 || shortPhase > 2300)
                 result = fail("fallback buffer did not include the recording interval plus the valid short playback phase");
             if (waitingForAudio != -1)
                 result = fail("first audio GUID marker was consumed before its playback boundary existed");
             if (matchedAudio != 2250)
                 result = fail("audio GUID buffer measured from recording completion instead of capture start");
-            if (missingAudioTimeout != 4000)
-                result = fail("missing audio GUID did not time out to the full capture-to-playback fallback");
+            if (missingAudioTimeout != -1)
+                result = fail("missing audio GUID produced an unverified beat-fallback estimate");
             if (boundaryGuard != -1)
                 result = fail("fallback lost its near-boundary guard");
             if (result == 0)
@@ -756,10 +970,12 @@ int main(int argc, char* argv[])
 
         int stableAlphaSnapshots = 0;
         int stableAlphaSnapshotsWithBuffer = 0;
-        int stableAlphaSnapshotsWithRefresh = 0;
+        bool stableAlphaRefreshExpired = true;
+        std::map<juce::String, double> refreshFirstObservedAt;
         juce::String lastStableAlphaPayload;
         std::vector<int> alphaBufferSamples;
         std::vector<int> bravoBufferSamples;
+        double nextStableHelperPollMs = 0.0;
         if (result == 0)
         {
             // Model the real helper's HTTP polling, including a background-tab
@@ -769,11 +985,24 @@ int main(int argc, char* argv[])
             pump({ alpha.get(), bravo.get() }, 5200, [&]
             {
                 audioGuidTiming.sample(*alpha, *bravo);
+                // GUID changes must be observed faster than the 600 ms test
+                // interval. Sampling them only at the background helper's
+                // 1000 ms cadence can assign completion to a later interval.
+                const double now = juce::Time::getMillisecondCounterHiRes();
+                if (now < nextStableHelperPollMs)
+                    return;
+                nextStableHelperPollMs = now + 1000.0;
                 const auto payload = fetchIntervals(alpha->processor.getVideoHelperPortForIntegrationTest());
                 const auto alphaObservation = observeRemotePayload(payload, "bravo");
                 if (alphaObservation.found && alphaObservation.bufferCalculated && alphaObservation.receiverBufferEmitted)
                     alphaBufferSamples.push_back(alphaObservation.receiverBufferMs);
                 const auto bravoObservation = observeRemote(bravo->processor.getVideoHelperPortForIntegrationTest(), "alpha");
+                const auto diagnostics = alpha->processor.getSyncDiagnosticState();
+                const auto measurements = diagnostics.getProperty("measurements", juce::var());
+                if (const auto* entries = measurements.getArray())
+                    for (const auto& entry : *entries)
+                        if (entry.getProperty("userKey", juce::var()).toString().startsWith("bravo"))
+                            std::cout << "alpha playback evidence: " << juce::JSON::toString(entry, true) << std::endl;
                 if (bravoObservation.found && bravoObservation.bufferCalculated && bravoObservation.receiverBufferEmitted)
                     bravoBufferSamples.push_back(bravoObservation.receiverBufferMs);
                 if (payload != lastStableAlphaPayload)
@@ -786,10 +1015,18 @@ int main(int argc, char* argv[])
                         if (observation.receiverBufferEmitted)
                             ++stableAlphaSnapshotsWithBuffer;
                         if (observation.refreshEventId.isNotEmpty())
-                            ++stableAlphaSnapshotsWithRefresh;
+                        {
+                            // A newly confirmed delay can legitimately refresh
+                            // during settling. Reject a retained event identity,
+                            // rather than assuming no new events can occur.
+                            const double now = juce::Time::getMillisecondCounterHiRes();
+                            const auto first = refreshFirstObservedAt.emplace(observation.refreshEventId, now);
+                            if (now - first.first->second > 2500.0)
+                                stableAlphaRefreshExpired = false;
+                        }
                     }
                 }
-            }, 1000.0);
+            }, 10.0);
         }
         std::cout << "phase: staggered soak complete" << std::endl;
 
@@ -851,6 +1088,11 @@ int main(int argc, char* argv[])
         if (result == 0
             && std::abs((double)stableAlphaBufferMs - (intervalDurationMs + audioGuidTiming.alphaPlaybackDelayMs.back())) > 120.0)
             result = fail("receiver buffer did not include recording duration before actual audio GUID playback");
+        if (result == 0 && audioGuidTiming.bravoPlaybackDelayMs.empty())
+            result = fail("did not observe alpha's audio GUID entering bravo playback");
+        if (result == 0
+            && std::abs((double)stableBravoBufferMs - (intervalDurationMs + audioGuidTiming.bravoPlaybackDelayMs.back())) > 120.0)
+            result = fail("bravo receiver buffer did not match absolute audio GUID playback timing");
 
         // Mobile-hotspot mode sends the primary tag plus +150 ms and +300 ms
         // retransmissions. More than ten accepted markers proves the long soak;
@@ -866,7 +1108,7 @@ int main(int argc, char* argv[])
             result = fail("a helper opening or reloading after the refresh event missed the stable receiver buffer ("
                           + juce::String(stableAlphaSnapshotsWithBuffer) + "/"
                           + juce::String(stableAlphaSnapshots) + " snapshots carried it)");
-        if (result == 0 && stableAlphaSnapshotsWithRefresh != 0)
+        if (result == 0 && !stableAlphaRefreshExpired)
             result = fail("the one-shot buffer refresh event remained in stable helper snapshots");
 
         if (result == 0)

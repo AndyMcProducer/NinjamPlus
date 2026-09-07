@@ -407,7 +407,7 @@ public:
     std::unique_ptr<NinjamStandalonePluginHolder> pluginHolder;
 };
 
-class NinjamStandaloneApp final : public JUCEApplication
+class NinjamStandaloneApp final : public JUCEApplication, private Timer
 {
 public:
     const String getApplicationName() override              { return JucePlugin_Name; }
@@ -469,6 +469,24 @@ public:
 
         mainWindow.reset (createWindow());
 
+        // Explicitly enabled local-file diagnostics; no network control listener.
+        const auto diagnosticPath = SystemStats::getEnvironmentVariable ("NINJAMPLUS_DIAGNOSTIC_DIR", {});
+        if (File::isAbsolutePath (diagnosticPath))
+        {
+            diagnosticDirectory = File (diagnosticPath);
+            if (diagnosticDirectory.createDirectory())
+            {
+                mainWindow->getPluginHolder()->shouldMuteInput = true;
+                if (auto* processor = dynamic_cast<NinjamVst3AudioProcessor*> (mainWindow->getAudioProcessor()))
+                {
+                    processor->setTransmitLocal (false);
+                    processor->setLocalMonitorEnabled (false);
+                    processor->setMetronomeMuted (true);
+                }
+                startTimer (250);
+            }
+        }
+
         // First-run check: if firstrun has not been set, show the audio settings dialog
         // so the user can configure their audio device before doing anything else.
         if (auto* settings = appProperties.getUserSettings())
@@ -484,6 +502,7 @@ public:
 
     void shutdown() override
     {
+        stopTimer();
         mainWindow = nullptr;
     }
 
@@ -517,6 +536,96 @@ private:
     }
 
     ApplicationProperties appProperties;
+    File diagnosticDirectory;
+    String lastDiagnosticId, lastDiagnosticResult;
+
+    void timerCallback() override
+    {
+        auto* processor = mainWindow != nullptr
+            ? dynamic_cast<NinjamVst3AudioProcessor*> (mainWindow->getAudioProcessor()) : nullptr;
+        if (processor == nullptr)
+            return;
+        const auto commandFile = diagnosticDirectory.getChildFile ("command.json");
+        if (commandFile.existsAsFile())
+        {
+            const auto command = JSON::parse (commandFile.loadFileAsString());
+            if (auto* object = command.getDynamicObject())
+            {
+                if (commandFile.deleteFile())
+                {
+                    lastDiagnosticId = object->getProperty ("id").toString();
+                    const auto action = object->getProperty ("action").toString();
+                    lastDiagnosticResult = "accepted";
+                    if (action == "connect")
+                    {
+                        const auto server = object->getProperty ("server").toString().trim();
+                        const auto user = object->getProperty ("user").toString().trim();
+                        if (server.isEmpty() || user.isEmpty())
+                            lastDiagnosticResult = "server and user required";
+                        else
+                        {
+                            processor->setTransmitLocal (false);
+                            processor->connectToServer (server, user, {});
+                        }
+                    }
+                    else if (action == "disconnect")
+                        processor->disconnectFromServer();
+                    else if (action == "openVideo")
+                        processor->launchVideoSessionAsync();
+                    else if (action == "recordStart")
+                        lastDiagnosticResult = processor->startSessionRecording (
+                            diagnosticDirectory.getNonexistentChildFile ("capture", {}, false))
+                            ? "accepted" : "recording could not start";
+                    else if (action == "recordStop")
+                        lastDiagnosticResult = processor->stopSessionRecording()
+                            ? "accepted" : "recording could not stop";
+                    else if (action == "hotspot" && object->getProperty ("enabled").isBool())
+                        processor->setMobileHotspotModeEnabled ((bool) object->getProperty ("enabled"));
+                    else
+                        lastDiagnosticResult = "unsupported action";
+                }
+            }
+        }
+        DynamicObject::Ptr status = new DynamicObject();
+        status->setProperty ("at", Time::currentTimeMillis());
+        status->setProperty ("version", getApplicationVersion());
+        status->setProperty ("executable", File::getSpecialLocation (File::currentExecutableFile).getFullPathName());
+        status->setProperty ("commandId", lastDiagnosticId);
+        status->setProperty ("commandResult", lastDiagnosticResult);
+        status->setProperty ("connectionStatus", processor->getClient().GetStatus());
+        status->setProperty ("connectionError", String::fromUTF8 (processor->getClient().GetErrorStr()));
+        status->setProperty ("bpm", processor->getBPM());
+        status->setProperty ("bpi", processor->getBPI());
+        status->setProperty ("hotspot", processor->isMobileHotspotModeEnabled());
+        status->setProperty ("inputMuted", (bool) mainWindow->getPluginHolder()->shouldMuteInput.getValue());
+        status->setProperty ("transmittingLocal", processor->isTransmittingLocal());
+        status->setProperty ("sync", processor->getSyncDiagnosticState());
+        status->setProperty ("recording", processor->isSessionRecording());
+        status->setProperty ("recordingStatus", processor->getSessionRecordingStatus());
+        status->setProperty ("recordingPath", processor->getSessionRecordingFile().getFullPathName());
+        Array<var> users;
+        for (const auto& user : processor->getConnectedUsers())
+        {
+            DynamicObject::Ptr entry = new DynamicObject();
+            entry->setProperty ("name", user.name);
+            entry->setProperty ("index", user.index);
+            entry->setProperty ("peakL", processor->getUserPeak (user.index, 0));
+            entry->setProperty ("peakR", processor->getUserPeak (user.index, 1));
+            users.add (var (entry.get()));
+        }
+        status->setProperty ("users", users);
+        if (auto* device = mainWindow->getPluginHolder()->deviceManager.getCurrentAudioDevice())
+        {
+            status->setProperty ("audioDevice", device->getName());
+            status->setProperty ("sampleRate", device->getCurrentSampleRate());
+            status->setProperty ("blockSize", device->getCurrentBufferSizeSamples());
+            status->setProperty ("outputLatencySamples", device->getOutputLatencyInSamples());
+        }
+        TemporaryFile snapshot (diagnosticDirectory.getChildFile ("status.json"));
+        if (snapshot.getFile().replaceWithText (JSON::toString (var (status.get()))))
+            snapshot.overwriteTargetFileWithTemporary();
+    }
+
     std::unique_ptr<NinjamStandaloneFilterWindow> mainWindow;
 };
 
