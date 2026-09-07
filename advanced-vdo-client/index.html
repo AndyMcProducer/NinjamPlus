@@ -940,8 +940,25 @@
             return latencyDebugByUser[normalizeUserId(userId)] || null;
         }
 
+        const videoHealthByUser = {};
+        window.addEventListener('message', function (event) {
+            if (event.origin !== window.location.origin || event.source !== appFrame.contentWindow
+                || !event.data || event.data.type !== 'ninjamVideoHealth') return;
+            const key = normalizeUserId(event.data.userId);
+            if (!key) return;
+            videoHealthByUser[key] = { ok: event.data.ok === true, text: String(event.data.text || ''), at: Date.now() };
+            updatePeerSyncLight(key);
+        });
         function getSyncDiagnostics(userId) {
-            return syncDiagnosticsByUser[normalizeUserId(userId)] || null;
+            const key = normalizeUserId(userId);
+            const sync = syncDiagnosticsByUser[key];
+            if (!sync) return null;
+            const video = videoHealthByUser[key];
+            const fresh = video && Date.now() - video.at < 8000;
+            const videoOk = fresh && video.ok;
+            return Object.assign({}, sync, { ok: sync.ok && videoOk,
+                text: sync.text + ' | ' + (fresh ? video.text : 'video pending'),
+                statusLabel: sync.statusLabel });
         }
 
         function fmtMeasured(v) {

@@ -10,10 +10,77 @@ const baseParams = {
 	chunkadaptceil: "2500",
 };
 
+test("clears missing video from both indicators and requests only the previously known stream", async ({ page }) => {
+    await page.clock.install();
+    let active = true;
+    await page.route("**/intervals", route => route.fulfill({ contentType: "application/json", body: JSON.stringify([
+        ...(active ? [
+        { type: "videoTimecode", userId: "remote-user", interval: 3, timecode: 0,
+          intervalMeasurementSeen: true, bufferCalculated: true, receiverBufferMs: 800,
+          receiverBufferFinal: true, syncRoute: "VDO" }
+        ] : [])
+    ]) }));
+    await page.goto(helperUrl({ label: "local-user" }));
+    const frame = await vdoFrame(page);
+    const app = frame.parentFrame();
+    await expect(page.locator("#peer-sync-light-remote-user")).toBeVisible();
+    await frame.evaluate(() => parent.postMessage({ streamIDs: { known_stream: "remote-user" } }, "*"));
+    await expect(app.locator(".peer-light.ok")).toHaveCount(1);
+    await expect(page.locator("#peer-sync-light-remote-user")).toHaveClass(/ok/);
+    await frame.evaluate(() => parent.postMessage({ streamIDs: {} }, "*"));
+    await expect(app.locator(".peer-light.ok")).toHaveCount(0);
+    await expect(page.locator("#peer-sync-light-remote-user")).not.toHaveClass(/ok/);
+    await expect(page.locator("#peer-sync-light-remote-user")).toHaveAttribute("aria-label", /video missing/i);
+    for (let i = 0; i < 8; i++) {
+        await page.clock.runFor(2500);
+    }
+    await expect.poll(() => frame.evaluate(() => received.filter(m => m.requestStream === "known_stream").length)).toBe(1);
+    const cleanupResult = await frame.evaluate(() => {
+        const cleanup = received.find(m => m.function === "eval" && m.value.includes("waitingWatchList"));
+        window.session = { rpcs: {}, waitingWatchList: { known_stream: true, unrelated_stream: true } };
+        (0, eval)(cleanup.value);
+        const missingCleared = !session.waitingWatchList.known_stream && session.waitingWatchList.unrelated_stream;
+        session.rpcs.peer = { streamID: "known_stream" };
+        session.waitingWatchList.known_stream = true;
+        (0, eval)(cleanup.value);
+        return { missingCleared, livePreserved: session.waitingWatchList.known_stream };
+    });
+    expect(cleanupResult).toEqual({ missingCleared: true, livePreserved: true });
+    await page.clock.fastForward(2500);
+    expect(await frame.evaluate(() => received.filter(m => m.requestStream).length)).toBe(1);
+    expect(await frame.evaluate(() => received.some(m => m.hangup || m.reload))).toBe(false);
+    await frame.evaluate(() => parent.postMessage({ streamIDs: { known_stream: "remote-user" } }, "*"));
+    await expect(app.locator(".peer-light.ok")).toHaveCount(1);
+    await expect(page.locator("#peer-sync-light-remote-user")).toHaveClass(/ok/);
+    await frame.evaluate(() => parent.postMessage({ streamIDs: {} }, "*"));
+    active = false;
+    for (let i = 0; i < 16; i++) await page.clock.runFor(2500);
+    expect(await frame.evaluate(() => received.filter(m => m.requestStream).length)).toBe(1);
+});
+
 function helperUrl(overrides = {}) {
 	const params = new URLSearchParams({ ...baseParams, ...overrides });
 	return "/buffer-room?" + params.toString();
 }
+
+test("does not resurrect a camera removed before native user discovery", async ({ page }) => {
+    let active = false;
+    await page.route("**/intervals", route => route.fulfill({ contentType: "application/json",
+        body: JSON.stringify(active ? [{ type: "videoTimecode", userId: "late-user", interval: 3,
+            timecode: 0, intervalMeasurementSeen: true, bufferCalculated: true,
+            receiverBufferMs: 800, receiverBufferFinal: true, syncRoute: "VDO" }] : []) }));
+    await page.goto(helperUrl());
+    const frame = await vdoFrame(page);
+    await frame.evaluate(() => {
+        parent.postMessage({ streamIDs: { departed_stream: "late-user" } }, "*");
+        parent.postMessage({ streamIDs: {} }, "*");
+    });
+    active = true;
+    const light = page.locator("#peer-sync-light-late-user");
+    await expect(light).toBeVisible();
+    await expect(light).toHaveAttribute("aria-label", /video missing/i);
+    await expect(light).not.toHaveClass(/ok/);
+});
 
 async function vdoFrame(page) {
 	await expect.poll(() => page.frames().some((frame) => frame.url().includes("/vdo-stub/"))).toBe(true);
