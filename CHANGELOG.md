@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Preserve the calculated VDO delay during helper refresh instead of briefly setting it to zero, which discarded valid buffered video and forced a full refill. Cold-start and helper-reload validation: [test results](docs/vdo-startup-refresh-fix-2026-09-07.md).
+
 ## v0.10.0.1 - 2026-08-01
 
 ### Dedicated Control Transport and VDO Sync Fixes

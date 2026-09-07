@@ -14,7 +14,8 @@ const root = path.resolve(__dirname, '..');
 const output = path.resolve(args.output || path.join(root, 'test-results', 'clock-browser-' + Date.now()));
 const base = args.base || 'https://vdo.ninja/alpha/';
 const chromePath = args.chrome || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
-const target = 5000;
+const target = Number(args.target || 5000);
+assert(target >= 1000 && target <= 30000);
 const delay = ms => new Promise(r => setTimeout(r, ms));
 const median = a => { a = [...a].sort((x,y) => x-y); return a[Math.floor(a.length/2)]; };
 const events = [], pending = [], scriptLoads = [], cases = [];
@@ -119,6 +120,23 @@ async function save(label,p) {
     const viewerUrl=url({view:stream,buffer:String(target),buffer2:'0',cleanoutput:'1',autostart:'1'});
     const keepalive=await newPage('keepalive',viewerUrl); await keepalive.evaluate(network);
     const baseline=await sampleWindow(keepalive,'baseline');
+    if(args['stall-ms']) {
+        const stall=Number(args['stall-ms']);assert(stall>=100 && stall<=2000);
+        try {
+            for(let attempt=0;attempt<3;attempt++) {
+                const started=Date.now();await event('scheduler-stall',{stall,attempt});
+                await keepalive.evaluate(ms=>{const end=performance.now()+ms;while(performance.now()<end){};},stall);
+                await until(async()=>keepalive.evaluate(({started,target})=>{
+                    const samples=__njLiveProbe.samples.filter(s=>s.now>started && Math.abs(s.delay-target)<750);
+                    let count=0,prior;for(const s of samples){const capture=s.now-s.delay;if(prior!==undefined && capture-prior>5)count++;prior=capture;}
+                    return count>=3;
+                },{started,target}),2000,'Intact video failed to catch up within two seconds after scheduler stall');
+                await event('stall-recovered',{attempt,elapsedMs:Date.now()-started});await delay(3000);
+            }
+            await event('pass',{scenario:'scheduler-stall'});
+        } finally {await save('scheduler-stall-viewer',keepalive);}
+        return;
+    }
     await publisher.evaluate(()=>{const original=Date.now;window.__njClockJumpMs=0;Date.now=()=>original()+__njClockJumpMs;});
     for (const jump of [1890,5053,-5053]) {
         await publisher.evaluate(value=>{__njClockJumpMs=value;},jump); await event('clock-jump',{jump});

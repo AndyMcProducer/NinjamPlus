@@ -655,6 +655,8 @@ int main(int argc, char* argv[])
         stopFile.deleteFile();
         const auto bpmFile = juce::File::getCurrentWorkingDirectory().getChildFile("test-results/live-bpm");
         bpmFile.deleteFile();
+        const auto bpiFile = juce::File::getCurrentWorkingDirectory().getChildFile("test-results/live-bpi");
+        bpiFile.deleteFile();
         auto alphaOwner = std::make_unique<Client>("alpha");
         auto bravoOwner = std::make_unique<Client>("bravo");
         auto& alpha = *alphaOwner;
@@ -710,6 +712,17 @@ int main(int argc, char* argv[])
                         alpha.processor.sendChatMessage("!vote bpm " + juce::String(requestedBpm));
                         bravo.processor.sendChatMessage("!vote bpm " + juce::String(requestedBpm));
                         std::cout << "LIVE requested bpm=" << requestedBpm << std::endl;
+                    }
+                }
+                if (bpiFile.existsAsFile())
+                {
+                    const int requestedBpi = bpiFile.loadFileAsString().trim().getIntValue();
+                    bpiFile.deleteFile();
+                    if (requestedBpi >= 1 && requestedBpi <= 64)
+                    {
+                        alpha.processor.sendChatMessage("!vote bpi " + juce::String(requestedBpi));
+                        bravo.processor.sendChatMessage("!vote bpi " + juce::String(requestedBpi));
+                        std::cout << "LIVE requested bpi=" << requestedBpi << std::endl;
                     }
                 }
                 pump({ &alpha, &bravo }, 100);

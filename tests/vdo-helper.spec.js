@@ -298,10 +298,19 @@ test("does not reapply a stable buffer for every interval or duplicate refresh",
 
 	await sendInterval(15, { refreshBuffer: true, bufferRefreshEventId: "refresh:tester:1" });
 	await page.waitForTimeout(250);
+	const refreshUpdates = await frame.evaluate(() => window.received.filter((m) => m && "setBufferDelay" in m));
+	expect(refreshUpdates.length).toBeGreaterThan(0);
+	expect(refreshUpdates.every((m) => m.setBufferDelay === 800)).toBe(true);
 	await frame.evaluate(() => { window.received = []; });
 	await sendInterval(15, { refreshBuffer: true, bufferRefreshEventId: "refresh:tester:1" });
 	await page.waitForTimeout(500);
 	expect(await frame.evaluate(() => window.received.filter((m) => m && "setBufferDelay" in m))).toEqual([]);
+	await sendInterval(16, { receiverBufferMs: 16000, refreshBuffer: true, bufferRefreshEventId: "refresh:tester:2" });
+	await page.waitForTimeout(250);
+	expect(await frame.evaluate(() => window.received.filter((m) => m && "setBufferDelay" in m).map(m => m.setBufferDelay))).toEqual([16000]);
+	await frame.evaluate(() => { window.received = []; });
+	await sendInterval(17, { voiceChatMode: true });
+	expect(await frame.evaluate(() => window.received.some(m => m && m.setBufferDelay === 0))).toBe(true);
 });
 
 test("recovers stable buffer state after a real HTTP-polling helper reload", async ({ page }) => {

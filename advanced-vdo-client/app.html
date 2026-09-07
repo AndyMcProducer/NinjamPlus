@@ -1845,7 +1845,7 @@
 			return true;
 		}
 
-		function scheduleBufferRefresh(userKey, refreshEventId, flushFirst) {
+		function scheduleBufferRefresh(userKey, refreshEventId, resetLatency) {
             const key = normalizeUserId(userKey);
             const eventId = String(refreshEventId || '');
             if (!key || !eventId || vdoState.lastBufferRefreshIdByUser[key] === eventId) {
@@ -1861,10 +1861,11 @@
                 clearTimeout(vdoState.bufferRefreshTimersByUser[key]);
             }
             vdoState.bufferRefreshPendingUntilByUser[key] = Date.now() + 150;
-            if (flushFirst) {
+            if (resetLatency) {
                 clearEstimatedVdoLatency(key);
-                sendTargetedBuffer(key, minimumBufferMs);
             }
+            // Refresh the receiver without briefly requesting live playback.
+            // A zero target discards valid delayed GOPs and forces a full refill.
             sendTargetedRefresh(key);
             vdoState.bufferRefreshTimersByUser[key] = setTimeout(function () {
                 delete vdoState.bufferRefreshTimersByUser[key];
