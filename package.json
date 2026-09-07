@@ -4,6 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "test:live-clock": "node tests/run-live-clock-regression.cjs",
     "embed:vdo": "node scripts/embed-vdo-assets.js",
     "check:vdo-embed": "node scripts/embed-vdo-assets.js --check",
     "test": "npm run check:vdo-embed && playwright test"

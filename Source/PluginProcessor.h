@@ -200,6 +200,7 @@ public:
         juce::StringArray channelNames; // name of each NINJAM channel (index 0..numChannels-1)
     };
     std::vector<UserInfo> getConnectedUsers();
+    juce::var getSyncDiagnosticState();
     void setUserOutput(int userIndex, int outputChannelIndex);
     bool setUserOutputToLinkAudio(int userIndex);
     void setUserLevel(int userIndex, float volume, float pan, bool isMuted, bool isSolo);
@@ -641,6 +642,7 @@ public:
     void requestVideoBufferRefreshForIntegrationTest();
     int applyRemoteLatencyMeasurementForIntegrationTest(const juce::String& sender, int elapsedMs);
     int measurePendingIntervalForIntegrationTest(int ageMs, bool withAudioGuid, bool hasPlaybackBoundary);
+    bool verifyLateAudioGuidForIntegrationTest();
     void setIntervalSyncTagArrivalOffsetForIntegrationTest(int offsetMs);
 #endif
 
@@ -1403,6 +1405,13 @@ private:
         double averageMs = 0.0;
         double firmAverageMs = 0.0;
         double lastMeasurementMs = -1.0;
+        juce::String measurementBasis;
+        juce::String measurementAudioGuid;
+        long long measurementReceivedSample = -1;
+        long long measurementPlaybackSample = -1;
+        double measurementIntervalMs = 0.0;
+        double measurementRouteMs = 0.0;
+        double measurementObservedAtMs = 0.0;
         std::deque<double> recentMeasurementsMs;
     };
     std::map<juce::String, RemoteLatencyAverageState> remoteLatencyAverageByUser;

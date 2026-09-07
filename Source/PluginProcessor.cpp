@@ -22053,6 +22053,56 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     }
 }
 
+juce::var NinjamVst3AudioProcessor::getSyncDiagnosticState()
+{
+    juce::DynamicObject::Ptr result = new juce::DynamicObject();
+    result->setProperty("sampleRate", getSampleRate());
+    result->setProperty("boundarySample", (juce::int64) remoteAudioPlaybackBoundarySampleCount.load());
+    result->setProperty("boundarySequence", (juce::int64) remoteAudioPlaybackBoundarySequence.load());
+    juce::Array<juce::var> playback;
+    {
+        const juce::ScopedLock lock(ninjamClientLock);
+        for (int user = 0; user < ninjamClient.GetNumUsers(); ++user)
+        {
+            const auto* name = ninjamClient.GetUserState(user);
+            if (name == nullptr) continue;
+            unsigned char guid[16] {};
+            bool hasCurrent = false;
+            ninjamClient.GetUserChannelPlaybackGuids(user, 0, guid, &hasCurrent, nullptr, nullptr);
+            juce::DynamicObject::Ptr entry = new juce::DynamicObject();
+            entry->setProperty("userKey", canonicalDelayUserKey(normaliseOpusPeerId(juce::String::fromUTF8(name))));
+            entry->setProperty("channel", 0);
+            entry->setProperty("audioGuid", hasCurrent ? guidToHexString(guid) : juce::String());
+            playback.add(juce::var(entry.get()));
+        }
+    }
+    result->setProperty("playback", playback);
+    juce::Array<juce::var> measurements;
+    {
+        const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+        for (const auto& item : remoteLatencyAverageByUser)
+        {
+            const auto& state = item.second;
+            juce::DynamicObject::Ptr entry = new juce::DynamicObject();
+            entry->setProperty("userKey", canonicalDelayUserKey(item.first));
+            entry->setProperty("basis", state.measurementBasis);
+            entry->setProperty("audioGuid", state.measurementAudioGuid);
+            entry->setProperty("receivedSample", (juce::int64) state.measurementReceivedSample);
+            entry->setProperty("playbackSample", (juce::int64) state.measurementPlaybackSample);
+            entry->setProperty("captureIntervalMs", state.measurementIntervalMs);
+            entry->setProperty("routeAddedMs", state.measurementRouteMs);
+            entry->setProperty("observedAtMonotonicMs", state.measurementObservedAtMs);
+            entry->setProperty("rawDelayMs", state.lastMeasurementMs);
+            entry->setProperty("smoothedDelayMs", state.firmAverageMs);
+            entry->setProperty("sampleCount", state.sampleCount);
+            measurements.add(juce::var(entry.get()));
+        }
+        result->setProperty("pendingMarkers", (int) pendingRemoteIntervalStartsByUser.size());
+    }
+    result->setProperty("measurements", measurements);
+    return juce::var(result.get());
+}
+
 int NinjamVst3AudioProcessor::applyRemoteLatencyMeasurementLocked(const juce::String& senderKey,
                                                                   int elapsedMs,
                                                                   int& averageMs,
@@ -22064,6 +22114,30 @@ int NinjamVst3AudioProcessor::applyRemoteLatencyMeasurementLocked(const juce::St
     avgState.recentMeasurementsMs.push_back((double)elapsedMs);
     while (avgState.recentMeasurementsMs.size() > remoteLatencyMedianWindowSize)
         avgState.recentMeasurementsMs.pop_front();
+
+    // A changed playback phase must not take another EMA settling period once
+    // a majority of the nine-reading window confirms a stable new delay.
+    // Require five tightly grouped readings, all >200 ms on the same side of
+    // the current estimate. Up to four transient outliers still cannot rebase it.
+    bool confirmedDelayStep = false;
+    double stepMedianMs = 0.0;
+    if (avgState.sampleCount > 5 && avgState.recentMeasurementsMs.size() >= 5)
+    {
+        std::vector<double> recent(avgState.recentMeasurementsMs.end() - 5,
+                                   avgState.recentMeasurementsMs.end());
+        std::sort(recent.begin(), recent.end());
+        confirmedDelayStep = recent.back() - recent.front() <= 150.0
+            && (recent.front() > avgState.firmAverageMs + 200.0
+                || recent.back() < avgState.firmAverageMs - 200.0);
+        stepMedianMs = recent[2];
+        if (confirmedDelayStep)
+        {
+            // Discard the previous phase so its readings cannot pull the
+            // estimate back after accepting the new phase.
+            while (avgState.recentMeasurementsMs.size() > 5)
+                avgState.recentMeasurementsMs.pop_front();
+        }
+    }
 
     std::vector<double> sortedMeasurements(avgState.recentMeasurementsMs.begin(),
                                            avgState.recentMeasurementsMs.end());
@@ -22077,7 +22151,9 @@ int NinjamVst3AudioProcessor::applyRemoteLatencyMeasurementLocked(const juce::St
 
     // Seed the first publishable value from the three-sample median. Smoothing
     // from sample one would retain a bad startup reading for many intervals.
-    if (avgState.sampleCount <= 3)
+    if (confirmedDelayStep)
+        avgState.firmAverageMs = stepMedianMs;
+    else if (avgState.sampleCount <= 3)
         avgState.firmAverageMs = medianMs;
     else
         avgState.firmAverageMs = (avgState.firmAverageMs * 0.88) + (medianMs * 0.12);
@@ -22338,6 +22414,17 @@ void NinjamVst3AudioProcessor::processPendingRemoteAudioPlaybackBoundaries(doubl
                                                                    safeIntervalDurationMs * 3.0,
                                                                    captureToPlaybackMs)),
                                       nowMs);
+        {
+            const juce::ScopedLock lock(intervalSyncAnnouncementLock);
+            auto& evidence = remoteLatencyAverageByUser[matched.senderKey];
+            evidence.measurementBasis = "audio-guid";
+            evidence.measurementAudioGuid = matched.pending.audioGuidHex;
+            evidence.measurementReceivedSample = matched.pending.receivedSampleCount;
+            evidence.measurementPlaybackSample = matched.playbackSampleCount;
+            evidence.measurementIntervalMs = safeIntervalDurationMs;
+            evidence.measurementRouteMs = routeLatencyMs;
+            evidence.measurementObservedAtMs = nowMs;
+        }
     }
 }
 
@@ -22377,10 +22464,14 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
                 const auto& candidate = it->second;
                 const double pendingAgeMs = candidate.receivedAtMs > 0.0
                     ? juce::jmax(0.0, localMarkerAtMs - candidate.receivedAtMs) : 0.0;
-                // The first GUID needs the same chance to reach audio playback
-                // as later GUIDs. An empty history is normal during startup.
-                const bool waitForAudioGuid = candidate.audioGuidHex.isNotEmpty()
-                    && pendingAgeMs < safeIntervalDurationMs * 1.5;
+                // A GUID identifies actual audio, so a local beat cannot stand
+                // in for its playback boundary. Timing out to the beat fallback
+                // both capped the delay at two intervals and consumed the tag,
+                // preventing a later GUID match from correcting a one-cycle lead.
+                // Keep it for GUID matching; the stale-entry sweep above bounds
+                // retention when that audio never arrives. Legacy tags without
+                // a GUID continue to use the beat estimate below.
+                const bool waitForAudioGuid = candidate.audioGuidHex.isNotEmpty();
                 // Defer markers that arrived too close to this boundary. If the
                 // sync message arrived within the last 100ms of this boundary
                 // (or at exactly this boundary), the remote audio for that
@@ -22451,6 +22542,14 @@ void NinjamVst3AudioProcessor::processPendingIntervalSyncMarkers(int localMarker
             // route. Do not add route latency again.
             correctedDelayMs = applyRemoteLatencyMeasurementLocked(senderKey, elapsedMs,
                                                                     averageMs, firmAverageMs);
+            auto& evidence = remoteLatencyAverageByUser[senderKey];
+            evidence.measurementBasis = "beat-fallback";
+            evidence.measurementAudioGuid = pending.audioGuidHex;
+            evidence.measurementReceivedSample = pending.receivedSampleCount;
+            evidence.measurementPlaybackSample = localMarkerSampleCount;
+            evidence.measurementIntervalMs = safeIntervalDurationMs;
+            evidence.measurementRouteMs = 0.0;
+            evidence.measurementObservedAtMs = localMarkerAtMs;
         }
         if (correctedDelayMs >= 0)
         {
