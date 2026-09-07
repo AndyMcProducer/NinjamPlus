@@ -1017,7 +1017,13 @@
         }
 
         function unregisterPeerTarget(streamId) {
-            return removeCameraTargetByStreamId(streamId);
+            const key = String(streamId || '').trim();
+            // A disconnect can precede native user discovery. Do not replay
+            // the old roster entry once that user becomes resolvable.
+            delete vdoState.announcedStreams[key];
+            const known = vdoState.knownStreams[key];
+            if (known && !known.missingSince) known.missingSince = Date.now();
+            return removeCameraTargetByStreamId(key);
         }
 
         function getStringProperty(objectValue, keyNames) {

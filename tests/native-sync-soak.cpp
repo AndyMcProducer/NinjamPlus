@@ -573,10 +573,12 @@ int main(int argc, char* argv[])
     const bool liveVdo = argc >= 3 && juce::String::fromUTF8(argv[2]) == "--live-vdo";
     bool liveHotspot = false;
     int liveBpm = 120;
+    int liveDurationSeconds = 900;
     for (int arg = 3; arg < argc; ++arg)
     {
         const auto option = juce::String::fromUTF8(argv[arg]);
         if (option == "--hotspot") liveHotspot = true;
+        else if (option.startsWith("--duration-seconds=")) liveDurationSeconds = juce::jlimit(30, 3600, option.fromFirstOccurrenceOf("=", false, false).getIntValue());
         else if (option.startsWith("--bpm=")) liveBpm = juce::jlimit(40, 240, option.fromFirstOccurrenceOf("=", false, false).getIntValue());
     }
     const juce::String config =
@@ -687,7 +689,7 @@ int main(int argc, char* argv[])
                       << " hotspot=" << liveHotspot << " bpm=" << liveBpm
                       << " alphaPort=" << alpha.processor.getVideoHelperPortForIntegrationTest()
                       << " bravoPort=" << bravo.processor.getVideoHelperPortForIntegrationTest() << std::endl;
-            const auto deadline = juce::Time::getMillisecondCounterHiRes() + 900000.0;
+            const auto deadline = juce::Time::getMillisecondCounterHiRes() + liveDurationSeconds * 1000.0;
             const auto diagnosticsFile = juce::File::getCurrentWorkingDirectory().getChildFile("test-results/live-native-diagnostics.jsonl");
             diagnosticsFile.replaceWithText({});
             double nextDiagnostics = 0.0;

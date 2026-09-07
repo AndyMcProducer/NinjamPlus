@@ -63,7 +63,8 @@ function helperUrl(overrides = {}) {
 	return "/buffer-room?" + params.toString();
 }
 
-test("does not resurrect a camera removed before native user discovery", async ({ page }) => {
+for (const removal of ['roster', 'disconnect']) {
+test(`does not resurrect a camera removed by ${removal} before native user discovery`, async ({ page }) => {
     let active = false;
     await page.route("**/intervals", route => route.fulfill({ contentType: "application/json",
         body: JSON.stringify(active ? [{ type: "videoTimecode", userId: "late-user", interval: 3,
@@ -71,16 +72,18 @@ test("does not resurrect a camera removed before native user discovery", async (
             receiverBufferMs: 800, receiverBufferFinal: true, syncRoute: "VDO" }] : []) }));
     await page.goto(helperUrl());
     const frame = await vdoFrame(page);
-    await frame.evaluate(() => {
+    await frame.evaluate((removal) => {
         parent.postMessage({ streamIDs: { departed_stream: "late-user" } }, "*");
-        parent.postMessage({ streamIDs: {} }, "*");
-    });
+        parent.postMessage(removal === 'roster' ? { streamIDs: {} }
+            : { action: 'push-connection', streamID: 'departed_stream', value: false }, "*");
+    }, removal);
     active = true;
     const light = page.locator("#peer-sync-light-late-user");
     await expect(light).toBeVisible();
     await expect(light).toHaveAttribute("aria-label", /video missing/i);
     await expect(light).not.toHaveClass(/ok/);
 });
+}
 
 async function vdoFrame(page) {
 	await expect.poll(() => page.frames().some((frame) => frame.url().includes("/vdo-stub/"))).toBe(true);
