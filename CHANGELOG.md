@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.11.0.4 - 2026-09-07
+
+- Calculate each VDO camera buffer from NTP capture time and the matching audio interval playback boundary.
+- Restart synchronization for all VDO users on BPM changes, rejecting old recordings and duplicate tempo resets.
+- Add an NTP online clock, optional system chat logs, and beat-sized camera offset controls.
 
 - Preserve the calculated VDO delay during helper refresh instead of briefly setting it to zero, which discarded valid buffered video and forced a full refill. Cold-start and helper-reload validation: [test results](docs/vdo-startup-refresh-fix-2026-09-07.md).
 

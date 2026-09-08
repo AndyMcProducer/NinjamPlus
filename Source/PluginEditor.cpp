@@ -8224,6 +8224,13 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
 
     addAndMakeVisible(statusLabel);
 
+    addAndMakeVisible(onlineClockLabel);
+    onlineClockLabel.setJustificationType(juce::Justification::centredRight);
+    onlineClockLabel.setColour(juce::Label::textColourId, juce::Colour(0xff88cc88));
+    onlineClockLabel.setFont(juce::Font(13.0f));
+    onlineClockLabel.setText("Online Clock: --:--:--", juce::dontSendNotification);
+    onlineClockLabel.setInterceptsMouseClicks(false, false);
+
     addAndMakeVisible(transmitButton);
     transmitButton.setClickingTogglesState(true);
     transmitButton.onClick = [this] { transmitToggled(); };
@@ -9608,7 +9615,9 @@ void NinjamVst3AudioProcessorEditor::resized()
     area.removeFromBottom(10);
 
     auto topRow = area.removeFromTop(30);
-    // Right side of top row: record controls, texture / video-bg
+    // Right side of top row: online clock, record controls, texture / video-bg
+    onlineClockLabel.setBounds(topRow.removeFromRight(180));
+    topRow.removeFromRight(6);
     backgroundSelector.setBounds(topRow.removeFromRight(130));
     topRow.removeFromRight(4);
     videoBgToggle.setBounds(topRow.removeFromRight(80));
@@ -10188,6 +10197,31 @@ void NinjamVst3AudioProcessorEditor::timerCallback()
     }
     if (statusLabel.getText() != statusStr)
         statusLabel.setText(statusStr, juce::dontSendNotification);
+
+    // Update online (NTP) clock display
+    if (audioProcessor.isNtpSynced())
+    {
+        const double ntpTimeMs = (double)juce::Time::currentTimeMillis()
+            + audioProcessor.getNtpOffsetMs();
+        const juce::Time ntpTime(static_cast<int64>(ntpTimeMs));
+        const juce::String clockText = "Online Clock: "
+            + ntpTime.toString(false, true, true, true);
+        if (onlineClockLabel.getText() != clockText)
+            onlineClockLabel.setText(clockText, juce::dontSendNotification);
+        onlineClockLabel.setColour(juce::Label::textColourId, juce::Colour(0xff88cc88));
+    }
+    else if (audioProcessor.isNtpSyncInProgress())
+    {
+        if (onlineClockLabel.getText() != "Online Clock: Syncing...")
+            onlineClockLabel.setText("Online Clock: Syncing...", juce::dontSendNotification);
+        onlineClockLabel.setColour(juce::Label::textColourId, juce::Colour(0xffccaa44));
+    }
+    else
+    {
+        if (onlineClockLabel.getText() != "Online Clock: --:--:--")
+            onlineClockLabel.setText("Online Clock: --:--:--", juce::dontSendNotification);
+        onlineClockLabel.setColour(juce::Label::textColourId, juce::Colour(0xff888888));
+    }
 
     const auto connectText = (status == NJClient::NJC_STATUS_OK || status == NJClient::NJC_STATUS_PRECONNECT)
         ? juce::String("Disconnect")
@@ -13454,6 +13488,7 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
     menu.addItem(46, "Enable Sample Pads / Looper", true, audioProcessor.isSamplePadsFeatureEnabled());
     menu.addItem(48, "Mobile Hotspot Mode", true, audioProcessor.isMobileHotspotModeEnabled());
     menu.addItem(63, "VDO TURN Mode", true, audioProcessor.isVdoTurnModeEnabled());
+    menu.addItem(64, "Show System/Log Messages", true, audioProcessor.isShowSystemChatLogsEnabled());
     menu.addItem(58, "Tunnel SSH", true, audioProcessor.isSshTunnelEnabled());
     menu.addItem(62, "Configure SSH Tunnel...");
     menu.addItem(49, "Automatically Reconnect", true, audioProcessor.isAutoReconnectEnabled());
@@ -13569,6 +13604,12 @@ void NinjamVst3AudioProcessorEditor::showOptionsMenu()
             if (result == 63)
             {
                 audioProcessor.setVdoTurnModeEnabled(!audioProcessor.isVdoTurnModeEnabled());
+                markPersistentSettingsDirty();
+                return;
+            }
+            if (result == 64)
+            {
+                audioProcessor.setShowSystemChatLogsEnabled(!audioProcessor.isShowSystemChatLogsEnabled());
                 markPersistentSettingsDirty();
                 return;
             }
