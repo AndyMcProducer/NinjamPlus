@@ -1015,6 +1015,8 @@ private:
     std::array<std::atomic<bool>, numSamplePads> samplePadPendingSpeedResync {};
     std::atomic<juce::uint64> samplePadBankLoadRequestSerial { 0 };
     std::atomic<juce::uint64> samplePadBankSaveRequestSerial { 0 };
+    std::atomic<bool> samplePadDeferResync { false };
+    juce::MemoryBlock lastAppliedStateInformation;
     std::atomic<bool> editorStateRestoredFromDisk { false };
     mutable juce::CriticalSection samplePadsLock;
     std::array<SamplePadState, numSamplePads> samplePads;
@@ -1682,6 +1684,8 @@ private:
     void resyncLoopedSamplePadsToBpm(double targetBpm);
     void resyncSamplePadToBpm(int padIndex, double targetBpm, bool force);
     void enqueueSamplePadResyncJob(int padIndex, double targetBpm, bool force);
+    void requestSamplePadBpmResync(int padIndex, double targetBpm, bool force);
+    void applySamplePadStateProperties(int padIndex, const juce::ValueTree& state);
     static void RemoteChannelAudioTap_Callback(void* userData,
                                                int useridx,
                                                const char* username,

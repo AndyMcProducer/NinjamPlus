@@ -14783,7 +14783,7 @@ void NinjamVst3AudioProcessor::loadSamplePadAsync(int padIndex,
 
                     // Auto-resync to NINJAM BPM if BPM sync was enabled by detection
                     if (prepared.detectedBpm > 1.0 && isSamplePadsFeatureEnabled())
-                        resyncSamplePadToBpm(padIndex, (double)getBPM(), false);
+                        enqueueSamplePadResyncJob(padIndex, (double)getBPM(), false);
 
                     if (completion)
                         completion(true, {});
@@ -15395,7 +15395,7 @@ void NinjamVst3AudioProcessor::setSamplePadBpmSyncEnabled(int padIndex, bool sho
         }
     }
     else if (isSamplePadsFeatureEnabled())
-        resyncSamplePadToBpm(padIndex, (double)getBPM(), false);
+        requestSamplePadBpmResync(padIndex, (double)getBPM(), false);
 }
 
 bool NinjamVst3AudioProcessor::isSamplePadBpmSyncEnabled(int padIndex) const
@@ -15437,7 +15437,7 @@ void NinjamVst3AudioProcessor::setSamplePadSourceBpm(int padIndex, double newBpm
     }
 
     // Trigger a resync to the current NINJAM BPM with the corrected values
-    resyncSamplePadToBpm(padIndex, (double)getBPM(), true);
+    requestSamplePadBpmResync(padIndex, (double)getBPM(), true);
 }
 
 void NinjamVst3AudioProcessor::setSamplePadPlaybackSpeed(int padIndex, SamplePadPlaybackSpeed speed)
@@ -15467,7 +15467,7 @@ void NinjamVst3AudioProcessor::setSamplePadPlaybackSpeed(int padIndex, SamplePad
         pad.lastSyncedTargetBpm = 0.0;
     }
     if (isSamplePadsFeatureEnabled())
-        resyncSamplePadToBpm(padIndex, (double)getBPM(), true);
+        requestSamplePadBpmResync(padIndex, (double)getBPM(), true);
 }
 
 NinjamVst3AudioProcessor::SamplePadPlaybackSpeed NinjamVst3AudioProcessor::getSamplePadPlaybackSpeed(int padIndex) const
@@ -15602,7 +15602,7 @@ void NinjamVst3AudioProcessor::setSamplePadLoopEnabled(int padIndex, bool should
         }
     }
     if (shouldLoop && isSamplePadsFeatureEnabled())
-        resyncSamplePadToBpm(padIndex, (double)getBPM(), false);
+        requestSamplePadBpmResync(padIndex, (double)getBPM(), false);
 }
 
 bool NinjamVst3AudioProcessor::isSamplePadLoopEnabled(int padIndex) const
@@ -16746,6 +16746,16 @@ void NinjamVst3AudioProcessor::resyncLoopedSamplePadsToBpm(double targetBpm)
 
     for (int pad = 0; pad < numSamplePads; ++pad)
         resyncSamplePadToBpm(pad, targetBpm, false);
+}
+
+void NinjamVst3AudioProcessor::requestSamplePadBpmResync(int padIndex, double targetBpm, bool force)
+{
+    // During state restore the resync is queued on the background pool so the
+    // (potentially multi-second) stretch never blocks the startup path.
+    if (samplePadDeferResync.load(std::memory_order_acquire))
+        enqueueSamplePadResyncJob(padIndex, targetBpm, force);
+    else
+        resyncSamplePadToBpm(padIndex, targetBpm, force);
 }
 
 void NinjamVst3AudioProcessor::resyncSamplePadToBpm(int padIndex, double targetBpm, bool force)
@@ -22149,6 +22159,17 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 
 void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
+    NinjamStartupTiming startupTiming("processor.setStateInformation");
+
+    // The standalone holder ("filterState") and the editor ("pluginStateBase64")
+    // both persist the processor state, so identical blobs can arrive twice in
+    // one startup. Re-applying would just repeat expensive work such as sample
+    // pad restoration, so skip a byte-identical replay.
+    const juce::MemoryBlock incomingState(data, (size_t) juce::jmax(0, sizeInBytes));
+    if (sizeInBytes > 0 && incomingState == lastAppliedStateInformation)
+        return;
+    lastAppliedStateInformation = incomingState;
+
     std::unique_ptr<juce::XmlElement> xmlState(getXmlFromBinary(data, sizeInBytes));
     if (xmlState == nullptr)
         return;
@@ -22165,6 +22186,7 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setSamplePadsMidiInputDeviceId(state.getProperty("samplePadsMidiInputDeviceId", "").toString());
     setSamplePadLooperInput((int)state.getProperty("samplePadLooperInput", looperInputLocalChannel));
     setSamplePadsFeatureEnabled((bool)state.getProperty("samplePadsFeatureEnabled", true));
+    logNinjamStartupTiming("state.midiAndPadsEnabled");
     setAutoTranslateEnabled((bool) state.getProperty("autoTranslate", false));
     setTranslateSourceLang(state.getProperty("translateSourceLang", "en").toString());
     setTranslateTargetLang(state.getProperty("translateTargetLang", "system").toString());
@@ -22190,6 +22212,7 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setMetronomeMuted((bool)state.getProperty("metronomeMuted", false));
     setMetronomeSoundKey(state.getProperty("metronomeSoundKey", getClassicMetronomeSoundKey()).toString());
     setMetronomeOutputChannel((int)state.getProperty("metronomeOutputChannel", 0));
+    logNinjamStartupTiming("state.metronome");
     setTransmitLocal((bool)state.getProperty("transmitLocal", false));
     setMobileHotspotModeEnabled((bool)state.getProperty("mobileHotspotMode", false));
     setVdoTurnModeEnabled((bool)state.getProperty("vdoTurnMode", false));
@@ -22201,7 +22224,9 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setSshTunnelUser(state.getProperty("sshTunnelUser", "").toString());
     setSshTunnelKeyFile(state.getProperty("sshTunnelKeyFile", "").toString());
     setAutoReconnectEnabled((bool)state.getProperty("autoReconnectEnabled", true));
+    logNinjamStartupTiming("state.ssh");
     setChordDetectionEnabled((bool)state.getProperty("chordDetectionEnabled", true));
+    logNinjamStartupTiming("state.chord");
     setSamplePadVolume(juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("samplePadsVolume", 1.0)));
     setSamplePadLimiterEnabled((bool)state.getProperty("samplePadsLimiter", false));
     setSamplePadDuckEnabled((bool)state.getProperty("samplePadsDuck", false));
@@ -22232,27 +22257,30 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     for (int pad = 0; pad < numSamplePads; ++pad)
     {
         const juce::String filePath = state.getProperty("samplePadFile" + juce::String(pad), "").toString();
+
+        if (filePath.isNotEmpty() && samplePadBackgroundAlive->load(std::memory_order_acquire))
+        {
+            // Decode and BPM analysis run on the background pool; the pad's
+            // saved properties are applied in the completion once the sample
+            // is committed, keeping multi-second restores off the startup path.
+            loadSamplePadAsync(pad, juce::File(filePath),
+                               [this, pad, state](bool loadedOk, const juce::String&)
+                               {
+                                   if (! loadedOk)
+                                       clearSamplePad(pad);
+                                   applySamplePadStateProperties(pad, state);
+                               });
+            continue;
+        }
+
         const bool loaded = filePath.isNotEmpty() && loadSamplePad(pad, juce::File(filePath));
         if (!loaded)
             clearSamplePad(pad);
 
-        setSamplePadPlaybackSpeed(pad,
-                                  sanitizeSamplePadPlaybackSpeed((int)state.getProperty("samplePadPlaybackSpeed" + juce::String(pad),
-                                                                                        (int)SamplePadPlaybackSpeed::normal)));
-        setSamplePadBpmSyncEnabled(pad, (bool)state.getProperty("samplePadBpmSync" + juce::String(pad), true));
-        setSamplePadLoopEnabled(pad, (bool)state.getProperty("samplePadLoop" + juce::String(pad), false));
-        setSamplePadReverseEnabled(pad, (bool)state.getProperty("samplePadReverse" + juce::String(pad), false));
-        setSamplePadMatchBpiEnabled(pad, (bool)state.getProperty("samplePadMatchBpi" + juce::String(pad), false));
-        setSamplePadDuckRouteEnabled(pad, (bool)state.getProperty("samplePadDuckRoute" + juce::String(pad), false));
-        setSamplePadVolume(pad, juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("samplePadVolume" + juce::String(pad), 1.0)));
-        for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
-            setSamplePadFxSlotRouteEnabled(pad,
-                                           slot,
-                                           (bool)state.getProperty("samplePadFxSlotRoute" + juce::String(pad) + "_" + juce::String(slot),
-                                                                   false));
-        if ((bool)state.getProperty("samplePadNameCustom" + juce::String(pad), false))
-            setSamplePadName(pad, state.getProperty("samplePadName" + juce::String(pad), "").toString());
+        applySamplePadStateProperties(pad, state);
     }
+
+    logNinjamStartupTiming("state.samplePads");
     for (int channel = 0; channel < maxLocalChannels; ++channel)
         setLocalChannelInput(channel, (int)state.getProperty("localInput" + juce::String(channel), -1));
     setVoiceChannelInput((int)state.getProperty("voiceInput", 0));
@@ -22268,6 +22296,30 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
         for (int channel = 0; channel < maxLocalChannels; ++channel)
             localChannelNames[channel] = state.getProperty("localChannelName" + juce::String(channel), "Ch" + juce::String(channel + 1)).toString();
     }
+}
+
+void NinjamVst3AudioProcessor::applySamplePadStateProperties(int pad, const juce::ValueTree& state)
+{
+    // Resyncs triggered by the setters below are queued on the background pool
+    // rather than stretching synchronously on the calling thread.
+    samplePadDeferResync.store(true, std::memory_order_release);
+    setSamplePadPlaybackSpeed(pad,
+                              sanitizeSamplePadPlaybackSpeed((int)state.getProperty("samplePadPlaybackSpeed" + juce::String(pad),
+                                                                                    (int)SamplePadPlaybackSpeed::normal)));
+    setSamplePadBpmSyncEnabled(pad, (bool)state.getProperty("samplePadBpmSync" + juce::String(pad), true));
+    setSamplePadLoopEnabled(pad, (bool)state.getProperty("samplePadLoop" + juce::String(pad), false));
+    setSamplePadReverseEnabled(pad, (bool)state.getProperty("samplePadReverse" + juce::String(pad), false));
+    setSamplePadMatchBpiEnabled(pad, (bool)state.getProperty("samplePadMatchBpi" + juce::String(pad), false));
+    setSamplePadDuckRouteEnabled(pad, (bool)state.getProperty("samplePadDuckRoute" + juce::String(pad), false));
+    setSamplePadVolume(pad, juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("samplePadVolume" + juce::String(pad), 1.0)));
+    for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+        setSamplePadFxSlotRouteEnabled(pad,
+                                       slot,
+                                       (bool)state.getProperty("samplePadFxSlotRoute" + juce::String(pad) + "_" + juce::String(slot),
+                                                               false));
+    if ((bool)state.getProperty("samplePadNameCustom" + juce::String(pad), false))
+        setSamplePadName(pad, state.getProperty("samplePadName" + juce::String(pad), "").toString());
+    samplePadDeferResync.store(false, std::memory_order_release);
 }
 
 juce::var NinjamVst3AudioProcessor::getSyncDiagnosticState()

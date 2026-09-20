@@ -11464,6 +11464,7 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
 {
     NinjamStartupTiming startupTiming("editor.settings");
     migrateOldSettingsIfNeeded();
+    logNinjamStartupTiming("editor.settings.migrate");
 
     auto popts = makeSettingsOptions();
     // Note: renewSettingsFileIfCorrupt was already called in the constructor,
@@ -11472,6 +11473,7 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
     // this function from being called at all.
 
     juce::PropertiesFile props(popts);
+    logNinjamStartupTiming("editor.settings.propsLoad");
 
     // Only restore the full processor state on the very first editor open.
     // On subsequent GUI reopens, the processor already has live state (playing
@@ -11492,6 +11494,7 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
             }
         }
     }
+    logNinjamStartupTiming("editor.settings.restoreState");
 
     const juce::String savedServer = props.getValue("server", {});
     if (savedServer.isNotEmpty())
