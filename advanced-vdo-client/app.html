@@ -561,6 +561,7 @@
             chunkEventsByStreamId: {},
             chunkStatsByUser: {},
             mappingSourceByUser: {},
+            qualityResyncTimer: 0,
             mappingDiagnosticsByUser: {},
             lastResolveSource: '',
             lastResolveDiagnostic: '',
@@ -1768,7 +1769,8 @@
         }
 
         function sendTargetedRefresh(userKey) {
-            const targets = getUserCameraTargets(userKey);
+            const key = normalizeUserId(userKey);
+            const targets = getUserCameraTargets(key);
             if (!targets.length) {
                 return false;
             }
@@ -1792,6 +1794,16 @@
                     if (!target.targetId) {
                         sendRefresh('target', target.streamId);
                     }
+                }
+                if (appState.obsMode) {
+                    const tileKey = obsTileKeyForTarget(key, target);
+                    const tileRefresh = { refresh: true };
+                    if (target.targetId) {
+                        tileRefresh.UUID = target.targetId;
+                    } else if (target.streamId) {
+                        tileRefresh.streamID = target.streamId;
+                    }
+                    sent = postToObsViewerFrame(tileKey, tileRefresh) || sent;
                 }
             }
             return sent;
@@ -2577,6 +2589,21 @@
             return postEvalToVdo(script);
         }
 
+        function resyncReceiversAfterQualityChange() {
+            if (vdoState.qualityResyncTimer) {
+                clearTimeout(vdoState.qualityResyncTimer);
+            }
+
+            vdoState.qualityResyncTimer = setTimeout(function () {
+                vdoState.qualityResyncTimer = 0;
+                const users = getTrackedUserKeys();
+                for (let i = 0; i < users.length; i++) {
+                    requestLocalBufferRefresh(users[i], 'qualityChange');
+                }
+                applyPeerBuffers();
+            }, 500);
+        }
+
         function applyLiveVdoEffects() {
             const effectId = vdoEffectIdForFx(appState.cameraFx);
             const payload = {
@@ -2620,6 +2647,9 @@
             appState.cameraBufferMode = normalizeCameraBufferMode(settings.cameraBufferMode || appState.cameraBufferMode);
             if (!changed || changed === 'quality') {
                 applyLiveVdoQuality();
+                if (changed === 'quality') {
+                    resyncReceiversAfterQualityChange();
+                }
             }
             if (!changed || changed === 'fx') {
                 applyLiveVdoEffects();
