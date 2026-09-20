@@ -183,6 +183,7 @@ target_sources(NINJAM_VST3 PRIVATE
     Source/SolititoChordModel.cpp
     Source/SolititoChordModel.h
     Source/StandaloneApp.cpp
+    Source/StartupTiming.h
     Source/ZapVideoCodec.cpp
     Source/ZapVideoCodec.h
     Source/AutoTune.h

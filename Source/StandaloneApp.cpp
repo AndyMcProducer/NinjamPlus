@@ -2,6 +2,7 @@
 #include <juce_audio_plugin_client/Standalone/juce_StandaloneFilterWindow.h>
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "StartupTiming.h"
 
 #if JucePlugin_Build_Standalone
 
@@ -194,12 +195,15 @@ public:
                                   bool autoOpenMidiDevices = false)
         : DocumentWindow (title, backgroundColour, DocumentWindow::minimiseButton | DocumentWindow::closeButton)
     {
-        pluginHolder = std::make_unique<NinjamStandalonePluginHolder> (settingsToUse,
-                                                                       takeOwnershipOfSettings,
-                                                                       preferredDefaultDeviceName,
-                                                                       preferredSetupOptions,
-                                                                       constrainToConfiguration,
-                                                                       autoOpenMidiDevices);
+        {
+            NinjamStartupTiming startupTiming ("standalone.holderAndAudio");
+            pluginHolder = std::make_unique<NinjamStandalonePluginHolder> (settingsToUse,
+                                                                           takeOwnershipOfSettings,
+                                                                           preferredDefaultDeviceName,
+                                                                           preferredSetupOptions,
+                                                                           constrainToConfiguration,
+                                                                           autoOpenMidiDevices);
+        }
 
        #if JUCE_IOS || JUCE_ANDROID
         setTitleBarHeight (0);
@@ -417,6 +421,8 @@ public:
 
     void initialise (const String&) override
     {
+        logNinjamStartupTiming("standalone.initialise.begin");
+        NinjamStartupTiming startupTiming("standalone.initialise");
         PropertiesFile::Options options;
         options.applicationName = JucePlugin_Name;
         options.filenameSuffix = ".settings";

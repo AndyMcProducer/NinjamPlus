@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "StartupTiming.h"
 #include "ZapVideoCodec.h"
 #include "Chromagram.h"
 #include "ChordDetector.h"
@@ -6088,6 +6089,7 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
                      .withOutput ("Output 16", juce::AudioChannelSet::stereo(), false)
                        )
 {
+    NinjamStartupTiming startupTiming("processor.constructor");
     metronomeFormatManager.registerBasicFormats();
     samplePadFormatManager.registerBasicFormats();
 
@@ -14387,6 +14389,7 @@ void NinjamVst3AudioProcessor::changeProgramName (int index, const juce::String&
 
 void NinjamVst3AudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    NinjamStartupTiming startupTiming("processor.prepareToPlay");
     intervalSyncSampleCounter.store(0, std::memory_order_relaxed);
     cachedNinjamTransportPos.store(0, std::memory_order_relaxed);
     cachedNinjamTransportLen.store(0, std::memory_order_relaxed);

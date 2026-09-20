@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "StartupTiming.h"
 #include "lice/lice.h"
 #include <atomic>
 #include <cmath>
@@ -8169,6 +8170,7 @@ void CustomKnobLookAndFeel::drawRotarySlider(juce::Graphics& g, int x, int y, in
 NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioProcessor& p)
     : AudioProcessorEditor (&p), audioProcessor (p), intervalDisplay(p), userList(p)
 {
+    NinjamStartupTiming startupTiming("editor.constructor");
     setResizable(true, true);
     setResizeLimits(1024, 600, 2200, 1500);
 
@@ -9425,6 +9427,12 @@ void NinjamVst3AudioProcessorEditor::unregisterSamplerFxKnobLearnTarget(juce::Co
 
 void NinjamVst3AudioProcessorEditor::paint (juce::Graphics& g)
 {
+    if (!startupPaintReported)
+    {
+        startupPaintReported = true;
+        logNinjamStartupTiming("editor.firstPaint");
+    }
+
     juce::ignoreUnused(g);
 }
 
@@ -11436,6 +11444,7 @@ void NinjamVst3AudioProcessorEditor::savePersistentSettingsToDisk(bool includePr
 
 void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
 {
+    NinjamStartupTiming startupTiming("editor.settings");
     migrateOldSettingsIfNeeded();
 
     auto popts = makeSettingsOptions();
@@ -12820,6 +12829,7 @@ bool NinjamVst3AudioProcessorEditor::isSidechainInputActive() const
 
 void NinjamVst3AudioProcessorEditor::loadControlImages(const juce::File& themeDir)
 {
+    NinjamStartupTiming startupTiming("editor.theme");
     backgroundImage = juce::Image();
     backgroundComponent.setBackgroundImage({});
     userList.setBackgroundImage({});
@@ -13966,6 +13976,7 @@ void NinjamVst3AudioProcessorEditor::showSettingsCallout(std::unique_ptr<juce::C
 
 void NinjamVst3AudioProcessorEditor::refreshExternalMidiInputDevices()
 {
+    NinjamStartupTiming startupTiming("editor.midi");
     const juce::String desiredLearnId = audioProcessor.getMidiLearnInputDeviceId();
     const juce::String desiredRelayId = audioProcessor.getMidiRelayInputDeviceId();
     const bool samplePadsFeatureEnabled = audioProcessor.isSamplePadsFeatureEnabled();
