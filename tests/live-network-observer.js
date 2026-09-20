@@ -17,11 +17,17 @@
                             if (transport.type !== 'transport' || !transport.selectedCandidatePairId) continue;
                             const pair = stats.get(transport.selectedCandidatePairId);
                             const local = stats.get(pair.localCandidateId);
+                            const remote = stats.get(pair.remoteCandidateId);
                             entry.pair = pair.id;
                             entry.rtt = pair.currentRoundTripTime;
                             entry.bytesReceived = pair.bytesReceived;
                             entry.bytesSent = pair.bytesSent;
                             entry.protocol = local.protocol;
+                            entry.port = local.port;
+                            entry.remoteProtocol = remote?.protocol;
+                            entry.remoteCandidateType = remote?.candidateType;
+                            entry.remoteAddress = remote?.address;
+                            entry.remotePort = remote?.port;
                             entry.relayProtocol = local.relayProtocol;
                             entry.address = local.address;
                             entry.url = local.url;

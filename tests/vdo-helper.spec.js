@@ -110,6 +110,46 @@ test("starts with the quality-first sync-safe profile", async ({ page }) => {
 	expect(params.get("chunkadaptinterval")).toBe("1200");
 	expect(params.get("chunkbufferadaptive")).toBe("0");
 	expect(params.get("chunknack")).toBe("1");
+	expect(params.has("scene")).toBe(false);
+	expect(params.has("view")).toBe(false);
+	expect(params.has("autostart")).toBe(false);
+	expect(params.has("cleanoutput")).toBe(false);
+});
+
+for (const obsParams of [{ obs: "1" }, { view: "obs" }]) {
+	test("OBS scene joins without guest interaction: " + JSON.stringify(obsParams), async ({ page }) => {
+		await page.route("**/intervals", route => route.fulfill({
+			contentType: "application/json",
+			body: JSON.stringify([{ type: "videoTimecode", userId: "remote-user", interval: 3,
+				timecode: 0, receiverBufferMs: 800, receiverBufferFinal: true }])
+		}));
+		await page.goto("/app?" + new URLSearchParams({ ...baseParams, ...obsParams }));
+		const frame = await vdoFrame(page);
+		const params = new URL(frame.url()).searchParams;
+		expect(params.get("room")).toBe(baseParams.room);
+		expect(params.get("scene")).toBe("0");
+		expect(params.get("cleanoutput")).toBe("1");
+		await frame.evaluate(() => parent.postMessage({ streamIDs: { camera_stream: "remote-user" } }, "*"));
+		const tile = page.locator("#obsGrid .obs-tile iframe");
+		await expect(tile).toHaveCount(1);
+		await expect(tile).toBeVisible();
+		const tileParams = new URL(await tile.getAttribute("src")).searchParams;
+		expect(tileParams.get("view")).toBe("camera_stream");
+		expect(tileParams.get("room")).toBe(baseParams.room);
+		expect(tileParams.get("solo")).toBe("1");
+	});
+}
+
+test("copied OBS links opt in while guest links retain their original startup", async ({ page }) => {
+	await page.goto(helperUrl());
+	const guestFrame = await vdoFrame(page);
+	const guestUrl = guestFrame.url();
+	const obsUrl = await page.evaluate(() => buildObsUrl());
+	expect(new URL(obsUrl).searchParams.get("obs")).toBe("1");
+	await page.goto(obsUrl);
+	expect(new URL((await vdoFrame(page)).url()).searchParams.get("scene")).toBe("0");
+	await page.goto(helperUrl({ obs: "0", obsLayout: "tiles", hideFooter: "1" }));
+	expect((await vdoFrame(page)).url()).toBe(guestUrl);
 });
 
 test("honors an explicit high-quality ceiling without lowering startup quality", async ({ page }) => {
