@@ -9058,6 +9058,8 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         static TextureScanCache scanCache;
 
         juce::Array<juce::File> roots;
+        roots.add(juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+                      .getChildFile("NINJAMplus"));
         roots.add(juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory());
         {
             const auto moduleFile = getThisModuleFile();
@@ -9081,6 +9083,22 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
             }
             if (texturesDir.isDirectory())
                 break;
+        }
+
+        // First-run seeding: if the shared per-user skins folder doesn't exist
+        // yet but a bundled copy was found, copy it into Documents\NINJAMplus so
+        // standalone and plug-in both read from the one canonical location and
+        // the package only needs to ship the textures once.
+        const juce::File userTexturesDir = roots.getFirst().getChildFile("textures");
+        if (texturesDir.isDirectory()
+            && texturesDir != userTexturesDir
+            && ! userTexturesDir.isDirectory())
+        {
+            std::thread([src = texturesDir, dst = userTexturesDir]() mutable
+            {
+                dst.getParentDirectory().createDirectory();
+                src.copyDirectoryTo(dst);
+            }).detach();
         }
 
         if (texturesDir.isDirectory())

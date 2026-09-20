@@ -2776,6 +2776,13 @@ private:
 };
 #endif
 
+static juce::File getSolititoUserAssetDir()
+{
+    return juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+        .getChildFile("NINJAMplus")
+        .getChildFile("solitito-ai");
+}
+
 static juce::File findSolititoChordAsset(const char* fileName)
 {
     std::vector<juce::File> dirs;
@@ -2783,6 +2790,8 @@ static juce::File findSolititoChordAsset(const char* fileName)
 #if defined(NINJAMPLUS_SOLITITO_ASSET_DIR)
     dirs.push_back(juce::File(juce::String(NINJAMPLUS_SOLITITO_ASSET_DIR)));
 #endif
+
+    dirs.push_back(getSolititoUserAssetDir());
 
     const juce::File moduleFile = getThisModuleFile();
     if (moduleFile.exists())
@@ -2812,6 +2821,10 @@ static juce::File findSolititoChordRuntime()
     constexpr auto runtimeName = "ninjamplus_onnxruntime.dll";
     std::vector<juce::File> dirs;
 
+    const auto userDir = getSolititoUserAssetDir();
+    dirs.push_back(userDir);
+    dirs.push_back(userDir.getParentDirectory());
+
     const juce::File moduleFile = getThisModuleFile();
     if (moduleFile.exists())
     {
@@ -2833,6 +2846,33 @@ static juce::File findSolititoChordRuntime()
     }
 
     return {};
+}
+
+// One-time seeding: copy the bundled Solitito runtime and model into
+// Documents\NINJAMplus\solitito-ai so the standalone and plug-in can share a
+// single canonical copy instead of each shipping their own.
+static void seedSolititoUserAssetsIfNeeded()
+{
+    static std::atomic<bool> attempted { false };
+    if (attempted.exchange(true))
+        return;
+
+    const auto userDir = getSolititoUserAssetDir();
+    const juce::File sources[] = {
+        findSolititoChordRuntime(),
+        findSolititoChordAsset("chord_model_v31_16k.onnx"),
+        findSolititoChordAsset("dsp_weights_v31_16k.bin")
+    };
+
+    for (const auto& src : sources)
+    {
+        const auto dst = userDir.getChildFile(src.getFileName());
+        if (src.existsAsFile() && ! dst.existsAsFile())
+        {
+            userDir.createDirectory();
+            src.copyFileTo(dst);
+        }
+    }
 }
 
 class BatchedChordAnalyzer final
@@ -2865,6 +2905,7 @@ public:
     {
         if (solititoModel != nullptr)
             return solititoModel->isAvailable();
+        seedSolititoUserAssetsIfNeeded();
         solititoModel = std::make_unique<SolititoChordModel>(trackCount);
         solititoModel->load(findSolititoChordRuntime(),
                             findSolititoChordAsset("chord_model_v31_16k.onnx"),
