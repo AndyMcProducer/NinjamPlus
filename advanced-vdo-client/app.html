@@ -1970,6 +1970,9 @@
         function buildObsViewerUrl(streamId, userKey, target) {
             const params = new URLSearchParams();
             params.set('view', String(streamId || '').trim());
+            // Room cameras need the same room scope as a normal solo scene link.
+            params.set('room', appState.room);
+            params.set('solo', '1');
             params.set('noaudio', '1');
             params.set('buffer2', '0');
             params.set('buffer', String(getCameraTargetDesiredBufferMs(userKey, target)));
@@ -2731,6 +2734,8 @@
             // measured delay after load, and sending both can double the result.
             iframeParams.set('buffer', String(minimumBufferMs));
             if (appState.obsMode) {
+                // The hidden roster frame must join without a guest's camera prompt.
+                iframeParams.set('scene', '0');
                 iframeParams.set('cleanoutput', '1');
                 iframeParams.set('autostart', '1');
             }

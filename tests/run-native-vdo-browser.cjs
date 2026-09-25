@@ -6,6 +6,8 @@ const args=Object.fromEntries(process.argv.slice(2).map(a=>a.replace(/^--/,'').s
 if(!args.room) throw new Error('--room, --alpha-port, --bravo-port required from native harness output');
 const duration=Number(args['duration-seconds']||600);
 if(!Number.isFinite(duration)||duration<10||duration>1800)throw new Error('--duration-seconds must be 10..1800');
+const transport=args.transport||'udp';
+if(!['tcp','udp','direct'].includes(transport))throw new Error('--transport must be tcp, udp (TURN), or direct (normal ICE)');
 const diagnostics=args.diagnostics||'full';
 if(!['minimal','full'].includes(diagnostics))throw new Error('--diagnostics must be minimal or full');
 const output=path.resolve(args.output||'test-results/e2e-alpha-udp');
@@ -26,10 +28,10 @@ async function snapshot(client){try{const data=await client.frame.evaluate(()=>(
  for(const label of ['alpha','bravo']){
    const page=await context.newPage();page.setDefaultTimeout(20000);
    page.on('response',async r=>{if(/\/(webrtc|main|lib)\.js\?/.test(r.url()))try{loads.push({label,url:r.url(),sha256:crypto.createHash('sha256').update(await r.body()).digest('hex')});}catch{}});
-   const u=new URL('http://127.0.0.1:'+args[label+'-port']+'/buffer-room');u.search=new URLSearchParams({room:args.room,label,vdoSyncUserKey:label,cameraQuality:'720p30',bufferMode:'remote',buffer:'0',chunked:'2500',chunkadaptceil:'2500',relay:'',...(args.transport==='tcp'?{tcp:''}:{})}).toString();
+   const u=new URL('http://127.0.0.1:'+args[label+'-port']+'/buffer-room');u.search=new URLSearchParams({room:args.room,label,vdoSyncUserKey:label,cameraQuality:'720p30',bufferMode:'remote',buffer:'0',chunked:'2500',chunkadaptceil:'2500',...(transport==='direct'?{}:{relay:''}),...(transport==='tcp'?{tcp:''}:{})}).toString();
    await page.goto(u.href);const client={label,page,generation:0};clients.push(client);await camera(client);await event('camera-started',{label,url:u.href});
  }
- const deadline=Date.now()+duration*1000;await event('ready',{durationSeconds:duration,diagnostics});
+ const deadline=Date.now()+duration*1000;await event('ready',{durationSeconds:duration,diagnostics,transport});
  while(Date.now()<deadline){
    try{const command=JSON.parse((await fs.readFile(path.join(output,'command.json'),'utf8')).replace(/^\uFEFF/,''));await fs.unlink(path.join(output,'command.json'));
      if(command.action==='stop')break;
