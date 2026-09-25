@@ -8008,6 +8008,10 @@ void NinjamVst3AudioProcessor::resetIntervalSyncTimingCache()
     lastIntervalSyncRouteByUser.clear();
     recentIntervalSyncAckEventIds.clear();
     recentVideoTimingChangeEventIds.clear();
+    {
+        const juce::ScopedLock lock(chatSyncPeerLock);
+        chatSyncPeerNameByUserKey.clear();
+    }
 }
 
 void NinjamVst3AudioProcessor::invalidateIntervalSyncLatencyState(bool keepRemoteServerLatency)
@@ -12209,6 +12213,12 @@ void NinjamVst3AudioProcessor::resetRemoteUserIndexState(int userIndex, const ju
         eraseForUser(remoteAudioPlaybackBoundariesByUser);
         eraseForUser(remoteVideoBufferRefreshIdByUser);
         eraseForUser(lastSentBufferMsByUser);
+        {
+            const juce::ScopedLock chatPeerLock(chatSyncPeerLock);
+            chatSyncPeerNameByUserKey.erase(senderKey);
+            if (canonicalSenderKey.isNotEmpty())
+                chatSyncPeerNameByUserKey.erase(canonicalSenderKey);
+        }
 
         for (auto it = pendingRemoteIntervalStartsByUser.begin(); it != pendingRemoteIntervalStartsByUser.end();)
         {
@@ -13672,9 +13682,101 @@ float NinjamVst3AudioProcessor::getLocalPeakRight() const
 
 void NinjamVst3AudioProcessor::sendSideSignal(const juce::String& target, const juce::String& type, const juce::String& payload)
 {
-    const char* tgt = target.isNotEmpty() ? target.toRawUTF8() : "*";
+    {
+        const juce::ScopedLock clientLock(ninjamClientLock);
+        const bool serverSupportsSideSignal = ninjamSideSignalServerSupported.load(std::memory_order_relaxed)
+                                           || ninjamClient.GetServerVideoSupported();
+        if (serverSupportsSideSignal)
+        {
+            const char* tgt = target.isNotEmpty() ? target.toRawUTF8() : "*";
+            ninjamClient.ChatMessage_Send("SIDE_SIGNAL", tgt, type.toRawUTF8(), payload.toRawUTF8());
+            return;
+        }
+    }
+    // Vanilla NINJAM servers silently drop the SIDE_SIGNAL command. Fall back
+    // to carriers that never surface in vanilla ReaNINJAM chat: the sync
+    // fourcc on the interval channel, then targeted private messages between
+    // peers that run this client.
+    if (!sendIntervalChannelSignal(type, payload))
+        sendPrivateChatSideSignal(type, payload, target);
+}
+
+bool NinjamVst3AudioProcessor::sendIntervalChannelSignal(const juce::String& type, const juce::String& payload)
+{
+    juce::DynamicObject::Ptr wrapper = new juce::DynamicObject();
+    wrapper->setProperty("sig", type);
+    wrapper->setProperty("data", payload);
+    const juce::String msg = juce::JSON::toString(juce::var(wrapper.get()));
+    const int payloadBytes = (int)msg.getNumBytesAsUTF8();
+
     const juce::ScopedLock clientLock(ninjamClientLock);
-    ninjamClient.ChatMessage_Send("SIDE_SIGNAL", tgt, type.toRawUTF8(), payload.toRawUTF8());
+    if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
+        return false;
+    if (kSyncSignalChannelIndex < serverMaxLocalChannelsCached.load(std::memory_order_relaxed)
+        && ninjamClient.SendRawIntervalItem(kSyncSignalChannelIndex, kSyncSignalFourcc, msg.toRawUTF8(), payloadBytes) == 0)
+        return true;
+    // Servers that only allow one local channel have no hidden control
+    // channel; smuggle the signal through the audio channel under the sync
+    // fourcc instead. Servers relay unknown fourccs transparently and
+    // vanilla clients discard unknown interval payloads without rendering
+    // anything.
+    return ninjamClient.SendRawIntervalItem(0, kSyncSignalFourcc, msg.toRawUTF8(), payloadBytes) == 0;
+}
+
+void NinjamVst3AudioProcessor::noteChatSyncPeer(const juce::String& sender)
+{
+    const juce::String key = normaliseOpusPeerId(sender);
+    const juce::String exactName = sender.trim();
+    if (key.isEmpty() || exactName.isEmpty())
+        return;
+    const juce::ScopedLock lock(chatSyncPeerLock);
+    chatSyncPeerNameByUserKey[key] = exactName;
+}
+
+bool NinjamVst3AudioProcessor::sendPrivateChatSideSignal(const juce::String& type, const juce::String& payload, const juce::String& target)
+{
+    if (type.isEmpty() || payload.isEmpty())
+        return false;
+
+    juce::DynamicObject::Ptr wrapper = new juce::DynamicObject();
+    wrapper->setProperty("type", type);
+    wrapper->setProperty("payload", payload);
+    if (target.isNotEmpty() && target != "*")
+        wrapper->setProperty("target", target);
+    const juce::String msg = juce::String(sideSignalChatPrefix)
+                           + juce::JSON::toString(juce::var(wrapper.get()), false);
+
+    juce::StringArray recipients;
+    {
+        const juce::ScopedLock lock(chatSyncPeerLock);
+        if (target.isNotEmpty() && target != "*")
+        {
+            auto it = chatSyncPeerNameByUserKey.find(normaliseOpusPeerId(target));
+            if (it != chatSyncPeerNameByUserKey.end())
+                recipients.add(it->second);
+        }
+        else
+        {
+            for (const auto& entry : chatSyncPeerNameByUserKey)
+                recipients.add(entry.second);
+        }
+    }
+    if (recipients.isEmpty())
+        return false;
+
+    // PRIVMSG is delivered by the server only to the named user, so vanilla
+    // ReaNINJAM clients are never sent these payloads and can never display
+    // them.
+    bool sent = false;
+    const juce::ScopedLock clientLock(ninjamClientLock);
+    if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
+        return false;
+    for (const auto& recipient : recipients)
+    {
+        ninjamClient.ChatMessage_Send("PRIVMSG", recipient.toRawUTF8(), msg.toRawUTF8());
+        sent = true;
+    }
+    return sent;
 }
 
 void NinjamVst3AudioProcessor::sendIntervalSignal(const juce::String& type, const juce::String& payload, const juce::String& target)
@@ -13711,11 +13813,21 @@ void NinjamVst3AudioProcessor::sendIntervalSignal(const juce::String& type, cons
     }
 
     // All NJ+ raw metadata stays on the hidden control channel; channel 0 is audio-only.
-    if (kSyncSignalChannelIndex >= serverMaxLocalChannelsCached.load(std::memory_order_relaxed))
-        return;
-    const int result = ninjamClient.SendRawIntervalItem(kSyncSignalChannelIndex, kSyncSignalFourcc, msg.toRawUTF8(), (int)msg.getNumBytesAsUTF8());
-    if (result != 0)
+    // When the server cannot host the hidden control channel (or rejects the
+    // upload), fall back to carriers that never surface in vanilla
+    // ReaNINJAM chat: smuggle through the audio channel under the sync
+    // fourcc, else targeted private messages between peers that run this
+    // client.
+    if (kSyncSignalChannelIndex < serverMaxLocalChannelsCached.load(std::memory_order_relaxed))
+    {
+        const int result = ninjamClient.SendRawIntervalItem(kSyncSignalChannelIndex, kSyncSignalFourcc, msg.toRawUTF8(), (int)msg.getNumBytesAsUTF8());
+        if (result == 0)
+            return;
         logIntervalPerf("interval sync raw send failed type=" + type + " result=" + juce::String(result));
+    }
+    if (ninjamClient.SendRawIntervalItem(0, kSyncSignalFourcc, msg.toRawUTF8(), (int)msg.getNumBytesAsUTF8()) == 0)
+        return;
+    sendPrivateChatSideSignal(type, payload, target);
 }
 
 void NinjamVst3AudioProcessor::setSpreadOutputsEnabled(bool shouldEnable)
@@ -18336,6 +18448,14 @@ int NinjamVst3AudioProcessor::LicenseAgreementCallback(void* userData, const cha
 void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, const juce::String& type,
                                                   const juce::String& payload, const juce::String& syncRoute)
 {
+    // Any signal that reaches us through the NINJAM server (side-signal
+    // command, prefixed chat, or interval-channel fourcc) proves the sender
+    // runs this client, so remember their exact username for private-message
+    // relays. VDO-route senders are identified by camera labels, not NINJAM
+    // usernames, and already have the VDO data channel available.
+    if (!syncRoute.equalsIgnoreCase("VDO"))
+        noteChatSyncPeer(sender);
+
     const bool isVdoSyncSignal = type == "intervalSyncTag"
                               || type == "intervalSyncAck"
                               || type == "intervalTransportProbe"
@@ -19190,14 +19310,15 @@ void NinjamVst3AudioProcessor::ChatMessage_Callback(void* userData, NJClient* in
         }
         return true;
     };
-    auto processInboundSideSignal = [self, &processOpusSyncSupport](const juce::String& sender, const juce::String& type, const juce::String& payload, juce::String* outEventId) -> bool
+    auto processInboundSideSignal = [self, &processOpusSyncSupport](const juce::String& sender, const juce::String& type, const juce::String& payload, juce::String* outEventId, const juce::String& syncRoute = "SIDE") -> bool
     {
+        self->noteChatSyncPeer(sender);
         if (type == "mobileHotspotKeepalive")
             return true;
         if (type == "opusSyncSupport")
             return processOpusSyncSupport(sender, payload, outEventId);
         juce::ignoreUnused(outEventId);
-        self->processSyncSignal(sender, type, payload, "SIDE");
+        self->processSyncSignal(sender, type, payload, syncRoute);
         return true;
     };
     // nparms is the static array size (always 5); count only non-null entries
@@ -19282,14 +19403,32 @@ void NinjamVst3AudioProcessor::ChatMessage_Callback(void* userData, NJClient* in
                 {
                     const juce::String type = wrappedObj->getProperty("type").toString();
                     const juce::String payload = wrappedObj->getProperty("payload").toString();
-                    if (type.isNotEmpty() && payload.isNotEmpty())
+                    const juce::String chatTarget = wrappedObj->getProperty("target").toString().trim();
+                    // Chat broadcasts echo back to the sender; never process
+                    // our own signals. Honour the optional target filter so
+                    // targeted chat relays behave like targeted SIDE_SIGNALs.
+                    const bool ownEcho = normaliseChatTargetNick(sender) == normaliseChatTargetNick(self->currentUser);
+                    bool targetOk = true;
+                    if (chatTarget.isNotEmpty() && chatTarget != "*")
                     {
-                            if (processInboundSideSignal(sender, type, payload, nullptr))
-                            {
-                                return;
-                            }
+                        const juce::String localKey = normaliseOpusPeerId(self->currentUser);
+                        const juce::String targetKey = normaliseOpusPeerId(chatTarget);
+                        targetOk = targetKey.isNotEmpty()
+                                   && (targetKey == localKey
+                                       || chatTarget.startsWithIgnoreCase(self->currentUser)
+                                       || self->currentUser.startsWithIgnoreCase(chatTarget));
+                    }
+                    if (!ownEcho && targetOk && type.isNotEmpty() && payload.isNotEmpty())
+                    {
+                        if (processInboundSideSignal(sender, type, payload, nullptr, "CHAT"))
+                        {
+                            return;
+                        }
                     }
                 }
+                // Swallow every prefixed line (parsed or not, ours or not) so
+                // sync payloads never render in the chat window.
+                return;
             }
         }
 
