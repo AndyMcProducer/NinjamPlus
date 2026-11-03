@@ -2040,6 +2040,7 @@ private:
     EditorBackgroundComponent backgroundComponent;
     juce::Label statusLabel;
     juce::Label onlineClockLabel;
+    bool startupPaintReported = false;
     
     // Login
     juce::Label serverLabel{ "Server", "Server:" };

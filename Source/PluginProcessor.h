@@ -489,6 +489,9 @@ public:
     float getLocalPeakRight() const;
 
     void sendSideSignal(const juce::String& target, const juce::String& type, const juce::String& payload);
+    bool sendIntervalChannelSignal(const juce::String& type, const juce::String& payload);
+    bool sendPrivateChatSideSignal(const juce::String& type, const juce::String& payload, const juce::String& target = "*");
+    void noteChatSyncPeer(const juce::String& sender);
     void sendIntervalSignal(const juce::String& type, const juce::String& payload, const juce::String& target = "*");
     void processSyncSignal(const juce::String& sender, const juce::String& type, const juce::String& payload,
                            const juce::String& syncRoute = {});
@@ -1015,6 +1018,8 @@ private:
     std::array<std::atomic<bool>, numSamplePads> samplePadPendingSpeedResync {};
     std::atomic<juce::uint64> samplePadBankLoadRequestSerial { 0 };
     std::atomic<juce::uint64> samplePadBankSaveRequestSerial { 0 };
+    std::atomic<bool> samplePadDeferResync { false };
+    juce::MemoryBlock lastAppliedStateInformation;
     std::atomic<bool> editorStateRestoredFromDisk { false };
     mutable juce::CriticalSection samplePadsLock;
     std::array<SamplePadState, numSamplePads> samplePads;
@@ -1409,6 +1414,11 @@ private:
     std::map<juce::String, double> lastSyncMessageReceivedMsByUser;
     std::map<juce::String, double> lastSyncMessageAckMsByUser;
     std::map<juce::String, juce::String> lastIntervalSyncRouteByUser;
+    // Peers confirmed to run this client (exact NINJAM usernames), used to
+    // target private-message signal relays so vanilla clients never receive
+    // them.
+    mutable juce::CriticalSection chatSyncPeerLock;
+    std::map<juce::String, juce::String> chatSyncPeerNameByUserKey;
     std::deque<juce::String> recentIntervalSyncAckEventIds;
     std::map<juce::String, double> pendingTransportProbeSentMsById;
     std::map<juce::String, long long> remoteLatencyLastAppliedIntervalByUser;
@@ -1682,6 +1692,8 @@ private:
     void resyncLoopedSamplePadsToBpm(double targetBpm);
     void resyncSamplePadToBpm(int padIndex, double targetBpm, bool force);
     void enqueueSamplePadResyncJob(int padIndex, double targetBpm, bool force);
+    void requestSamplePadBpmResync(int padIndex, double targetBpm, bool force);
+    void applySamplePadStateProperties(int padIndex, const juce::ValueTree& state);
     static void RemoteChannelAudioTap_Callback(void* userData,
                                                int useridx,
                                                const char* username,

@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "StartupTiming.h"
 #include "lice/lice.h"
 #include <atomic>
 #include <cmath>
@@ -8169,6 +8170,7 @@ void CustomKnobLookAndFeel::drawRotarySlider(juce::Graphics& g, int x, int y, in
 NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioProcessor& p)
     : AudioProcessorEditor (&p), audioProcessor (p), intervalDisplay(p), userList(p)
 {
+    NinjamStartupTiming startupTiming("editor.constructor");
     setResizable(true, true);
     setResizeLimits(1024, 600, 2200, 1500);
 
@@ -9056,6 +9058,8 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
         static TextureScanCache scanCache;
 
         juce::Array<juce::File> roots;
+        roots.add(juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+                      .getChildFile("NINJAMplus"));
         roots.add(juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory());
         {
             const auto moduleFile = getThisModuleFile();
@@ -9079,6 +9083,22 @@ NinjamVst3AudioProcessorEditor::NinjamVst3AudioProcessorEditor (NinjamVst3AudioP
             }
             if (texturesDir.isDirectory())
                 break;
+        }
+
+        // First-run seeding: if the shared per-user skins folder doesn't exist
+        // yet but a bundled copy was found, copy it into Documents\NINJAMplus so
+        // standalone and plug-in both read from the one canonical location and
+        // the package only needs to ship the textures once.
+        const juce::File userTexturesDir = roots.getFirst().getChildFile("textures");
+        if (texturesDir.isDirectory()
+            && texturesDir != userTexturesDir
+            && ! userTexturesDir.isDirectory())
+        {
+            std::thread([src = texturesDir, dst = userTexturesDir]() mutable
+            {
+                dst.getParentDirectory().createDirectory();
+                src.copyDirectoryTo(dst);
+            }).detach();
         }
 
         if (texturesDir.isDirectory())
@@ -9425,6 +9445,12 @@ void NinjamVst3AudioProcessorEditor::unregisterSamplerFxKnobLearnTarget(juce::Co
 
 void NinjamVst3AudioProcessorEditor::paint (juce::Graphics& g)
 {
+    if (!startupPaintReported)
+    {
+        startupPaintReported = true;
+        logNinjamStartupTiming("editor.firstPaint");
+    }
+
     juce::ignoreUnused(g);
 }
 
@@ -11436,7 +11462,9 @@ void NinjamVst3AudioProcessorEditor::savePersistentSettingsToDisk(bool includePr
 
 void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
 {
+    NinjamStartupTiming startupTiming("editor.settings");
     migrateOldSettingsIfNeeded();
+    logNinjamStartupTiming("editor.settings.migrate");
 
     auto popts = makeSettingsOptions();
     // Note: renewSettingsFileIfCorrupt was already called in the constructor,
@@ -11445,6 +11473,7 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
     // this function from being called at all.
 
     juce::PropertiesFile props(popts);
+    logNinjamStartupTiming("editor.settings.propsLoad");
 
     // Only restore the full processor state on the very first editor open.
     // On subsequent GUI reopens, the processor already has live state (playing
@@ -11465,6 +11494,7 @@ void NinjamVst3AudioProcessorEditor::loadPersistentSettingsFromDisk()
             }
         }
     }
+    logNinjamStartupTiming("editor.settings.restoreState");
 
     const juce::String savedServer = props.getValue("server", {});
     if (savedServer.isNotEmpty())
@@ -12820,6 +12850,7 @@ bool NinjamVst3AudioProcessorEditor::isSidechainInputActive() const
 
 void NinjamVst3AudioProcessorEditor::loadControlImages(const juce::File& themeDir)
 {
+    NinjamStartupTiming startupTiming("editor.theme");
     backgroundImage = juce::Image();
     backgroundComponent.setBackgroundImage({});
     userList.setBackgroundImage({});
@@ -13966,6 +13997,7 @@ void NinjamVst3AudioProcessorEditor::showSettingsCallout(std::unique_ptr<juce::C
 
 void NinjamVst3AudioProcessorEditor::refreshExternalMidiInputDevices()
 {
+    NinjamStartupTiming startupTiming("editor.midi");
     const juce::String desiredLearnId = audioProcessor.getMidiLearnInputDeviceId();
     const juce::String desiredRelayId = audioProcessor.getMidiRelayInputDeviceId();
     const bool samplePadsFeatureEnabled = audioProcessor.isSamplePadsFeatureEnabled();

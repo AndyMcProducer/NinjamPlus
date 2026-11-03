@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "StartupTiming.h"
 #include "ZapVideoCodec.h"
 #include "Chromagram.h"
 #include "ChordDetector.h"
@@ -2775,6 +2776,13 @@ private:
 };
 #endif
 
+static juce::File getSolititoUserAssetDir()
+{
+    return juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+        .getChildFile("NINJAMplus")
+        .getChildFile("solitito-ai");
+}
+
 static juce::File findSolititoChordAsset(const char* fileName)
 {
     std::vector<juce::File> dirs;
@@ -2782,6 +2790,8 @@ static juce::File findSolititoChordAsset(const char* fileName)
 #if defined(NINJAMPLUS_SOLITITO_ASSET_DIR)
     dirs.push_back(juce::File(juce::String(NINJAMPLUS_SOLITITO_ASSET_DIR)));
 #endif
+
+    dirs.push_back(getSolititoUserAssetDir());
 
     const juce::File moduleFile = getThisModuleFile();
     if (moduleFile.exists())
@@ -2811,6 +2821,10 @@ static juce::File findSolititoChordRuntime()
     constexpr auto runtimeName = "ninjamplus_onnxruntime.dll";
     std::vector<juce::File> dirs;
 
+    const auto userDir = getSolititoUserAssetDir();
+    dirs.push_back(userDir);
+    dirs.push_back(userDir.getParentDirectory());
+
     const juce::File moduleFile = getThisModuleFile();
     if (moduleFile.exists())
     {
@@ -2832,6 +2846,33 @@ static juce::File findSolititoChordRuntime()
     }
 
     return {};
+}
+
+// One-time seeding: copy the bundled Solitito runtime and model into
+// Documents\NINJAMplus\solitito-ai so the standalone and plug-in can share a
+// single canonical copy instead of each shipping their own.
+static void seedSolititoUserAssetsIfNeeded()
+{
+    static std::atomic<bool> attempted { false };
+    if (attempted.exchange(true))
+        return;
+
+    const auto userDir = getSolititoUserAssetDir();
+    const juce::File sources[] = {
+        findSolititoChordRuntime(),
+        findSolititoChordAsset("chord_model_v31_16k.onnx"),
+        findSolititoChordAsset("dsp_weights_v31_16k.bin")
+    };
+
+    for (const auto& src : sources)
+    {
+        const auto dst = userDir.getChildFile(src.getFileName());
+        if (src.existsAsFile() && ! dst.existsAsFile())
+        {
+            userDir.createDirectory();
+            src.copyFileTo(dst);
+        }
+    }
 }
 
 class BatchedChordAnalyzer final
@@ -2864,6 +2905,7 @@ public:
     {
         if (solititoModel != nullptr)
             return solititoModel->isAvailable();
+        seedSolititoUserAssetsIfNeeded();
         solititoModel = std::make_unique<SolititoChordModel>(trackCount);
         solititoModel->load(findSolititoChordRuntime(),
                             findSolititoChordAsset("chord_model_v31_16k.onnx"),
@@ -6088,6 +6130,7 @@ NinjamVst3AudioProcessor::NinjamVst3AudioProcessor()
                      .withOutput ("Output 16", juce::AudioChannelSet::stereo(), false)
                        )
 {
+    NinjamStartupTiming startupTiming("processor.constructor");
     metronomeFormatManager.registerBasicFormats();
     samplePadFormatManager.registerBasicFormats();
 
@@ -7965,6 +8008,10 @@ void NinjamVst3AudioProcessor::resetIntervalSyncTimingCache()
     lastIntervalSyncRouteByUser.clear();
     recentIntervalSyncAckEventIds.clear();
     recentVideoTimingChangeEventIds.clear();
+    {
+        const juce::ScopedLock lock(chatSyncPeerLock);
+        chatSyncPeerNameByUserKey.clear();
+    }
 }
 
 void NinjamVst3AudioProcessor::invalidateIntervalSyncLatencyState(bool keepRemoteServerLatency)
@@ -12166,6 +12213,12 @@ void NinjamVst3AudioProcessor::resetRemoteUserIndexState(int userIndex, const ju
         eraseForUser(remoteAudioPlaybackBoundariesByUser);
         eraseForUser(remoteVideoBufferRefreshIdByUser);
         eraseForUser(lastSentBufferMsByUser);
+        {
+            const juce::ScopedLock chatPeerLock(chatSyncPeerLock);
+            chatSyncPeerNameByUserKey.erase(senderKey);
+            if (canonicalSenderKey.isNotEmpty())
+                chatSyncPeerNameByUserKey.erase(canonicalSenderKey);
+        }
 
         for (auto it = pendingRemoteIntervalStartsByUser.begin(); it != pendingRemoteIntervalStartsByUser.end();)
         {
@@ -13629,9 +13682,101 @@ float NinjamVst3AudioProcessor::getLocalPeakRight() const
 
 void NinjamVst3AudioProcessor::sendSideSignal(const juce::String& target, const juce::String& type, const juce::String& payload)
 {
-    const char* tgt = target.isNotEmpty() ? target.toRawUTF8() : "*";
+    {
+        const juce::ScopedLock clientLock(ninjamClientLock);
+        const bool serverSupportsSideSignal = ninjamSideSignalServerSupported.load(std::memory_order_relaxed)
+                                           || ninjamClient.GetServerVideoSupported();
+        if (serverSupportsSideSignal)
+        {
+            const char* tgt = target.isNotEmpty() ? target.toRawUTF8() : "*";
+            ninjamClient.ChatMessage_Send("SIDE_SIGNAL", tgt, type.toRawUTF8(), payload.toRawUTF8());
+            return;
+        }
+    }
+    // Vanilla NINJAM servers silently drop the SIDE_SIGNAL command. Fall back
+    // to carriers that never surface in vanilla ReaNINJAM chat: the sync
+    // fourcc on the interval channel, then targeted private messages between
+    // peers that run this client.
+    if (!sendIntervalChannelSignal(type, payload))
+        sendPrivateChatSideSignal(type, payload, target);
+}
+
+bool NinjamVst3AudioProcessor::sendIntervalChannelSignal(const juce::String& type, const juce::String& payload)
+{
+    juce::DynamicObject::Ptr wrapper = new juce::DynamicObject();
+    wrapper->setProperty("sig", type);
+    wrapper->setProperty("data", payload);
+    const juce::String msg = juce::JSON::toString(juce::var(wrapper.get()));
+    const int payloadBytes = (int)msg.getNumBytesAsUTF8();
+
     const juce::ScopedLock clientLock(ninjamClientLock);
-    ninjamClient.ChatMessage_Send("SIDE_SIGNAL", tgt, type.toRawUTF8(), payload.toRawUTF8());
+    if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
+        return false;
+    if (kSyncSignalChannelIndex < serverMaxLocalChannelsCached.load(std::memory_order_relaxed)
+        && ninjamClient.SendRawIntervalItem(kSyncSignalChannelIndex, kSyncSignalFourcc, msg.toRawUTF8(), payloadBytes) == 0)
+        return true;
+    // Servers that only allow one local channel have no hidden control
+    // channel; smuggle the signal through the audio channel under the sync
+    // fourcc instead. Servers relay unknown fourccs transparently and
+    // vanilla clients discard unknown interval payloads without rendering
+    // anything.
+    return ninjamClient.SendRawIntervalItem(0, kSyncSignalFourcc, msg.toRawUTF8(), payloadBytes) == 0;
+}
+
+void NinjamVst3AudioProcessor::noteChatSyncPeer(const juce::String& sender)
+{
+    const juce::String key = normaliseOpusPeerId(sender);
+    const juce::String exactName = sender.trim();
+    if (key.isEmpty() || exactName.isEmpty())
+        return;
+    const juce::ScopedLock lock(chatSyncPeerLock);
+    chatSyncPeerNameByUserKey[key] = exactName;
+}
+
+bool NinjamVst3AudioProcessor::sendPrivateChatSideSignal(const juce::String& type, const juce::String& payload, const juce::String& target)
+{
+    if (type.isEmpty() || payload.isEmpty())
+        return false;
+
+    juce::DynamicObject::Ptr wrapper = new juce::DynamicObject();
+    wrapper->setProperty("type", type);
+    wrapper->setProperty("payload", payload);
+    if (target.isNotEmpty() && target != "*")
+        wrapper->setProperty("target", target);
+    const juce::String msg = juce::String(sideSignalChatPrefix)
+                           + juce::JSON::toString(juce::var(wrapper.get()), false);
+
+    juce::StringArray recipients;
+    {
+        const juce::ScopedLock lock(chatSyncPeerLock);
+        if (target.isNotEmpty() && target != "*")
+        {
+            auto it = chatSyncPeerNameByUserKey.find(normaliseOpusPeerId(target));
+            if (it != chatSyncPeerNameByUserKey.end())
+                recipients.add(it->second);
+        }
+        else
+        {
+            for (const auto& entry : chatSyncPeerNameByUserKey)
+                recipients.add(entry.second);
+        }
+    }
+    if (recipients.isEmpty())
+        return false;
+
+    // PRIVMSG is delivered by the server only to the named user, so vanilla
+    // ReaNINJAM clients are never sent these payloads and can never display
+    // them.
+    bool sent = false;
+    const juce::ScopedLock clientLock(ninjamClientLock);
+    if (ninjamClient.GetStatus() != NJClient::NJC_STATUS_OK)
+        return false;
+    for (const auto& recipient : recipients)
+    {
+        ninjamClient.ChatMessage_Send("PRIVMSG", recipient.toRawUTF8(), msg.toRawUTF8());
+        sent = true;
+    }
+    return sent;
 }
 
 void NinjamVst3AudioProcessor::sendIntervalSignal(const juce::String& type, const juce::String& payload, const juce::String& target)
@@ -13668,11 +13813,21 @@ void NinjamVst3AudioProcessor::sendIntervalSignal(const juce::String& type, cons
     }
 
     // All NJ+ raw metadata stays on the hidden control channel; channel 0 is audio-only.
-    if (kSyncSignalChannelIndex >= serverMaxLocalChannelsCached.load(std::memory_order_relaxed))
-        return;
-    const int result = ninjamClient.SendRawIntervalItem(kSyncSignalChannelIndex, kSyncSignalFourcc, msg.toRawUTF8(), (int)msg.getNumBytesAsUTF8());
-    if (result != 0)
+    // When the server cannot host the hidden control channel (or rejects the
+    // upload), fall back to carriers that never surface in vanilla
+    // ReaNINJAM chat: smuggle through the audio channel under the sync
+    // fourcc, else targeted private messages between peers that run this
+    // client.
+    if (kSyncSignalChannelIndex < serverMaxLocalChannelsCached.load(std::memory_order_relaxed))
+    {
+        const int result = ninjamClient.SendRawIntervalItem(kSyncSignalChannelIndex, kSyncSignalFourcc, msg.toRawUTF8(), (int)msg.getNumBytesAsUTF8());
+        if (result == 0)
+            return;
         logIntervalPerf("interval sync raw send failed type=" + type + " result=" + juce::String(result));
+    }
+    if (ninjamClient.SendRawIntervalItem(0, kSyncSignalFourcc, msg.toRawUTF8(), (int)msg.getNumBytesAsUTF8()) == 0)
+        return;
+    sendPrivateChatSideSignal(type, payload, target);
 }
 
 void NinjamVst3AudioProcessor::setSpreadOutputsEnabled(bool shouldEnable)
@@ -14387,6 +14542,7 @@ void NinjamVst3AudioProcessor::changeProgramName (int index, const juce::String&
 
 void NinjamVst3AudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    NinjamStartupTiming startupTiming("processor.prepareToPlay");
     intervalSyncSampleCounter.store(0, std::memory_order_relaxed);
     cachedNinjamTransportPos.store(0, std::memory_order_relaxed);
     cachedNinjamTransportLen.store(0, std::memory_order_relaxed);
@@ -14739,7 +14895,7 @@ void NinjamVst3AudioProcessor::loadSamplePadAsync(int padIndex,
 
                     // Auto-resync to NINJAM BPM if BPM sync was enabled by detection
                     if (prepared.detectedBpm > 1.0 && isSamplePadsFeatureEnabled())
-                        resyncSamplePadToBpm(padIndex, (double)getBPM(), false);
+                        enqueueSamplePadResyncJob(padIndex, (double)getBPM(), false);
 
                     if (completion)
                         completion(true, {});
@@ -15351,7 +15507,7 @@ void NinjamVst3AudioProcessor::setSamplePadBpmSyncEnabled(int padIndex, bool sho
         }
     }
     else if (isSamplePadsFeatureEnabled())
-        resyncSamplePadToBpm(padIndex, (double)getBPM(), false);
+        requestSamplePadBpmResync(padIndex, (double)getBPM(), false);
 }
 
 bool NinjamVst3AudioProcessor::isSamplePadBpmSyncEnabled(int padIndex) const
@@ -15393,7 +15549,7 @@ void NinjamVst3AudioProcessor::setSamplePadSourceBpm(int padIndex, double newBpm
     }
 
     // Trigger a resync to the current NINJAM BPM with the corrected values
-    resyncSamplePadToBpm(padIndex, (double)getBPM(), true);
+    requestSamplePadBpmResync(padIndex, (double)getBPM(), true);
 }
 
 void NinjamVst3AudioProcessor::setSamplePadPlaybackSpeed(int padIndex, SamplePadPlaybackSpeed speed)
@@ -15423,7 +15579,7 @@ void NinjamVst3AudioProcessor::setSamplePadPlaybackSpeed(int padIndex, SamplePad
         pad.lastSyncedTargetBpm = 0.0;
     }
     if (isSamplePadsFeatureEnabled())
-        resyncSamplePadToBpm(padIndex, (double)getBPM(), true);
+        requestSamplePadBpmResync(padIndex, (double)getBPM(), true);
 }
 
 NinjamVst3AudioProcessor::SamplePadPlaybackSpeed NinjamVst3AudioProcessor::getSamplePadPlaybackSpeed(int padIndex) const
@@ -15558,7 +15714,7 @@ void NinjamVst3AudioProcessor::setSamplePadLoopEnabled(int padIndex, bool should
         }
     }
     if (shouldLoop && isSamplePadsFeatureEnabled())
-        resyncSamplePadToBpm(padIndex, (double)getBPM(), false);
+        requestSamplePadBpmResync(padIndex, (double)getBPM(), false);
 }
 
 bool NinjamVst3AudioProcessor::isSamplePadLoopEnabled(int padIndex) const
@@ -16702,6 +16858,16 @@ void NinjamVst3AudioProcessor::resyncLoopedSamplePadsToBpm(double targetBpm)
 
     for (int pad = 0; pad < numSamplePads; ++pad)
         resyncSamplePadToBpm(pad, targetBpm, false);
+}
+
+void NinjamVst3AudioProcessor::requestSamplePadBpmResync(int padIndex, double targetBpm, bool force)
+{
+    // During state restore the resync is queued on the background pool so the
+    // (potentially multi-second) stretch never blocks the startup path.
+    if (samplePadDeferResync.load(std::memory_order_acquire))
+        enqueueSamplePadResyncJob(padIndex, targetBpm, force);
+    else
+        resyncSamplePadToBpm(padIndex, targetBpm, force);
 }
 
 void NinjamVst3AudioProcessor::resyncSamplePadToBpm(int padIndex, double targetBpm, bool force)
@@ -18282,6 +18448,14 @@ int NinjamVst3AudioProcessor::LicenseAgreementCallback(void* userData, const cha
 void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, const juce::String& type,
                                                   const juce::String& payload, const juce::String& syncRoute)
 {
+    // Any signal that reaches us through the NINJAM server (side-signal
+    // command, prefixed chat, or interval-channel fourcc) proves the sender
+    // runs this client, so remember their exact username for private-message
+    // relays. VDO-route senders are identified by camera labels, not NINJAM
+    // usernames, and already have the VDO data channel available.
+    if (!syncRoute.equalsIgnoreCase("VDO"))
+        noteChatSyncPeer(sender);
+
     const bool isVdoSyncSignal = type == "intervalSyncTag"
                               || type == "intervalSyncAck"
                               || type == "intervalTransportProbe"
@@ -19136,14 +19310,15 @@ void NinjamVst3AudioProcessor::ChatMessage_Callback(void* userData, NJClient* in
         }
         return true;
     };
-    auto processInboundSideSignal = [self, &processOpusSyncSupport](const juce::String& sender, const juce::String& type, const juce::String& payload, juce::String* outEventId) -> bool
+    auto processInboundSideSignal = [self, &processOpusSyncSupport](const juce::String& sender, const juce::String& type, const juce::String& payload, juce::String* outEventId, const juce::String& syncRoute = "SIDE") -> bool
     {
+        self->noteChatSyncPeer(sender);
         if (type == "mobileHotspotKeepalive")
             return true;
         if (type == "opusSyncSupport")
             return processOpusSyncSupport(sender, payload, outEventId);
         juce::ignoreUnused(outEventId);
-        self->processSyncSignal(sender, type, payload, "SIDE");
+        self->processSyncSignal(sender, type, payload, syncRoute);
         return true;
     };
     // nparms is the static array size (always 5); count only non-null entries
@@ -19228,14 +19403,32 @@ void NinjamVst3AudioProcessor::ChatMessage_Callback(void* userData, NJClient* in
                 {
                     const juce::String type = wrappedObj->getProperty("type").toString();
                     const juce::String payload = wrappedObj->getProperty("payload").toString();
-                    if (type.isNotEmpty() && payload.isNotEmpty())
+                    const juce::String chatTarget = wrappedObj->getProperty("target").toString().trim();
+                    // Chat broadcasts echo back to the sender; never process
+                    // our own signals. Honour the optional target filter so
+                    // targeted chat relays behave like targeted SIDE_SIGNALs.
+                    const bool ownEcho = normaliseChatTargetNick(sender) == normaliseChatTargetNick(self->currentUser);
+                    bool targetOk = true;
+                    if (chatTarget.isNotEmpty() && chatTarget != "*")
                     {
-                            if (processInboundSideSignal(sender, type, payload, nullptr))
-                            {
-                                return;
-                            }
+                        const juce::String localKey = normaliseOpusPeerId(self->currentUser);
+                        const juce::String targetKey = normaliseOpusPeerId(chatTarget);
+                        targetOk = targetKey.isNotEmpty()
+                                   && (targetKey == localKey
+                                       || chatTarget.startsWithIgnoreCase(self->currentUser)
+                                       || self->currentUser.startsWithIgnoreCase(chatTarget));
+                    }
+                    if (!ownEcho && targetOk && type.isNotEmpty() && payload.isNotEmpty())
+                    {
+                        if (processInboundSideSignal(sender, type, payload, nullptr, "CHAT"))
+                        {
+                            return;
+                        }
                     }
                 }
+                // Swallow every prefixed line (parsed or not, ours or not) so
+                // sync payloads never render in the chat window.
+                return;
             }
         }
 
@@ -22105,6 +22298,17 @@ void NinjamVst3AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 
 void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
+    NinjamStartupTiming startupTiming("processor.setStateInformation");
+
+    // The standalone holder ("filterState") and the editor ("pluginStateBase64")
+    // both persist the processor state, so identical blobs can arrive twice in
+    // one startup. Re-applying would just repeat expensive work such as sample
+    // pad restoration, so skip a byte-identical replay.
+    const juce::MemoryBlock incomingState(data, (size_t) juce::jmax(0, sizeInBytes));
+    if (sizeInBytes > 0 && incomingState == lastAppliedStateInformation)
+        return;
+    lastAppliedStateInformation = incomingState;
+
     std::unique_ptr<juce::XmlElement> xmlState(getXmlFromBinary(data, sizeInBytes));
     if (xmlState == nullptr)
         return;
@@ -22121,6 +22325,7 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setSamplePadsMidiInputDeviceId(state.getProperty("samplePadsMidiInputDeviceId", "").toString());
     setSamplePadLooperInput((int)state.getProperty("samplePadLooperInput", looperInputLocalChannel));
     setSamplePadsFeatureEnabled((bool)state.getProperty("samplePadsFeatureEnabled", true));
+    logNinjamStartupTiming("state.midiAndPadsEnabled");
     setAutoTranslateEnabled((bool) state.getProperty("autoTranslate", false));
     setTranslateSourceLang(state.getProperty("translateSourceLang", "en").toString());
     setTranslateTargetLang(state.getProperty("translateTargetLang", "system").toString());
@@ -22146,6 +22351,7 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setMetronomeMuted((bool)state.getProperty("metronomeMuted", false));
     setMetronomeSoundKey(state.getProperty("metronomeSoundKey", getClassicMetronomeSoundKey()).toString());
     setMetronomeOutputChannel((int)state.getProperty("metronomeOutputChannel", 0));
+    logNinjamStartupTiming("state.metronome");
     setTransmitLocal((bool)state.getProperty("transmitLocal", false));
     setMobileHotspotModeEnabled((bool)state.getProperty("mobileHotspotMode", false));
     setVdoTurnModeEnabled((bool)state.getProperty("vdoTurnMode", false));
@@ -22157,7 +22363,9 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     setSshTunnelUser(state.getProperty("sshTunnelUser", "").toString());
     setSshTunnelKeyFile(state.getProperty("sshTunnelKeyFile", "").toString());
     setAutoReconnectEnabled((bool)state.getProperty("autoReconnectEnabled", true));
+    logNinjamStartupTiming("state.ssh");
     setChordDetectionEnabled((bool)state.getProperty("chordDetectionEnabled", true));
+    logNinjamStartupTiming("state.chord");
     setSamplePadVolume(juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("samplePadsVolume", 1.0)));
     setSamplePadLimiterEnabled((bool)state.getProperty("samplePadsLimiter", false));
     setSamplePadDuckEnabled((bool)state.getProperty("samplePadsDuck", false));
@@ -22188,27 +22396,30 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
     for (int pad = 0; pad < numSamplePads; ++pad)
     {
         const juce::String filePath = state.getProperty("samplePadFile" + juce::String(pad), "").toString();
+
+        if (filePath.isNotEmpty() && samplePadBackgroundAlive->load(std::memory_order_acquire))
+        {
+            // Decode and BPM analysis run on the background pool; the pad's
+            // saved properties are applied in the completion once the sample
+            // is committed, keeping multi-second restores off the startup path.
+            loadSamplePadAsync(pad, juce::File(filePath),
+                               [this, pad, state](bool loadedOk, const juce::String&)
+                               {
+                                   if (! loadedOk)
+                                       clearSamplePad(pad);
+                                   applySamplePadStateProperties(pad, state);
+                               });
+            continue;
+        }
+
         const bool loaded = filePath.isNotEmpty() && loadSamplePad(pad, juce::File(filePath));
         if (!loaded)
             clearSamplePad(pad);
 
-        setSamplePadPlaybackSpeed(pad,
-                                  sanitizeSamplePadPlaybackSpeed((int)state.getProperty("samplePadPlaybackSpeed" + juce::String(pad),
-                                                                                        (int)SamplePadPlaybackSpeed::normal)));
-        setSamplePadBpmSyncEnabled(pad, (bool)state.getProperty("samplePadBpmSync" + juce::String(pad), true));
-        setSamplePadLoopEnabled(pad, (bool)state.getProperty("samplePadLoop" + juce::String(pad), false));
-        setSamplePadReverseEnabled(pad, (bool)state.getProperty("samplePadReverse" + juce::String(pad), false));
-        setSamplePadMatchBpiEnabled(pad, (bool)state.getProperty("samplePadMatchBpi" + juce::String(pad), false));
-        setSamplePadDuckRouteEnabled(pad, (bool)state.getProperty("samplePadDuckRoute" + juce::String(pad), false));
-        setSamplePadVolume(pad, juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("samplePadVolume" + juce::String(pad), 1.0)));
-        for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
-            setSamplePadFxSlotRouteEnabled(pad,
-                                           slot,
-                                           (bool)state.getProperty("samplePadFxSlotRoute" + juce::String(pad) + "_" + juce::String(slot),
-                                                                   false));
-        if ((bool)state.getProperty("samplePadNameCustom" + juce::String(pad), false))
-            setSamplePadName(pad, state.getProperty("samplePadName" + juce::String(pad), "").toString());
+        applySamplePadStateProperties(pad, state);
     }
+
+    logNinjamStartupTiming("state.samplePads");
     for (int channel = 0; channel < maxLocalChannels; ++channel)
         setLocalChannelInput(channel, (int)state.getProperty("localInput" + juce::String(channel), -1));
     setVoiceChannelInput((int)state.getProperty("voiceInput", 0));
@@ -22224,6 +22435,30 @@ void NinjamVst3AudioProcessor::setStateInformation (const void* data, int sizeIn
         for (int channel = 0; channel < maxLocalChannels; ++channel)
             localChannelNames[channel] = state.getProperty("localChannelName" + juce::String(channel), "Ch" + juce::String(channel + 1)).toString();
     }
+}
+
+void NinjamVst3AudioProcessor::applySamplePadStateProperties(int pad, const juce::ValueTree& state)
+{
+    // Resyncs triggered by the setters below are queued on the background pool
+    // rather than stretching synchronously on the calling thread.
+    samplePadDeferResync.store(true, std::memory_order_release);
+    setSamplePadPlaybackSpeed(pad,
+                              sanitizeSamplePadPlaybackSpeed((int)state.getProperty("samplePadPlaybackSpeed" + juce::String(pad),
+                                                                                    (int)SamplePadPlaybackSpeed::normal)));
+    setSamplePadBpmSyncEnabled(pad, (bool)state.getProperty("samplePadBpmSync" + juce::String(pad), true));
+    setSamplePadLoopEnabled(pad, (bool)state.getProperty("samplePadLoop" + juce::String(pad), false));
+    setSamplePadReverseEnabled(pad, (bool)state.getProperty("samplePadReverse" + juce::String(pad), false));
+    setSamplePadMatchBpiEnabled(pad, (bool)state.getProperty("samplePadMatchBpi" + juce::String(pad), false));
+    setSamplePadDuckRouteEnabled(pad, (bool)state.getProperty("samplePadDuckRoute" + juce::String(pad), false));
+    setSamplePadVolume(pad, juce::jlimit(0.0f, 2.0f, (float)(double)state.getProperty("samplePadVolume" + juce::String(pad), 1.0)));
+    for (int slot = 0; slot < numSamplePadFxSlots; ++slot)
+        setSamplePadFxSlotRouteEnabled(pad,
+                                       slot,
+                                       (bool)state.getProperty("samplePadFxSlotRoute" + juce::String(pad) + "_" + juce::String(slot),
+                                                               false));
+    if ((bool)state.getProperty("samplePadNameCustom" + juce::String(pad), false))
+        setSamplePadName(pad, state.getProperty("samplePadName" + juce::String(pad), "").toString());
+    samplePadDeferResync.store(false, std::memory_order_release);
 }
 
 juce::var NinjamVst3AudioProcessor::getSyncDiagnosticState()
