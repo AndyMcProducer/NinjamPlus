@@ -215,18 +215,127 @@ bool NinjamVst3AudioProcessor::testNtpPlaybackCorrelationForIntegrationTest()
     if (!check(remoteLatencyFirmDelayMsByUser.empty() && forceIntervalSyncResend.load(),
                "a subsequent BPM change must restart synchronization again")) return false;
 
+    // A peer can enter the new tempo before our local interval boundary.
+    // Exercise the real message parser and exact-GUID playback correlation.
+    cachedNinjamBpm.store(100.0f);
+    cachedNinjamBpi.store(16);
+    vdoVideoSyncEnabled.store(true);
+    earliestVdoSyncCaptureNtpMs = sourceNtpMs + 100000.0;
+    double cutoff = earliestVdoSyncCaptureNtpMs;
+    auto tempoCase = [&](const char* name, double captureStart, double captureEnd,
+                         double audioBpm, int audioBpi, bool metadata,
+                         double playback, bool expected, bool withGuid = true)
+    {
+        juce::DynamicObject::Ptr tag = new juce::DynamicObject();
+        tag->setProperty("userId", name);
+        tag->setProperty("syncSessionId", "tempo-session");
+        tag->setProperty("intervalIndex", 30);
+        tag->setProperty("intervalAbsolute", 30);
+        tag->setProperty("beatIndex", 0);
+        tag->setProperty("bpm", (double)getBPM());
+        tag->setProperty("bpi", getBPI());
+        if (withGuid)
+            tag->setProperty("audioGuid", guid);
+        tag->setProperty("audioNtpStartTimeMs", captureStart);
+        tag->setProperty("ntpBpi1TimeMs", captureEnd);
+        tag->setProperty("ntpSynced", true);
+        if (metadata)
+        {
+            tag->setProperty("audioBpm", audioBpm);
+            tag->setProperty("audioBpi", audioBpi);
+            tag->setProperty("audioNtpEndTimeMs", captureEnd);
+        }
+        processSyncSignal(name, "intervalSyncTag", juce::JSON::toString(juce::var(tag.get())), "VDO");
+        remoteAudioPlaybackBoundariesByUser[name][guid] = { 1000, nowMs, playback };
+        processPendingRemoteAudioPlaybackBoundaries(60000.0 * getBPI() / getBPM());
+        const auto found = remoteLatencyFirmDelayMsByUser.find(name);
+        return check(expected ? found != remoteLatencyFirmDelayMsByUser.end()
+                                && found->second == (int)std::llround(playback - captureStart)
+                              : found == remoteLatencyFirmDelayMsByUser.end(), name);
+    };
+    if (!tempoCase("new-tempo-before-local-cutoff", cutoff - 1200.0, cutoff + 8400.0,
+                   100.0, 16, true, cutoff + 9000.0, true)) return false;
+    if (!tempoCase("old-capture-with-new-marker-bpm", cutoff - 1200.0, cutoff + 6800.0,
+                   120.0, 16, true, cutoff + 9000.0, false)) return false;
+    if (!tempoCase("old-bpi-with-new-marker-bpi", cutoff - 1200.0, cutoff + 3600.0,
+                   100.0, 8, true, cutoff + 9000.0, false)) return false;
+    if (!tempoCase("delayed-old-same-tempo-recording", cutoff - 10800.0, cutoff - 1200.0,
+                   100.0, 16, true, cutoff + 9000.0, false)) return false;
+    if (!tempoCase("playback-before-current-change", cutoff - 1200.0, cutoff + 8400.0,
+                   100.0, 16, true, cutoff - 100.0, false)) return false;
+    if (!tempoCase("legacy-pre-change-keeps-cutoff", cutoff - 1200.0, cutoff + 8400.0,
+                   100.0, 16, false, cutoff + 9000.0, false)) return false;
+    if (!tempoCase("legacy-post-change-still-accepted", cutoff + 100.0, cutoff + 9700.0,
+                   100.0, 16, false, cutoff + 10000.0, true)) return false;
+    if (!tempoCase("missing-completion-time", cutoff - 1200.0, 0.0,
+                   100.0, 16, true, cutoff + 9000.0, false)) return false;
+    if (!tempoCase("invalid-captured-tempo", cutoff - 1200.0, cutoff + 8400.0,
+                   0.0, 16, true, cutoff + 9000.0, false)) return false;
+    if (!tempoCase("invalid-captured-bpi", cutoff - 1200.0, cutoff + 8400.0,
+                   100.0, 0, true, cutoff + 9000.0, false)) return false;
+    if (!tempoCase("reversed-recording-times", cutoff - 1200.0, cutoff - 1300.0,
+                   100.0, 16, true, cutoff + 9000.0, false)) return false;
+    if (!tempoCase("missing-guid-cannot-bypass-cutoff", cutoff - 1200.0, cutoff + 8400.0,
+                   100.0, 16, true, cutoff + 9000.0, false, false)) return false;
+    if (!tempoCase("long-delay-preserved", cutoff - 1200.0, cutoff + 8400.0,
+                   100.0, 16, true, cutoff + 118800.0, true)) return false;
+    if (!tempoCase("excessive-delay-still-rejected", cutoff - 1200.0, cutoff + 8400.0,
+                   100.0, 16, true, cutoff + 118801.0, false)) return false;
+
+    // Returning to the same BPM must not revive recordings from its old phase.
+    restartVdoSyncForTimingChange(120.0, 16);
+    restartVdoSyncForTimingChange(100.0, 16);
+    cutoff += 20000.0;
+    earliestVdoSyncCaptureNtpMs = cutoff;
+    if (!tempoCase("aba-old-phase-rejected", cutoff - 21200.0, cutoff - 11600.0,
+                   100.0, 16, true, cutoff + 9000.0, false)) return false;
+    if (!tempoCase("aba-current-phase-accepted", cutoff - 1200.0, cutoff + 8400.0,
+                   100.0, 16, true, cutoff + 9000.0, true)) return false;
+    forceIntervalSyncResend.store(false);
+    restartVdoSyncForTimingChange(100.0, 16);
+    if (!check(remoteLatencyFirmDelayMsByUser["aba-current-phase-accepted"] == 10200
+               && !forceIntervalSyncResend.load(),
+               "duplicate tempo announcement must preserve early valid correction")) return false;
+
+    cachedNinjamBpi.store(8);
+    restartVdoSyncForTimingChange(100.0, 8);
+    cutoff += 10000.0;
+    earliestVdoSyncCaptureNtpMs = cutoff;
+    if (!tempoCase("bpi-transition-old-recording", cutoff - 1200.0, cutoff + 8400.0,
+                   100.0, 16, true, cutoff + 4000.0, false)) return false;
+    if (!tempoCase("bpi-transition-current-recording", cutoff - 1200.0, cutoff + 3600.0,
+                   100.0, 8, true, cutoff + 4000.0, true)) return false;
+    vdoVideoSyncEnabled.store(false);
+
     // Exercise the sender's coherent completed-GUID/start-time snapshot.
     completedAudioIntervalGuidLow.store(1);
     completedAudioIntervalGuidHigh.store(2);
     completedAudioIntervalBoundarySampleCount.store(0);
     completedAudioIntervalStartNtpMs.store(sourceNtpMs);
+    completedAudioIntervalEndNtpMs.store(sourceNtpMs + 8000.0);
+    completedAudioIntervalBpm.store(120.0);
+    completedAudioIntervalBpi.store(16);
     intervalSyncSampleCounter.store(480);
     juce::String emittedGuid;
-    double offsetMs = 0.0, captureMs = 0.0;
-    if (!check(getCompletedAudioIntervalGuidForSyncTag(emittedGuid, offsetMs, captureMs)
-               && captureMs == sourceNtpMs && std::abs(offsetMs - 10.0) < 0.001,
-               "completed audio GUID must carry its own capture timestamp")) return false;
-    std::cout << "PASS: NTP GUID matching, late arrival, duplicate, per-peer, invalid clock, BPM restart, and sender timestamp regressions"
+    double offsetMs = 0.0, captureMs = 0.0, endMs = 0.0, captureBpm = 0.0;
+    int captureBpi = 0;
+    if (!check(getCompletedAudioIntervalGuidForSyncTag(emittedGuid, offsetMs, captureMs, endMs, captureBpm, captureBpi)
+               && captureMs == sourceNtpMs && std::abs(offsetMs - 10.0) < 0.001
+               && endMs == sourceNtpMs + 8000.0 && captureBpm == 120.0 && captureBpi == 16,
+               "completed audio GUID must carry its own timestamps and tempo")) return false;
+    completedAudioIntervalGuidSequence.store(1);
+    if (!check(!getCompletedAudioIntervalGuidForSyncTag(emittedGuid, offsetMs, captureMs, endMs, captureBpm, captureBpi),
+               "in-progress sender snapshot must not expose mixed timing")) return false;
+    completedAudioIntervalGuidSequence.store(2);
+    intervalSyncSampleCounter.store(24001);
+    if (!check(!getCompletedAudioIntervalGuidForSyncTag(emittedGuid, offsetMs, captureMs, endMs, captureBpm, captureBpi),
+               "stale sender snapshot must retain the 500 ms guard")) return false;
+    resetIntervalSyncTimingCache();
+    if (!check(currentAudioIntervalBpm.load() == 0.0 && currentAudioIntervalBpi.load() == 0
+               && completedAudioIntervalBpm.load() == 0.0 && completedAudioIntervalBpi.load() == 0
+               && completedAudioIntervalEndNtpMs.load() == 0.0,
+               "reconnect must clear captured timing metadata")) return false;
+    std::cout << "PASS: NTP GUID matching, late arrival, duplicate, per-peer, invalid clock, BPM/BPI transitions, legacy tags, long delay, and sender snapshot regressions"
               << std::endl;
     return true;
 }
@@ -1074,8 +1183,10 @@ int main(int argc, char* argv[])
             result = fail("older alpha rejected later-joining bravo's sync tags");
         if (result == 0 && !bravoSeesAlpha.bufferCalculated)
             result = fail("later-joining bravo did not calculate alpha's buffer");
-        if (result == 0 && (alphaSeesBravo.intervalSampleCount < 8 || bravoSeesAlpha.intervalSampleCount < 8))
-            result = fail("both directions did not collect at least eight interval-sync samples before assertion");
+        // NTP uses a single exact GUID match, not the legacy averaging counter.
+        if (result == 0 && (audioGuidTiming.alphaPlaybackDelayMs.size() < 8
+                            || audioGuidTiming.bravoPlaybackDelayMs.size() < 8))
+            result = fail("both directions did not observe at least eight audio GUID playback matches");
         constexpr double loopbackPhaseToleranceMs = 85.0;
         if (result == 0
             && (alphaIntervalStartMs < 0.0 || bravoIntervalStartMs < 0.0
@@ -1118,7 +1229,9 @@ int main(int argc, char* argv[])
             // present for the next poll, then expire without requiring an ACK.
             pump({ alpha.get(), bravo.get() }, 700);
             const auto retainedRefresh = observeRemote(alpha->processor.getVideoHelperPortForIntegrationTest(), "bravo");
-            if (retainedRefresh.intervalSampleCount < alphaSeesBravo.intervalSampleCount)
+            if (retainedRefresh.intervalSampleCount < alphaSeesBravo.intervalSampleCount
+                || !retainedRefresh.bufferCalculated
+                || retainedRefresh.receiverBufferMs != alphaSeesBravo.receiverBufferMs)
                 result = fail("helper refresh discarded established native sync measurements");
             if (retainedRefresh.refreshEventId.isEmpty())
                 result = fail("a skipped helper poll lost the buffer refresh event");

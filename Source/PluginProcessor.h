@@ -1357,7 +1357,12 @@ private:
     std::atomic<long long> lastProcessedIntervalMarkerKey { -1 };
     juce::CriticalSection intervalSyncAnnouncementLock;
     std::atomic<double> currentAudioIntervalStartNtpMs { 0.0 };
+    std::atomic<double> currentAudioIntervalBpm { 0.0 };
+    std::atomic<int> currentAudioIntervalBpi { 0 };
     std::atomic<double> completedAudioIntervalStartNtpMs { 0.0 };
+    std::atomic<double> completedAudioIntervalEndNtpMs { 0.0 };
+    std::atomic<double> completedAudioIntervalBpm { 0.0 };
+    std::atomic<int> completedAudioIntervalBpi { 0 };
     std::atomic<double> remoteAudioPlaybackBoundaryNtpMs { 0.0 };
     std::atomic<juce::uint64> completedAudioIntervalGuidSequence { 0 };
     std::atomic<juce::uint64> completedAudioIntervalGuidLow { 0 };
@@ -1394,6 +1399,9 @@ private:
         // remote sender's BPI1 started. Zero if the sender doesn't have
         // NTP sync. Used for one-shot buffer calculation.
         double ntpBpi1TimeMs = 0.0;
+        double audioNtpEndTimeMs = 0.0;
+        double audioBpm = 0.0;
+        int audioBpi = 0;
         bool ntpSynced = false;
     };
     std::map<juce::String, PendingRemoteIntervalStart> pendingRemoteIntervalStartsByUser;
@@ -1582,7 +1590,9 @@ private:
     void captureCompletedAudioIntervalGuidFromAudioThread(NJClient* inst);
     bool getCompletedAudioIntervalGuidForSyncTag(juce::String& audioGuidHex,
                                                  double& boundaryToSendOffsetMs,
-                                                 double& captureStartNtpMs) const;
+                                                 double& captureStartNtpMs,
+                                                 double& captureEndNtpMs,
+                                                 double& captureBpm, int& captureBpi) const;
     void processPendingRemoteAudioPlaybackBoundaries(double intervalDurationMs);
     void invalidateIntervalSyncLatencyState(bool keepRemoteServerLatency);
     void pruneDisconnectedRemoteSyncState();
