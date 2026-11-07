@@ -7426,6 +7426,9 @@ void NinjamVst3AudioProcessor::captureCompletedAudioIntervalGuidFromAudioThread(
     const double boundaryNtpMs = ntpSynced.load(std::memory_order_acquire)
         ? (double)juce::Time::currentTimeMillis() + ntpOffsetMs.load(std::memory_order_acquire) : 0.0;
     const double captureStartNtpMs = currentAudioIntervalStartNtpMs.exchange(boundaryNtpMs);
+    // NJClient has already switched to the next interval's tempo here.
+    const double captureBpm = currentAudioIntervalBpm.exchange(inst != nullptr ? inst->GetActualBPM() : 0.0);
+    const int captureBpi = currentAudioIntervalBpi.exchange(inst != nullptr ? inst->GetBPI() : 0);
     unsigned char guid[16] {};
     const bool hasGuid = inst != nullptr
         && vdoVideoSyncEnabled.load(std::memory_order_relaxed)
@@ -7444,6 +7447,9 @@ void NinjamVst3AudioProcessor::captureCompletedAudioIntervalGuidFromAudioThread(
     completedAudioIntervalGuidLow.store(low, std::memory_order_relaxed);
     completedAudioIntervalGuidHigh.store(high, std::memory_order_relaxed);
     completedAudioIntervalStartNtpMs.store(hasGuid ? captureStartNtpMs : 0.0, std::memory_order_relaxed);
+    completedAudioIntervalEndNtpMs.store(hasGuid ? boundaryNtpMs : 0.0, std::memory_order_relaxed);
+    completedAudioIntervalBpm.store(hasGuid ? captureBpm : 0.0, std::memory_order_relaxed);
+    completedAudioIntervalBpi.store(hasGuid ? captureBpi : 0, std::memory_order_relaxed);
     completedAudioIntervalBoundarySampleCount.store(
         hasGuid ? intervalSyncSampleCounter.load(std::memory_order_relaxed) : -1,
         std::memory_order_relaxed);
@@ -7451,11 +7457,15 @@ void NinjamVst3AudioProcessor::captureCompletedAudioIntervalGuidFromAudioThread(
 }
 
 bool NinjamVst3AudioProcessor::getCompletedAudioIntervalGuidForSyncTag(
-    juce::String& audioGuidHex, double& boundaryToSendOffsetMs, double& captureStartNtpMs) const
+    juce::String& audioGuidHex, double& boundaryToSendOffsetMs, double& captureStartNtpMs,
+    double& captureEndNtpMs, double& captureBpm, int& captureBpi) const
 {
     audioGuidHex.clear();
     boundaryToSendOffsetMs = 0.0;
     captureStartNtpMs = 0.0;
+    captureEndNtpMs = 0.0;
+    captureBpm = 0.0;
+    captureBpi = 0;
 
     for (int attempt = 0; attempt < 8; ++attempt)
     {
@@ -7467,6 +7477,9 @@ bool NinjamVst3AudioProcessor::getCompletedAudioIntervalGuidForSyncTag(
         const auto high = completedAudioIntervalGuidHigh.load(std::memory_order_relaxed);
         const auto boundarySampleCount = completedAudioIntervalBoundarySampleCount.load(std::memory_order_relaxed);
         const double startNtpMs = completedAudioIntervalStartNtpMs.load(std::memory_order_relaxed);
+        const double endNtpMs = completedAudioIntervalEndNtpMs.load(std::memory_order_relaxed);
+        const double bpm = completedAudioIntervalBpm.load(std::memory_order_relaxed);
+        const int bpi = completedAudioIntervalBpi.load(std::memory_order_relaxed);
         const auto sequenceAfter = completedAudioIntervalGuidSequence.load(std::memory_order_acquire);
         if (sequenceBefore != sequenceAfter || (sequenceAfter & 1u) != 0u)
             continue;
@@ -7488,6 +7501,9 @@ bool NinjamVst3AudioProcessor::getCompletedAudioIntervalGuidForSyncTag(
         audioGuidHex = guidToHexString(guid);
         boundaryToSendOffsetMs = offsetMs;
         captureStartNtpMs = startNtpMs;
+        captureEndNtpMs = endNtpMs;
+        captureBpm = bpm;
+        captureBpi = bpi;
         return audioGuidHex.isNotEmpty();
     }
 
@@ -7515,7 +7531,11 @@ void NinjamVst3AudioProcessor::broadcastIntervalSyncTag(const juce::String& targ
     juce::String completedAudioGuidHex;
     double boundaryToSendOffsetMs = 0.0;
     double audioNtpStartTimeMs = 0.0;
-    getCompletedAudioIntervalGuidForSyncTag(completedAudioGuidHex, boundaryToSendOffsetMs, audioNtpStartTimeMs);
+    double audioNtpEndTimeMs = 0.0;
+    double audioBpm = 0.0;
+    int audioBpi = 0;
+    getCompletedAudioIntervalGuidForSyncTag(completedAudioGuidHex, boundaryToSendOffsetMs,
+                                           audioNtpStartTimeMs, audioNtpEndTimeMs, audioBpm, audioBpi);
 
     // Build the sync tag payload. The "sendOffsetMs" field tells the receiver
     // how many ms after the sample-accurate audio boundary this transmission was
@@ -7531,7 +7551,8 @@ void NinjamVst3AudioProcessor::broadcastIntervalSyncTag(const juce::String& targ
     const double ntpBpi1TimeMs = currentAudioIntervalStartNtpMs.load(std::memory_order_acquire);
     auto buildPayload = [this, localUserId, syncSessionId, tag, completedAudioGuidHex,
                          displayInterval, intervalAbs, bpi, beatIndex, intervalProgress,
-                         ntpReady, ntpBpi1TimeMs, audioNtpStartTimeMs, markerBpm](double sendOffsetMs) -> juce::String
+                         ntpReady, ntpBpi1TimeMs, audioNtpStartTimeMs, audioNtpEndTimeMs,
+                         audioBpm, audioBpi, markerBpm](double sendOffsetMs) -> juce::String
     {
         juce::DynamicObject::Ptr obj = new juce::DynamicObject();
         obj->setProperty("type", "intervalSyncTag");
@@ -7555,7 +7576,12 @@ void NinjamVst3AudioProcessor::broadcastIntervalSyncTag(const juce::String& targ
             obj->setProperty("audioGuid", completedAudioGuidHex);
             // This GUID is the recording that just ended, not the new interval.
             if (ntpReady && audioNtpStartTimeMs > 0.0)
+            {
                 obj->setProperty("audioNtpStartTimeMs", audioNtpStartTimeMs);
+                obj->setProperty("audioNtpEndTimeMs", audioNtpEndTimeMs);
+                obj->setProperty("audioBpm", audioBpm);
+                obj->setProperty("audioBpi", audioBpi);
+            }
         }
         obj->setProperty("eventId", "intervalTag:" + localUserId + ":" + juce::String(++sideSignalEventCounter));
         return juce::JSON::toString(juce::var(obj.get()));
@@ -7967,6 +7993,11 @@ void NinjamVst3AudioProcessor::resetIntervalSyncTimingCache()
     lastProcessedIntervalMarkerKey.store(-1);
     remoteAudioPlaybackBoundarySampleCount.store(-1, std::memory_order_relaxed);
     currentAudioIntervalStartNtpMs.store(0.0, std::memory_order_release);
+    currentAudioIntervalBpm.store(0.0, std::memory_order_release);
+    currentAudioIntervalBpi.store(0, std::memory_order_release);
+    completedAudioIntervalEndNtpMs.store(0.0, std::memory_order_release);
+    completedAudioIntervalBpm.store(0.0, std::memory_order_release);
+    completedAudioIntervalBpi.store(0, std::memory_order_release);
     remoteAudioPlaybackBoundaryNtpMs.store(0.0, std::memory_order_release);
     lastProcessedRemoteAudioPlaybackBoundarySequence =
         remoteAudioPlaybackBoundarySequence.load(std::memory_order_acquire);
@@ -8108,7 +8139,7 @@ void NinjamVst3AudioProcessor::restartVdoSyncForTimingChange(double bpm, int bpi
     lastSyncMessageAckMsByUser.clear();
     lastVdoSyncResetBpm = bpm;
     lastVdoSyncResetBpi = bpi;
-    // Ignore recordings begun before the change, including delayed old tags.
+    // Legacy tags cannot identify the completed recording's tempo.
     earliestVdoSyncCaptureNtpMs = ntpSynced.load(std::memory_order_acquire)
         ? (double)juce::Time::currentTimeMillis() + ntpOffsetMs.load(std::memory_order_acquire) : 0.0;
     forceIntervalSyncResend.store(true, std::memory_order_release);
@@ -18887,6 +18918,9 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
         double remoteNtpBpi1TimeMs = 0.0;
         bool remoteNtpSynced = false;
         double remoteAudioNtpStartTimeMs = 0.0;
+        double remoteAudioNtpEndTimeMs = 0.0;
+        double remoteAudioBpm = 0.0;
+        int remoteAudioBpi = 0;
         const juce::var parsed = juce::JSON::parse(payload);
         if (auto* obj = parsed.getDynamicObject())
         {
@@ -18923,6 +18957,12 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                 remoteNtpBpi1TimeMs = (double)obj->getProperty("ntpBpi1TimeMs");
             if (obj->hasProperty("audioNtpStartTimeMs"))
                 remoteAudioNtpStartTimeMs = (double)obj->getProperty("audioNtpStartTimeMs");
+            if (obj->hasProperty("audioNtpEndTimeMs"))
+                remoteAudioNtpEndTimeMs = (double)obj->getProperty("audioNtpEndTimeMs");
+            if (obj->hasProperty("audioBpm"))
+                remoteAudioBpm = (double)obj->getProperty("audioBpm");
+            if (obj->hasProperty("audioBpi"))
+                remoteAudioBpi = (int)obj->getProperty("audioBpi");
         }
         sendOffsetMs = std::isfinite(sendOffsetMs) ? juce::jlimit(0.0, 4000.0, sendOffsetMs) : 0.0;
         double receiveForwardOffsetMs = 0.0;
@@ -19144,6 +19184,12 @@ void NinjamVst3AudioProcessor::processSyncSignal(const juce::String& sender, con
                         ? remoteAudioNtpStartTimeMs
                         : remoteNtpBpi1TimeMs - (60000.0 * markerBpi / juce::jmax(1.0, (double)getBPM()));
                     pending.ntpBpi1TimeMs = captureNtpMs;
+                    if (remoteAudioNtpStartTimeMs > 0.0)
+                    {
+                        pending.audioNtpEndTimeMs = remoteAudioNtpEndTimeMs;
+                        pending.audioBpm = remoteAudioBpm;
+                        pending.audioBpi = remoteAudioBpi;
+                    }
                     pending.ntpSynced = remoteNtpSynced && std::isfinite(captureNtpMs) && captureNtpMs > 0.0;
                 }
                 if (shouldStorePending)
@@ -22620,7 +22666,19 @@ void NinjamVst3AudioProcessor::applyRemoteLatencyMeasurement(
     auto appliedIt = remoteLatencyLastAppliedIntervalByUser.find(senderKey);
     const bool isFirstAppliedDelay = (appliedIt == remoteLatencyLastAppliedIntervalByUser.end());
     if (pending.ntpSynced && pending.ntpBpi1TimeMs < earliestVdoSyncCaptureNtpMs)
-        return;
+    {
+        // Peers enter a new tempo at different local boundaries. Accept a
+        // matching recording that spans our change, not an older queued one.
+        if (pending.audioGuidHex.isEmpty()
+            || !std::isfinite(pending.audioBpm) || pending.audioBpm <= 0.0
+            || std::abs(pending.audioBpm - lastVdoSyncResetBpm) > 0.05
+            || pending.audioBpi != lastVdoSyncResetBpi
+            || !std::isfinite(pending.audioNtpEndTimeMs)
+            || pending.audioNtpEndTimeMs <= pending.ntpBpi1TimeMs
+            || pending.audioNtpEndTimeMs < earliestVdoSyncCaptureNtpMs
+            || playbackNtpMs < earliestVdoSyncCaptureNtpMs)
+            return;
+    }
     if (remoteNtpBufferAppliedByUser.count(senderKey) != 0
         || (canonicalSenderKey.isNotEmpty() && remoteNtpBufferAppliedByUser.count(canonicalSenderKey) != 0))
         return;
